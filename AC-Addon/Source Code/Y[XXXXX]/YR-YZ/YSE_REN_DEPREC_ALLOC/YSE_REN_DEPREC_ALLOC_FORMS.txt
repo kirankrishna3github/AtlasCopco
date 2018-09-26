@@ -1,0 +1,574 @@
+*&---------------------------------------------------------------------*
+*&  Include           YSE_REN_DEPREC_ALLOC_FORMS                       *
+*&---------------------------------------------------------------------*
+
+************************************************************************
+* Form                 : GET_DATA                                      *
+************************************************************************
+* Description          : Pre-loads equipments and COS data in internal *
+*                        tables.                                       *
+************************************************************************
+FORM GET_DATA.
+
+  DATA:
+    LV_PERBL    TYPE JAHRPERBL.   " Period
+
+* Select all rental equipment for the selected company code
+* Note: this is a minimized ITOB join, can be optimized further (?)
+  SELECT      EQUI~EQUNR ILOA~ANLNR ILOA~ANLUN
+         INTO TABLE IT_EQUI
+         FROM EQUI
+        INNER JOIN EQUZ
+           ON EQUI~EQUNR EQ EQUZ~EQUNR
+        INNER JOIN ILOA
+           ON EQUZ~ILOAN EQ ILOA~ILOAN
+        WHERE EQUZ~DATBI EQ '99991231'
+          AND ILOA~BUKRS EQ P_BUKRS
+          AND (    EQUI~EQTYP EQ GC_EQTYPX
+                OR EQUI~EQTYP EQ GC_EQTYPY )
+          AND EQUI~EQUNR IN S_EQUNR.
+
+* Delete duplicates
+  SORT IT_EQUI BY EQUNR.
+  DELETE ADJACENT DUPLICATES FROM IT_EQUI.
+
+* Don't proceed fetching data if no equipments selected
+  CHECK NOT IT_EQUI[] IS INITIAL.
+
+* Duplicate IT_EQUI to IT_EQUI_EXT
+  IT_EQUI_EXT[] = IT_EQUI[].
+* If also lines without equipments are requested
+  IF NOT P_EQLESS IS INITIAL.
+    CLEAR IT_EQUI_EXT.
+    APPEND IT_EQUI_EXT.
+  ENDIF.
+
+* Retrieve all equipment's locations over selected period
+  SELECT      *
+         FROM YSE_LOC_EQUIP
+         INTO TABLE IT_LOC_EQUIP
+          FOR ALL ENTRIES IN IT_EQUI
+        WHERE EQUNR EQ IT_EQUI-EQUNR
+          AND DATUM GE GV_START
+          AND DATUM LE GV_END.
+
+* Get all contract items for the equipments within selected period
+  SELECT      *
+         FROM YSE_RENT_SME
+         INTO TABLE IT_SME
+          FOR ALL ENTRIES IN IT_EQUI
+        WHERE ZZEQUNR EQ IT_EQUI-EQUNR
+          AND (    AUART EQ 'ZQP'
+                OR AUART EQ 'ZQP1'
+                OR AUART EQ 'ZQP2'
+                OR AUART EQ 'ZRIB' )
+          AND (    (      ANGDT GE GV_START
+                      AND ANGDT LE GV_END   )
+                OR (      BNDDT GE GV_START
+                      AND BNDDT LE GV_END   )
+                OR (      ANGDT LT GV_START
+                      AND BNDDT GT GV_END   ) ). "#EC CI_NOFIRST
+
+* Get equipment key to access COS data
+  SELECT      EQUNR VKORG VKBUR PAOBJNR WW006 WW007
+         INTO TABLE IT_COS4
+         FROM CE41000
+          FOR ALL ENTRIES IN IT_EQUI_EXT
+        WHERE BUKRS = P_BUKRS
+          AND VTWEG = GC_RENT
+          AND EQUNR = IT_EQUI_EXT-EQUNR.
+  SORT IT_COS4 BY PAOBJNR.
+
+* Build VRGAR values range
+  GR_VRGAR-SIGN = 'I'.
+  GR_VRGAR-OPTION = 'EQ'.
+  GR_VRGAR-LOW = 'B'.
+  APPEND GR_VRGAR.
+  GR_VRGAR-LOW = 'C'.
+  APPEND GR_VRGAR.
+  GR_VRGAR-LOW = 'F'.
+  APPEND GR_VRGAR.
+  GR_VRGAR-LOW = '0'.
+  APPEND GR_VRGAR.
+  GR_VRGAR-LOW = '9'.
+  APPEND GR_VRGAR.
+
+  LV_PERBL(4) = P_FYEAR.
+  LV_PERBL+4(1) = '0'.
+  LV_PERBL+5(2) = P_FPERD.
+
+  IF NOT IT_COS4[] IS INITIAL.
+*   Get equipment's COS data
+    SELECT PAOBJNR
+           VRGAR
+           REC_WAERS
+           PERBL
+           VV100001
+           VV200001
+           VV300001
+           VV400001
+           VV500001
+           VV600001
+           VV112001
+           VV130001
+      INTO CORRESPONDING FIELDS OF TABLE IT_COS3
+      FROM CE31000
+       FOR ALL ENTRIES IN IT_COS4
+     WHERE PAOBJNR  EQ IT_COS4-PAOBJNR
+       AND PALEDGER EQ GC_PALED            " Currency type
+       AND VRGAR    IN GR_VRGAR            " Posting type
+       AND PERBL    EQ LV_PERBL.           " Period
+
+    SORT IT_COS4 BY PAOBJNR.
+
+*   Add equipment number and sales office to IT_COS3, and also GAC/PGC
+    LOOP AT IT_COS3.
+      READ TABLE IT_COS4 WITH KEY PAOBJNR = IT_COS3-PAOBJNR
+                         BINARY SEARCH.
+      IF SY-SUBRC EQ 0.
+        IT_COS3-EQUNR = IT_COS4-EQUNR.
+        IT_COS3-VKORG = IT_COS4-VKORG.
+        IT_COS3-VKBUR = IT_COS4-VKBUR.
+        IT_COS3-WW006 = IT_COS4-WW006.
+        IT_COS3-WW007 = IT_COS4-WW007.
+        MODIFY IT_COS3.
+      ENDIF.
+    ENDLOOP.                                                " it_cos3
+
+  ENDIF.
+
+* Get equipment's depreciation data
+  SELECT      ANLP~BUKRS ANLP~GJAHR ANLP~PERAF  ANLP~AFBNR
+              ANLP~ANLN1 ANLP~ANLN2 ANLP~AFABER ANLP~ZUJHR
+              ANLP~ZUCOD ANLP~NAFAZ T093B~WAERS
+         INTO TABLE IT_ANLP
+         FROM ANLP
+         JOIN T093B
+           ON ANLP~BUKRS  EQ T093B~BUKRS
+          AND ANLP~AFABER EQ T093B~AFABE
+          FOR ALL ENTRIES IN IT_EQUI
+        WHERE ANLP~BUKRS  EQ P_BUKRS
+          AND ANLP~GJAHR  EQ P_FYEAR
+          AND ANLP~PERAF  EQ P_FPERD
+          AND ANLP~ANLN1  EQ IT_EQUI-ANLNR
+          AND ANLP~AFABER EQ GC_AFABER.
+
+* Get all rental revenue and costs from re-rent (not owned equipments)
+  SELECT      PALEDGER VRGAR VERSI PERIO     PAOBJNR PASUBNR BELNR POSNR
+              EQUNR    GJAHR PERDE REC_WAERS VKORG   VKBUR   VTWEG PRCTR
+              SKOST
+              VV100    VV130 WW006 WW007
+         FROM CE11000
+         INTO TABLE IT_CE11
+        WHERE PALEDGER EQ GC_PALED            " Currency type
+          AND PERIO EQ LV_PERBL
+          AND WW006 IN S_GAC
+          AND BUKRS EQ P_BUKRS.
+
+* Get sales office per plant
+* Get cost center postings per sales offices
+* Get this data for current company code
+  SELECT      VKORG VKBUR WERKS KOSTL
+         INTO TABLE IT_DEPOTS
+         FROM YSE_RENT_DEPOT
+        WHERE BUKRS = P_BUKRS. "#EC CI_NOFIELD
+
+* Get controlling area
+  SELECT SINGLE KOKRS
+      INTO GV_KOKRS
+      FROM TKA02
+     WHERE BUKRS = P_BUKRS.
+
+* Load postings per sales office cost center
+  LOOP AT IT_DEPOTS WHERE NOT KOSTL IS INITIAL.
+    IT_DEPOTS-OBJNR      = GC_KS.
+    IT_DEPOTS-OBJNR+2(4) = GV_KOKRS.
+    IT_DEPOTS-OBJNR+6    = IT_DEPOTS-KOSTL.
+    MODIFY IT_DEPOTS.
+  ENDLOOP.
+
+  SELECT     OBJNR WOGBTR OWAER
+        FROM COEP
+        INTO CORRESPONDING FIELDS OF TABLE IT_COEP
+         FOR ALL ENTRIES IN IT_DEPOTS
+       WHERE KOKRS EQ GV_KOKRS
+         AND OBJNR EQ IT_DEPOTS-OBJNR
+         AND PERIO EQ P_FPERD                 " gv_perio
+         AND GJAHR EQ P_FYEAR.
+
+ENDFORM.    " GET_DATA
+
+************************************************************************
+* Form                 : CALC_DATES                                    *
+************************************************************************
+* Description          : Determine dates
+************************************************************************
+FORM CALC_DATES.
+
+* If "process previous period" flag is set
+  IF NOT P_PPERD EQ SPACE.
+*   Go to previous period starting from the selection parameters
+    IF P_FPERD = '01'.
+      P_FYEAR  = P_FYEAR - 1.
+      P_FPERD  = '12'.
+    ELSE.
+      P_FPERD  = P_FPERD - 1.
+    ENDIF.
+  ENDIF.
+
+* Add leading 0 to period/month if necessary
+  IF P_FPERD < 10 AND P_FPERD(1) <> '0'.
+    P_FPERD+1(1) = '0'.
+    SHIFT P_FPERD CIRCULAR.
+  ENDIF.
+
+* Build start date
+  CONCATENATE P_FYEAR P_FPERD '01' INTO GV_START.
+
+* Count number of days in this month
+  CALL FUNCTION 'HR_E_NUM_OF_DAYS_OF_MONTH'
+    EXPORTING
+      P_FECHA        = GV_START
+    IMPORTING
+      NUMBER_OF_DAYS = GV_DAYS.
+
+* Build end date
+  GV_END = GV_START + GV_DAYS - 1.
+
+ENDFORM.    " calc_dates
+
+*************************************************************************
+* Form BUILD_FIELDCAT                                                   *
+*************************************************************************
+FORM BUILD_FIELDCAT.
+
+  REFRESH:
+    IT_FIELDCAT.
+
+  CONCATENATE 'YSE_RENT_COPA_' GV_TABNM INTO GV_STRUC.
+
+* Set screen variables
+  SV_BUKRS = P_BUKRS.
+  SV_YEAR = P_FYEAR.
+  SV_PERIOD = P_FPERD.
+
+  CALL FUNCTION 'LVC_FIELDCATALOG_MERGE'
+    EXPORTING
+      I_BUFFER_ACTIVE  = SPACE
+      I_STRUCTURE_NAME = GV_STRUC
+    CHANGING
+      CT_FIELDCAT      = IT_FIELDCAT.
+
+  LOOP AT IT_FIELDCAT INTO WA_FIELDCAT.
+    CASE WA_FIELDCAT-FIELDNAME.
+      WHEN 'BUKRS' OR 'FYEAR' OR 'FPERD'.
+        WA_FIELDCAT-NO_OUT = 'X'.
+    ENDCASE.
+    MODIFY IT_FIELDCAT FROM WA_FIELDCAT.
+  ENDLOOP.
+
+* WA_LAYOUT-NO_TOOLBAR = GC_TRUE.
+  WA_LAYOUT-SEL_MODE   = 'B'.        " single row selectable
+  WA_LAYOUT-CWIDTH_OPT = 'X'.
+
+ENDFORM.                    " BUILD_FIELDCAT
+
+************************************************************************
+* Form                 : SAVE_DATA                                     *
+************************************************************************
+* Description          : Saves the distribution data to a table to be  *
+*                        used in P/L per Depot report.                 *
+************************************************************************
+FORM SAVE_DATA.
+
+  DELETE FROM YSE_RENT_COPA_CO WHERE BUKRS EQ P_BUKRS
+                                 AND FYEAR EQ P_FYEAR
+                                 AND FPERD EQ P_FPERD.
+  DELETE FROM YSE_RENT_COPA_CN WHERE BUKRS EQ P_BUKRS
+                                 AND FYEAR EQ P_FYEAR
+                                 AND FPERD EQ P_FPERD.
+  DELETE FROM YSE_RENT_COPA_RV WHERE BUKRS EQ P_BUKRS
+                                 AND FYEAR EQ P_FYEAR
+                                 AND FPERD EQ P_FPERD.
+  INSERT YSE_RENT_COPA_CO FROM TABLE IT_COPA_CO.
+  INSERT YSE_RENT_COPA_CN FROM TABLE IT_COPA_CN.
+  INSERT YSE_RENT_COPA_RV FROM TABLE IT_COPA_RV.
+
+ENDFORM.  " save_data
+
+*&---------------------------------------------------------------------*
+*&      Form  PROCESS_CO
+*&---------------------------------------------------------------------*
+*
+*----------------------------------------------------------------------*
+
+FORM PROCESS_CO.
+
+  DATA:
+    LV_INDEX      TYPE SY-TABIX,
+    LV_DATE       TYPE DATS,
+    LV_ANGDT      TYPE DATUM,
+    LV_BNDDT      TYPE DATUM.
+
+* *******************************************************************************
+* STEP 1: Determine for each equip, how many days it was alloc to which sales off
+* *******************************************************************************
+
+* For every equipment
+  LOOP AT IT_EQUI.
+
+*   First fill the output table with data from contracts which use current equipment
+    SORT IT_SME BY VKBUR ANGDT.
+    LOOP AT IT_SME WHERE ZZEQUNR EQ IT_EQUI-EQUNR.
+      CLEAR: IT_COPA_CO.
+
+*     Determine startdate (date of period or date of contract)
+      IF IT_SME-ANGDT < GV_START.
+        LV_ANGDT = GV_START.
+      ELSE.
+        LV_ANGDT = IT_SME-ANGDT.
+      ENDIF.
+*     Determine enddate (date of period or date of contract)
+      IF IT_SME-BNDDT > GV_END.
+        LV_BNDDT = GV_END.
+      ELSE.
+        LV_BNDDT = IT_SME-BNDDT.
+      ENDIF.
+      IF LV_BNDDT IS INITIAL.
+        LV_BNDDT = GV_END.
+      ENDIF.
+*     Create a new equipment/depot record.
+      IT_COPA_CO-BUKRS = P_BUKRS.
+      IT_COPA_CO-FYEAR = P_FYEAR.
+      IT_COPA_CO-FPERD = P_FPERD.
+      IT_COPA_CO-EQUNR = IT_EQUI-EQUNR.
+      IT_COPA_CO-VKORG = IT_SME-VKORG.
+      IT_COPA_CO-VKBUR = IT_SME-VKBUR.
+      IT_COPA_CO-DZCON = LV_BNDDT - LV_ANGDT + 1.
+      COLLECT IT_COPA_CO.
+
+*     Increment the denominator for the equipment across sales offices
+      IT_EQUI-DENOM = IT_EQUI-DENOM + IT_COPA_CO-DZCON.
+    ENDLOOP.  " it_sme
+
+*   Clear working area
+    CLEAR: IT_COPA_CO.
+
+*   Now fill in gaps of the month with depot location
+    LV_DATE = GV_START.
+    WHILE LV_DATE LE GV_END.
+*     Check if equipment in a contract for current day
+      CLEAR IT_SME.
+      LOOP AT IT_SME WHERE ZZEQUNR EQ IT_EQUI-EQUNR
+                       AND ANGDT   LE LV_DATE
+                       AND BNDDT   GE LV_DATE.
+      ENDLOOP.
+*     If so, advance the date until after the validity of the contract
+      IF SY-SUBRC = 0.
+        LV_DATE = IT_SME-BNDDT + 1.
+*     Otherwise, get location of the equipment for current day
+      ELSE.
+*       Get the location of the equipment for current day
+        READ TABLE IT_LOC_EQUIP WITH KEY EQUNR = IT_EQUI-EQUNR
+                                   DATUM = LV_DATE.
+*       Note: there should be one for each day but test anyway
+        IF SY-SUBRC = 0.
+*         Get corresponding sales org and office
+          READ TABLE IT_DEPOTS WITH KEY WERKS = IT_LOC_EQUIP-B_WERK.
+          IF SY-SUBRC = 0.
+            IT_COPA_CO-BUKRS = P_BUKRS.
+            IT_COPA_CO-FYEAR = P_FYEAR.
+            IT_COPA_CO-FPERD = P_FPERD.
+            IT_COPA_CO-EQUNR = IT_EQUI-EQUNR.
+            IT_COPA_CO-VKORG = IT_DEPOTS-VKORG.
+            IT_COPA_CO-VKBUR = IT_DEPOTS-VKBUR.
+            IT_COPA_CO-DZDEP = 1.
+            COLLECT IT_COPA_CO.
+*           Increment the denominator for the equipment across sales offices
+            IT_EQUI-DENOM = IT_EQUI-DENOM + IT_COPA_CO-DZDEP.
+          ENDIF.  " SUBRC EQ 0 after READ on DEPOTS
+        ENDIF.    " SUBRC EQ 0 after READ on IT_LOC_EQUIP
+*       Go on with next day
+        LV_DATE = LV_DATE + 1.
+      ENDIF.     " contract interval exists or not
+    ENDWHILE.  " lv_date
+
+    MODIFY IT_EQUI.
+
+  ENDLOOP.  " IT_EQUI
+
+* *********************************************************
+* STEP 2: Now add appropriate costs to the IT_COPA_CO table
+* *********************************************************
+  SORT IT_EQUI BY EQUNR.
+* Calculate COS by allocation percentage
+  LOOP AT IT_COPA_CO.
+
+*   Store internal table index for later use (modification of current record)
+    LV_INDEX = SY-TABIX.
+
+*   Read related asset and denominator (is in IT_EQUI)
+    READ TABLE IT_EQUI WITH KEY EQUNR = IT_COPA_CO-EQUNR BINARY SEARCH.
+
+*   Calculate percentage: (depot days + contract days) / total days equipment is assigned to a(ny) depot
+    IT_COPA_CO-PERAL = ( IT_COPA_CO-DZDEP + IT_COPA_CO-DZCON ) / IT_EQUI-DENOM * 100.
+
+*   Loop over COS3 where equipment and sales office match the current IT_LINE
+    LOOP AT IT_COS3 WHERE EQUNR EQ IT_COPA_CO-EQUNR    " used to be a loop on IT_COS4
+                    AND   VKBUR EQ IT_COPA_CO-VKBUR.
+*      LOOP AT IT_COS3 WHERE PAOBJNR = IT_COS4-PAOBJNR.
+*       IT_COPA_CO-VDEPR = IT_COPA_CO-VDEPR + IT_COS3-VV130001.
+        IT_COPA_CO-VSERV = IT_COPA_CO-VSERV + IT_COS3-VV200001 + IT_COS3-VV300001
+                         + IT_COS3-VV400001 + IT_COS3-VV500001 + IT_COS3-VV600001.
+        IT_COPA_CO-WAERS = IT_COS3-REC_WAERS.
+*      ENDLOOP.    " read it_cos3.
+    ENDLOOP.                                                " it_cos3
+*   Calculate equipment's depreciation cost
+    LOOP AT IT_ANLP WHERE ANLN1 = IT_EQUI-ANLNR
+                      AND ANLN2 = IT_EQUI-ANLUN.
+      IT_COPA_CO-VDEPR = IT_COPA_CO-VDEPR + IT_ANLP-NAFAZ.
+      IT_COPA_CO-WAERS = IT_ANLP-WAERS.
+    ENDLOOP.    " it_anlp
+
+*   Calculate percentile allocation based on # of days the equipment has been
+*   somewhere and not relative to # of days in this month.
+    IT_COPA_CO-ADEPR = IT_COPA_CO-VDEPR * IT_COPA_CO-PERAL / 100.
+
+*   Get equipment's other costs
+    READ TABLE IT_DEPOTS WITH KEY VKBUR = IT_COPA_CO-VKBUR.
+    IF SY-SUBRC = 0.
+      LOOP AT IT_COEP WHERE OBJNR EQ IT_DEPOTS-OBJNR.
+        IT_COPA_CO-VOTHR = IT_COPA_CO-VOTHR + IT_COEP-WOGBTR.
+      ENDLOOP.  " it_coep
+      IF IT_COPA_CO-WAERS IS INITIAL.
+        IT_COPA_CO-WAERS = IT_COEP-OWAER.
+      ENDIF.
+    ENDIF.
+*   Invert costs
+    IT_COPA_CO-VDEPR = 0 - IT_COPA_CO-VDEPR.
+    IT_COPA_CO-ADEPR = 0 - IT_COPA_CO-ADEPR.
+
+*   Save changed record
+    MODIFY IT_COPA_CO INDEX LV_INDEX.
+
+  ENDLOOP.  " IT_COPA_CO
+
+* If also costs registered without equipment should be considered:
+  IF P_EQLESS NE SPACE.
+    CLEAR IT_COPA_CO.
+    IT_COPA_CO-BUKRS = P_BUKRS.
+    IT_COPA_CO-FYEAR = P_FYEAR.
+    IT_COPA_CO-FPERD = P_FPERD.
+    LOOP AT IT_COS3 WHERE EQUNR EQ SPACE.
+      IT_COPA_CO-VKORG = IT_COS3-VKORG.
+      IT_COPA_CO-VKBUR = IT_COS3-VKBUR.
+      IT_COPA_CO-VSERV = IT_COS3-VV200001 + IT_COS3-VV300001
+                       + IT_COS3-VV400001 + IT_COS3-VV500001 + IT_COS3-VV600001.
+      COLLECT IT_COPA_CO.
+    ENDLOOP.
+  ENDIF.
+
+ENDFORM.                    " PROCESS_CO
+
+*&---------------------------------------------------------------------*
+*&      Form  PROCESS_CN
+*&---------------------------------------------------------------------*
+*
+*----------------------------------------------------------------------*
+FORM PROCESS_CN.
+
+  CLEAR IT_COPA_CN.
+
+  IT_COPA_CN-BUKRS = P_BUKRS.
+  IT_COPA_CN-FYEAR = P_FYEAR.
+  IT_COPA_CN-FPERD = P_FPERD.
+
+  LOOP AT IT_CE11 WHERE PRCTR EQ P_PRCTR
+                    AND VTWEG EQ GC_RENT.
+
+*   Get corr. cost center from YSE_REN_DEPOT for this line's sales org and sales office
+    READ TABLE IT_DEPOTS WITH KEY KOSTL = IT_CE11-SKOST.
+*   If no depot found with this cost center, skip the line
+    IF SY-SUBRC NE 0 OR IT_CE11-SKOST IS INITIAL.
+      CONTINUE.
+    ENDIF.
+
+    IT_COPA_CN-VKORG = IT_DEPOTS-VKORG.
+    IT_COPA_CN-VKBUR = IT_DEPOTS-VKBUR.
+    IT_COPA_CN-VOTHR = IT_CE11-VV130.
+    IT_COPA_CN-WAERS = IT_CE11-REC_WAERS.
+
+    COLLECT IT_COPA_CN.
+  ENDLOOP.
+
+ENDFORM.                    " PROCESS_CN
+
+*&---------------------------------------------------------------------*
+*&      Form  PROCESS_RV
+*&---------------------------------------------------------------------*
+*
+*----------------------------------------------------------------------*
+FORM PROCESS_RV .
+
+* First add revenue owned equipments
+* Prepare default line
+  CLEAR IT_COPA_RV.
+  IT_COPA_RV-BUKRS = P_BUKRS.
+  IT_COPA_RV-FYEAR = P_FYEAR.
+  IT_COPA_RV-FPERD = P_FPERD.
+  IT_COPA_RV-OWNED = 'X'.
+* Process all equipments
+  LOOP AT IT_EQUI.
+
+    IT_COPA_RV-EQUNR = IT_EQUI-EQUNR.
+
+*   Loop over COS3 where equipment matches the current IT_EQUI
+    LOOP AT IT_COS3 WHERE EQUNR EQ IT_COPA_RV-EQUNR.     " used to be a loop on IT_COS4
+      IT_COPA_RV-VKORG = IT_COS3-VKORG.
+      IT_COPA_RV-VKBUR = IT_COS3-VKBUR.
+      IT_COPA_RV-WW006 = IT_COS3-WW006.   " GAC
+      IT_COPA_RV-WW007 = IT_COS3-WW007.   " PGC
+*      READ TABLE IT_COS3 WITH KEY PAOBJNR = IT_COS4-PAOBJNR.
+*      LOOP AT IT_COS3 WHERE PAOBJNR = IT_COS4-PAOBJNR.
+      IT_COPA_RV-VREVU = IT_COS3-VV100001.
+      IT_COPA_RV-WAERS = IT_COS3-REC_WAERS.
+      COLLECT IT_COPA_RV.
+*      ENDLOOP.    " it_cos3.
+    ENDLOOP.      " it_cos3
+  ENDLOOP.
+
+* Now add revenue not owned equipments
+* Prepare default line
+  CLEAR IT_COPA_RV-OWNED.
+* Process CE11 lines
+  LOOP AT IT_CE11 WHERE VRGAR EQ 'F'.
+    IT_COPA_RV-EQUNR = IT_CE11-EQUNR.
+    IT_COPA_RV-VKORG = IT_CE11-VKORG.
+    IT_COPA_RV-VKBUR = IT_CE11-VKBUR.
+    IT_COPA_RV-WW006 = IT_CE11-WW006.
+    IT_COPA_RV-WW007 = IT_CE11-WW007.
+    IT_COPA_RV-VREVU = IT_CE11-VV100.
+    IT_COPA_RV-WAERS = IT_CE11-REC_WAERS.
+    COLLECT IT_COPA_RV.
+  ENDLOOP.
+
+* If also revenue registered without equipment should be considered:
+  IF P_EQLESS NE SPACE.
+    CLEAR IT_COPA_RV.
+    IT_COPA_RV-BUKRS = P_BUKRS.
+    IT_COPA_RV-FYEAR = P_FYEAR.
+    IT_COPA_RV-FPERD = P_FPERD.
+    IT_COPA_RV-OWNED = 'X'.
+    LOOP AT IT_COS3 WHERE EQUNR EQ SPACE.
+      IT_COPA_RV-VKORG = IT_COS3-VKORG.
+      IT_COPA_RV-VKBUR = IT_COS3-VKBUR.
+      IT_COPA_RV-WW006 = IT_COS3-WW006.   " GAC
+      IT_COPA_RV-WW007 = IT_COS3-WW007.   " PGC
+      IT_COPA_RV-VREVU = IT_COS3-VV100001.
+      IT_COPA_RV-WAERS = IT_COS3-REC_WAERS.
+      COLLECT IT_COPA_RV.
+    ENDLOOP.
+
+  ENDIF.
+
+ENDFORM.                    " PROCESS_RV

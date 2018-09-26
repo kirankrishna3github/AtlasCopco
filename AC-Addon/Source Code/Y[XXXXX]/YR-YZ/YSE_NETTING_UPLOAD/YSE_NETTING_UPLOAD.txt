@@ -1,0 +1,2047 @@
+REPORT  yse_netting_upload LINE-SIZE 180 LINE-COUNT 55.
+
+************************************************************************
+* Title          : Intercompany Netting - Uploading to SAP             *
+*                                                                      *
+* Reference      : SFSP-FtM-021-Netting inbound                        *
+*                  This report receives a file from mirrored ledger    *
+*                  and will do the matching with BATCH INPUT           *
+*                                                                      *
+* Date           : 2005.05.22                                          *
+*                                                                      *
+* Author         : Sten-Olov Bj#rbrand Capgemini                       *
+* Copy from:     : ZACTA_NETTING_UPLOAD                                *
+************************************************************************
+* Corr/Vers  Date        Pers.        Description                      *
+* ---------  ----------  -----------  ---------------------------------*
+* <Corr.No.> DD.MM.YYYY  <Ini.>       <Issuenumber> <Short Description>*
+*  X0001     2.05.2005   EXTSB        Error message                    *
+*  X0002     6.09.2005   T. RING      EARS00002898067 no translation   *
+*                        ETAMS10      doc.no                           *
+*  ------------------------------------------------------------------- *
+*  SEED Raskin Kevin                                                   *
+*  Issue 2688                                                          *
+*  Added logic for ref number for customers                            *
+*  ------------------------------------------------------------------- *
+*  Issue CR0692    ( Uzzawal Vemparala )                               *
+*  CR0692: Update Netting Program
+*  Changes done by EXTUVE on 29/02/2009  (CD1K946565) (CD1K946567)     *
+*  ------------------------------------------------------------------- *
+*  MOD-005    21.03.2013  Nanda Sreenivasan  CD1K975364     CR 2818    *
+*  Fix to resolve dump arising because of changes in netting file.     *
+************************************************************************
+* MOD-006 |31/07/2014| Shireesha D |CD1K983112  | EXTSDA               *
+*               CR3239 : Change in Netting Code to incorporate changes *
+*                        similar to ACT template                       *
+************************************************************************
+* MOD-007 |06/11/2015| Shireesha D |CD1K987401  | EXTSDA               *
+*               CR3798 : Fix to resolve the issue raised for the       *
+*                        currency fields in AR and AP files            *
+************************************************************************
+
+
+TABLES: kna1, knb1, lfa1, bseg.
+
+** Structures -
+DATA: data_tab(1028) TYPE c OCCURS 0 WITH HEADER LINE.
+TYPES: BEGIN OF accounts,
+        document(16) TYPE c,
+        dcsign(1) TYPE c,
+        buyer(3) TYPE c,
+        seller(3) TYPE c,
+        doc_date(10) TYPE c,
+        due_date(10) TYPE c,
+        currency(3) TYPE c,
+        value_cur(10) TYPE c,
+        ref1(20) TYPE c,
+        ref2(20) TYPE c,
+        rate(15) TYPE c,
+        value_mcu(10) TYPE c,
+      END OF accounts.
+
+TYPES: BEGIN OF totals,
+         buyer(3) TYPE c,
+         seller(3) TYPE c,
+         currency(3) TYPE c,
+         amount_1 TYPE p DECIMALS 2,        "On list
+         amount_2 TYPE p DECIMALS 2,        "Newly posted
+         amount_3 TYPE p DECIMALS 2,        "Already posted
+      END OF totals.
+
+TYPES: BEGIN OF hdrmsg,
+         document(16) TYPE c,
+         posted(1) TYPE c,
+         msgtyp(1) TYPE c,
+         msgtext(60) TYPE c,
+         buyer(3) TYPE c,
+         seller(3) TYPE c,
+         currency(3) TYPE c,
+         dcsign TYPE c,
+         amount TYPE p DECIMALS 2,
+      END OF hdrmsg.
+
+
+** Internal tables -
+DATA: it_vendors TYPE STANDARD TABLE OF accounts,
+      it_customers TYPE STANDARD TABLE OF accounts.
+DATA: it_tot_customers TYPE HASHED TABLE OF totals
+              WITH UNIQUE KEY seller buyer currency,
+      it_tot_vendors TYPE HASHED TABLE OF totals
+              WITH UNIQUE KEY buyer seller currency,
+      bdcdata TYPE TABLE OF bdcdata WITH HEADER LINE,
+      it_messages TYPE TABLE OF bdcmsgcoll WITH HEADER LINE,
+      it_hdrmsg TYPE TABLE OF hdrmsg WITH HEADER LINE.
+
+* Begin of Insert EXTSDA MOD-006++
+DATA  BEGIN OF dynpfields OCCURS 1.
+        INCLUDE STRUCTURE dynpread.
+DATA  END   OF dynpfields.
+* End of Insert EXTSDA MOD-006++
+
+** Global data -
+DATA: wa_vendors TYPE accounts,
+      wa_customers TYPE accounts,
+      wa_tot_vendors TYPE totals,
+      wa_tot_customers TYPE totals.
+
+DATA: type_accounts(2) TYPE c,
+      gv_lcounter TYPE i,
+      gv_header(120),
+      gv_rate LIKE bkpf-kursf,
+      gv_posting_key(2) TYPE c,
+      gv_account_number LIKE lfa1-lifnr,
+      gv_account_type(4) TYPE c,
+      gv_document_type LIKE bkpf-blart,
+      gv_account LIKE ska1-saknr,
+      gv_flag_in_payment,
+      gv_flag_out_payment,
+      gv_errtxt(60) TYPE c,
+      gv_value_cur TYPE p DECIMALS 2,
+      gv_value_mcu TYPE p DECIMALS 2,
+      gv_skip_posted,
+      gv_file LIKE rlgrap-filename,
+      gv_docdate(8) TYPE c,
+      gv_belnr LIKE bkpf-belnr,
+      filename TYPE string,
+      mode VALUE 'N',
+      wa_search_term(2) TYPE c,      "A06
+      wa_invoice(4) TYPE c,          "A06
+      wa_company(3) TYPE c,          "A06
+      wa_waers(3) TYPE c,
+      gv_customers(12) TYPE c, "+MOD-007
+      gv_vendors(12) TYPE c.   "+MOD-007
+
+.
+DATA: BEGIN OF wa_date,
+         dd(2) TYPE c,
+         mm(2) TYPE c,
+         yy(4) TYPE c,
+      END OF wa_date.
+DATA: arbgb            LIKE  t100-arbgb,
+      msgnr            LIKE  sy-msgno,
+      msgv1            LIKE  sy-msgv1,
+      msgv2            LIKE  sy-msgv2,
+      msgv3            LIKE  sy-msgv3,
+      msgv4            LIKE  sy-msgv4,
+      msgtext(80) TYPE c,
+      text(100).
+
+DATA: BEGIN OF lv_docdate,
+        day(2) TYPE n,
+        month(2) TYPE n,
+        year(4) TYPE n,
+      END OF lv_docdate.
+
+DATA: day(2) TYPE p DECIMALS 0,
+      month(2) TYPE p DECIMALS 0.
+
+
+CONSTANTS: file_delimiter TYPE c VALUE ';',
+           nodata VALUE '/'
+           .
+
+*------------------------------------------------- End of data -------*
+
+
+*** PARAMETERS ********************************************************
+*General
+SELECTION-SCREEN BEGIN OF BLOCK b00 WITH FRAME TITLE text-t01.
+PARAMETERS: p_bukrs LIKE knb1-bukrs OBLIGATORY.
+*PARAMETERS: p_gsber LIKE bseg-gsber. "DEFAULT '3900'.
+* Begin of Insert EXTSDA MOD-006++
+PARAMETERS: p_zfam LIKE yse_cc_segm_ftm-zfam.
+* End of Insert EXTSDA MOD-006++
+PARAMETERS: p_budat LIKE sy-datum DEFAULT sy-datum.
+
+PARAMETERS: p_file LIKE rlgrap-filename DEFAULT gv_file.
+
+SELECTION-SCREEN END OF BLOCK b00.
+
+*Customer block
+SELECTION-SCREEN BEGIN OF BLOCK b10 WITH FRAME TITLE text-t02.
+PARAMETERS: p_cust AS CHECKBOX DEFAULT 'X'.
+
+SELECTION-SCREEN BEGIN OF BLOCK b11 WITH FRAME.
+SELECT-OPTIONS: p_kunnr FOR kna1-kunnr.
+*PARAMETERS: p_blrtar LIKE bkpf-blart OBLIGATORY DEFAULT 'DZ'. "CR0639
+PARAMETERS: p_blrtar LIKE bkpf-blart OBLIGATORY DEFAULT 'Z4'. "CR0639
+PARAMETERS:  p_accar LIKE ska1-saknr OBLIGATORY.
+PARAMETERS:     test_1 AS CHECKBOX.
+
+SELECTION-SCREEN BEGIN OF LINE.
+PARAMETERS:    p_post1 AS CHECKBOX DEFAULT 'X'.
+SELECTION-SCREEN COMMENT (26) FOR FIELD p_post1.
+SELECTION-SCREEN POSITION 28.
+SELECT-OPTIONS: p_augdt1 FOR bseg-augdt.
+SELECTION-SCREEN END OF LINE.
+
+SELECTION-SCREEN END OF BLOCK b11.
+SELECTION-SCREEN END OF BLOCK b10.
+
+*Vendor block
+SELECTION-SCREEN BEGIN OF BLOCK b20 WITH FRAME TITLE text-t03.
+PARAMETERS: p_vend AS CHECKBOX DEFAULT 'X'.
+
+SELECTION-SCREEN BEGIN OF BLOCK b21 WITH FRAME.
+
+SELECT-OPTIONS: p_lifnr FOR lfa1-lifnr.
+*PARAMETERS: p_blrtap LIKE bkpf-blart OBLIGATORY DEFAULT 'KZ'. "CR0639
+PARAMETERS: p_blrtap LIKE bkpf-blart OBLIGATORY DEFAULT 'Z5'. "CR0639
+PARAMETERS:  p_accap LIKE ska1-saknr OBLIGATORY.
+PARAMETERS:     test_2 AS CHECKBOX.
+
+SELECTION-SCREEN BEGIN OF LINE.
+PARAMETERS:     p_post2 AS CHECKBOX DEFAULT 'X'.
+SELECTION-SCREEN COMMENT (26) FOR FIELD p_post2.
+SELECTION-SCREEN POSITION 28.
+SELECT-OPTIONS: p_augdt2 FOR bseg-augdt.
+SELECTION-SCREEN END OF LINE.
+
+
+SELECTION-SCREEN END OF BLOCK b21.
+SELECTION-SCREEN END OF BLOCK b20.
+
+*------------------------------------------------- End of parameters -*
+
+*** PROGRAM ***********************************************************
+START-OF-SELECTION.
+
+  PERFORM init_company_settings.
+
+  PERFORM load_table.
+  IF sy-subrc = 0.
+    PERFORM load_documents.
+    PERFORM display_statistics.
+    IF p_cust = 'X'.
+      PERFORM create_totals_customers.
+      PERFORM start_transaction_customer.
+      PERFORM display_errors_customers.
+      PERFORM display_totals_customers.
+    ENDIF.
+    IF p_vend = 'X'.
+      PERFORM create_totals_vendors.
+      PERFORM start_transaction_vendor.
+      PERFORM display_errors_vendors.
+      PERFORM display_totals_vendors.
+    ENDIF.
+  ELSE.
+    CONCATENATE 'Could not open file'(001) filename
+           INTO  msgtext SEPARATED BY ': '.
+    MESSAGE msgtext TYPE 'E'.
+  ENDIF.
+
+END-OF-SELECTION.
+*------------------------------------------------- End of program ----*
+
+*** SCREEN CONTROLS ***************************************************
+INITIALIZATION.
+*  gv_file = 'C:\Temp\nettings2.CSV'.
+  gv_file =
+  'c:\TESTNETTING.CSV'.
+  p_file = gv_file.
+  GET PARAMETER ID 'BUK' FIELD p_bukrs.
+* p_accar = '1561005'.
+* p_accap = '2463006'.
+*  p_accar = '1568950'.
+*  p_accap = '2464950'.
+  gv_skip_posted = 'Y'.
+
+  CLEAR p_augdt1.
+  MOVE: 'EQ'     TO p_augdt1-option,
+        sy-datum TO p_augdt1-low.
+  APPEND p_augdt1.
+  CLEAR p_augdt2.
+  MOVE: 'EQ'     TO p_augdt2-option,
+        sy-datum TO p_augdt2-low.
+  APPEND p_augdt2.
+
+AT SELECTION-SCREEN.
+
+  PERFORM check_authorization.
+
+** local file F4 help offered
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_file.
+
+  CALL FUNCTION 'WS_FILENAME_GET'
+     EXPORTING
+          def_filename     = '*'
+          def_path         =
+        '\\Actdc12\PTDData\Finance\Mirrored Ledger Project'
+          mask             = ',*.*,*.*.'
+          mode             = 'O'
+*            title            =
+     IMPORTING
+          filename         = p_file
+     EXCEPTIONS
+          inv_winsys       = 01
+          no_batch         = 02
+          selection_cancel = 03
+          selection_error  = 04.                            "#EC *
+
+* Begin of Insert EXTSDA MOD-006++
+* To avail F-4 functionality for P_ZFAM based on P_BUKRS
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_zfam.
+  PERFORM f4_zfam.
+
+AT SELECTION-SCREEN OUTPUT.
+*  LOOP AT SCREEN.
+
+*    CASE p_bukrs.
+*      WHEN 'BEXA'.
+*        MOVE '3290' TO p_gsber.
+*        MODIFY SCREEN.
+*      WHEN 'BEAA'.
+*        MOVE '3900' TO p_gsber.
+*        MODIFY SCREEN.
+*    ENDCASE.
+
+*    IF screen-name(7) EQ 'P_GSBER' OR
+*       screen-name(7) EQ 'P_ACCAR' OR
+*       screen-name(7) EQ 'P_ACCAP'.
+*      screen-input = '0'.
+*      MODIFY SCREEN.
+*    ENDIF.
+*  ENDLOOP.
+
+
+*------------------------------------------------- End of Screen Ctls *
+
+
+*** TOP/END OF PAGE ***************************************************
+
+FORM init_company_settings.
+
+*  CLEAR wa_search_term.
+*  CASE p_bukrs.
+*    WHEN 'TOOA'.
+*      wa_search_term = 'AC'.
+*      wa_invoice = '9000'.
+*      wa_company = 'TOO'.
+*  ENDCASE.
+
+  SELECT SINGLE rcomp FROM t001 INTO wa_company
+    WHERE bukrs = p_bukrs.
+
+* Also the currency of the company code needs to be read
+* Begin of comment EXTSDA MOD-006--
+*  select rcomp waers   from t001
+*  into (wa_company , wa_waers)
+*  where bukrs = p_bukrs.
+*  endselect.
+* End of comment EXTSDA MOD-006--
+* Begin of Insert EXTSDA MOD-006++
+  SELECT SINGLE waers
+         FROM t001
+         INTO  wa_waers
+         WHERE bukrs = p_bukrs.
+
+  IF p_zfam IS NOT INITIAL.
+    wa_company = p_zfam.
+  ENDIF.
+* End of Insert EXTSDA MOD-006++
+
+ENDFORM.                    "init_company_settings
+
+*---------------------------------------------------------------------*
+*       FORM load_documents                                           *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+FORM load_documents.
+
+  LOOP AT data_tab.
+    IF data_tab+0(16) = 'INVOICES PAYABLE'.
+      MOVE 'AP' TO type_accounts.
+    ELSEIF data_tab+0(19) = 'INVOICES RECEIVABLE'.
+      MOVE 'AR' TO type_accounts.
+    ELSEIF type_accounts = 'AR' OR type_accounts = 'AP'.
+      CASE type_accounts.
+        WHEN 'AP'.
+          SPLIT data_tab AT file_delimiter
+              INTO wa_vendors-document
+                   wa_vendors-dcsign
+                   wa_vendors-buyer
+                   wa_vendors-seller
+                   wa_vendors-doc_date
+                   wa_vendors-due_date
+                   wa_vendors-currency
+                   wa_vendors-value_cur
+                   wa_vendors-ref1
+                   wa_vendors-ref2
+                   wa_vendors-rate
+                   wa_vendors-value_mcu
+                   gv_vendors  "+MOD-007
+                   .
+* Begin of Comment MOD-007
+* Begin of MOD-005
+*          REPLACE ALL OCCURRENCES OF ';'  IN wa_vendors-value_mcu WITH ''.
+* End   of MOD-005
+* End of Comment MOD-007
+*         IF wa_vendors-buyer = 'TDC' and         "A06
+          IF wa_vendors-buyer = wa_company AND    "A06
+             wa_vendors-document <> ' ' .
+            APPEND wa_vendors TO it_vendors.
+          ENDIF.
+
+        WHEN 'AR'.
+          SPLIT data_tab AT file_delimiter
+              INTO wa_customers-document
+                   wa_customers-dcsign
+                   wa_customers-buyer
+                   wa_customers-seller
+                   wa_customers-doc_date
+                   wa_customers-due_date
+                   wa_customers-currency
+                   wa_customers-value_cur
+                   wa_customers-ref1
+                   wa_customers-ref2
+                   wa_customers-rate
+                   wa_customers-value_mcu
+                   gv_customers "+MOD-007
+                   .
+* Begin of Comment MOD-007
+* Begin of MOD-005
+*          REPLACE ALL OCCURRENCES OF ';'  IN wa_customers-value_mcu WITH ''.
+* End   of MOD-005
+* Begin of Comment MOD-007
+
+*          CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'        "EXTSB
+*            EXPORTING
+*              INPUT  = wa_customers-document
+*            IMPORTING
+*              OUTPUT = wa_customers-document.
+*          wa_customers-document = wa_customers-document+6(10).
+          IF wa_customers-doc_date CA '/'.
+            SPLIT wa_customers-doc_date
+                  AT '/' INTO
+                        wa_date-dd
+                        wa_date-mm
+                        wa_date-yy.
+          ELSE.
+            SPLIT wa_customers-doc_date
+                  AT '-' INTO
+                        wa_date-dd
+                        wa_date-mm
+                        wa_date-yy.
+
+          ENDIF.
+          IF sy-subrc = 0.
+            IF wa_date-dd+1(1) = space.
+              SHIFT wa_date-dd RIGHT.
+              wa_date-dd+0(1) = '0'.
+            ENDIF.
+            IF wa_date-mm+1(1) = space.
+              SHIFT wa_date-mm RIGHT.
+              wa_date-mm+0(1) = '0'.
+            ENDIF.
+            CONCATENATE wa_date-yy wa_date-mm wa_date-dd
+                  INTO gv_docdate.
+
+*Document numbering exceptions-------------------------
+*A05  Except manual documents (starting with 18)
+*A06  Company BEAA / BEXA
+*-----> X0002 2005-09-06 No translation of doc.no
+*            IF wa_customers-document+0(2) <> '18'.  "18=Manual invoice
+*<----- X0002 2005-09-06 No translation of doc.no
+
+*              IF ( wa_company = 'TDC' and
+*                   NOT gv_docdate < 20040301 )   "A05
+*                  OR
+*                  ( wa_company = 'XDC' and
+*                    gv_docdate ge 20041101 ).
+*                    if p_bukrs ne 'TOOA'.           " EXTSB
+*                      CONCATENATE                    "A07 extew
+*                      wa_invoice                     "A07 extew
+*                      wa_customers-document+4(6)     "A07 extew
+*                      INTO wa_customers-document.    "A07 extew
+**                    endif.
+*              ENDIF.
+*              IF wa_company = 'XDC' and           "A06
+*                 gv_docdate lt 20041101.          "A06
+*                 if p_bukrs ne 'TOOA'.           " EXTSB
+*                   CONCATENATE                    "A06  "A07 extew
+*                  '9000'                         "A06  "A07 extew
+*                   wa_customers-document+4(6)     "A06  "A07 extew
+*                   INTO wa_customers-document.    "A06  "A07 extew
+*                 endif.
+*              ENDIF.
+*-----> X0002 2005-09-06 No translation of doc.no
+*start of delete
+*              IF ( wa_company = 'TOO' AND
+*                         NOT gv_docdate < 20050509 ).  " GO LIVE ACTA
+*                CONCATENATE                                 "A07 extew
+*                wa_invoice                                  "A07 extew
+*                 wa_customers-document+4(6)                 "A07 extew
+*                 INTO wa_customers-document.                "A07 extew
+**                    endif.
+*              ENDIF.
+*end of delete
+*            ENDIF.
+*<----- X0002 2005-09-06 No translation of doc.no
+
+          ENDIF.
+*A06-------------------------------------------
+*         IF wa_customers-buyer <> 'TDC' and          "A06
+          IF wa_customers-buyer <> wa_company AND     "A06
+             wa_customers-document <> ' ' .
+            APPEND wa_customers TO it_customers.
+          ENDIF.
+
+      ENDCASE.
+
+    ENDIF.
+
+  ENDLOOP.
+
+ENDFORM.                    "load_documents
+
+*---------------------------------------------------------------------*
+*       FORM display_statistics                                       *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+FORM display_statistics.
+
+  WRITE:/ 'Statistics Mirrored Ledgers - Company'(002), p_bukrs,
+          ' - File extract on'(005).
+  WRITE: sy-datum, ' at '(006), sy-uzeit, 'by'(007), sy-uname.
+  IF p_cust = 'X'.
+    DESCRIBE TABLE it_customers LINES gv_lcounter.
+    WRITE:/ 'Total documents received for A/R:'(003),(5) gv_lcounter.
+  ENDIF.
+  IF p_vend = 'X'.
+    DESCRIBE TABLE it_vendors LINES gv_lcounter.
+    WRITE:/ 'Total documents received for A/P:'(004),(5) gv_lcounter.
+  ENDIF.
+  ULINE.
+
+ENDFORM.                    "display_statistics
+
+*&--------------------------------------------------------------------*
+*&      Form  create_totals_customers
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+FORM create_totals_customers.
+  FORMAT INTENSIFIED OFF.
+  SORT it_customers BY seller document.
+  WRITE:/ 'ACCOUNTS RECEIVABLE' COLOR COL_HEADING.
+
+  LOOP AT it_customers INTO wa_customers.
+
+* rate conversion '999.999.999' into '9,99999999'.
+    TRANSLATE wa_customers-rate USING '. '.
+    CONDENSE wa_customers-rate NO-GAPS.
+    gv_rate = wa_customers-rate / 100000000.
+
+    gv_value_cur = wa_customers-value_cur.
+    gv_value_mcu = wa_customers-value_mcu.
+
+* add to summary
+    MOVE: wa_customers-buyer TO wa_tot_customers-buyer,
+          wa_customers-seller TO wa_tot_customers-seller,
+          wa_customers-currency TO wa_tot_customers-currency,
+          gv_value_cur TO wa_tot_customers-amount_1.
+
+    COLLECT wa_tot_customers INTO it_tot_customers.
+
+    IF test_1 = 'X'.
+* Display documents
+      WRITE:/ wa_customers-document,
+                   wa_customers-buyer,
+                   wa_customers-seller,
+                   wa_customers-doc_date,
+                   wa_customers-due_date,
+                   wa_customers-currency,
+                   gv_value_cur,
+                   gv_rate,
+                   gv_value_mcu
+                   .
+    ENDIF.
+
+  ENDLOOP.
+
+ENDFORM.                    "create_totals_customers
+
+*---------------------------------------------------------------------*
+*       FORM load_table                                               *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+FORM load_table.
+
+  filename = p_file.
+  CALL FUNCTION 'GUI_UPLOAD'
+    EXPORTING
+      filename                      = filename
+     filetype                      = 'ASC'
+*   HAS_FIELD_SEPARATOR           = ' '
+*   HEADER_LENGTH                 = 0
+*   READ_BY_LINE                  = 'X'
+*   DAT_MODE                      = ' '
+*   CODEPAGE                      = ' '
+*   IGNORE_CERR                   = ABAP_TRUE
+*   REPLACEMENT                   = '#'
+* IMPORTING
+*   FILELENGTH                    =
+*   HEADER                        =
+    TABLES
+      data_tab                      = data_tab
+ EXCEPTIONS
+  file_open_error               = 1
+  file_read_error               = 2
+  no_batch                      = 3
+  gui_refuse_filetransfer       = 4
+  invalid_type                  = 5
+  no_authority                  = 6
+  unknown_error                 = 7
+  bad_data_format               = 8
+  header_not_allowed            = 9
+  separator_not_allowed         = 10
+  header_too_long               = 11
+  unknown_dp_error              = 12
+  access_denied                 = 13
+  dp_out_of_memory              = 14
+  disk_full                     = 15
+  dp_timeout                    = 16
+  OTHERS                        = 17
+            .
+ENDFORM.                    "load_table
+
+*&--------------------------------------------------------------------*
+*&      Form  start_transaction_customer
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+FORM start_transaction_customer.
+
+  DATA: lv_dcsign(1) TYPE c,
+        lv_doctype LIKE bkpf-blart.
+
+  REFRESH: it_messages, it_hdrmsg.
+  CLEAR  : it_messages, it_hdrmsg.
+
+  LOOP AT it_customers INTO wa_customers.
+
+* convert document date dd/mm/yyyy into ddmmyyyy
+    IF wa_customers-doc_date CA '/'.
+      SPLIT wa_customers-doc_date AT '/'
+          INTO lv_docdate-day
+               lv_docdate-month
+               lv_docdate-year.
+    ELSE.
+      SPLIT wa_customers-doc_date AT '-'
+          INTO lv_docdate-day
+               lv_docdate-month
+               lv_docdate-year.
+
+    ENDIF.
+    MOVE lv_docdate-day TO day.
+    MOVE day TO lv_docdate-day.
+    MOVE lv_docdate-month TO month.
+    MOVE month TO lv_docdate-month.
+
+* check if document can be cleared
+    PERFORM check_document_customer
+        USING wa_customers-document
+              lv_docdate-year
+        CHANGING gv_errtxt
+                 lv_doctype
+              .
+    IF gv_errtxt IS INITIAL.
+
+* Posting Key 40=Incoming Payment   50=Outgoing Payment
+      IF wa_customers-value_cur < 0.
+        MOVE '50' TO gv_posting_key.
+        MOVE 'C'  TO lv_dcsign.
+        MOVE ' '  TO gv_flag_in_payment.
+        MOVE 'X'  TO gv_flag_out_payment.
+      ELSE.
+        MOVE '40' TO gv_posting_key.
+        MOVE 'D'  TO lv_dcsign.
+        MOVE ' '  TO gv_flag_out_payment.
+        MOVE 'X'  TO gv_flag_in_payment.
+      ENDIF.
+* Account type = 'D'
+* Document type = 'ND' (Netting Debitoren)
+      MOVE 'D' TO gv_account_type.
+*      MOVE 'ND'  TO gv_document_type.
+      MOVE p_blrtar  TO gv_document_type.
+
+*Look up the customer number based on buyer information in the upload
+*file
+      SELECT SINGLE kunnr FROM kna1 INTO gv_account_number  "#EC *
+        WHERE vbund = wa_customers-buyer.                   "#EC *
+
+* rate conversion '999.999.999' into '9,99999999'.
+      TRANSLATE wa_customers-rate USING '. '.
+      CONDENSE wa_customers-rate NO-GAPS.
+      gv_rate = wa_customers-rate / 100000000.
+
+* Clearing Account
+      MOVE p_accar TO gv_account.
+
+      PERFORM fill_bdcdata USING wa_customers-document
+                                 lv_docdate
+                                 wa_customers-currency
+                                 wa_customers-value_cur
+                                 gv_posting_key
+                                 gv_account_number
+                                 gv_account_type
+                                 gv_document_type
+                                 gv_flag_in_payment
+                                 gv_flag_out_payment
+                                 gv_account
+                                 gv_rate
+                                 lv_doctype
+                                 wa_customers-value_mcu.
+
+*    mode = 'A'.
+      CALL TRANSACTION 'FB05'
+              USING bdcdata
+              MODE mode
+              UPDATE 'S'
+              MESSAGES INTO it_messages.
+
+      PERFORM create_hdrmsg
+              USING   wa_customers-document
+                      wa_customers-currency
+                      wa_customers-buyer
+                      wa_customers-seller
+                      lv_dcsign
+                      wa_customers-value_cur.
+      REFRESH it_messages.
+
+    ENDIF.
+
+  ENDLOOP.
+
+ENDFORM.                    "start_transaction
+
+*&--------------------------------------------------------------------*
+*&      Form  create_hdrmsg
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+*      -->DOCUMENT   text
+*---------------------------------------------------------------------*
+FORM create_hdrmsg
+                USING document
+                      currency
+                      buyer
+                      seller
+                      dcsign
+                      value_cur.
+
+  CLEAR it_hdrmsg.
+  DATA: swerr.
+
+  MOVE 'N' TO it_hdrmsg-posted.
+
+  LOOP AT it_messages.
+
+    arbgb = it_messages-msgid.
+    msgnr = it_messages-msgnr.
+    msgv1 = it_messages-msgv1.
+    msgv2 = it_messages-msgv2.
+    msgv3 = it_messages-msgv3.
+    msgv4 = it_messages-msgv4.
+
+    CALL FUNCTION 'RP_READ_T100'
+      EXPORTING
+        arbgb = arbgb
+        msgnr = msgnr
+        msgv1 = msgv1
+        msgv2 = msgv2
+        msgv3 = msgv3
+        msgv4 = msgv4
+*          sprsl = sy-langu
+      IMPORTING
+        text  = text.
+
+    CASE it_messages-msgtyp.
+      WHEN 'S'.
+        CASE msgnr.
+          WHEN '312'.
+*   Document posted successfully
+            MOVE 'Y' TO it_hdrmsg-posted.
+            MOVE text TO it_hdrmsg-msgtext.
+            MOVE it_messages-msgtyp TO it_hdrmsg-msgtyp.
+            EXIT.
+          WHEN '263'.
+* The difference is too large for clearing
+            MOVE 'Y' TO it_hdrmsg-posted.
+            MOVE text TO it_hdrmsg-msgtext.
+            MOVE it_messages-msgtyp TO it_hdrmsg-msgtyp.
+            EXIT.
+          WHEN OTHERS.
+*   Other status message
+            IF swerr = 0.
+              MOVE text TO it_hdrmsg-msgtext.
+              MOVE it_messages-msgtyp TO it_hdrmsg-msgtyp.
+            ENDIF.
+        ENDCASE.
+      WHEN 'E'.
+*   Error in posting Document
+        MOVE text TO it_hdrmsg-msgtext.
+        MOVE it_messages-msgtyp TO it_hdrmsg-msgtyp.
+        EXIT.
+      WHEN OTHERS.
+        MOVE 1 TO swerr.
+        MOVE text TO it_hdrmsg-msgtext.
+        MOVE it_messages-msgtyp TO it_hdrmsg-msgtyp.
+    ENDCASE.
+
+  ENDLOOP.
+
+  MOVE document  TO it_hdrmsg-document.
+  MOVE buyer     TO it_hdrmsg-buyer.
+  MOVE seller    TO it_hdrmsg-seller.
+  MOVE currency  TO it_hdrmsg-currency.
+  MOVE dcsign    TO it_hdrmsg-dcsign.
+  gv_value_cur = value_cur.
+
+* IF ( seller = 'TDC' and DCsign = 'C' ) "A06
+  IF ( seller = wa_company  AND dcsign = 'C' )  "A06
+      OR                                 "C02
+*    ( buyer  = 'TDC' and DCsign = 'D' )."A06
+     ( buyer  = wa_company AND dcsign = 'D' ).  "A06
+    gv_value_cur = value_cur * -1.       "C02
+  ENDIF.                                 "C02
+
+  MOVE gv_value_cur TO it_hdrmsg-amount.
+
+  APPEND it_hdrmsg.
+
+ENDFORM.                    "create_hdrmsg
+
+
+*&--------------------------------------------------------------------*
+*&      Form  Add_errmsg
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+FORM add_errmsg USING document
+                      currency
+                      buyer
+                      seller
+                      dcsign
+                      value_cur
+                      posted
+                      errtext.
+
+  CLEAR it_hdrmsg.
+  MOVE posted    TO it_hdrmsg-posted.
+  MOVE errtext   TO it_hdrmsg-msgtext.
+  MOVE document  TO it_hdrmsg-document.
+  MOVE buyer     TO it_hdrmsg-buyer.
+  MOVE seller    TO it_hdrmsg-seller.
+  MOVE currency  TO it_hdrmsg-currency.
+  MOVE dcsign    TO it_hdrmsg-dcsign.
+  gv_value_cur = value_cur.
+  MOVE gv_value_cur TO it_hdrmsg-amount.
+  APPEND it_hdrmsg.
+
+ENDFORM.                    "Add_hdrmsg
+
+*&--------------------------------------------------------------------*
+*&      Form  display_error_customers
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+FORM display_errors_customers.
+
+  SORT it_hdrmsg BY posted buyer currency document.
+
+  SKIP.
+  MOVE 'Documents NEWLY posted'(008) TO gv_header.
+  WRITE:/ gv_header COLOR COL_POSITIVE.
+  LOOP AT it_hdrmsg.
+*   IF it_hdrmsg-seller = 'TDC' and it_hdrmsg-posted = 'Y'.      "A06
+    IF it_hdrmsg-seller = wa_company AND it_hdrmsg-posted = 'Y'. "A06
+      PERFORM display_document_message.
+    ENDIF.
+  ENDLOOP.
+
+  IF p_post1 = 'X'.
+    SKIP.
+    MOVE 'Documents ALREADY posted'(009) TO gv_header.
+    WRITE:/ gv_header COLOR COL_POSITIVE.
+    LOOP AT it_hdrmsg.
+*     IF it_hdrmsg-seller = 'TDC' and it_hdrmsg-posted = 'P'.    "A06
+      IF it_hdrmsg-seller = wa_company AND it_hdrmsg-posted = 'P'. "A06
+        "A06
+        PERFORM display_document_message.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+
+  SKIP.
+  MOVE 'Documents NOT posted'(010) TO gv_header.
+  WRITE:/ gv_header COLOR COL_NEGATIVE.
+  LOOP AT it_hdrmsg.
+*   IF it_hdrmsg-seller = 'TDC' and it_hdrmsg-posted = 'N'.  "A06
+    IF it_hdrmsg-seller = wa_company AND it_hdrmsg-posted = 'N'.  "A06
+      PERFORM display_document_message.
+    ENDIF.
+  ENDLOOP.
+
+
+
+ENDFORM.                    "display_error_customers
+
+*&--------------------------------------------------------------------*
+*&      Form  display_document_message
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+FORM display_document_message.
+
+* IF it_hdrmsg-buyer = 'TDC'.       "A06
+  IF it_hdrmsg-buyer = wa_company.  "A06
+    WRITE:/ it_hdrmsg-seller.
+  ELSE.
+    WRITE:/  it_hdrmsg-buyer.
+  ENDIF.
+  WRITE:  it_hdrmsg-currency,
+          it_hdrmsg-amount,
+          it_hdrmsg-dcsign,
+          it_hdrmsg-document,
+          it_hdrmsg-msgtyp INTENSIFIED ON,
+          it_hdrmsg-msgtext.
+
+ENDFORM.                    "display_document_message
+
+*&--------------------------------------------------------------------*
+*&      Form  display_totals
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+FORM display_totals_customers.
+
+  DATA: lv_amount LIKE wa_tot_customers-amount_1.
+
+* First add amounts posted documents to totals
+
+  LOOP AT it_hdrmsg.
+
+    IF it_hdrmsg-posted = 'Y' OR it_hdrmsg-posted = 'P'.
+*     IF it_hdrmsg-seller = 'TDC'.    "A06
+      IF it_hdrmsg-seller = wa_company.    "A06
+        READ TABLE it_tot_customers INTO wa_tot_customers
+            WITH TABLE KEY seller = it_hdrmsg-seller
+                           buyer  = it_hdrmsg-buyer
+                         currency = it_hdrmsg-currency.
+
+        IF it_hdrmsg-posted = 'Y'.
+          ADD it_hdrmsg-amount TO wa_tot_customers-amount_2.
+        ELSE.
+          ADD it_hdrmsg-amount TO wa_tot_customers-amount_3.
+        ENDIF.
+        MODIFY TABLE it_tot_customers FROM wa_tot_customers.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+* Print totals and differences
+  SKIP.
+  FORMAT INTENSIFIED OFF.
+  MOVE '*** TOTALS INVOICES RECEIVABLE ***' TO gv_header.
+  WRITE:/ gv_header COLOR COL_TOTAL.
+  FORMAT INTENSIFIED ON.
+  WRITE AT:/23 'ON LIST',
+            42 'POSTED',
+            56 'DIFFERENCE'.
+  IF p_post1 = 'X'.
+    WRITE: 70 'ALREADY POSTED'.
+  ENDIF.
+  FORMAT INTENSIFIED OFF.
+
+  LOOP AT it_tot_customers INTO wa_tot_customers.
+    WRITE:/ wa_tot_customers-buyer,
+            wa_tot_customers-seller,
+            wa_tot_customers-currency,
+            wa_tot_customers-amount_1,
+            wa_tot_customers-amount_2.
+    lv_amount = wa_tot_customers-amount_1 - wa_tot_customers-amount_2
+                                          - wa_tot_customers-amount_3.
+    WRITE:   lv_amount.
+    IF p_post1 = 'X'.
+      WRITE wa_tot_customers-amount_3.
+    ENDIF.
+
+  ENDLOOP.
+  ULINE.
+ENDFORM.                    "display_totals
+
+*&--------------------------------------------------------------------*
+*&      Form  check_document_customer
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+*      -->DOCUMENT   text
+*      -->YEAR       text
+*---------------------------------------------------------------------*
+FORM check_document_customer
+          USING document year
+          CHANGING errtxt
+                   doctype.
+
+  DATA: lv_value(13) TYPE c,
+        lv_value_cur LIKE bseg-wrbtr,
+        lv_augdt LIKE bseg-augdt,
+        lv_wrbtr LIKE bseg-wrbtr,
+         lv_belnr LIKE bkpf-belnr,
+        lv_pswsl LIKE bseg-pswsl,
+        lv_posted TYPE c,
+        lv_blart LIKE bkpf-blart,
+        lv_dcsign,
+        lv_subrc LIKE sy-subrc.                             "X0001
+
+  errtxt = ' '.
+  lv_posted = 'N'.           "C01
+
+* Soll und Haben
+  gv_value_cur = wa_customers-value_cur.
+  IF gv_value_cur < 0.
+    gv_value_cur = gv_value_cur * -1.
+    MOVE 'C'  TO lv_dcsign.
+  ELSE.
+    MOVE 'D'  TO lv_dcsign.
+  ENDIF.
+
+* Retrieve document from reference document no
+  SELECT SINGLE belnr blart
+          INTO (lv_belnr, lv_blart)
+          FROM bkpf
+          WHERE bukrs = p_bukrs AND
+                gjahr = year AND
+                belnr = document.
+  lv_subrc = sy-subrc.                                      "X0001
+* Check Document type   A02
+  IF sy-subrc <> 0.
+*     or ( sy-subrc = 0 AND lv_blart <> 'RV'
+*          and lv_blart <> 'DX' ).   "A03
+*    SELECT SINGLE belnr
+*          INTO (lv_belnr)
+*          FROM bkpf
+*          WHERE bukrs = p_bukrs AND
+*                gjahr = year AND
+*                belnr = document.
+*    lv_subrc = sy-subrc.                                    "X0001
+*    IF sy-subrc <> 0.
+    CONCATENATE 'Document not found in Fiscal Year'(011)
+          year INTO errtxt
+          SEPARATED BY space.
+*    ENDIF.
+  ENDIF.
+
+*  IF sy-subrc = 0.                                             "-X0001
+  IF lv_subrc = 0.                                          "-X0001
+    MOVE lv_blart TO doctype.
+    SELECT SINGLE augdt wrbtr pswsl
+          INTO  (lv_augdt, lv_wrbtr, lv_pswsl)
+          FROM bseg
+          WHERE bukrs = p_bukrs AND
+                belnr = lv_belnr AND
+                gjahr = year AND
+                buzei = 001.
+
+* Correction on JPY & HUF
+    IF lv_pswsl = 'JPY' OR                    "C01
+       lv_pswsl = 'HUF'.                      "C01
+      lv_value_cur = lv_wrbtr * 100.         "C01
+    ELSE.                                     "C01
+      lv_value_cur = lv_wrbtr.               "C01
+    ENDIF.                                    "C01
+
+    IF NOT lv_augdt IS INITIAL.
+      IF lv_augdt IN p_augdt1.   "only print when date is selected
+        CONCATENATE 'Document was already cleared on date'(012)
+                lv_augdt INTO errtxt SEPARATED BY space.
+        lv_posted = 'P'.
+      ENDIF.
+    ELSEIF   lv_value_cur <> gv_value_cur            "C01
+*              lv_wrbtr <> gv_value_cur                "C01
+        OR lv_pswsl <> wa_customers-currency.
+
+*       MOVE  lv_wrbtr TO lv_value.                    "C01
+      WRITE lv_wrbtr TO lv_value CURRENCY lv_pswsl.   "C01
+      CONCATENATE 'Document amount'(013) lv_value lv_pswsl
+      'is different'
+          INTO errtxt SEPARATED BY space.
+      CONDENSE errtxt.
+    ENDIF.
+  ENDIF.
+
+  IF errtxt  <> ' '.
+    PERFORM add_errmsg
+            USING   wa_customers-document
+                    wa_customers-currency
+                    wa_customers-buyer
+                    wa_customers-seller
+                    lv_dcsign
+                    wa_customers-value_cur
+                    lv_posted
+                    errtxt.
+  ENDIF.
+
+ENDFORM.                    "check_documents_customers
+
+*&--------------------------------------------------------------------*
+*&      Form  create_totals_vendors
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+FORM create_totals_vendors.
+
+  SORT it_vendors BY buyer document.
+
+  FORMAT INTENSIFIED OFF.
+  WRITE:/ 'ACCOUNTS PAYABLE' COLOR COL_HEADING.
+  LOOP AT it_vendors INTO wa_vendors.
+
+* rate conversion '999.999.999' into '9,99999999'.
+    TRANSLATE wa_vendors-rate USING '. '.
+    CONDENSE wa_vendors-rate NO-GAPS.
+    gv_rate = wa_vendors-rate / 100000000.
+
+    gv_value_cur = wa_vendors-value_cur.
+    gv_value_mcu = wa_vendors-value_mcu.
+
+* add to summary
+    MOVE: wa_vendors-buyer TO wa_tot_vendors-buyer,
+          wa_vendors-seller TO wa_tot_vendors-seller,
+          wa_vendors-currency TO wa_tot_vendors-currency,
+          gv_value_cur TO wa_tot_vendors-amount_1.
+
+    COLLECT wa_tot_vendors INTO it_tot_vendors.
+
+    IF test_2 = 'X'.
+      WRITE:/ wa_vendors-document,
+              wa_vendors-buyer,
+              wa_vendors-seller,
+              wa_vendors-doc_date,
+              wa_vendors-due_date,
+              wa_vendors-currency,
+              gv_value_cur,
+              gv_rate,
+              gv_value_mcu
+              .
+    ENDIF.
+
+  ENDLOOP.
+
+ENDFORM.                    "create_totals_vendors
+
+*&--------------------------------------------------------------------*
+*&      Form  start_transaction_vendor
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+FORM start_transaction_vendor.
+
+  DATA: lv_dcsign.
+
+  REFRESH it_messages.
+
+  SKIP.
+  LOOP AT it_vendors INTO wa_vendors.
+
+* convert document date dd/mm/yyyy into ddmmyyyy
+    IF wa_vendors-doc_date CA '/'.
+      SPLIT wa_vendors-doc_date AT '/'
+          INTO lv_docdate-day
+               lv_docdate-month
+               lv_docdate-year.
+    ELSE.
+      SPLIT wa_vendors-doc_date AT '-'
+          INTO lv_docdate-day
+               lv_docdate-month
+               lv_docdate-year.
+
+    ENDIF.
+    MOVE lv_docdate-day TO day.
+    MOVE day TO lv_docdate-day.
+    MOVE lv_docdate-month TO month.
+    MOVE month TO lv_docdate-month.
+
+* check if document can be cleared
+    CLEAR gv_belnr.
+    PERFORM check_document_vendor
+        USING wa_vendors-document
+              lv_docdate-year
+        CHANGING gv_errtxt
+                 gv_belnr.
+    IF gv_errtxt IS INITIAL.
+
+* Posting Key 40=Incoming Payment   50=Outgoing Payment
+      IF wa_vendors-value_cur < 0.
+        MOVE '40' TO gv_posting_key.
+        MOVE 'D'  TO lv_dcsign.
+        MOVE 'X'  TO gv_flag_in_payment.
+        MOVE ' '  TO gv_flag_out_payment.
+      ELSE.
+        MOVE '50' TO gv_posting_key.
+        MOVE 'C'  TO lv_dcsign.
+        MOVE 'X'  TO gv_flag_out_payment.
+        MOVE ' '  TO gv_flag_in_payment.
+      ENDIF.
+
+* Account type = 'K' (Kreditoren)
+* Document type = 'NK' (Netting Kreditoren)
+      MOVE 'K' TO gv_account_type.
+*      MOVE 'NK' TO gv_document_type.
+      MOVE p_blrtap TO gv_document_type.
+
+*Look up the vendor number based on seller information in the upload
+*file
+
+      SELECT SINGLE lifnr FROM bseg INTO gv_account_number
+        WHERE bukrs EQ p_bukrs
+          AND belnr EQ gv_belnr
+          AND gjahr EQ lv_docdate-year.
+*      SELECT SINGLE lifnr FROM lfa1 INTO gv_account_number "#EC *
+*        WHERE vbund = wa_vendors-seller.                   "#EC *
+
+* rate conversion '999.999.999' into '9,99999999'.
+      TRANSLATE wa_vendors-rate USING '. '.
+      CONDENSE wa_vendors-rate NO-GAPS.
+      gv_rate = wa_vendors-rate / 100000000.
+
+* Clearing Account
+      MOVE p_accap TO gv_account.
+
+      PERFORM fill_bdcdata USING wa_vendors-document
+                                 lv_docdate
+                                 wa_vendors-currency
+                                 wa_vendors-value_cur
+                                 gv_posting_key
+                                 gv_account_number
+                                 gv_account_type
+                                 gv_document_type
+                                 gv_flag_in_payment
+                                 gv_flag_out_payment
+                                 gv_account
+                                 gv_rate
+                                 ' '
+                                 wa_vendors-value_mcu.
+
+*      mode = 'A'.
+      CALL TRANSACTION 'FB05'
+              USING bdcdata
+              MODE mode
+              UPDATE 'S'
+              MESSAGES INTO it_messages.
+
+*      IF sy-subrc <> 0.
+      PERFORM create_hdrmsg
+              USING   wa_vendors-document
+                      wa_vendors-currency
+                      wa_vendors-buyer
+                      wa_vendors-seller
+                      lv_dcsign
+                      wa_vendors-value_cur.
+      REFRESH it_messages.
+*      ENDIF.
+
+*    ELSE.
+*      WRITE:/  wa_vendors-document COLOR COL_NEGATIVE,
+*                gv_errtxt
+*                .
+    ENDIF.
+
+  ENDLOOP.
+
+ENDFORM.                    "start_transaction
+
+*&--------------------------------------------------------------------*
+*&      Form  display_error_vendors
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+FORM display_errors_vendors.
+
+  SORT it_hdrmsg BY posted seller currency document.
+
+  SKIP.
+  MOVE 'Documents NEWLY posted'(008) TO gv_header.
+  WRITE:/ gv_header COLOR COL_POSITIVE.
+  LOOP AT it_hdrmsg.
+*   IF it_hdrmsg-buyer = 'TDC' and it_hdrmsg-posted = 'Y'.        "A06
+    IF it_hdrmsg-buyer = wa_company AND it_hdrmsg-posted = 'Y'.   "A06
+      PERFORM display_document_message.
+    ENDIF.
+  ENDLOOP.
+
+  IF p_post2 = 'X'.
+    SKIP.
+    MOVE 'Documents ALREADY posted'(009) TO gv_header.
+    WRITE:/ gv_header COLOR COL_POSITIVE.
+    LOOP AT it_hdrmsg.
+*      IF it_hdrmsg-buyer = 'TDC' and it_hdrmsg-posted = 'P'.      "A06
+      IF it_hdrmsg-buyer = wa_company AND it_hdrmsg-posted = 'P'. "A06
+        PERFORM display_document_message.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+
+  SKIP.
+  MOVE 'Documents NOT posted'(010) TO gv_header.
+  WRITE:/  gv_header COLOR COL_NEGATIVE.
+  LOOP AT it_hdrmsg.
+*   IF it_hdrmsg-buyer = 'TDC' and it_hdrmsg-posted = 'N'.      "A06
+    IF it_hdrmsg-buyer = wa_company AND it_hdrmsg-posted = 'N'. "A06
+      PERFORM display_document_message.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    "display_error
+
+*&--------------------------------------------------------------------*
+*&      Form  display_totals_vendors
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+FORM display_totals_vendors.
+
+  DATA: lv_amount LIKE wa_tot_vendors-amount_1.
+
+* First add amounts posted documents to totals
+  LOOP AT it_hdrmsg.
+    IF it_hdrmsg-posted = 'Y' OR it_hdrmsg-posted = 'P'.
+*     IF it_hdrmsg-buyer = 'TDC'.       "A06
+      IF it_hdrmsg-buyer = wa_company.  "A06
+        READ TABLE it_tot_vendors INTO wa_tot_vendors
+            WITH TABLE KEY seller = it_hdrmsg-seller
+                           buyer  = it_hdrmsg-buyer
+                         currency = it_hdrmsg-currency.
+        IF it_hdrmsg-posted = 'Y'.
+          ADD it_hdrmsg-amount TO wa_tot_vendors-amount_2.
+        ELSE.
+          ADD it_hdrmsg-amount TO wa_tot_vendors-amount_3.
+        ENDIF.
+        MODIFY TABLE it_tot_vendors FROM wa_tot_vendors.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+* Display totals
+  SKIP.
+  FORMAT INTENSIFIED OFF.
+  MOVE '*** TOTALS INVOICES PAYABLE ***' TO gv_header.
+  WRITE:/ gv_header COLOR COL_TOTAL.
+  FORMAT INTENSIFIED ON.
+  WRITE AT:/23 'ON LIST',
+            42 'POSTED',
+            56 'DIFFERENCE'.
+  IF p_post2 = 'X'.
+    WRITE AT 70 'ALREADY POSTED'.
+  ENDIF.
+  FORMAT INTENSIFIED OFF.
+
+  LOOP AT it_tot_vendors INTO wa_tot_vendors.
+    WRITE:/ wa_tot_vendors-buyer,
+            wa_tot_vendors-seller,
+            wa_tot_vendors-currency,
+            wa_tot_vendors-amount_1,
+            wa_tot_vendors-amount_2.
+    lv_amount = wa_tot_vendors-amount_1 - wa_tot_vendors-amount_2
+                                        - wa_tot_vendors-amount_3.
+    WRITE:   lv_amount.
+    IF p_post2 = 'X'.
+      WRITE wa_tot_vendors-amount_3.
+    ENDIF.
+  ENDLOOP.
+  ULINE.
+ENDFORM.                    "display_totals_vendors
+*&--------------------------------------------------------------------*
+*&      Form  check_document_vendor
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+*      -->DOCUMENT   text
+*      -->YEAR       text
+*      -->ERRTXT     text
+*---------------------------------------------------------------------*
+FORM check_document_vendor
+          USING document year
+          CHANGING errtxt
+                   lv_belnr.
+
+  DATA: lv_zlspr            LIKE bseg-zlspr,
+        lv_value_cur        LIKE bseg-wrbtr,
+        lv_augdt            LIKE bseg-augdt,
+        lv_wrbtr            LIKE bseg-wrbtr,
+        lv_pswsl            LIKE bseg-pswsl,
+*        lv_belnr            LIKE bkpf-belnr,
+        lv_value(13)        TYPE c,
+        lv_posted           TYPE c,
+        lv_lines            TYPE sytfill,
+        lv_ind_filter_bkpf  TYPE c,
+        lv_dcsign.
+
+  DATA:
+    BEGIN OF it_lifnr OCCURS 0,
+      lifnr TYPE lifnr,
+    END OF it_lifnr.
+
+* internal tables
+  DATA: lt_bkpf           LIKE bkpf OCCURS 0 WITH HEADER LINE.
+
+
+  errtxt = ' '.
+  lv_posted = 'N'.
+
+* Soll und Haben
+  gv_value_cur = wa_vendors-value_cur.
+  IF gv_value_cur < 0.
+    MOVE 'D' TO lv_dcsign.
+    gv_value_cur = gv_value_cur * -1.
+  ELSE.
+    MOVE 'C' TO lv_dcsign.
+  ENDIF.
+
+* start change EXTAV 2005-03-31
+** Retrieve document from reference document no
+*  SELECT SINGLE belnr
+*          INTO (lv_belnr)
+*          FROM bkpf
+*          WHERE bukrs = p_bukrs AND
+*                gjahr = year AND
+*                xblnr = document.
+*
+*  IF sy-subrc <> 0.
+*    errtxt = 'Document not found in SAP'.
+*  ELSE.
+*    SELECT SINGLE augdt wrbtr zlspr pswsl
+*          INTO  (lv_augdt, lv_wrbtr, lv_zlspr, lv_pswsl)
+*          FROM bseg
+*          WHERE bukrs = p_bukrs AND
+*                belnr = lv_belnr AND
+*                gjahr = year AND
+*                buzei = 001.
+** Correction on JPY & HUF
+*    IF lv_pswsl = 'JPY' OR                    "C01
+*       lv_pswsl = 'HUF'.                      "C01
+*      lv_value_cur = lv_wrbtr * 100.         "C01
+*    ELSE.                                     "C01
+*      lv_value_cur = lv_wrbtr.               "C01
+*    ENDIF.                                    "C01
+*
+*    IF lv_zlspr <> ' '.
+*      errtxt = 'Document is blocked for payments'.
+*    ELSEIF NOT lv_augdt IS INITIAL.
+*      IF lv_augdt IN p_augdt2.   "only print when date is selected
+*        CONCATENATE 'Document was already cleared on date
+*                lv_augdt INTO errtxt SEPARATED BY space.
+*        lv_posted = 'P'.
+*      ENDIF.
+*    ELSEIF lv_value_cur <> gv_value_cur           "C01
+**          lv_wrbtr <> gv_value_cur               "C01
+*        OR lv_pswsl <> wa_vendors-currency.
+**      MOVE lv_wrbtr TO lv_value.                 "C01
+*      WRITE lv_wrbtr TO lv_value CURRENCY lv_pswsl. "C01
+*      CONCATENATE 'Document amount' lv_value lv_pswsl 'is different'
+*          INTO errtxt SEPARATED BY space.
+*      CONDENSE errtxt.
+*    ENDIF.
+*
+*  ENDIF.
+*
+*  IF errtxt <> ' '.
+*    PERFORM add_errmsg
+*            USING   wa_vendors-document
+*                    wa_vendors-currency
+*                    wa_vendors-buyer
+*                    wa_vendors-seller
+*                    lv_dcsign
+*                    wa_vendors-value_cur
+*                    lv_posted
+*                    errtxt.
+*  ENDIF.
+* start new code EXTAV 2005-03-31
+* reset global values
+  CLEAR: gv_belnr.
+
+* Retrieve document from reference document no
+* reset table
+  CLEAR  : lt_bkpf.
+  REFRESH: lt_bkpf.
+
+  SELECT *
+  INTO TABLE lt_bkpf
+  FROM bkpf
+  WHERE bukrs = p_bukrs
+    AND gjahr = year
+    AND xblnr = document.
+
+* filter retrieved bkpf table if more then one line
+  DESCRIBE TABLE lt_bkpf LINES lv_lines.
+
+  CLEAR lv_augdt.
+  IF lv_lines > 1.
+    PERFORM filter_bkpf TABLES lt_bkpf USING lv_augdt.
+    lv_ind_filter_bkpf = 'X'.
+  ENDIF. " endif lv_lines > 1
+
+* if we have more then one entry after the filter was made
+* print error for both documents
+  DESCRIBE TABLE lt_bkpf LINES lv_lines.
+
+  IF lv_lines IS INITIAL.
+    IF NOT lv_augdt IS INITIAL.
+      CONCATENATE 'Document was already cleared on date'(012)
+              lv_augdt INTO errtxt SEPARATED BY space.
+      lv_posted = 'P'.
+    ELSE.
+      errtxt = 'Document not found in SAP'(014).
+    ENDIF.
+  ELSEIF lv_lines > 1.
+    LOOP AT lt_bkpf.
+*      errtxt = 'Vendor document duplicated, no posting, please check'.
+*      PERFORM add_errmsg
+*        USING wa_vendors-document
+*              wa_vendors-currency
+*              wa_vendors-buyer
+*              wa_vendors-seller
+*              lv_dcsign
+*              wa_vendors-value_cur
+*              lv_posted
+*              errtxt.
+
+*     SELECT SINGLE lifnr FROM LFA1 into gv_account_number  "#EC *
+*       where vbund = wa_vendors-seller.                    "#EC *
+      SELECT      lifnr
+             INTO TABLE it_lifnr
+             FROM lfa1
+            WHERE vbund = wa_vendors-seller.
+
+      SELECT      belnr
+             INTO lv_belnr
+             FROM bseg
+              FOR ALL ENTRIES IN it_lifnr
+            WHERE belnr = lt_bkpf-belnr
+              AND bukrs = p_bukrs
+              AND gjahr = year
+              AND lifnr = it_lifnr-lifnr.
+      ENDSELECT.
+    ENDLOOP.
+* exit form and leave the last error message to avoid posting
+* from calling form
+    EXIT.
+  ELSE.
+    READ TABLE lt_bkpf INDEX 1.
+* if filtering of bkpf was made the posting has to be made by using
+* document number instead of reference number
+* save the document number for posting
+    lv_belnr = lt_bkpf-belnr.
+    IF lv_ind_filter_bkpf = 'X'.
+      gv_belnr = lv_belnr.
+    ENDIF.
+    SELECT SINGLE augdt wrbtr zlspr pswsl
+          INTO  (lv_augdt, lv_wrbtr, lv_zlspr, lv_pswsl)
+          FROM bseg
+          WHERE bukrs = p_bukrs
+            AND belnr = lv_belnr
+            AND gjahr = year
+            AND buzei = 001.
+* Correction on JPY & HUF
+    IF lv_pswsl = 'JPY' OR                    "C01
+       lv_pswsl = 'HUF'.                      "C01
+      lv_value_cur = lv_wrbtr * 100.         "C01
+    ELSE.                                     "C01
+      lv_value_cur = lv_wrbtr.               "C01
+    ENDIF.                                    "C01
+
+    IF lv_zlspr <> ' '.
+      errtxt = 'Document is blocked for payments'(015).
+    ELSEIF NOT lv_augdt IS INITIAL.
+      IF lv_augdt IN p_augdt2.   "only print when date is selected
+        CONCATENATE 'Document was already cleared on date'(012)
+                lv_augdt INTO errtxt SEPARATED BY space.
+        lv_posted = 'P'.
+      ENDIF.
+    ELSEIF lv_value_cur <> gv_value_cur           "C01
+*          lv_wrbtr <> gv_value_cur               "C01
+        OR lv_pswsl <> wa_vendors-currency.
+*      MOVE lv_wrbtr TO lv_value.                 "C01
+      WRITE lv_wrbtr TO lv_value CURRENCY lv_pswsl. "C01
+      CONCATENATE 'Document amount'(013) lv_value lv_pswsl
+      'is different'
+          INTO errtxt SEPARATED BY space.
+      CONDENSE errtxt.
+    ENDIF.
+
+  ENDIF.
+
+  IF errtxt <> ' '.
+    PERFORM add_errmsg
+           USING   wa_vendors-document
+                    wa_vendors-currency
+                    wa_vendors-buyer
+                    wa_vendors-seller
+                    lv_dcsign
+                    wa_vendors-value_cur
+                    lv_posted
+                    errtxt.
+  ENDIF.
+* end change EXTAV 2005-03-31
+
+ENDFORM.                    "check_document_vendor
+
+*&--------------------------------------------------------------------*
+*&      Form  fill_bdcdata
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+FORM fill_bdcdata USING document
+                        docdate
+                        currency
+                        value_cur
+                        posting_key
+                        account_number
+                        account_type
+                        document_type
+                        flag_in_payment
+                        flag_out_payment
+                        lv_account
+                        lv_rate
+                        doctype
+                        value_local.
+
+  DATA: lv_budat(10) TYPE c,                       "EXTSB 8=>10
+        lv_month(2) TYPE c,
+        lv_year(4) TYPE c,                         " CR692
+        lv_xblnr TYPE xblnr1,                      " CR692
+        lv_value(15) TYPE c,
+        lv_value_local(15) TYPE c,
+        lv_int(15) TYPE c,
+        lv_dec(15) TYPE c,
+        lv_document     LIKE wa_vendors-document,
+        format_rate(11) VALUE '9999,99999',
+        lv_cursor(15) TYPE c.
+
+*  format_rate = lv_rate.
+** Change decimal point by into comma
+*  REPLACE FIRST OCCURRENCE OF '.' IN format_rate WITH ','.
+*  CONCATENATE '/' format_rate INTO format_rate.
+
+*  CONCATENATE p_budat+6(2) p_budat+4(2) p_budat+0(4) INTO lv_budat.
+*EXTSB Start
+  CALL FUNCTION 'CONVERT_DATE_TO_EXTERNAL'
+    EXPORTING
+      date_internal            = p_budat
+    IMPORTING
+      date_external            = lv_budat
+    EXCEPTIONS
+      date_internal_is_invalid = 1
+      OTHERS                   = 2.
+  IF sy-subrc <> 0.
+* MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*         WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+  ENDIF.
+*EXTSB End
+
+  MOVE p_budat+4(2) TO lv_month.
+  CLEAR lv_year.                                " CR692
+  MOVE docdate+4(4) TO lv_year.                 " CR692
+
+*  * start of insert EXTUVE CR692
+  CLEAR lv_xblnr.
+  SELECT SINGLE xblnr INTO lv_xblnr FROM bkpf
+                    WHERE bukrs = p_bukrs
+                      AND belnr = document
+                      AND gjahr = lv_year.
+*  * end   of insert EXTUVE CR692
+
+  IF value_cur < 0.
+    value_cur = value_cur * -1.
+  ENDIF.
+  lv_value = value_cur.
+* Change decimal point into comma for document amount
+  REPLACE FIRST OCCURRENCE OF '.' IN lv_value WITH ','.
+  IF sy-subrc = 0                            "C01
+* No decimal part allowed for JPY & HUF      "C01
+    AND ( currency = 'JPY' OR                "C01
+          currency = 'HUF').                 "C01
+    SPLIT lv_value AT ','                    "C01
+      INTO lv_int lv_dec.                    "C01
+    MOVE lv_int TO lv_value.                 "C01
+  ENDIF.                                     "C01
+
+  lv_value_local = ''.
+* Change decimal point into comma for local amount
+*  IF currency NE 'SEK'.
+  IF currency NE wa_waers.
+    IF value_local < 0.
+      value_local = value_local * -1.
+    ENDIF.
+    lv_value_local = value_local.
+    REPLACE FIRST OCCURRENCE OF '.' IN lv_value_local  WITH ','.
+  ENDIF.
+
+  lv_document = document.
+
+* Select Reference
+*  IF gv_account_type = 'K'.
+  MOVE 'RF05A-XPOS1(06)' TO lv_cursor.
+*  ELSE.
+*      MOVE 'RF05A-XPOS1(03)' TO lv_cursor.
+*  ENDIF.
+  IF gv_account_type = 'D' AND              "A01
+     doctype <> 'RV'  AND                   "A01
+     doctype <> 'DX'.                       "A03
+    MOVE 'RF05A-XPOS1(03)' TO lv_cursor.   "A01
+  ENDIF.                                    "A01
+
+* if global variabel for document was set, use document number
+* for posting - this is additional code for vendors
+  IF gv_belnr IS INITIAL.
+    MOVE 'RF05A-XPOS1(06)' TO lv_cursor.
+  ELSE.
+    lv_document = gv_belnr.
+    MOVE 'RF05A-XPOS1(03)' TO lv_cursor.
+  ENDIF.
+
+*SCREEN 1 (Header data)
+  REFRESH bdcdata.
+  PERFORM bdc_dynpro USING  'SAPMF05A'      '0122'.
+  PERFORM bdc_field  USING: 'BDC_CURSOR'    'RF05A-NEWKO',
+                            'BDC_OKCODE'    '/00',
+***                         'BKPF-BLDAT'    docdate,
+                            'BKPF-BLDAT'    lv_budat,
+                            'BKPF-BLART'    document_type,
+                            'BKPF-BUKRS'    p_bukrs,
+                            'BKPF-BUDAT'    lv_budat,
+                            'BKPF-MONAT'    lv_month,
+                            'BKPF-WAERS'    currency.
+*{Insert Raskin Kevin Issue 2688
+*                           if P_BLRTAR = 'DZ'.  "CR0639
+  IF p_blrtar = 'Z4'.                                       "CR0639
+    PERFORM bdc_field  USING 'BKPF-XBLNR'    document.
+  ENDIF.
+*}End insert Raskin Kevin
+*                            'BKPF-KURSF'    format_rate,
+  PERFORM bdc_field  USING: 'RF05A-XPOS1(02)' flag_in_payment,
+                            'RF05A-XPOS1(01)' flag_out_payment,
+                            'FS006-DOCID'  '*',
+                            'RF05A-NEWBS'  posting_key,
+                            'RF05A-NEWKO'  lv_account
+                            .
+
+*SCREEN 2 (Amount)
+  PERFORM bdc_dynpro USING  'SAPMF05A'      '0300'.
+  PERFORM bdc_field  USING: 'BDC_CURSOR'    'BSEG-WRBTR',
+                            'BDC_OKCODE'    '=SL',
+                            'BSEG-WRBTR'    lv_value.
+*  IF currency NE 'SEK'.
+  IF currency NE wa_waers.
+    PERFORM bdc_field  USING: 'BSEG-DMBTR'    lv_value_local.
+  ENDIF.
+
+*                           'BSEG-VALUT'    lv_budat,    "EXTSB
+  PERFORM bdc_field  USING: 'BDC_SUBSCR'    'SAPLKACB',
+                            'DKACB-FMORE'   'X'
+                            .
+
+*SCREEN 3 (Business area)
+*  IF P_BUKRS NE 'TOOA'.                                 "EXTSB
+*    PERFORM bdc_dynpro USING  'SAPLKACB'      '0002'.
+*    PERFORM bdc_field  USING: 'BDC_CURSOR'    'COBL-GSBER',
+*                              'BDC_OKCODE'    '=ENTE',
+*                              'COBL-GSBER'    p_gsber,
+*                             'BDC_SUBSCR'    'SAPLKACB'.
+*  else.
+  PERFORM bdc_dynpro USING  'SAPLKACB'      '0002'.
+  PERFORM bdc_field  USING:'BDC_OKCODE'    '=ENTE',
+                           'BDC_SUBSCR'    'SAPLKACB'.
+*  endif.
+*SCREEN 4 (Open Item Selection - additional selection on document
+  PERFORM bdc_dynpro USING  'SAPMF05A'      '0710'.
+  PERFORM bdc_field  USING: 'BDC_CURSOR'    lv_cursor,
+                            'BDC_OKCODE'    '/00',
+                            'RF05A-AGBUK'   p_bukrs,
+                            'RF05A-AGKON'   account_number,
+                            'RF05A-AGKOA'   account_type,
+                            'RF05A-XNOPS'   'X',
+                            'RF05A-XPOS1(01)' ' ',
+                            'RF05A-XPOS1(03)' 'X'           "CR0692
+*                            lv_cursor  'X'               "CR0692
+                            .
+
+*SCREEN 5 (Fill in Document)
+  PERFORM bdc_dynpro USING  'SAPMF05A'      '0731'.
+  PERFORM bdc_field  USING: 'BDC_CURSOR'    'RF05A-SEL01(01)',
+                            'BDC_OKCODE'    '/00'.
+*  * start of insert EXTUVE CR692
+  PERFORM bdc_field  USING 'RF05A-SEL01(01)' lv_document.
+*  *end of insert EXTUVE CR692
+
+*SCREEN 5 (Process open items)
+  PERFORM bdc_dynpro USING  'SAPMF05A'      '0731'.
+  PERFORM bdc_field  USING: 'BDC_CURSOR'    'RF05A-SEL01(01)',
+                            'BDC_OKCODE'    '=PA'
+                            .
+* Last screen : Posting
+  PERFORM bdc_dynpro USING  'SAPDF05X'      '3100'.
+  PERFORM bdc_field  USING: 'BDC_OKCODE'    '=BU',
+                            'BDC_SUBSCR'    'SAPDF05X',
+                            'BDC_CURSOR'    'DF05B-PSSKT(01)',
+                            'RF05A-ABPOS'  '1'
+                            .
+
+
+ENDFORM.                    "fill_bdcdata
+
+*&--------------------------------------------------------------------*
+*&      Form  bdc_dynpro
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+*      -->PROGRAM    text
+*      -->DYNPRO     text
+*---------------------------------------------------------------------*
+FORM bdc_dynpro USING program dynpro.
+
+  CLEAR bdcdata.
+  bdcdata-program  = program.
+  bdcdata-dynpro   = dynpro.
+  bdcdata-dynbegin = 'X'.
+  APPEND bdcdata.
+
+ENDFORM.                    "bdc_dynpro
+
+*&--------------------------------------------------------------------*
+*&      Form  bdc_field
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+*      -->FNAM       text
+*      -->FVAL       text
+*---------------------------------------------------------------------*
+FORM bdc_field USING fnam fval.
+
+  IF fval <> nodata.
+    CLEAR bdcdata.
+    bdcdata-fnam = fnam.
+    bdcdata-fval = fval.
+    APPEND bdcdata.
+  ENDIF.
+
+ENDFORM.                    "bdc_field
+
+*------------------------------------------------- End of forms ------*
+*&---------------------------------------------------------------------*
+*&      Form  filter_bkpf
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_LT_BKPF  text
+*----------------------------------------------------------------------*
+FORM filter_bkpf  TABLES   p_lt_bkpf STRUCTURE bkpf USING p_augdt.
+
+  DATA: lv_wrbtr_vendor LIKE bseg-wrbtr.
+
+  DATA: lt_bseg    LIKE bseg OCCURS 0 WITH HEADER LINE.
+
+* reset table
+  CLEAR  : lt_bseg.
+  REFRESH: lt_bseg.
+
+* value in uploading file
+  lv_wrbtr_vendor = wa_vendors-value_cur.
+
+* load all vendor documnet lines for all documents
+  SELECT *
+  INTO TABLE lt_bseg
+  FROM bseg
+  FOR ALL ENTRIES IN p_lt_bkpf
+  WHERE bukrs = p_lt_bkpf-bukrs
+    AND belnr = p_lt_bkpf-belnr
+    AND gjahr = p_lt_bkpf-gjahr
+    AND koart = 'K'.                "vendor document
+
+  LOOP AT lt_bseg.
+    IF lt_bseg-pswsl = 'JPY' OR
+       lt_bseg-pswsl = 'HUF'.
+      lt_bseg-wrbtr = lt_bseg-wrbtr * 100.
+    ENDIF.
+* if not same amount as in the uploading file - delete entry
+    IF lt_bseg-wrbtr <> lv_wrbtr_vendor.
+      DELETE lt_bseg.
+    ELSEIF NOT lt_bseg-augdt IS INITIAL.          "Document cleared
+      IF lt_bseg-augdt > p_augdt.
+        p_augdt = lt_bseg-augdt.                  "Highest clearing date
+      ENDIF.
+      DELETE lt_bseg.
+    ENDIF.
+
+  ENDLOOP.
+
+* now delete document header without document lines
+  LOOP AT p_lt_bkpf.
+* read document line for document header
+    READ TABLE lt_bseg WITH KEY bukrs = p_lt_bkpf-bukrs
+                                belnr = p_lt_bkpf-belnr
+                                gjahr = p_lt_bkpf-gjahr.
+* delete document header if document lines is missing
+    IF sy-subrc <> 0.
+      DELETE p_lt_bkpf.
+    ENDIF.
+
+  ENDLOOP.
+
+ENDFORM.                    " filter_bkpf
+*&---------------------------------------------------------------------*
+*&      Form  check_authorization
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM check_authorization .
+
+  AUTHORITY-CHECK OBJECT 'F_SKA1_BUK'
+                      ID 'BUKRS' FIELD p_bukrs
+                      ID 'ACTVT' DUMMY.
+
+  IF sy-subrc = 4.
+*   No authorisation to display the data
+    MESSAGE ID 'YSE_GENERAL' TYPE 'E' NUMBER '008' WITH p_bukrs.
+  ELSEIF sy-subrc <> 0.
+*   Error checking authorization.
+    MESSAGE ID 'YSE_GENERAL' TYPE 'E' NUMBER '004'.
+  ENDIF.
+
+ENDFORM.                    " check_authorization
+*&---------------------------------------------------------------------*
+*&      Form  F4_ZFAM
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM f4_zfam .
+* To avail F-4 functionality for P_ZFAM based on P_BUKRS
+  dynpfields-fieldname = 'P_BUKRS'.
+  APPEND dynpfields.
+
+  CALL FUNCTION 'DYNP_VALUES_READ'
+    EXPORTING
+      dyname               = 'YSE_NETTING_UPLOAD'
+      dynumb               = '1000'
+      translate_to_upper   = 'X'
+    TABLES
+      dynpfields           = dynpfields[]
+    EXCEPTIONS
+      invalid_abapworkarea = 1
+      invalid_dynprofield  = 2
+      invalid_dynproname   = 3
+      invalid_dynpronummer = 4
+      invalid_request      = 5
+      no_fielddescription  = 6
+      invalid_parameter    = 7
+      undefind_error       = 8
+      OTHERS               = 9.
+
+  LOOP AT dynpfields.
+    IF dynpfields-fieldname = 'P_BUKRS'.
+      p_bukrs =  dynpfields-fieldvalue.
+    ENDIF.
+  ENDLOOP.
+
+* Declare local internal tables
+  DATA: lt_zfam   TYPE TABLE OF yse_cc_segm_ftm.
+  DATA: lt_return TYPE TABLE OF ddshretval,
+        ls_return TYPE ddshretval.
+
+* Get data from yse_cc_segm_ftm
+  SELECT * FROM yse_cc_segm_ftm
+                INTO TABLE lt_zfam
+                WHERE bukrs = p_bukrs.
+
+* Call Function Module to create search help for ZFAM code
+  CALL FUNCTION 'F4IF_INT_TABLE_VALUE_REQUEST'
+    EXPORTING
+      retfield        = 'ZFAM'
+      dynpprog        = sy-repid
+      dynprofield     = 'P_ZFAM'
+      value_org       = 'S'
+    TABLES
+      value_tab       = lt_zfam
+      return_tab      = lt_return
+    EXCEPTIONS
+      parameter_error = 1
+      no_values_found = 2
+      OTHERS          = 3.
+  IF sy-subrc = 0.
+    READ TABLE lt_return INTO ls_return INDEX 1.
+    IF sy-subrc = 0.
+      p_zfam = ls_return-fieldval.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    " F4_ZFAM
+
+*Text symbol text£º
+*001:Could not open file
+*002:Statistics Mirrored Ledgers - Company
+*003:Total documents received for A/R:
+*004:Total documents received for A/P:
+*005: - File extract on
+*006: at
+*007:by
+*008:Documents NEWLY posted
+*009:Documents ALREADY posted
+*010:Documents NOT posted
+*011:Document not found in Fiscal Year
+*012:Document was already cleared on date
+*013:Document amount
+*014:Document not found in SAP
+*015:Document is blocked for payments
+*T01:General Selections
+*T02:Accounts Receivable
+
+*T03:Accounts Payable
+*Selection text£º
+*P_ACCAP:        Clearing Account
+*P_ACCAR:        Clearing Account
+*P_AUGDT1:        clearing date
+*P_AUGDT2:        clearing date
+*P_BLRTAP:        Document type
+*P_BLRTAR:        Document type
+*P_BUDAT:        Posting Date
+*P_BUKRS:        Company Code
+*P_CUST:        Select customers
+*P_FILE:        Read from external file
+*P_KUNNR:        Customer
+*P_LIFNR:        Vendor
+*P_POST1:        Display already posted docs
+*P_POST2:        Display already posted docs
+*P_VEND:        Select vendors
+*P_ZFAM:        FAM Code
+*TEST_1:        Display documents on screen
+*TEST_2:        Display documents on screen

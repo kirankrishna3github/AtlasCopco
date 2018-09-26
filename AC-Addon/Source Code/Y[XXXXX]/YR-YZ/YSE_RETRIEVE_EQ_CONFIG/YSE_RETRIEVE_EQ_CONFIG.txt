@@ -1,0 +1,552 @@
+*&---------------------------------------------------------------------*
+*& Report  YSE_RETRIEVE_EQ_CONFIG
+*&
+*&---------------------------------------------------------------------*
+*&                                                                     *
+*& ACT! : Equipment Characteristics extraction                         *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+*  Author                : Geert Rutten
+*  Date                  : 25.08.2014
+*  Change Request Number :
+*  Transport request Nr. : CD1K982800
+*----------------------------------------------------------------------*
+*                                                                      *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD. NR.|   DATE     | NAME            | CORRECTION NR.| CHANGE REF. *
+*----------------------------------------------------------------------*
+*----------------------------------------------------------------------*
+
+************************************************************************
+
+REPORT  yse_retrieve_eq_config.
+
+TABLES: equi,
+        equz,
+        iloa,
+        jest,
+        cawn.
+
+TYPE-POOLS: ibco2.
+
+TYPES: BEGIN OF ty_equi,
+         equnr      TYPE equnr,
+         kmatn      TYPE kmatn,
+         objnr      TYPE j_objnr,
+         cuobj      TYPE cuobj,
+      END OF ty_equi.
+
+TYPES: BEGIN OF ty_dlfl,
+         objnr      TYPE j_objnr,
+      END OF ty_dlfl.
+
+DATA: gt_equi  TYPE TABLE OF ty_equi
+                    WITH HEADER LINE.
+
+DATA: gt_dlfl  TYPE HASHED TABLE OF ty_dlfl
+                    WITH UNIQUE KEY objnr
+                    WITH HEADER LINE,
+      gt_dlfli TYPE TABLE OF ty_dlfl
+                    WITH HEADER LINE.
+
+DATA: gt_cawn  TYPE HASHED TABLE OF cawn
+                    WITH UNIQUE KEY atinn atzhl
+                    WITH HEADER LINE.
+
+DATA: gt_alloclist  TYPE TABLE OF bapi1003_alloc_list,
+      gs_alloclist  TYPE bapi1003_alloc_list.
+
+DATA: gt_valnum   TYPE TABLE OF bapi1003_alloc_values_num,
+      gs_valnum   TYPE bapi1003_alloc_values_num.
+
+DATA: gt_valchar  TYPE TABLE OF bapi1003_alloc_values_char,
+      gs_valchar  TYPE bapi1003_alloc_values_char.
+
+DATA: gt_valcurr  TYPE TABLE OF bapi1003_alloc_values_curr,
+      gs_valcurr  TYPE bapi1003_alloc_values_curr.
+
+DATA: gt_return  TYPE TABLE OF bapiret2,
+      gs_return  TYPE bapiret2.
+
+* Internal table with classificaton data
+DATA: BEGIN OF gt_clobjdat OCCURS 0.
+        INCLUDE STRUCTURE clobjdat.
+DATA: END OF gt_clobjdat.
+
+* Internal table with classes
+DATA: BEGIN OF gt_class OCCURS 0.
+        INCLUDE STRUCTURE sclass.
+DATA: END OF gt_class.
+
+* Characteristic values for the instance
+DATA: gt_values    TYPE ibco2_value_tab,
+      gs_values    TYPE ibco2_value_rec.
+
+DATA: BEGIN OF gt_out  OCCURS 0,
+        equnr      TYPE equnr,
+        tab01(1)   TYPE c,
+        kmatn      TYPE kmatn,
+        tab02(1)   TYPE c,
+        class      TYPE klasse_d,
+        tab03(1)   TYPE c,
+        klart      TYPE klassenart,
+        tab04(1)   TYPE c,
+        atnam      TYPE atnam,
+        tab05(1)   TYPE c,
+        atwrt      TYPE atwrt,
+        tab06(1)   TYPE c,
+      END OF gt_out.
+
+DATA: BEGIN OF gt_outh  OCCURS 0,
+        equnr      TYPE fieldname,
+        tab01(1)   TYPE c,
+        kmatn      TYPE fieldname,
+        tab02(1)   TYPE c,
+        class      TYPE fieldname,
+        tab03(1)   TYPE c,
+        klart      TYPE fieldname,
+        tab04(1)   TYPE c,
+        atnam      TYPE fieldname,
+        tab05(1)   TYPE c,
+        atwrt      TYPE fieldname,
+        tab06(1)   TYPE c,
+      END OF gt_outh.
+
+DATA: gv_directory(25) TYPE c VALUE '/var/load/xxx/UK/read/',
+      gv_ofile         LIKE /sapdmc/lsoinp-filename,
+      gv_logsys        LIKE tbdlst-logsys,
+      gv_object        TYPE objnum,
+      gv_objectkey     TYPE bapi1003_key-object,
+      gv_cuobj         TYPE cuib_cuobj,
+      gv_atinn         TYPE atinn,
+      gv_cnt_eq(5)     TYPE p,
+      gv_cnt_fm(5)     TYPE p,
+      gv_ersda(12)     TYPE c,                      "YYYYMMDDHHMM
+      gv_seqnr(3)      TYPE n,
+      gv_error         TYPE xfeld.
+
+CONSTANTS: gc_stat_dl  TYPE j_status  VALUE 'I0076',
+           gc_stat_in  TYPE j_status  VALUE 'I0320',
+           gc_stat_scr TYPE j_status  VALUE 'E0005'.
+
+SELECTION-SCREEN  BEGIN OF BLOCK input  WITH FRAME  TITLE text-s01.
+PARAMETERS: p_bukrs  LIKE iloa-bukrs  OBLIGATORY  MEMORY ID buk.
+SELECTION-SCREEN SKIP.
+SELECT-OPTIONS: s_equnr  FOR equi-equnr.
+SELECTION-SCREEN  END OF BLOCK input.
+SELECTION-SCREEN  BEGIN OF BLOCK output  WITH FRAME  TITLE text-s02.
+PARAMETERS: p_nreq  TYPE num6  OBLIGATORY  DEFAULT 100000.
+SELECTION-SCREEN  END OF BLOCK output.
+
+
+************************************************************************
+*       I N I T I A L I Z A T I O N    E V E N T                       *
+************************************************************************
+INITIALIZATION.
+
+* Logical system
+  CALL FUNCTION 'OWN_LOGICAL_SYSTEM_GET'
+    IMPORTING
+      own_logical_system             = gv_logsys
+    EXCEPTIONS
+      own_logical_system_not_defined = 1
+      OTHERS                         = 2.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+         WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+
+************************************************************************
+*       S T A R T - O F - S E L E C T I O N    E V E N T               *
+************************************************************************
+START-OF-SELECTION.
+
+* Select data
+  PERFORM select_data.
+
+* Check anything selected
+  IF gt_equi[] IS INITIAL.
+    MESSAGE ID 'YSE_GENERAL' TYPE 'S' NUMBER '000'
+            WITH 'No equipments selected'(e01).
+    RETURN.
+  ENDIF.
+
+* Build output
+  PERFORM build_output.
+* Error ?
+  IF NOT gv_error IS INITIAL.
+    RETURN.
+  ENDIF.
+
+* Save output (rest).
+  PERFORM save_output.
+
+  IF gv_error IS INITIAL.
+    WRITE: /01 'Program ended succesfully'(i01).
+  ENDIF.
+
+
+************************************************************************
+*       S U B R O U T I N E S                                          *
+************************************************************************
+
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_DATA
+*&---------------------------------------------------------------------*
+*       Select data
+*----------------------------------------------------------------------*
+FORM select_data .
+
+* Equipment time segment
+  SELECT e~equnr e~kmatn e~objnr e~cuobj
+         INTO TABLE gt_equi
+         FROM equi AS e
+         INNER JOIN equz AS z
+                    ON z~equnr = e~equnr
+         INNER JOIN iloa AS l
+                    ON l~iloan = z~iloan
+         WHERE e~equnr IN s_equnr
+           AND z~datbi =  '99991231'
+           AND l~bukrs =  p_bukrs.
+  CHECK NOT gt_equi[] IS INITIAL.
+
+*** MOD-001 * begin ***
+** Check for deleted/scrapped equipments
+*  SELECT objnr
+*         INTO TABLE gt_dlfli
+*         FROM jest
+*         FOR ALL ENTRIES IN gt_equi
+*         WHERE objnr = gt_equi-objnr
+*           AND ( stat = gc_stat_dl   OR
+*                 stat = gc_stat_in   OR
+*                 stat = gc_stat_scr )
+*           AND inact = ' '.
+*  SORT gt_dlfli BY objnr.
+*  DELETE ADJACENT DUPLICATES FROM gt_dlfli
+*                                  COMPARING objnr.
+*  gt_dlfl[] = gt_dlfli[].
+*  FREE gt_dlfli.
+*
+*  LOOP AT gt_equi.
+*    READ TABLE gt_dlfl WITH TABLE KEY objnr = gt_equi-objnr.
+*    IF sy-subrc = 0.
+*      DELETE gt_equi.
+*    ENDIF.
+*  ENDLOOP.
+*  FREE gt_dlfl.
+*  CHECK NOT gt_equi[] IS INITIAL.
+*** MOD-001 * end ***
+
+* Characteristic values
+  SELECT * INTO TABLE gt_cawn                           "#EC CI_NOWHERE
+           FROM cawn.
+
+ENDFORM.                    " SELECT_DATA
+
+*&---------------------------------------------------------------------*
+*&      Form  BUILD_OUTPUT
+*&---------------------------------------------------------------------*
+*       Build table fot output file
+*----------------------------------------------------------------------*
+FORM build_output .
+
+  LOOP AT gt_equi.
+
+*   Get characteristics for equipment
+    PERFORM get_characteristics_equnr.
+
+*   Get characteristics for configurable material
+    IF NOT gt_equi-cuobj IS INITIAL.
+      PERFORM get_characteristics_kmatn.
+    ENDIF.
+
+*   Check the number of equipments processed (Eventually start a new file)
+    gv_cnt_eq = gv_cnt_eq + 1.
+    IF gv_cnt_eq GE p_nreq.
+*     Save output.
+      PERFORM save_output.
+*     Error ?
+      IF NOT gv_error IS INITIAL.
+        EXIT.
+      ENDIF.
+    ENDIF.
+
+*   Free memory
+    gv_cnt_fm = gv_cnt_fm + 1.
+    IF gv_cnt_fm GE 1000.
+      CALL FUNCTION 'CLSE_FREE_MEMORY'.
+      CALL FUNCTION 'CUCB_INITIALIZER'
+*        EXPORTING
+*          IT_INSTANCES       =
+                .
+    ENDIF.
+
+  ENDLOOP.
+
+ENDFORM.                    " BUILD_OUTPUT
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_CHARACTERISTICS_EQUNR
+*&---------------------------------------------------------------------*
+*       Get characteristics for equipment
+*----------------------------------------------------------------------*
+FORM get_characteristics_equnr .
+
+*  REFRESH: gt_alloclist,
+*           gt_return.
+*
+*  MOVE gt_equi-equnr TO gv_objectkey.
+*
+** Get classes
+*  CALL FUNCTION 'BAPI_OBJCL_GETCLASSES'
+*    EXPORTING
+*      objectkey_imp         = gv_objectkey
+*      objecttable_imp       = 'EQUI'
+*      classtype_imp         = '002'
+**      READ_VALUATIONS       =
+**      KEYDATE               = SY-DATUM
+**      LANGUAGE              = SY-LANGU
+*    TABLES
+*      alloclist             = gt_alloclist
+**      ALLOCVALUESCHAR       =
+**      ALLOCVALUESCURR       =
+**      ALLOCVALUESNUM        =
+*      return                = gt_return.
+*
+** Get characteristics
+*  LOOP AT gt_alloclist INTO gs_alloclist.
+*    REFRESH: gt_valnum, gt_valchar, gt_valcurr,
+*             gt_return.
+*    CALL FUNCTION 'BAPI_OBJCL_GETDETAIL'
+*      EXPORTING
+*        objectkey              = gv_objectkey
+*        objecttable            = 'EQUI'
+*        classnum               = gs_alloclist-classnum
+*        classtype              = '002'
+**        KEYDATE                = SY-DATUM
+**        UNVALUATED_CHARS       = ' '
+**        LANGUAGE               = SY-LANGU
+**      IMPORTING
+**        STATUS                 =
+**        STANDARDCLASS          =
+*      TABLES
+*        allocvaluesnum         = gt_valnum
+*        allocvalueschar        = gt_valchar
+*        allocvaluescurr        = gt_valcurr
+*        return                 = gt_return.
+*
+**   Fill output table
+*    LOOP AT gt_valchar INTO gs_valchar.
+*      CLEAR: gt_out.
+*      MOVE '|' TO: gt_out-tab01, gt_out-tab02, gt_out-tab03,
+*                   gt_out-tab04, gt_out-tab05, gt_out-tab06.
+*      gt_out-equnr = gt_equi-equnr.
+**      gt_out-kmatn = gt_equi-kmatn.
+*      gt_out-class = gs_alloclist-classnum.
+*      gt_out-klart = gs_alloclist-classtype.
+*      gt_out-atnam = gs_valchar-charact.
+*      gt_out-atwrt = gs_valchar-value_char.
+*      APPEND gt_out.
+*    ENDLOOP.
+*
+*  ENDLOOP.
+
+  REFRESH: gt_clobjdat,
+           gt_class.
+
+  MOVE gt_equi-equnr TO gv_object.
+
+* Get equipment configuration
+  CALL FUNCTION 'CLAF_CLASSIFICATION_OF_OBJECTS'
+    EXPORTING
+      classtype          = '002'
+      object             = gv_object
+      objecttable        = 'EQUI'
+      initial_charact    = ' '
+      no_value_descript  = 'X'
+    TABLES
+      t_class            = gt_class
+      t_objectdata       = gt_clobjdat
+    EXCEPTIONS
+      no_classification  = 1
+      no_classtypes      = 2
+      invalid_class_type = 3
+      OTHERS             = 4.
+
+  IF sy-subrc <> 0.
+*    MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*            WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+  ENDIF.
+
+* Fill output table
+  CHECK NOT gt_clobjdat[] IS INITIAL.
+
+  LOOP AT gt_clobjdat.
+
+    READ TABLE gt_class INDEX gt_clobjdat-tabix.
+
+    IF sy-subrc = 0.
+      CLEAR: gt_out.
+      MOVE '|' TO: gt_out-tab01, gt_out-tab02, gt_out-tab03,
+                   gt_out-tab04, gt_out-tab05, gt_out-tab06.
+      gt_out-equnr = gt_equi-equnr.
+*      gt_out-kmatn = gt_equi-kmatn.
+      gt_out-class = gt_class-class.
+      gt_out-klart = gt_class-klart.
+      gt_out-atnam = gt_clobjdat-atnam.
+      gt_out-atwrt = gt_clobjdat-ausp1.
+*      CALL FUNCTION 'CONVERSION_EXIT_ATINN_INPUT'
+*        EXPORTING
+*          input  = gt_clobjdat-atnam
+*        IMPORTING
+*          output = gv_atinn.
+*      READ TABLE gt_cawn WITH TABLE KEY atinn = gv_atinn
+*                                        atzhl = gt_clobjdat-zaehl.
+*      IF sy-subrc = 0.
+*        gt_out-atwrt = gt_cawn-atwrt.
+*      ENDIF.
+
+      APPEND gt_out.
+    ENDIF.
+
+  ENDLOOP.
+
+ENDFORM.                    " GET_CHARACTERISTICS_EQUNR
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_CHARACTERISTICS_KMATN
+*&---------------------------------------------------------------------*
+*       Get characteristics for configurable material
+*----------------------------------------------------------------------*
+FORM get_characteristics_kmatn .
+
+  REFRESH: gt_values.
+
+  MOVE gt_equi-cuobj TO gv_cuobj.
+
+* Get material configuration
+  CALL FUNCTION 'CUCB_GET_VALUES_FROM_INSTANCE'
+    EXPORTING
+      iv_instance                  = gv_cuobj
+    IMPORTING
+      et_values                    = gt_values
+    EXCEPTIONS
+      invalid_instance             = 1
+      instance_is_a_classification = 2
+      OTHERS                       = 3.
+  IF sy-subrc <> 0.
+*    MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*            WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+  ENDIF.
+
+* Fill output table
+  CHECK NOT gt_values[] IS INITIAL.
+
+  LOOP AT gt_values INTO gs_values.
+
+    CLEAR: gt_out.
+    MOVE '|' TO: gt_out-tab01, gt_out-tab02, gt_out-tab03,
+                 gt_out-tab04, gt_out-tab05, gt_out-tab06.
+    gt_out-equnr = gt_equi-equnr.
+    gt_out-kmatn = gt_equi-kmatn.
+*    gt_out-class = gt_class-class.
+*    gt_out-klart = gt_class-klart.
+    CALL FUNCTION 'CONVERSION_EXIT_ATINN_OUTPUT'
+      EXPORTING
+        input  = gs_values-atinn
+      IMPORTING
+        output = gt_out-atnam.
+    gt_out-atwrt = gs_values-atwrt.
+    APPEND gt_out.
+
+  ENDLOOP.
+
+
+ENDFORM.                    " GET_CHARACTERISTICS_KMATN
+
+*&---------------------------------------------------------------------*
+*&      Form  SAVE_OUTPUT
+*&---------------------------------------------------------------------*
+*       Save output file
+*----------------------------------------------------------------------*
+FORM save_output .
+
+  CLEAR: gv_ofile.
+
+* Timestamp
+  CONCATENATE sy-datum sy-uzeit INTO gv_ersda.
+* Sequence number
+  gv_seqnr = gv_seqnr + 1.
+
+  CONCATENATE 'EQUIPMENT' 'CHAR' p_bukrs gv_ersda gv_seqnr
+             INTO gv_ofile SEPARATED BY '_'.
+
+  REPLACE 'xxx' IN gv_directory WITH gv_logsys(3).
+  CONCATENATE gv_directory gv_ofile INTO gv_ofile.
+
+  OPEN DATASET gv_ofile FOR OUTPUT IN TEXT MODE ENCODING DEFAULT.
+  IF sy-subrc <> 0.
+    WRITE: / text-e02, gv_ofile.
+    gv_error = 'X'.
+    EXIT.
+  ENDIF.
+
+* Fill header
+  PERFORM fill_header.
+  LOOP AT gt_outh.
+    TRANSFER gt_outh TO gv_ofile.
+  ENDLOOP.
+
+* Fill output
+  LOOP AT gt_out.
+    TRANSFER gt_out TO gv_ofile.
+  ENDLOOP.
+
+  REFRESH gt_out.
+  CLEAR: gv_cnt_eq.
+
+ENDFORM.                    " SAVE_OUTPUT
+
+*&---------------------------------------------------------------------*
+*&      Form  FILL_HEADER
+*&---------------------------------------------------------------------*
+*       Fill header
+*----------------------------------------------------------------------*
+FORM fill_header .
+
+  CLEAR: gt_outh.
+  MOVE '|' TO: gt_outh-tab01, gt_outh-tab02, gt_outh-tab03,
+               gt_outh-tab04, gt_outh-tab05, gt_outh-tab06.
+
+  gt_outh-equnr  = 'EQUNR'.
+  gt_outh-kmatn  = 'KMATN'.
+  gt_outh-class  = 'KLASSE_D'.
+  gt_outh-klart  = 'KLASSENART'.
+  gt_outh-atnam  = 'ATNAM'.
+  gt_outh-atwrt  = 'ATWRT'.
+  APPEND gt_outh.
+
+  gt_outh-equnr  = 'Equipment'.
+  gt_outh-kmatn  = 'Configurable Mat.'.
+  gt_outh-class  = 'Class'.
+  gt_outh-klart  = 'Class Type'.
+  gt_outh-atnam  = 'Charact. Name'.
+  gt_outh-atwrt  = 'Charact. Value'.
+  APPEND gt_outh.
+
+ENDFORM.                    " FILL_HEADER
+
+*Text symbol text£º
+*E01:No equipments selected
+*E02:Could not open output file
+*I01:Program ended succesfully
+*S01:Selection
+
+*S02:Output
+*Selection text£º
+*P_BUKRS:D       .
+*P_NREQ:        Nr. of equipments (per file)
+*S_EQUNR:D       .

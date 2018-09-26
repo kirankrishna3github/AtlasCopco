@@ -1,0 +1,3188 @@
+
+*&--------------------------------------------------------------------*
+*& Report  ZZ_PFCG_V1                                                 *
+*&--------------------------------------------------------------------*
+*& Programm zur Anzeige und Analyse von Rollen,
+*&          Usern, die Rollen innehaben oder
+*&          Rollen, die Usern zugeordnet sind
+*&
+*&          sowie zum Update von einer oder mehreren Rollen
+*&          (in jeweils einem Berechtigungsobjekt und -Feld)
+*&
+*&          mittlerweile auch zum #ndern von Org.ElementWerten
+*&          auf Organisationsebene
+*&          ...und nicht zu vergesen die Anzeige g¨¹ltiger Werte zu
+*&          OrgEbenen, Feldern und Aktivit#ten zu Berechtigungsobjekt
+*&--------------------------------------------------------------------*
+*&          Copyright (c) 2007-2008 UNIORG Consulting GmbH,
+*&                D-44269 Dortmund.
+*&                Written by Dorothee Scharping-Hammad (dsh).
+*&                All rights reserved.
+*&
+*&--------------------------------------------------------------------*
+* ggf wieder reinnehmen, wenn nicht INCLUDE Programm benutzt wird:
+
+*REPORT ZZ_PFCG_V1.  "<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+TABLES: adrp,
+        agr_agrs,
+        agr_prof, agr_tcodes, agr_users, agr_1016, agr_1251, agr_1252,
+        tstca,    usobt_c,    usr02,     usr21,    ust12,
+        t354b,     dd07l,      dd07t.
+TYPE-POOLS: sscr, icon.
+TYPE-POOLS:                 slis.
+
+TYPES: BEGIN OF my_type,
+        uname      LIKE agr_users-uname,
+        agr_name   LIKE agr_users-agr_name,
+        profn      LIKE ust10s-profn,
+        auth       LIKE ust10s-auth,
+        tcode      LIKE tstca-tcode,
+        objct      LIKE tstca-objct,
+        field      LIKE tstca-field,
+        von        LIKE agr_1251-low,
+        bis        LIKE agr_1251-high,
+        node       LIKE agr_1251-node,
+        variant    LIKE agr_1251-variant,
+        name_text  LIKE adrp-name_text,
+        change_dat LIKE agr_users-change_dat,
+        change_tim LIKE agr_users-change_tim,
+        icon_id    LIKE icon-id,
+        icon_text  LIKE icont-shorttext,
+       END   OF my_type.
+TYPES: BEGIN OF tcd_type,
+        tcode       TYPE  agr_tcodes-tcode,
+        tcode_bis   TYPE  agr_tcodes-tcode,
+       END   OF tcd_type.
+
+TYPES: BEGIN OF limit_type,
+        unten_alt     TYPE agr_1251-low,
+        oben_neu      TYPE agr_1251-high,
+        unten_neu     TYPE agr_1251-low,
+        oben_alt      TYPE agr_1251-high,
+END   OF limit_type.
+
+TYPES: BEGIN OF sel,
+         sign(1),
+         option(2),
+         low  LIKE agr_1251-low,
+         high LIKE agr_1251-low,
+      END   OF sel.
+
+DATA: pettern   TYPE c LENGTH 38
+              VALUE '?0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ*'.
+
+CONSTANTS:  unten        VALUE '1',
+            oben         VALUE '2',
+            old          VALUE 'O',
+            new          VALUE 'N',
+            ja           VALUE 'J',
+            nein         VALUE 'N',
+            spass        VALUE ' ',
+            c_upd   LIKE sy-ucomm     VALUE 'UPD',
+            loesch_kz  TYPE c LENGTH 30 VALUE '00000++',
+            loeschen   TYPE c LENGTH 04 VALUE 'LOE',
+            einfuegen  TYPE c LENGTH 04 VALUE 'EINF',
+            aendern    TYPE c LENGTH 04 VALUE 'AEND',
+            dollar       VALUE '$',
+            stern        VALUE '*',
+            stern_blank TYPE c LENGTH 2 VALUE '* ',
+            punkt        VALUE '.',
+            icks         VALUE 'X',
+            c_space  TYPE c LENGTH 05    VALUE 'SPACE',
+            c_stern  TYPE c LENGTH 05    VALUE 'STERN',
+            c_star   TYPE c LENGTH 05    VALUE 'STAR ',
+            c_sap    TYPE c LENGTH 03    VALUE 'SAP',
+            c_sap_u  TYPE c LENGTH 30
+            VALUE 'SAP                           ',
+            c_sap_o  TYPE c LENGTH 30
+            VALUE 'SAP__ZZZZZZZZZZZZZZZZZZZZZZZZZ'.
+
+DATA:  mv1          TYPE  sy-msgv1,
+       mv2          TYPE  sy-msgv2,
+       mv3          TYPE  sy-msgv2,
+       merk_rolle   TYPE c LENGTH 30,
+       merk_profile TYPE c LENGTH 10,
+       merk_uname    TYPE agr_users-uname,
+       merk_agr_name TYPE agr_users-agr_name,
+       merk_berechtigung TYPE agr_1251-auth,
+       h_name        TYPE adrp-name_text .
+*kennungen und #hnliches:
+DATA:  kz_teil1      TYPE i,
+       kz_teil2      TYPE i,
+       image         TYPE i,
+       listtyp           TYPE c,       "Listtyp
+       kz_modified   TYPE i,
+       kz_appended   TYPE i,
+       kz_gwunne     TYPE i,
+       kz_sternexcl  TYPE i,
+       kz_error      TYPE i,
+       idefix        TYPE sy-tabix,
+       kz_prod       TYPE c,
+       ja_nein       TYPE c.
+
+DATA: my_ucomm     LIKE      sy-ucomm,
+      ok_code      LIKE      sy-ucomm,
+      last_action  LIKE      sy-ucomm,
+      sta_tab TYPE TABLE  OF sy-ucomm.
+
+*ALV Variable f¨¹r FuBa:************************************************
+DATA my_layout     TYPE slis_layout_alv.
+DATA fieldcat      TYPE slis_t_fieldcat_alv.
+DATA wa_fieldcat   LIKE LINE OF fieldcat.
+DATA repid         LIKE sy-repid.
+DATA cprog         LIKE sy-cprog.
+DATA my_variant    LIKE disvariant.
+DATA listheader    TYPE slis_t_listheader.
+DATA wa_listheader TYPE slis_listheader.
+
+*wir probieren...:
+DATA: exit_by_caller TYPE c.
+DATA: BEGIN OF exit_by_user,
+         back(1) TYPE c,
+         exit(1) TYPE c,
+         cancel(1) TYPE c,
+       END OF exit_by_user,
+       my_own_stack TYPE i.
+***********************************************************************
+
+DATA: i_cont   TYPE TABLE OF my_type,
+      i_cont_h TYPE TABLE OF my_type,
+      i_cont2  TYPE TABLE OF my_type,
+      i_cont3  TYPE TABLE OF my_type,
+      i_cont4  TYPE TABLE OF my_type,
+      i_success TYPE TABLE OF my_type,
+      w_cont   LIKE LINE  OF i_cont.
+FIELD-SYMBOLS: <fsout> TYPE my_type.
+DATA: i_out    TYPE TABLE OF my_type,
+      w_out    LIKE LINE  OF i_out,
+      anz_out  TYPE i.
+
+DATA: i_limits    TYPE TABLE OF limit_type,
+      w_limits    LIKE LINE  OF i_limits.
+DATA: BEGIN OF w_neue_werte,
+         low  LIKE agr_1251-low,
+         high LIKE agr_1251-high,
+END OF w_neue_werte.
+DATA i_neue_werte  LIKE TABLE OF w_neue_werte.
+
+DATA: wh_auth_von     TYPE agr_1251-auth,
+      wh_auth_bis     TYPE agr_1251-auth.
+DATA: i_agr_users      TYPE TABLE OF agr_users,
+      w_agr_users      TYPE          agr_users.
+DATA: i_usr02      TYPE TABLE OF usr02,
+      w_usr02      TYPE          usr02.
+DATA: i_ust04      TYPE TABLE OF ust04,
+      w_ust04      TYPE          ust04.
+DATA: i_ust10s     TYPE TABLE OF ust10s,
+      w_ust10s     TYPE          ust10s.
+DATA: i_ust12      TYPE TABLE OF ust12,
+      w_ust12      TYPE          ust12.
+DATA: i_agr_1251   TYPE TABLE OF agr_1251,
+      i_mod_1251   TYPE TABLE OF agr_1251,
+      i_mod1_1251  TYPE TABLE OF agr_1251,
+      i_fehl_1251  TYPE TABLE OF agr_1251,
+      w_agr_1251   TYPE          agr_1251,
+      w_mod_1251   TYPE          agr_1251,
+      w_mod1_1251  TYPE          agr_1251,
+      w_mod2_1251  TYPE          agr_1251,
+      w_save_1251  TYPE          agr_1251,
+      h_counter    LIKE agr_1251-counter.
+FIELD-SYMBOLS: <fs1251>   TYPE   agr_1251,
+               <fs1251_z> TYPE   agr_1251.
+DATA: i_agr_1252   TYPE TABLE OF agr_1252,
+      i_mod_1252   TYPE TABLE OF agr_1252,
+      i_mod1_1252  TYPE TABLE OF agr_1252,
+      w_agr_1252   TYPE          agr_1252.
+FIELD-SYMBOLS: <fs1252>   TYPE   agr_1252,
+               <fs1252_1> TYPE   agr_1252.
+DATA: i_agr_agrs   TYPE TABLE OF agr_agrs,
+      w_agr_agrs   TYPE          agr_agrs.
+DATA: i_agr_1016   TYPE TABLE OF agr_1016,
+      w_agr_1016   TYPE          agr_1016.
+DATA: i_agr_prof   TYPE TABLE OF agr_prof,
+      w_agr_prof   TYPE          agr_prof.
+DATA: i_agr_tcodes TYPE TABLE OF agr_tcodes,
+      w_agr_tcodes TYPE          agr_tcodes.
+DATA: i_tcode TYPE TABLE OF tcd_type,
+      w_tcode TYPE          tcd_type.
+DATA: i_tstca TYPE TABLE OF tstca,
+      w_tstca TYPE          tstca.
+DATA: i_usobt TYPE TABLE OF usobt_c,
+      w_usobt TYPE          usobt_c.
+
+DATA: i_usorg TYPE TABLE OF usorg,
+      w_usorg TYPE          usorg.
+DATA: i_authx TYPE TABLE OF authx,
+      w_authx TYPE          authx.
+
+DATA: i_tactz TYPE TABLE OF tactz,
+      w_tactz TYPE          tactz.
+DATA: i_tactt TYPE TABLE OF tactt,
+      w_tactt TYPE          tactt.
+DATA: BEGIN OF w_outactvt,
+      brobj   TYPE tactz-brobj,
+      actvt   TYPE tactz-actvt,
+      ltext   TYPE tactt-ltext,
+      END OF w_outactvt,
+      i_outactvt LIKE TABLE OF w_outactvt.
+DATA: BEGIN OF w_outfld,
+      domvalue_l  TYPE dd07l-domvalue_l,
+      ddtext      TYPE dd07t-ddtext,
+      END   OF w_outfld,
+      i_outfld LIKE TABLE OF w_outfld.
+
+DATA: linetype TYPE string,
+      refdyntab TYPE REF TO data.
+FIELD-SYMBOLS: <dyntab>  TYPE STANDARD TABLE.
+RANGES: r_checktable FOR w_authx-checktable.
+
+*zur Intervallberechnung:
+DATA: BEGIN OF i_intvl OCCURS 10,
+      wert   LIKE w_agr_1251-low,
+      uodero TYPE c,
+      END OF   i_intvl.
+DATA:  w_intvlu LIKE LINE OF i_intvl,
+       w_intvlo LIKE LINE OF i_intvl.
+
+DATA: w_t000    TYPE t000,
+      w_adrp    TYPE adrp,
+      w_usr21   TYPE usr21.
+
+*f¨¹r die F4-Hilfe:
+DATA: BEGIN OF value_tab OCCURS 0,
+         field1 LIKE agr_users-agr_name,
+      END OF value_tab,
+      BEGIN OF value_tab_u OCCURS 0,
+         field1 LIKE agr_users-uname,
+      END OF value_tab_u,
+
+      value_org TYPE c VALUE 'S',
+      retfield  TYPE  dfies-fieldname,
+      my_dynprog LIKE sy-repid,
+      my_dynpnr  LIKE sy-dynnr.
+
+
+* Definition des Objekts, das an den Parameter RESTRICTION ¨¹bergeben
+* wird.
+DATA restrict TYPE sscr_restrict.
+
+* Hilfsobjekte zum F¨¹llen von RESTRICT
+DATA opt_list TYPE sscr_opt_list.
+DATA ass      TYPE sscr_ass.
+
+SELECTION-SCREEN BEGIN OF BLOCK sel_bloc0 WITH FRAME.
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 14(28) text-s02.
+SELECTION-SCREEN PUSHBUTTON 42(16) text-p01
+                            USER-COMMAND guelakt MODIF ID pb.
+SELECTION-SCREEN PUSHBUTTON 60(16) text-p02
+                            USER-COMMAND guelfld MODIF ID pb.
+SELECTION-SCREEN PUSHBUTTON 78(16) text-p03
+                            USER-COMMAND guelorg MODIF ID pb.
+SELECTION-SCREEN END OF LINE.
+SELECTION-SCREEN SKIP 1.
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 8(34) text-s05.
+SELECTION-SCREEN PUSHBUTTON 42(16) text-p04
+                            USER-COMMAND samroll MODIF ID pb.
+SELECTION-SCREEN PUSHBUTTON 60(16) text-p05
+                            USER-COMMAND rollsam MODIF ID pb.
+SELECTION-SCREEN END OF LINE.
+SELECTION-SCREEN END   OF BLOCK sel_bloc0.
+
+SELECTION-SCREEN BEGIN OF BLOCK sel_bloc1 WITH FRAME TITLE text-004.
+SELECTION-SCREEN COMMENT 4(51) text-001.
+
+*SELECT-OPTIONS: s_uname   FOR w_agr_users-uname NO-EXTENSION
+SELECT-OPTIONS: s_uname   FOR agr_users-uname NO-EXTENSION
+                                                NO INTERVALS.
+*                                generische Eingabe dennoch m#glich!
+SELECT-OPTIONS: s_rolle   FOR agr_users-agr_name,
+                s_profn   FOR w_ust10s-profn    NO-EXTENSION
+                                                NO INTERVALS.
+SELECTION-SCREEN COMMENT /08(72) text-003.
+SELECT-OPTIONS: s_tcode   FOR w_tcode           NO-EXTENSION
+                                                NO INTERVALS.
+SELECTION-SCREEN COMMENT /08(72) text-002.
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN          COMMENT 01(31) text-018.
+PARAMETERS: s_object  LIKE w_agr_1251-object,
+            s_field   LIKE w_agr_1251-field.
+SELECTION-SCREEN END OF LINE.
+SELECTION-SCREEN END   OF BLOCK sel_bloc1.
+
+SELECTION-SCREEN BEGIN OF BLOCK sel_bloc1a WITH FRAME TITLE text-019.
+PARAMETERS  p_org AS CHECKBOX.
+SELECTION-SCREEN END   OF BLOCK sel_bloc1a.
+
+SELECTION-SCREEN BEGIN OF BLOCK sel_bloc2 WITH FRAME TITLE text-005.
+
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN          COMMENT 01(31) text-016.
+PARAMETERS:      p_obj1   LIKE w_agr_1251-object. "Auth. Object in User Master Maintenance
+*                            neuerdings auch Eingabefeld f¨¹r OrgElement
+SELECTION-SCREEN          COMMENT 55(01) text-015.
+PARAMETERS:       b_r1 RADIOBUTTON GROUP rad1 DEFAULT 'X'
+                       USER-COMMAND ucom.
+SELECTION-SCREEN          COMMENT 59(08) text-013.
+PARAMETERS:       b_r2 RADIOBUTTON GROUP rad1.
+SELECTION-SCREEN          COMMENT 70(35) text-014.
+
+PARAMETERS: p_case TYPE c LENGTH 4.
+SELECTION-SCREEN END OF LINE.
+
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN          COMMENT 12(42) text-017.
+PARAMETERS: p_zobj    LIKE w_agr_1251-object.       "Zusatzbedingung
+PARAMETERS: p_zfld    LIKE w_agr_1251-field.
+SELECTION-SCREEN          COMMENT (30) text-17a.
+SELECTION-SCREEN END OF LINE.
+
+SELECTION-SCREEN          COMMENT /08(72) text-006.
+PARAMETERS:      p_field  LIKE w_agr_1251-field.
+SELECTION-SCREEN          COMMENT /08(72) text-008.
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN          COMMENT 1(10) text-012.
+PARAMETERS:      p_low1  LIKE w_agr_1251-low,
+                 p_high1 LIKE w_agr_1251-high.
+SELECTION-SCREEN END OF LINE.
+SELECTION-SCREEN COMMENT /08(72) text-009.
+*SELECTION-SCREEN BEGIN OF LINE.
+*SELECTION-SCREEN          COMMENT 1(10) text-017.
+PARAMETERS:      p_repl1  LIKE w_agr_1251-low.
+PARAMETERS:      p_repl2  LIKE w_agr_1251-high.
+*SELECTION-SCREEN END OF LINE.
+SELECTION-SCREEN COMMENT /08(72) text-011.
+*auszuschlie#ende Werte:
+SELECT-OPTIONS: s_excl FOR w_agr_1251-low.
+*               DEFAULT '.' TO '.' OPTION NB SIGN I,
+SELECTION-SCREEN COMMENT /08(72) text-010.
+*neu einzuf¨¹genden Werte:
+SELECT-OPTIONS: s_incl   FOR w_agr_1251-low.
+SELECTION-SCREEN END   OF BLOCK sel_bloc2.
+
+DATA: w_excl LIKE LINE OF s_excl,
+      w_incl LIKE LINE OF s_incl,
+      h_incl LIKE LINE OF s_incl.
+
+TYPES: BEGIN OF check_type,
+        agr_name      TYPE agr_users-agr_name,
+        ch_incl       LIKE s_incl[],
+        ch_1251       TYPE agr_1251,
+       END OF check_type.
+
+DATA: i_checktab  TYPE TABLE OF check_type,
+      w_checkline TYPE check_type.
+
+INITIALIZATION.
+
+* FASTALL: fast alle Optionen erlaubt
+  MOVE 'FASTALL'        TO opt_list-name.
+  MOVE 'X' TO: opt_list-options-bt,
+*               OPT_LIST-OPTIONS-CP,
+               opt_list-options-eq,
+               opt_list-options-ge,
+               opt_list-options-gt,
+               opt_list-options-le,
+               opt_list-options-lt,
+*               OPT_LIST-OPTIONS-NB,
+               opt_list-options-ne.
+*               OPT_LIST-OPTIONS-NP.
+  APPEND opt_list TO restrict-opt_list_tab.
+* KIND = 'S': gilt f¨¹r die SELECT-OPTION S_INCL
+  CLEAR ass.
+  MOVE: 'S'          TO ass-kind,
+        'S_INCL'     TO ass-name,
+        'I'          TO ass-sg_main,
+        ''           TO ass-sg_addy,
+        'FASTALL'    TO ass-op_main,
+        'FASTALL'    TO ass-op_addy.
+  APPEND ass TO restrict-ass_tab.
+  MOVE: 'S_EXCL'     TO ass-name.
+  APPEND ass TO restrict-ass_tab.
+
+* mal f¨¹r sp#ter, um exclude bei select_options s_incl
+*                                           und s_excl auszuschlie#en!
+  CALL FUNCTION 'SELECT_OPTIONS_RESTRICT'
+    EXPORTING
+      restriction = restrict.
+  IF sy-subrc NE 0.
+  ENDIF.
+*                                           ...wieder was dazugelernt!
+
+  SELECT SINGLE * FROM t000 INTO w_t000 WHERE mandt = sy-mandt.
+  IF  w_t000-cccategory <> 'C'.
+    kz_prod = icks.
+  ENDIF.
+
+  r_checktable-sign    = 'I'.
+  r_checktable-option  = 'EQ'.
+  r_checktable-low     = 'TJ01'.
+  APPEND r_checktable.
+  r_checktable-low     = 'T354B'.
+  APPEND r_checktable.
+
+AT SELECTION-SCREEN OUTPUT.
+  SET CURSOR FIELD 'S_ROLLE-LOW'.
+
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR s_uname-low.
+  REFRESH value_tab_u.
+  SELECT DISTINCT uname INTO  TABLE  value_tab_u  FROM agr_users
+    WHERE uname     IN s_uname.
+*          AND agr_name IN s_rolle.
+  SORT value_tab_u.
+  my_dynprog = sy-repid.
+  my_dynpnr  = sy-dynnr.
+  CALL FUNCTION 'F4IF_INT_TABLE_VALUE_REQUEST'
+   EXPORTING
+*   DDIC_STRUCTURE         = ' '
+     retfield               = retfield
+*   PVALKEY                = ' '
+   dynpprog               = my_dynprog
+   dynpnr                 = my_dynpnr
+   dynprofield            = 'S_UNAME-LOW'
+*   STEPL                  = 0
+*   WINDOW_TITLE           =
+*   VALUE                  = ' '
+     value_org              = 'S'
+*   MULTIPLE_CHOICE        = ' '
+*   DISPLAY                = ' '
+*   CALLBACK_PROGRAM       = ' '
+*   CALLBACK_FORM          = ' '
+*   MARK_TAB               =
+* IMPORTING
+*   USER_RESET             =
+   TABLES
+     value_tab              = value_tab_u.
+*   FIELD_TAB              =
+*   RETURN_TAB             =
+*   DYNPFLD_MAPPING        =
+* EXCEPTIONS
+*   PARAMETER_ERROR        = 1
+*   NO_VALUES_FOUND        = 2
+*   OTHERS                 = 3
+  .
+  IF sy-subrc <> 0.
+* MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*         WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+  ENDIF.
+
+
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR s_rolle-low.
+
+  PERFORM append_ecpsap.
+  REFRESH value_tab.
+
+  SELECT DISTINCT agr_name INTO TABLE value_tab FROM agr_1251
+         WHERE agr_name IN s_rolle.
+  PERFORM delete_ecpsap.
+  SORT value_tab.
+
+  my_dynprog = sy-repid.
+  my_dynpnr  = sy-dynnr.
+
+  CALL FUNCTION 'F4IF_INT_TABLE_VALUE_REQUEST'
+    EXPORTING
+      retfield    = retfield
+      dynpprog    = my_dynprog
+      dynpnr      = my_dynpnr
+      dynprofield = 'S_ROLLE-LOW'
+      value_org   = 'S'
+    TABLES
+      value_tab   = value_tab.
+* EXCEPTIONS
+*   PARAMETER_ERROR        = 1
+*   NO_VALUES_FOUND        = 2
+*   OTHERS                 = 3
+  .
+  IF sy-subrc <> 0.
+  ENDIF.
+
+AT SELECTION-SCREEN ON RADIOBUTTON GROUP rad1.
+  IF kz_prod = icks AND b_r2 = icks.
+    MESSAGE e208(00) WITH text-020.
+*                  '#nderungen sind nur im Entwicklungssystem m#glich'.
+  ENDIF.
+
+AT SELECTION-SCREEN.
+  CLEAR my_ucomm.
+  PERFORM plaus_pruefung1 CHANGING my_ucomm.
+  CASE my_ucomm.
+    WHEN 'GUELAKT'.
+      PERFORM anzeige_actvt USING p_obj1.
+    WHEN 'GUELFLD'.
+      PERFORM anzeige_feldwerte USING p_field.
+    WHEN 'GUELORG'.
+      PERFORM anzeige_orgelemwerte USING p_obj1.
+    WHEN 'SAMROLL'.
+      PERFORM anzeige_sammelrollen.
+    WHEN 'ROLLSAM'.
+      PERFORM anzeige_sammelrollen.
+  ENDCASE.
+
+START-OF-SELECTION.
+  IF kz_error IS INITIAL.
+    IF image IS INITIAL.
+      PERFORM lesen_daten.   "<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+    ENDIF.
+    IF kz_error IS INITIAL.
+      PERFORM pseudo_pbo.
+    ENDIF.
+  ENDIF.
+  CLEAR kz_error.
+
+*END-OF-SELECTION......................................................
+*  PERFORM pseudo_pbo.
+
+*&====================================================================*
+*&====================================================================*
+*&      Form user_command (Aufruf via ALV FuBa)
+*&--------------------------------------------------------------------*
+FORM user_command USING r_ucomm     LIKE sy-ucomm
+                        rs_selfield TYPE slis_selfield.
+  MOVE r_ucomm TO ok_code.
+  IF r_ucomm = '&IC1'. "Doppelklick im Feld
+
+    PERFORM handle_doubleclick USING rs_selfield.
+
+  ELSE.
+
+    CASE ok_code.
+      WHEN 'ZRUCK'.
+        CLEAR image.
+        LEAVE LIST-PROCESSING.
+*         CALL SCREEN 1000.
+
+        CALL SELECTION-SCREEN 1000.
+        PERFORM pseudo_stol.      "Pseudo Start-of-Selection
+      WHEN 'BACK'.
+        IF last_action = 'FEHL'.
+          MOVE 5 TO image.
+        ELSE.
+          CLEAR image.
+          LEAVE TO SCREEN 0.
+        ENDIF.
+      WHEN 'EXIT'.
+        LEAVE PROGRAM.
+      WHEN 'END'.
+        LEAVE PROGRAM.
+      WHEN 'NOO'.               "nicht org.ebenengepflegte org.elemente
+        PERFORM manuelle_orgelemente.
+      WHEN 'UZR'.
+        IF last_action = 'ROU'.
+          MOVE last_action TO ok_code.
+          mv1 = text-w01.
+*              'keine User zu Rollen vorhanden'.
+          CLEAR mv2.
+          PERFORM message_ausgabe_w.
+        ELSE.
+          PERFORM user_zu_rollen.
+        ENDIF.
+      WHEN 'RZU'.
+        IF last_action = 'ROU'.
+          MOVE last_action TO ok_code.
+          mv1 = text-w02.
+*               'Rollen zu User macht hier keinen Sinn'.
+          CLEAR mv2.
+          PERFORM message_ausgabe_w.
+        ELSE.
+          PERFORM rollen_zu_user.
+        ENDIF.
+      WHEN 'ROU'.
+        PERFORM rollen_ohne_user.
+*      APPEND 'RZU' TO sta_tab.
+*      APPEND 'UZR' TO sta_tab.
+      WHEN 'FEHL'.
+        IF i_fehl_1251 IS NOT INITIAL.
+          MOVE 6 TO image.
+        ENDIF.
+      WHEN 'UPD'.
+        IF last_action = 'UPD'.
+          CLEAR image.
+          CALL SELECTION-SCREEN 1000.
+          PERFORM pseudo_stol.      "Pseudo Start-of-Selection
+        ELSE.
+          CASE image.
+            WHEN 5 OR 6.
+              IF b_r2 = 'X'.
+                image = 5.
+                PERFORM update_rollen.
+              ELSE.
+                mv1 = text-w03.
+*                     'Ernstfall ist noch nicht beantragt!'.
+                CLEAR mv2.
+                PERFORM message_ausgabe_w.
+              ENDIF.
+            WHEN 9.
+              IF b_r2 = 'X'.
+                PERFORM update_orgs.
+              ELSE.
+                mv1 = text-w03.
+*                    'Ernstfall ist noch nicht beantragt!'.
+                CLEAR mv2.
+                PERFORM message_ausgabe_w.
+              ENDIF.
+            WHEN OTHERS.
+              mv1 = text-e01.
+              mv2 = text-e1a.
+*                   da l#uft noch was ziemlich verkehrt'.
+*                   - hier d¨¹rfte er nicht landen!'.
+              PERFORM message_ausgabe_e.
+          ENDCASE.
+        ENDIF.
+      WHEN OTHERS.
+        IF image = 5 OR image = 6.
+          mv1 = text-w04.
+*               'Zum #ndern bitte Funktionsbutton dr¨¹cken'.
+          CLEAR mv2.
+          PERFORM message_ausgabe_w.
+        ENDIF.
+    ENDCASE.
+  ENDIF.
+  MOVE ok_code TO last_action.
+
+*   um das Auffrischen anzusto#en Flag setzen
+  rs_selfield-refresh = 'X'.
+*   'Festhalten' der aktuellen Position
+  rs_selfield-col_stable = 'X'.
+  rs_selfield-row_stable = 'X'.
+  PERFORM pseudo_pbo.
+ENDFORM.                    "user_command
+*&--------------------------------------------------------------------*
+*&      Form  handle_Doubleclick
+*&--------------------------------------------------------------------*
+FORM handle_doubleclick USING selfield TYPE slis_selfield.
+  DATA: mfield1(50) TYPE c,
+        mfield2(50) TYPE c,
+        mtabix(03) TYPE c,
+     done.
+  IF image = 1 OR image = 2 OR image = 7.
+    READ TABLE i_out INDEX selfield-tabindex INTO w_out.
+    IF selfield-fieldname = 'OBJECT'
+    OR selfield-fieldname = 'OBJCT'.
+      IF w_out-objct(1) = dollar.
+        PERFORM anzeige_orgelemwerte USING w_out-objct.
+        done = icks.
+      ELSE.
+        PERFORM anzeige_actvt USING w_out-objct.
+        done = icks.
+      ENDIF.
+    ELSE.
+      IF selfield-fieldname = 'FIELD'.
+        PERFORM anzeige_feldwerte USING w_out-field.
+        done = icks.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+  IF done IS INITIAL.
+*   wird nur Meldung ausgegeben, an welches Feld ist geklopft.
+    mtabix = selfield-tabindex.
+    CONCATENATE text-s03 selfield-fieldname
+                      INTO mfield1 SEPARATED BY space.
+    CONCATENATE text-s04 mtabix
+                      INTO mfield2 SEPARATED BY space.
+    MESSAGE s368(00) WITH mfield1 mfield2.
+  ENDIF.
+ENDFORM.                    "handle_Doubleclick
+*&--------------------------------------------------------------------*
+*&      Form  pseudo_pbo
+*&--------------------------------------------------------------------*
+FORM pseudo_pbo.
+
+  IF  ok_code NA '%'.              "das sind wohl die ALV Funz.Codes?
+    listtyp = image.                    "lt - Listtyp
+    CASE image.
+      WHEN 0.
+        CASE my_ucomm.
+          WHEN 'GUELAKT'.
+            listtyp = 'A'.
+            PERFORM aufbau_feldkatalog USING listtyp 'I_OUTACTVT'.
+            PERFORM call_alv TABLES i_outactvt fieldcat
+                                       USING         'I_OUTACTVT'.
+          WHEN 'GUELFLD'.
+            MESSAGE i001(00) WITH 'steig mer doch ind tasch!'.
+          WHEN 'GUELORG'.
+            MESSAGE i001(00) WITH 'steig mer doch ind tasch!'.
+        ENDCASE.
+      WHEN 5.
+        IF  ok_code = 'UPD'.
+          MOVE i_success TO i_out.
+          listtyp = '7'.
+          PERFORM aufbau_feldkatalog USING listtyp 'I_OUT'.
+          PERFORM call_alv  TABLES   i_out fieldcat USING 'I_OUT'.
+        ELSE.
+          PERFORM aufbau_feldkatalog USING  listtyp 'I_MOD1_1251'.
+          PERFORM call_alv  TABLES i_mod1_1251
+                                   fieldcat USING 'I_MOD1_1251'.
+        ENDIF.
+      WHEN 6.
+        PERFORM aufbau_feldkatalog USING listtyp 'I_FEHL_1251'.
+        PERFORM call_alv  TABLES i_fehl_1251
+                                 fieldcat USING 'I_FEHL_1251'.
+      WHEN 7.
+        listtyp = '2'.
+        PERFORM aufbau_feldkatalog USING  listtyp 'I_OUT'.
+        PERFORM call_alv  TABLES   i_out fieldcat USING 'I_OUT'.
+      WHEN 8.
+        PERFORM aufbau_feldkatalog USING  listtyp'I_AGR_1252'.
+        PERFORM call_alv  TABLES i_agr_1252
+                                 fieldcat USING 'I_AGR_1252'.
+      WHEN 9.
+        IF  ok_code = 'UPD'.
+          MOVE i_success TO i_out.
+          listtyp = '7'.
+          PERFORM aufbau_feldkatalog USING listtyp 'I_OUT'.
+          PERFORM call_alv  TABLES   i_out fieldcat USING 'I_OUT'.
+        ELSE.
+          PERFORM aufbau_feldkatalog USING  listtyp 'I_MOD1_1252'.
+          PERFORM call_alv  TABLES i_mod1_1252
+                                   fieldcat USING 'I_MOD1_1252'.
+        ENDIF.
+      WHEN OTHERS.
+        IF image = 3 OR image = 4.
+        ELSE.
+          listtyp = '1'.
+        ENDIF.
+        PERFORM aufbau_feldkatalog USING  listtyp 'I_OUT'.
+        PERFORM call_alv  TABLES   i_out fieldcat USING 'I_OUT'.
+    ENDCASE.
+
+    CLEAR my_ucomm.
+
+*   h i e r  lassen sich  exit_by_caller und exit_by_user abfragen!
+*                                                 ... und dann?
+    IF exit_by_user-back = icks.
+      my_own_stack = my_own_stack - 1.
+      IF my_own_stack > 0.
+        IF image = 3 OR image = 4 OR image = 6 OR image = 7
+        OR image = 5 OR image = 9.
+          LEAVE TO SCREEN 0.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    "pseudo_pbo
+*&---------------------------------------------------------------------*
+*&      Form  pseudo_stol  (STart Of Selection)
+*&---------------------------------------------------------------------*
+FORM pseudo_stol.
+  CLEAR image.
+  CLEAR my_own_stack.
+
+  PERFORM lesen_daten.    "<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+ENDFORM.                    "pseudo_stol
+
+*&--------------------------------------------------------------------*
+*&      Form  anzeige_actvt
+*&--------------------------------------------------------------------*
+*      -->P_OBJ1     text
+*---------------------------------------------------------------------*
+FORM anzeige_actvt USING object TYPE agr_1251-object.
+
+  SELECT z~brobj z~actvt t~ltext
+    INTO CORRESPONDING FIELDS OF TABLE i_outactvt
+    FROM       tactz AS z
+    INNER JOIN tactt AS t ON z~actvt = t~actvt
+    WHERE brobj = object
+      AND spras = sy-langu.
+  IF sy-subrc = 0.
+    listtyp = 'A'.
+    PERFORM aufbau_feldkatalog          USING listtyp 'I_OUTACTVT'.
+    PERFORM call_alv TABLES i_outactvt fieldcat USING 'I_OUTACTVT'.
+  ELSE.
+    MESSAGE i001(00) WITH text-i04 text-i4a.
+*        'keine Daten gefunden - gibt es das Ber.Objekt tats#chlich?'.
+  ENDIF.
+
+ENDFORM.                    "anzeige_actvt
+*&--------------------------------------------------------------------*
+*&      Form  anzeige_feldwerte
+*&--------------------------------------------------------------------*
+*      -->P_FIELD    text
+*---------------------------------------------------------------------*
+FORM anzeige_feldwerte USING field TYPE agr_1251-field.
+  DATA success.
+
+  SELECT SINGLE * INTO w_authx
+    FROM authx WHERE fieldname = field.
+  IF sy-subrc NE 0.
+    MESSAGE i001(00) WITH text-i05 text-i4a.
+*        'keine Daten gefunden - gibt es den Feldnamen tats#chlich?'.
+  ELSE.
+    IF  w_authx-checktable IS INITIAL.
+      PERFORM feldwerte_aus_dom USING success.
+      IF success IS INITIAL.
+        MESSAGE i001(00) WITH text-i06.
+*        'keine Checktable zu Feld vorhanden - schade!'.
+      ELSE.
+        listtyp = 'B'.
+        PERFORM aufbau_feldkatalog USING listtyp 'DD07L'.
+        PERFORM call_alv TABLES i_outfld fieldcat
+                          USING 'I_OUTFLD'.
+      ENDIF.
+    ELSE.
+      IF w_authx-checktable NOT IN r_checktable.
+        linetype = w_authx-checktable.
+      ELSE.
+        CONCATENATE 'H_' w_authx-checktable INTO linetype.
+      ENDIF.
+      CREATE DATA refdyntab TYPE STANDARD TABLE OF (linetype).
+      ASSIGN refdyntab->* TO <dyntab>.
+      IF w_authx-checktable NOT IN r_checktable.
+
+        SELECT * FROM (w_authx-checktable) INTO TABLE <dyntab>.
+      ELSE.
+        PERFORM extrawurst TABLES <dyntab>
+                           USING w_authx-checktable .
+      ENDIF.
+      IF sy-subrc = 0.
+        listtyp = 'B'.
+        PERFORM aufbau_feldkatalog    USING listtyp w_authx-checktable.
+        PERFORM call_alv TABLES <dyntab> fieldcat
+                          USING linetype.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    "anzeige_feldwerte
+*&--------------------------------------------------------------------*
+*&      Form  feldwerte_aus_dom
+*&--------------------------------------------------------------------*
+FORM feldwerte_aus_dom USING success.
+  CLEAR success.
+  SELECT l~domvalue_l t~ddtext
+    INTO CORRESPONDING FIELDS OF TABLE i_outfld
+    FROM dd07l AS l
+    INNER JOIN dd07t AS t  ON l~domname  = t~domname
+                          AND l~as4local = t~as4local
+                          AND l~valpos   = t~valpos
+      WHERE l~domname = w_authx-rollname
+        AND t~ddlanguage = sy-langu.
+  IF sy-subrc = 0.
+    success = icks.
+  ENDIF.
+ENDFORM.                    "feldwerte_aus_dom
+*&--------------------------------------------------------------------*
+*&      Form  extrawurst
+*&--------------------------------------------------------------------*
+FORM extrawurst TABLES dyntab     TYPE STANDARD TABLE
+                 USING checktable LIKE authx-checktable.
+  DATA: BEGIN OF t1.
+          INCLUDE STRUCTURE  t354b.
+  DATA:       txt TYPE tj01t-txt,
+         END OF t1,
+         i_t1 LIKE TABLE OF t1.
+
+  CASE checktable.
+    WHEN 'T354B'.
+      SELECT a~vrgng b~txt INTO CORRESPONDING FIELDS OF TABLE i_t1
+      FROM t354b AS a
+      INNER JOIN tj01t AS b ON a~vrgng = b~vrgng
+      WHERE b~spras = sy-langu.
+      APPEND LINES OF i_t1 TO dyntab.
+    WHEN 'TJ01'.
+      SELECT a~vrgng b~txt INTO CORRESPONDING FIELDS OF TABLE i_t1
+      FROM tj01 AS a
+      INNER JOIN tj01t AS b ON a~vrgng = b~vrgng
+      WHERE b~spras = sy-langu.
+      APPEND LINES OF i_t1 TO dyntab.
+  ENDCASE.
+
+ENDFORM.                    "extrawurst
+*&--------------------------------------------------------------------*
+*&      Form  anzeige_orgelemwerte
+*&--------------------------------------------------------------------*
+*      -->P_OBJ1     text
+*---------------------------------------------------------------------*
+FORM anzeige_orgelemwerte USING object TYPE agr_1251-object.
+  SELECT SINGLE u~field u~varbl a~checktable
+    INTO (w_usorg-field, w_usorg-varbl, w_authx-checktable)
+    FROM       usorg AS u
+    INNER JOIN authx AS a ON u~field = a~fieldname
+    WHERE varbl = object.
+
+  IF sy-subrc NE 0.
+    MESSAGE i001(00) WITH text-i07 text-i4a.
+*        'keine Daten gefunden - gibt es das OrgElement tats#chlich?'.
+  ELSE.
+    IF  w_authx-checktable IS INITIAL.
+      MESSAGE i001(00) WITH text-i08.
+*        'keine Checktable zu OrgElement/Feld vorhanden - schade!'.
+    ELSE.
+      linetype = w_authx-checktable.
+      CREATE DATA refdyntab TYPE STANDARD TABLE OF (linetype).
+      ASSIGN refdyntab->* TO <dyntab>.
+      SELECT * FROM (w_authx-checktable) INTO TABLE <dyntab>.
+      IF sy-subrc = 0.
+        listtyp = 'C'.
+        PERFORM aufbau_feldkatalog    USING listtyp w_authx-checktable.
+        PERFORM call_alv TABLES <dyntab> fieldcat
+                          USING w_authx-checktable.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    "anzeige_orgelemwerte
+
+*&--------------------------------------------------------------------*
+*&      Form  anzeige_sammelrollen
+*&--------------------------------------------------------------------*
+FORM anzeige_sammelrollen.
+  IF sy-ucomm = 'ROLLSAM'.
+    SELECT * FROM agr_agrs INTO TABLE i_agr_agrs
+    WHERE agr_name IN s_rolle.
+  ELSE.
+    SELECT * FROM agr_agrs INTO TABLE i_agr_agrs
+    WHERE child_agr IN s_rolle.
+  ENDIF.
+  IF sy-subrc = 0.
+    listtyp = 'D'.
+    PERFORM aufbau_feldkatalog          USING listtyp 'I_AGR_AGRS'.
+    PERFORM call_alv TABLES i_agr_agrs fieldcat USING 'I_AGR_AGRS'.
+  ENDIF.
+
+ENDFORM.                    "anzeige_sammelrollen
+
+*&--------------------------------------------------------------------*
+*&      Form  lesen_daten
+*&--------------------------------------------------------------------*
+FORM lesen_daten.
+
+  IF image IS INITIAL.
+    IF p_org IS INITIAL.
+      CASE kz_teil1.
+        WHEN 1.
+          PERFORM teil1_user_rolle_etc.
+        WHEN 2.
+          PERFORM teil2_field_object.
+        WHEN 3.
+          PERFORM teil2_field_object.
+          PERFORM pruefen_aenderungen.
+          PERFORM aufbau_anzeige_aend.
+          IF i_mod1_1251 IS NOT INITIAL.
+            MOVE 5 TO image.
+          ENDIF.
+        WHEN OTHERS.
+*         was kann dann noch sein?
+      ENDCASE.
+    ELSE.  "ist es Sonderbehandlung OrgEbenen
+      CASE kz_teil1.
+        WHEN 1.
+          PERFORM lesen_agr1252 USING kz_teil1.
+        WHEN 2.
+          PERFORM lesen_agr1252 USING kz_teil1.
+        WHEN 3.
+          PERFORM pruefen_aenderungen_1252.
+          PERFORM aufbau_anzeige_aend_1252.
+          IF i_mod1_1252 IS NOT INITIAL.
+            MOVE 9 TO image.
+          ENDIF.
+        WHEN OTHERS.
+*         was kann dann noch sein?
+      ENDCASE.
+    ENDIF.
+  ENDIF.
+ENDFORM.                    " lesen_daten
+*&--------------------------------------------------------------------*
+*&      Form  lesen_agr1252
+*&--------------------------------------------------------------------*
+FORM lesen_agr1252 USING kennung.
+  IF kennung = 1.
+    SELECT * FROM agr_1252 INTO TABLE i_agr_1252
+                        WHERE agr_name IN s_rolle.
+  ELSE.
+    SELECT * FROM agr_1252 INTO TABLE i_agr_1252
+                        WHERE agr_name IN s_rolle
+                          AND varbl = p_obj1.
+  ENDIF.
+  image = 8.
+ENDFORM.                    "lesen_agr1252
+*&--------------------------------------------------------------------*
+*&      Form  pruefen_aenderungen_1252
+*&--------------------------------------------------------------------*
+FORM pruefen_aenderungen_1252.
+  REFRESH i_neue_werte.
+  IF p_repl1 IS NOT INITIAL.
+    w_neue_werte-low  = p_repl1.
+    w_neue_werte-high = p_repl2.
+    APPEND w_neue_werte TO i_neue_werte.
+  ENDIF.
+  LOOP AT s_incl.
+    w_neue_werte-low  = s_incl-low.
+    w_neue_werte-high = s_incl-high.
+    APPEND w_neue_werte TO i_neue_werte.
+  ENDLOOP.
+ENDFORM.                    "pruefen_aenderungen_1252
+*&--------------------------------------------------------------------*
+*&      Form  aufbau_anzeige_aend_1252
+*&--------------------------------------------------------------------*
+FORM aufbau_anzeige_aend_1252.
+  REFRESH i_mod1_1252.
+  PERFORM lesen_agr1252 USING kz_teil1.
+
+  LOOP AT i_agr_1252 ASSIGNING <fs1252>.
+    w_agr_1252 = <fs1252>.
+*    AT NEW agr_name.                                      "dsh20121219
+    IF p_low1 IS INITIAL
+    OR ( p_low1 = c_stern AND w_agr_1252-low = stern )
+    OR w_agr_1252-low = p_low1
+    OR ( p_low1 IS NOT INITIAL AND p_high1 IS NOT INITIAL
+         AND w_agr_1252-low GE p_low1
+         AND w_agr_1252-low LE p_high1 ).
+      LOOP AT i_neue_werte INTO w_neue_werte.
+        w_agr_1252-low   = w_neue_werte-low.
+        w_agr_1252-high  = w_neue_werte-high.
+        APPEND w_agr_1252 TO i_mod1_1252.
+      ENDLOOP.
+    ENDIF.
+*    ENDAT.                                                "dsh20121219
+  ENDLOOP.
+
+  DELETE ADJACENT DUPLICATES FROM i_mod1_1252
+         COMPARING agr_name varbl low high.
+ENDFORM.                    "aufbau_anzeige_aend_1252
+
+*&--------------------------------------------------------------------*
+*&      Form  teil1_user_rolle_etc
+*---------------------------------------------------------------------*
+FORM teil1_user_rolle_etc.
+  DATA: kz_ecpsap TYPE c VALUE ' '.
+  REFRESH: i_out, i_cont, i_cont_h.
+
+  IF s_uname IS INITIAL.
+    IF s_rolle IS NOT INITIAL.
+
+      PERFORM append_ecpsap.
+      kz_ecpsap = icks.
+
+      SELECT * FROM agr_1251
+           INTO  CORRESPONDING FIELDS OF TABLE i_agr_1251
+             WHERE agr_name IN s_rolle
+               AND deleted <> icks.
+
+      IF sy-subrc NE 0.
+*>>>IDEE>>>: pr¨¹fen, ob in AGR_AGRS vorhanden, wenn ja -> Sammelrolle
+*            (wie wird damit verfahren?)
+        kz_error = 1.
+        MESSAGE i001(00) WITH text-022.
+*        'Keine Daten zu Rolle vorhanden -
+*         Handelt es sich evtl.um eine Sammelrolle?'.
+      ELSE.
+        IF kz_ecpsap = icks.
+          PERFORM delete_ecpsap.
+        ENDIF.
+
+        PERFORM ermitteln_profil_zu_rolle.
+
+        PERFORM ermitteln_ueber_agr_1251.
+      ENDIF.
+    ELSE.
+      IF s_profn IS INITIAL.
+
+        PERFORM bis_hierher_und.
+*                        ...bisher_nicht_weiter.
+      ELSE.            "kein User, keine Rolle - aber Profil eingegeben
+        PERFORM ermitteln_rolle_zu_profil.
+        LOOP AT i_agr_prof INTO w_agr_prof.
+          SELECT * FROM agr_1251
+            INTO  CORRESPONDING FIELDS OF TABLE i_agr_1251
+            WHERE agr_name = w_agr_prof-agr_name
+              AND deleted <> icks.
+
+          PERFORM ermitteln_ueber_agr_1251.
+
+        ENDLOOP.
+      ENDIF.
+    ENDIF.
+  ELSE.
+*   ...d.h. User ist angegeben
+    IF s_rolle IS INITIAL.
+      SELECT *  FROM agr_users
+        INTO  TABLE  i_agr_users
+        WHERE uname    IN s_uname.
+    ELSE.
+      SELECT *  FROM agr_users
+        INTO  TABLE  i_agr_users
+        WHERE uname    IN s_uname
+          AND agr_name IN s_rolle.
+    ENDIF.
+    IF sy-subrc NE 0.
+      kz_error = 1.
+      MESSAGE i001(00) WITH text-021.
+*      'User (oder User m.Rolle) nicht vorhanden - '.
+    ELSE.
+
+      LOOP AT i_agr_users INTO w_agr_users.
+        SELECT * FROM agr_1251
+        INTO  CORRESPONDING FIELDS OF TABLE i_agr_1251
+          WHERE agr_name = w_agr_users-agr_name
+            AND deleted <> icks.
+
+        PERFORM ermitteln_profil_zu_rolle.
+
+        PERFORM ermitteln_ueber_agr_1251.
+      ENDLOOP.
+    ENDIF.
+  ENDIF.
+ENDFORM.                    " teil1_user_rolle_etc
+
+*&--------------------------------------------------------------------*
+*&      Form  teil2_field_object
+*&--------------------------------------------------------------------*
+FORM teil2_field_object.
+  REFRESH: i_cont,
+           i_mod_1251.
+
+*>>>IDEE>>> wenn Objekt 'TCODE' enth#lt oder Field = 'TCD'
+*           und S_INCL nicht initial - pr¨¹fen, ob abgeleitete Rolle
+*           d.h. in AGR_DEFINE parent_agr nicht initial
+*           wenn ja, kein Einf¨¹gen von Transaktionen m#glich
+
+  PERFORM append_ecpsap.
+
+  IF p_obj1 IS NOT INITIAL.
+    IF p_field IS NOT INITIAL.
+      SELECT * FROM agr_1251
+           INTO  CORRESPONDING FIELDS OF TABLE i_agr_1251
+             WHERE agr_name IN s_rolle
+               AND object = p_obj1
+               AND field  = p_field
+               AND deleted <> icks.
+    ELSE.
+      SELECT * FROM agr_1251
+           INTO  CORRESPONDING FIELDS OF TABLE i_agr_1251
+             WHERE agr_name IN s_rolle
+               AND object = p_obj1
+               AND deleted <> icks.
+    ENDIF.
+  ELSE.
+    IF p_field IS NOT INITIAL.
+      SELECT * FROM agr_1251
+           INTO  CORRESPONDING FIELDS OF TABLE i_agr_1251
+             WHERE agr_name IN s_rolle
+               AND field  = p_field
+               AND deleted <> icks.
+    ELSE.
+      PERFORM bis_hierher_und.
+    ENDIF.
+  ENDIF.
+
+
+  IF p_zobj IS NOT INITIAL.
+    PERFORM zusatzbedingung.
+
+  ENDIF.
+
+
+  PERFORM delete_ecpsap.
+
+  IF p_low1 IS NOT INITIAL.
+    PERFORM von_bis_werte_setzen CHANGING p_low1 p_high1.
+  ENDIF.
+  LOOP AT i_agr_1251 INTO w_agr_1251.
+
+*mit obigem Append wohl ¨¹berfl¨¹ssig:
+*                  WHERE agr_name(03) NE c_sap.
+
+    IF  p_low1 IS INITIAL
+    OR ( p_low1 = c_star  AND w_agr_1251-low(01) = stern )
+    OR ( p_low1 = c_stern AND w_agr_1251-low(01) = stern )
+    OR ( p_low1 = c_space AND w_agr_1251-low     = spass ).
+
+      IF  w_agr_1251-low+0(1) = '$'
+      AND kz_teil1            NE 3.     "(das w¨¹rde #ndern bedeuten)
+
+        PERFORM aus_tab_ust12_nach_mod .
+      ELSE.
+        PERFORM append_i_mod_1251.
+      ENDIF.
+    ELSE.
+
+      IF  w_agr_1251-low(01) = stern.
+        PERFORM append_i_mod_1251.
+      ELSE.
+*$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
+        IF  w_agr_1251-low+0(1) = '$'
+        AND kz_teil1            NE 3.     "(das w¨¹rde #ndern bedeuten)
+          PERFORM aus_tab_ust12_limit.
+        ELSE.
+*$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
+          PERFORM ob_in_intervall USING  p_low1
+                                         p_high1
+                                         w_agr_1251-low
+                                         w_agr_1251-high
+                                  CHANGING ja_nein.       .
+          IF  ja_nein = ja.
+            PERFORM append_i_mod_1251.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+  SORT i_cont BY agr_name objct.
+  DELETE ADJACENT DUPLICATES FROM i_cont.
+  SORT i_mod_1251 BY agr_name object.
+  DELETE ADJACENT DUPLICATES FROM i_mod_1251.
+  MOVE i_cont TO i_out.
+  IF i_cont IS NOT INITIAL.
+    MOVE 2 TO image.
+  ENDIF.
+
+ENDFORM.                    " teil2_field_object
+*&--------------------------------------------------------------------*
+*&      Form  append_i_mod_1251
+*---------------------------------------------------------------------*
+FORM append_i_mod_1251.
+  MOVE w_agr_1251-agr_name  TO w_cont-agr_name.
+  MOVE w_agr_1251-object    TO w_cont-objct.
+  MOVE w_agr_1251-auth      TO w_cont-auth.
+  MOVE w_agr_1251-field     TO w_cont-field.
+  MOVE w_agr_1251-low       TO w_cont-von.
+  MOVE w_agr_1251-high      TO w_cont-bis.
+  MOVE w_agr_1251-node      TO w_cont-node.
+
+  APPEND w_cont             TO i_cont.
+  APPEND w_agr_1251         TO i_mod_1251.
+ENDFORM.                    "append_i_mod_1251
+
+*&--------------------------------------------------------------------*
+*&      Form  bis_hierher_und
+*                         ...bisher nicht weiter
+*&--------------------------------------------------------------------*
+FORM bis_hierher_und.
+*                ...bisher_nicht_weiter.
+  kz_error = 1.
+  MESSAGE i001(00) WITH text-023.
+*  'Auswertung ohne Eingabe User, Rolle und/oder Profil
+*                                             (noch) nicht realisiert'.
+
+ENDFORM.                    " bis_hierher_und
+*&--------------------------------------------------------------------*
+*&      Form  zusatzbedingung
+*&--------------------------------------------------------------------*
+FORM zusatzbedingung.
+  DATA: i_agr_1251_h    TYPE TABLE OF agr_1251,
+        i_agr_1251_z    TYPE TABLE OF agr_1251,
+        i_agr_1251_copy TYPE TABLE OF agr_1251,
+        merk_rolle      LIKE agr_1251-agr_name,
+        loopcount TYPE i.
+  IF p_zfld IS NOT INITIAL.
+    SELECT * FROM agr_1251
+     INTO  CORRESPONDING FIELDS OF TABLE i_agr_1251_z
+       WHERE agr_name IN s_rolle
+         AND object = p_zobj
+         AND field  = p_zfld
+         AND deleted <> icks.
+  ELSE.
+    SELECT * FROM agr_1251
+     INTO  CORRESPONDING FIELDS OF TABLE i_agr_1251_z
+       WHERE agr_name IN s_rolle
+         AND object = p_zobj
+         AND deleted <> icks.
+  ENDIF.
+
+  i_agr_1251_copy = i_agr_1251.
+  LOOP AT i_agr_1251_copy ASSIGNING <fs1251>.
+    IF <fs1251>-agr_name NE merk_rolle.
+      merk_rolle = <fs1251>-agr_name.
+      CLEAR loopcount.
+      LOOP AT i_agr_1251_z ASSIGNING <fs1251_z>
+                     WHERE agr_name = <fs1251>-agr_name.
+        loopcount = loopcount + 1.
+        APPEND <fs1251_z> TO i_agr_1251_h.
+      ENDLOOP.
+      IF loopcount = 0.
+*       L#schen alle S#tze aus i_agr_1251
+*                          mit agr_name = <fs1251>-agr_name
+        DELETE i_agr_1251 WHERE agr_name = <fs1251>-agr_name.
+      ELSE.
+        APPEND LINES OF i_agr_1251_h TO i_agr_1251.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+  SORT i_agr_1251.
+ENDFORM.                    "zusatzbedingung
+
+*&--------------------------------------------------------------------*
+*&      Forms diverse message_ausgaben
+*---------------------------------------------------------------------*
+FORM message_ausgabe.
+  CALL FUNCTION 'AQ_INT_SHOW_MESSAGE_AS_POPUP'
+    EXPORTING
+      popup_pos_x            = 10
+      popup_pos_y            = 10
+      message_class          = '00'
+      message_number         = 162
+      message_type           = 'W'
+      message_var1           = mv1
+      message_var2           = mv2
+      message_var3           = ' '
+      message_var4           = ' '
+    EXCEPTIONS
+      internal_error         = 1
+      message_does_not_exist = 2
+      OTHERS                 = 3.
+
+  IF sy-subrc <> 0.
+  ENDIF.
+ENDFORM.                    " message_ausgabe
+*&--------------------------------------------------------------------*
+*&      Form  message_ausgabe_w
+*---------------------------------------------------------------------*
+FORM message_ausgabe_w.
+  CALL FUNCTION 'AQ_INT_SHOW_MESSAGE_AS_POPUP'
+    EXPORTING
+      popup_pos_x            = 10
+      popup_pos_y            = 10
+      message_class          = '00'
+      message_number         = 162
+      message_type           = 'W'
+      message_var1           = mv1
+      message_var2           = mv2
+      message_var3           = mv3
+      message_var4           = mv3
+    EXCEPTIONS
+      internal_error         = 1
+      message_does_not_exist = 2
+      OTHERS                 = 3.
+
+  IF sy-subrc <> 0.
+  ENDIF.
+ENDFORM.                    " message_ausgabe_w
+*&--------------------------------------------------------------------*
+*&      Form  message_ausgabe_e
+*---------------------------------------------------------------------*
+FORM message_ausgabe_e.
+  CALL FUNCTION 'AQ_INT_SHOW_MESSAGE_AS_POPUP'
+    EXPORTING
+      popup_pos_x            = 10
+      popup_pos_y            = 10
+      message_class          = '00'
+      message_number         = 162
+      message_type           = 'E'
+      message_var1           = mv1
+      message_var2           = mv2
+*      message_var3           = mv3
+*      message_var4           = mv3
+    EXCEPTIONS
+      internal_error         = 1
+      message_does_not_exist = 2
+      OTHERS                 = 3.
+
+  MOVE 1 TO kz_error.
+ENDFORM.                    " message_ausgabe_e
+
+*&--------------------------------------------------------------------*
+*&      Form  plaus_pruefung1
+*---------------------------------------------------------------------*
+FORM plaus_pruefung1 CHANGING ucomm TYPE sy-ucomm.
+  CASE sy-ucomm.
+    WHEN 'GUELAKT'.
+      IF p_obj1 IS INITIAL.
+        kz_error = 1.
+        MESSAGE i001(00) WITH text-i01.
+      ELSE.
+        ucomm = sy-ucomm.
+      ENDIF.
+    WHEN 'GUELFLD'.
+      IF p_field IS INITIAL.
+        kz_error = 1.
+        MESSAGE i001(00) WITH text-i02.
+      ELSE.
+        ucomm = sy-ucomm.
+      ENDIF.
+    WHEN 'GUELORG'.
+      IF p_obj1 IS INITIAL
+      OR p_obj1(01) NE dollar.
+        kz_error = 1.
+        MESSAGE i001(00) WITH text-i03.
+      ELSE.
+        ucomm = sy-ucomm.
+      ENDIF.
+    WHEN 'SAMROLL'.
+      IF s_rolle IS INITIAL.
+        kz_error = 1.
+        MESSAGE i001(00) WITH text-i09.
+      ELSE.
+        ucomm = sy-ucomm.
+      ENDIF.
+    WHEN OTHERS.
+      PERFORM plaus_pruefung2 CHANGING ucomm.
+  ENDCASE.
+ENDFORM.                    " plaus_pruefung1
+
+*&--------------------------------------------------------------------*
+*&      Form  plaus_pruefung2
+*---------------------------------------------------------------------*
+FORM plaus_pruefung2 CHANGING ucomm TYPE sy-ucomm.
+
+  IF  sy-ucomm NA '%'.
+    IF  p_obj1  IS INITIAL
+    AND p_field IS INITIAL.
+      IF  s_uname IS INITIAL
+      AND s_rolle IS INITIAL
+      AND s_profn IS INITIAL.
+        PERFORM bis_hierher_und.         "...bisher_nicht_weiter.
+      ELSE.
+        MOVE 1     TO kz_teil1.
+      ENDIF.
+    ELSE.
+      IF  s_excl IS INITIAL
+      AND s_incl IS INITIAL.
+        MOVE 2     TO kz_teil1.
+
+*       Versuch, nur Stern durch "was" zu ersetzen:
+        IF  p_low1  = c_stern
+        AND p_high1 IS INITIAL.
+          IF  p_repl1 IS NOT INITIAL
+          AND p_repl2 IS INITIAL.
+            MOVE 3 TO kz_teil1.
+          ENDIF.
+        ENDIF.
+*
+      ELSE.
+        IF  p_field IS INITIAL.
+          IF p_org NE icks.
+            mv1 = text-e02.
+*                 'f¨¹r #nderungen muss Feldname gef¨¹llt sein'.
+            CLEAR: mv2, mv3.
+            PERFORM message_ausgabe_e.
+          ELSE.
+            MOVE 3 TO kz_teil1.
+          ENDIF.
+        ELSE.
+          MOVE 3   TO kz_teil1.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+* und das geht schon mal echt nicht:
+  IF s_rolle+3(03) = c_sap AND s_rolle-sign = 'I'.
+    mv1 = text-e03.
+*         'SAP Rollen sind von der Analyse/#nderung ausgenommen'.
+    CLEAR mv2.
+    PERFORM message_ausgabe_e.
+  ENDIF.
+
+  IF s_tcode IS NOT INITIAL.
+    IF s_tcode CA stern.
+      mv1 = text-e04.
+*          'Generische Eingabe bei Transaktionscode nicht m#glich'.
+      CLEAR mv2.
+      PERFORM message_ausgabe_e.
+    ENDIF.
+  ENDIF.
+
+  TRANSLATE p_low1  TO UPPER CASE.
+  TRANSLATE p_high1 TO UPPER CASE.
+  TRANSLATE p_obj1  TO UPPER CASE.
+  TRANSLATE p_field TO UPPER CASE.
+  TRANSLATE p_repl1 TO UPPER CASE.
+  TRANSLATE p_repl2 TO UPPER CASE.
+  LOOP AT s_excl.
+    TRANSLATE s_excl-low  TO UPPER CASE.
+    TRANSLATE s_excl-high TO UPPER CASE.
+    MODIFY s_excl.
+  ENDLOOP.
+  LOOP AT s_incl.
+    TRANSLATE s_incl-low  TO UPPER CASE.
+    TRANSLATE s_incl-high TO UPPER CASE.
+    MODIFY s_incl.
+  ENDLOOP.
+
+  IF p_repl2 IS NOT INITIAL
+  AND p_repl1 > p_repl2.
+    MESSAGE e398(00) WITH text-e05.
+*    mv1 = text-e05.
+**         'Von-Wert gr##er Bis-Wert'.
+*    PERFORM message_ausgabe_e.
+  ENDIF.
+
+  IF  s_excl  IS NOT INITIAL.
+    LOOP AT s_excl INTO w_excl.
+      IF w_excl-low(01) = dollar.
+        MESSAGE e398(00) WITH text-e06 text-e6a.
+*              'Org.ebenen ($-Werte) sind so nicht #nderbar '.
+*              ' - bitte ¨¹ber PFCG pflegen'.
+      ENDIF.
+      IF w_excl-low(05) = c_stern
+      OR w_excl-low(05) = c_star.
+        IF  p_repl1 IS INITIAL
+        AND s_incl  IS INITIAL.
+          MESSAGE e398(00) WITH text-e07 text-e7a.
+*                 'Sterneintr#ge sind nicht ersatzlos l#schbar '.
+*                 ' - bitte neue Werte eingeben - '.
+        ENDIF.
+      ENDIF.
+      IF w_excl-low(05) = c_space.
+        IF  p_repl1 IS INITIAL
+        AND s_incl  IS INITIAL.
+          MESSAGE e398(00) WITH text-e08 text-e7a.
+*                'Leere Eintr#ge sind nicht ersatzlos l#schbar '.
+*                 ' - bitte neue Werte eingeben - '.
+        ENDIF.
+      ENDIF.
+      IF  w_excl-low(05) NE c_stern
+      AND w_excl-low(05) NE c_star
+      AND w_excl-low(05) NE c_space.
+
+        IF p_repl1 IS INITIAL.
+          MESSAGE w398(00) WITH text-w05 text-w5a.
+*                'ohne Eingabe der Ersatzmenge werden Stern-Eintr#ge'.
+*                ' nicht ber¨¹cksichtigt'.
+          PERFORM message_ausgabe_w.
+        ENDIF.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+
+  LOOP AT s_incl INTO w_incl.
+    IF w_incl-low(01) = dollar.
+*      mv1 = 'Org.ebenen ($-Werte) sind so nicht #nderbar '.
+*      mv2 = ' - bitte ¨¹ber PFCG pflegen'.
+      mv1 = 'Org.values ($-value) can not bze changed like this '.
+      mv2 = ' - use PFCG instead'.
+      PERFORM message_ausgabe_e.
+    ENDIF.
+  ENDLOOP.
+  ucomm = sy-ucomm.
+ENDFORM.                    " plaus_pruefung2
+
+*&--------------------------------------------------------------------*
+*&      Form  ermitteln_ueber_agr_1251
+*---------------------------------------------------------------------*
+FORM ermitteln_ueber_agr_1251 .
+  REFRESH i_cont_h.
+
+  IF   s_tcode  IS INITIAL
+  AND  s_object IS INITIAL.
+    PERFORM ermitteln_ueber_agr_1251_1 .
+  ELSE.
+    PERFORM ermitteln_ueber_agr_1251_2 .
+  ENDIF.
+  LOOP AT i_out INTO w_cont.
+    MOVE w_cont-agr_name TO merk_agr_name.
+    CLEAR w_cont.
+    w_cont-agr_name = merk_agr_name.
+    APPEND w_cont TO i_cont.
+  ENDLOOP.
+  SORT i_cont BY agr_name.
+  DELETE ADJACENT DUPLICATES FROM i_cont.
+
+  MOVE 1 TO image.
+ENDFORM.                    "ermitteln_ueber_agr_1251
+*&--------------------------------------------------------------------*
+*&      Form  ermitteln_ueber_agr_1251_1
+*---------------------------------------------------------------------*
+FORM ermitteln_ueber_agr_1251_1 .
+  LOOP AT i_agr_1251 INTO w_agr_1251.
+    IF s_uname IS NOT INITIAL.
+      MOVE w_agr_users-uname  TO w_out-uname.
+    ENDIF.
+
+    MOVE w_agr_1251-agr_name  TO w_out-agr_name.
+    LOOP AT i_agr_prof INTO w_agr_prof
+      WHERE agr_name = w_out-agr_name.
+      MOVE w_agr_prof-profile TO w_out-profn.
+    ENDLOOP.
+
+    MOVE w_agr_1251-object    TO w_out-objct.
+    MOVE w_agr_1251-auth      TO w_out-auth.
+    MOVE w_agr_1251-field     TO w_out-field.
+    MOVE w_agr_1251-low       TO w_out-von.
+    MOVE w_agr_1251-high      TO w_out-bis.
+    MOVE w_agr_1251-node      TO w_out-node.
+    IF w_agr_1251-low+0(1) = '$'.
+      PERFORM aus_tab_ust12.
+    ELSE.
+      APPEND w_out  TO i_out.
+    ENDIF.
+
+  ENDLOOP.
+ENDFORM.                    "ermitteln_ueber_agr_1251_1
+*&--------------------------------------------------------------------*
+*&      Form  ermitteln_ueber_agr_1251_2
+*---------------------------------------------------------------------*
+FORM ermitteln_ueber_agr_1251_2 .
+  REFRESH: i_tcode, i_cont_h.
+
+  LOOP AT i_agr_1251 INTO w_agr_1251
+                    WHERE object = 'S_TCODE'.
+
+    IF s_tcode IS NOT INITIAL.
+*     IF w_agr_1251-low IN s_tcode.
+      IF w_agr_1251-low = s_tcode+3(10).
+        MOVE w_agr_1251-low  TO w_tcode-tcode.
+        APPEND w_tcode       TO i_tcode.
+        PERFORM tcode_into_cont_h.
+      ELSE.
+        IF  w_agr_1251-low  LE s_tcode+3(10)
+        AND w_agr_1251-high GE s_tcode+3(10).
+          MOVE w_agr_1251-low  TO w_tcode-tcode.
+          MOVE w_agr_1251-high TO w_tcode-tcode_bis.
+          APPEND w_tcode       TO i_tcode.
+          PERFORM tcode_into_cont_h.
+        ENDIF.
+      ENDIF.
+    ELSE.
+      MOVE w_agr_1251-low  TO w_tcode-tcode.
+      MOVE w_agr_1251-high TO w_tcode-tcode_bis.
+      APPEND w_tcode       TO i_tcode.
+      PERFORM tcode_into_cont_h.
+    ENDIF.
+  ENDLOOP.
+  SORT i_tcode.
+  DELETE ADJACENT DUPLICATES FROM i_tcode.
+
+  LOOP AT i_tcode INTO w_tcode.
+    IF w_tcode-tcode_bis IS INITIAL.
+      SELECT * FROM usobt_c
+          INTO  CORRESPONDING FIELDS OF TABLE i_usobt
+            WHERE name = w_tcode-tcode
+              AND type = 'TR'.
+    ELSE.
+      SELECT * FROM usobt_c
+       INTO  CORRESPONDING FIELDS OF TABLE i_usobt
+       WHERE name GE w_tcode-tcode
+         AND name LE w_tcode-tcode_bis
+         AND type = 'TR'.
+    ENDIF.
+    IF sy-subrc = 0.
+      LOOP AT i_usobt INTO w_usobt.
+        IF s_tcode IS INITIAL.
+          MOVE w_usobt-name     TO w_cont-tcode.
+          MOVE w_usobt-object   TO w_cont-objct.
+          APPEND w_cont         TO i_cont.
+          CLEAR  w_cont.
+        ELSE.
+          IF w_usobt-name = s_tcode+3(10).
+            MOVE w_usobt-name     TO w_cont-tcode.
+            MOVE w_usobt-object   TO w_cont-objct.
+            APPEND w_cont         TO i_cont.
+            CLEAR  w_cont.
+          ENDIF.
+        ENDIF.
+      ENDLOOP.
+    ELSE.
+      PERFORM versuch_aus_tstca.
+    ENDIF.
+  ENDLOOP.
+
+  SORT i_cont BY tcode objct.
+  DELETE ADJACENT DUPLICATES FROM i_cont.
+  LOOP AT i_cont_h ASSIGNING <fsout>.
+    APPEND <fsout> TO i_out.
+  ENDLOOP.
+  LOOP AT i_cont INTO w_out.
+
+    IF ( s_object IS INITIAL
+    OR ( s_object IS NOT INITIAL AND
+        w_out-objct = s_object ) )
+    AND  ( s_field IS INITIAL
+    OR ( s_field IS NOT INITIAL AND
+        w_out-field = s_field ) ).
+
+      LOOP AT i_agr_1251 INTO w_agr_1251
+        WHERE object = w_out-objct.
+        IF s_uname IS NOT INITIAL.
+          MOVE w_agr_users-uname  TO w_out-uname.
+        ENDIF.
+
+        MOVE w_agr_1251-agr_name  TO w_out-agr_name.
+        LOOP AT i_agr_prof INTO w_agr_prof
+          WHERE agr_name = w_out-agr_name.
+          MOVE w_agr_prof-profile TO w_out-profn.
+        ENDLOOP.
+
+        MOVE w_agr_1251-auth      TO w_out-auth.
+        MOVE w_agr_1251-field     TO w_out-field.
+        MOVE w_agr_1251-low       TO w_out-von.
+        MOVE w_agr_1251-high      TO w_out-bis.
+        MOVE w_agr_1251-node      TO w_out-node.
+        IF w_agr_1251-low+0(1) = '$'.
+          PERFORM aus_tab_ust12.
+        ELSE.
+          APPEND w_out  TO i_out.
+        ENDIF.
+
+      ENDLOOP.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    " ermitteln_ueber_agr_1251_2
+
+*&--------------------------------------------------------------------*
+*&      Form  tcode_into_cont_h
+*---------------------------------------------------------------------*
+FORM tcode_into_cont_h .
+  CLEAR w_out.
+  IF s_uname IS NOT INITIAL.
+    MOVE w_agr_users-uname  TO w_out-uname.
+  ENDIF.
+
+  MOVE w_agr_1251-agr_name  TO w_out-agr_name.
+  LOOP AT i_agr_prof INTO w_agr_prof
+    WHERE agr_name = w_out-agr_name.
+    MOVE w_agr_prof-profile TO w_out-profn.
+  ENDLOOP.
+
+  MOVE w_agr_1251-auth      TO w_out-auth.
+  MOVE w_agr_1251-low       TO w_out-tcode.
+  MOVE w_agr_1251-object    TO w_out-objct.
+  MOVE w_agr_1251-field     TO w_out-field.
+  MOVE w_agr_1251-low       TO w_out-von.
+  MOVE w_agr_1251-high      TO w_out-bis.
+  MOVE w_agr_1251-node      TO w_out-node.
+  APPEND w_out  TO i_cont_h.
+  CLEAR w_out.
+ENDFORM.                    " tcode_into_cont_h
+
+*&--------------------------------------------------------------------*
+*&      Form  ermitteln_profil_zu_rolle
+*---------------------------------------------------------------------*
+FORM ermitteln_profil_zu_rolle.
+  IF w_agr_users IS INITIAL.
+    IF s_rolle IS NOT INITIAL.
+      SELECT DISTINCT agr_name FROM agr_1251
+           APPENDING  CORRESPONDING FIELDS OF TABLE i_agr_prof
+           WHERE agr_name IN s_rolle.
+      LOOP AT i_agr_prof INTO w_agr_prof.
+        SELECT SINGLE * FROM agr_prof
+            INTO w_agr_prof
+            WHERE agr_name = w_agr_prof-agr_name.
+        MODIFY i_agr_prof FROM w_agr_prof
+        TRANSPORTING profile WHERE agr_name = w_agr_prof-agr_name.
+      ENDLOOP.
+
+    ENDIF.
+  ELSE.
+    MOVE w_agr_users-agr_name TO w_agr_prof-agr_name.
+    SELECT * FROM agr_prof
+        APPENDING CORRESPONDING FIELDS OF TABLE i_agr_prof
+        WHERE agr_name = w_agr_prof-agr_name.
+  ENDIF.
+ENDFORM.                    " ermitteln_profil_zu_rolle
+
+*&--------------------------------------------------------------------*
+*&      Form  ermitteln_rolle_zu_profil
+*---------------------------------------------------------------------*
+FORM ermitteln_rolle_zu_profil .
+  SELECT * FROM agr_prof INTO TABLE i_agr_prof
+      WHERE profile IN s_profn.
+  IF sy-subrc <> 0.
+    mv1 = 'Bitte ¨¹ber User einsteigen'.
+    mv2 = 'da rolle zu profil nicht vorhanden'.
+    PERFORM message_ausgabe_w.
+    kz_error = 1.
+  ENDIF.
+ENDFORM.                    " ermitteln_rolle_zu_profil
+
+*&--------------------------------------------------------------------*
+*&      Form  aus_tab_ust12
+*---------------------------------------------------------------------*
+FORM aus_tab_ust12 .
+  SELECT * FROM ust12
+  INTO  CORRESPONDING FIELDS OF TABLE i_ust12
+           WHERE auth  = w_agr_1251-auth
+             AND objct = w_agr_1251-object
+             AND field = w_agr_1251-field.
+  LOOP AT i_ust12 INTO w_ust12.
+    MOVE w_ust12-von TO w_out-von.
+    MOVE w_ust12-bis TO w_out-bis.
+    APPEND w_out  TO i_out.
+  ENDLOOP.
+ENDFORM.                    " aus_tab_ust12
+
+*&--------------------------------------------------------------------*
+*&      Form  aus_tab_ust12_nach_mod
+*&--------------------------------------------------------------------*
+FORM aus_tab_ust12_nach_mod .
+  SELECT * FROM ust12
+  INTO  CORRESPONDING FIELDS OF TABLE i_ust12
+           WHERE auth  = w_agr_1251-auth
+             AND objct = w_agr_1251-object
+             AND field = w_agr_1251-field.
+  LOOP AT i_ust12 INTO w_ust12.
+    MOVE w_ust12-von TO w_agr_1251-low.
+    MOVE w_ust12-bis TO w_agr_1251-high.
+    PERFORM append_i_mod_1251.
+  ENDLOOP.
+ENDFORM.                    "aus_tab_ust12_nach_mod
+*&--------------------------------------------------------------------*
+*&      Form  aus_tab_ust12_limit
+*---------------------------------------------------------------------*
+*$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
+FORM aus_tab_ust12_limit.
+  SELECT * FROM ust12
+  INTO  CORRESPONDING FIELDS OF TABLE i_ust12
+           WHERE auth  = w_agr_1251-auth
+             AND objct = w_agr_1251-object
+             AND field = w_agr_1251-field.
+  LOOP AT i_ust12 INTO w_ust12.
+    PERFORM ob_in_intervall USING w_ust12-von
+                                  w_ust12-bis
+                                  p_low1
+                                  p_high1
+                           CHANGING ja_nein.
+    IF ja_nein = ja
+*attentione! versuchsweise drin:
+    OR w_ust12-von = w_agr_1251-low.
+************************************
+      MOVE w_ust12-von TO w_agr_1251-low.
+      MOVE w_ust12-bis TO w_agr_1251-high.
+      PERFORM append_i_mod_1251.
+    ENDIF.
+  ENDLOOP.
+ENDFORM.                    "aus_tab_ust12_limit
+*$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
+*&--------------------------------------------------------------------*
+*&      Form  versuch_aus_tstca
+*---------------------------------------------------------------------*
+FORM versuch_aus_tstca .
+  SELECT DISTINCT objct FROM tstca
+       INTO  CORRESPONDING FIELDS OF TABLE i_tstca
+         WHERE tcode  = w_tcode-tcode.
+  LOOP AT i_tstca INTO w_tstca.
+
+    IF sy-subrc = 0.
+      MOVE w_tcode-tcode TO w_cont-tcode.
+      MOVE w_tstca-objct TO w_cont-objct.
+      APPEND w_cont  TO i_cont.
+      CLEAR  w_cont.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    " versuch_aus_tstca
+*&==== zu PAI =======================================================*
+*&===================================================================*
+*&      Form  user_zu_rollen
+*&===================================================================*
+FORM user_zu_rollen .
+  DATA:   h_name        TYPE adrp-name_text.
+
+  REFRESH i_out.
+  CLEAR   w_out.
+  LOOP AT i_cont INTO w_cont.
+    SELECT * FROM agr_users
+    INTO TABLE  i_agr_users
+    WHERE agr_name = w_cont-agr_name.
+    LOOP AT i_agr_users INTO w_agr_users.
+      w_out-agr_name    = w_agr_users-agr_name.
+      w_out-uname       = w_agr_users-uname.
+      PERFORM lesen_adrp
+                 USING    w_agr_users-uname
+                 CHANGING h_name.
+      w_out-name_text  =  h_name.
+      PERFORM lesen_usr02
+                 USING    w_agr_users-uname
+                 CHANGING w_out-icon_id
+                          w_out-icon_text.
+
+      IF  p_obj1  IS NOT INITIAL
+      AND p_field IS NOT INITIAL
+      AND p_low1  IS NOT INITIAL.
+        w_out-auth       = w_cont-auth.
+        w_out-tcode      = w_cont-tcode.
+        w_out-objct      = w_cont-objct.
+        w_out-field      = w_cont-field.
+        w_out-von        = w_cont-von.
+        w_out-bis        = w_cont-bis.
+      ENDIF.
+
+      APPEND w_out TO i_out.
+      CLEAR  w_out.
+    ENDLOOP.
+  ENDLOOP.
+  IF i_out IS NOT INITIAL.
+    SORT i_out BY agr_name uname .
+    DELETE ADJACENT DUPLICATES FROM i_out.
+
+    MOVE 3     TO image.
+    MOVE i_out TO i_cont2.
+    DESCRIBE TABLE i_out LINES anz_out.
+  ELSE.
+    MESSAGE w208(00) WITH text-024. "'User zu Rollen nicht vorhanden'.
+  ENDIF.
+ENDFORM.                    " user_zu_rollen
+*&====================================================================*
+*&      Form  rollen_zu_user
+*&====================================================================*
+FORM rollen_zu_user .
+  IF image = 3.
+    REFRESH i_cont3.
+    LOOP AT i_cont2 INTO w_cont.
+      MOVE spass TO w_cont-agr_name.
+      APPEND w_cont TO i_cont3.
+    ENDLOOP.
+    SORT i_cont3 BY uname.
+    DELETE ADJACENT DUPLICATES FROM i_cont3 COMPARING uname.
+
+    REFRESH i_out.
+    CLEAR:  w_out,
+            merk_uname.
+    LOOP AT i_cont3 INTO w_cont.
+      SELECT * FROM agr_users
+      INTO TABLE  i_agr_users
+      WHERE uname = w_cont-uname.
+      LOOP AT i_agr_users INTO w_agr_users.
+        IF w_agr_users-uname NE merk_uname.
+          MOVE w_agr_users-uname  TO w_out-uname.
+          PERFORM lesen_adrp USING   w_agr_users-uname
+                          CHANGING h_name.
+          MOVE h_name              TO w_out-name_text.
+
+        ELSE.
+          MOVE spass              TO w_out-uname.
+          MOVE spass              TO w_out-name_text.
+        ENDIF.
+        MOVE w_agr_users-agr_name TO w_out-agr_name.
+        APPEND w_out TO i_out.
+        merk_uname = w_agr_users-uname.
+      ENDLOOP.
+    ENDLOOP.
+    IF i_out IS NOT INITIAL.
+      MOVE 4     TO image.
+      MOVE i_out TO i_cont3.
+      DESCRIBE TABLE i_out LINES anz_out.
+      REFRESH i_cont2.
+    ENDIF.
+  ELSE.
+    MESSAGE 'Bitte zun#chst ¨¹ber "User zu Rollen" gehen' TYPE 'S'.
+  ENDIF.
+ENDFORM.                    " rollen_zu_user
+*&====================================================================*
+*&      Form  rollen_ohne_user
+*&====================================================================*
+FORM rollen_ohne_user.
+
+  IF i_cont4 IS INITIAL.
+    CLEAR w_cont.
+    SELECT * FROM agr_1016 INTO TABLE i_agr_1016
+                        WHERE agr_name < c_sap_u
+                           OR agr_name > c_sap_o.
+    LOOP AT i_agr_1016 INTO w_agr_1016.
+      SELECT SINGLE agr_name FROM agr_users
+        INTO w_agr_1016-agr_name
+      WHERE agr_name = w_agr_1016-agr_name.
+      IF sy-subrc NE 0.
+        MOVE w_agr_1016-agr_name TO w_cont-agr_name.
+        APPEND w_cont TO i_cont4.
+      ENDIF.
+    ENDLOOP.
+    SORT i_cont4.
+    DELETE ADJACENT DUPLICATES FROM i_cont4.
+  ENDIF.
+  DESCRIBE TABLE i_cont4 LINES anz_out.
+  MOVE i_cont4 TO i_out.
+ENDFORM.                    " rollen_ohne_user
+
+*&--------------------------------------------------------------------*
+*&      Form  manuelle_orgelemente
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+FORM manuelle_orgelemente.
+  SELECT * FROM usorg INTO TABLE i_usorg.
+  IF  s_rolle[] IS INITIAL.
+    MESSAGE w208(00) WITH text-025.
+*    'Funktion nur bei Rolleneingabe m#glich!'.
+  ELSE.
+    IF  p_org NE icks.      "oder image ungleich 8?
+      PERFORM lesen_agr1252 USING '1'.
+    ENDIF.
+    REFRESH i_agr_1251.
+    SELECT * FROM agr_1251
+         INTO  CORRESPONDING FIELDS OF TABLE i_agr_1251
+           WHERE agr_name IN s_rolle
+             AND deleted <> icks.
+  ENDIF.
+  REFRESH i_out.
+  LOOP AT i_agr_1252 ASSIGNING <fs1252>.
+    READ TABLE i_usorg WITH KEY varbl = <fs1252>-varbl
+                       INTO w_usorg.
+    IF sy-subrc NE 0.
+      CASE <fs1252>-varbl.
+        WHEN '$ACT_GROUP'.
+          w_usorg-field = 'ACT_GROUP'.
+        WHEN 'TMP'.
+          w_usorg-field = 'DEVCLASS'.
+      ENDCASE.
+    ENDIF.
+    IF w_usorg-field = 'CSWRK'.
+      w_usorg-field = 'WERKS'.
+    ENDIF.
+    LOOP AT i_agr_1251 ASSIGNING <fs1251>
+                      WHERE agr_name = <fs1252>-agr_name
+                        AND field    = w_usorg-field.
+      IF <fs1251>-low(1) NE dollar.
+        w_out-agr_name = <fs1251>-agr_name.
+        w_out-auth     = <fs1251>-auth.
+        w_out-objct    = <fs1251>-object.
+        w_out-field    = <fs1251>-field.
+        w_out-von      = <fs1251>-low.
+        w_out-bis      = <fs1251>-high.
+        w_out-node     = <fs1251>-node.
+        APPEND w_out TO i_out.
+        CLEAR  w_out.
+      ENDIF.
+    ENDLOOP.
+  ENDLOOP.
+  image = 7.
+ENDFORM.                    "manuelle_orgelemente
+*&--------------------------------------------------------------------*
+*&      Form  lesen_adrp
+*&--------------------------------------------------------------------*
+FORM lesen_adrp USING    p_uname
+                         CHANGING p_name.
+
+  SELECT SINGLE u~persnumber a~name_text
+   INTO CORRESPONDING FIELDS OF w_adrp
+   FROM  usr21 AS u
+   INNER JOIN adrp AS a
+   ON a~persnumber    EQ u~persnumber
+        WHERE   u~bname  = p_uname.
+  IF sy-subrc = 0.
+    p_name = w_adrp-name_text.
+  ENDIF.
+
+ENDFORM.                    "lesen_adrp
+
+*&--------------------------------------------------------------------*
+*&      Form  lesen_usr02
+*&--------------------------------------------------------------------*
+FORM lesen_usr02 USING     p_uname
+                 CHANGING  p_icon p_icontext.
+  CLEAR w_usr02.
+  READ TABLE i_usr02 INTO w_usr02
+                       WITH KEY bname = p_uname.
+  IF sy-subrc <> 0.
+    SELECT SINGLE bname uflag FROM usr02
+             INTO CORRESPONDING FIELDS OF w_usr02
+             WHERE bname = p_uname.
+    IF sy-subrc = 0.
+      APPEND w_usr02 TO i_usr02.
+    ENDIF.
+  ENDIF.
+  CASE w_usr02-uflag.
+    WHEN  32.
+      p_icon     = icon_locked.
+      p_icontext = 'Locked from Admin (global)'.
+    WHEN  64.
+      p_icon     = icon_locked.
+      p_icontext = 'Locked from Admin (local) '.
+    WHEN 128.
+      p_icon     = icon_failure.
+      p_icontext = 'Locked (wrong password)  '.
+    WHEN OTHERS.
+      CLEAR: p_icon, p_icontext.
+  ENDCASE.
+ENDFORM.                    "lesen_usr02
+
+*&--------------------------------------------------------------------*
+*&      Form  pruefen_aenderungen
+*---------------------------------------------------------------------*
+FORM pruefen_aenderungen.
+
+  IF s_excl IS NOT INITIAL.
+    PERFORM berechnen_neue_grenzen.
+  ENDIF.
+  IF s_incl IS NOT INITIAL.
+    PERFORM check_auf_inserts.
+  ENDIF.
+ENDFORM.                    " pruefen_aenderungen
+*&--------------------------------------------------------------------*
+*&      Form  berechnen_neue_grenzen
+*---------------------------------------------------------------------*
+FORM berechnen_neue_grenzen .
+  CLEAR kz_sternexcl.
+  LOOP AT s_excl INTO w_excl.
+    IF  w_excl-low(05) <> c_stern
+    AND w_excl-low(05) <> c_star
+    AND w_excl-low(05) <> c_space.
+      IF w_excl-high IS INITIAL.
+        MOVE w_excl-low TO w_excl-high.
+      ENDIF.
+      CLEAR w_limits.
+      PERFORM eins_davor   USING  w_excl-low
+                        CHANGING  w_limits-oben_neu.
+      PERFORM eins_dahinter USING w_excl-high
+                         CHANGING w_limits-unten_neu.
+      APPEND w_limits TO i_limits.
+    ELSE.
+      CLEAR w_limits.
+      w_limits-oben_neu  = w_excl-low(05).
+      w_limits-unten_neu = w_excl-low(05).
+      APPEND w_limits TO i_limits.
+      kz_sternexcl = 1.
+    ENDIF.
+  ENDLOOP.
+ENDFORM.                    " berechnen_neue_grenzen
+*&--------------------------------------------------------------------*
+*&      Form  check_auf_inserts.
+*---------------------------------------------------------------------*
+FORM check_auf_inserts.
+  REFRESH i_checktab.
+  CLEAR merk_berechtigung.
+  LOOP AT i_mod_1251 INTO w_mod_1251.
+    MOVE w_mod_1251 TO w_save_1251.
+*    at new agr_name.
+    AT NEW auth.
+      IF w_save_1251-auth <> merk_berechtigung.
+        CLEAR                       w_checkline.
+        MOVE w_mod_1251-agr_name TO w_checkline-agr_name.
+        MOVE s_incl[]            TO w_checkline-ch_incl.
+        MOVE w_save_1251         TO w_checkline-ch_1251.
+        APPEND w_checkline TO i_checktab.
+      ENDIF.
+    ENDAT.
+    MOVE w_save_1251-auth TO merk_berechtigung.
+  ENDLOOP.
+* das Kennzeichen SIGN der Selektionstabelle wird hier zweckentfremdet
+* als Kennung, ob einzuf¨¹gen oder nicht ('X' hei#t NICHT einzuf¨¹gen)
+  LOOP AT i_checktab INTO w_checkline.
+    CLEAR kz_modified.
+    LOOP AT i_mod_1251 INTO w_mod_1251
+                      WHERE agr_name = w_checkline-agr_name
+                        AND auth     = w_checkline-ch_1251-auth.
+      LOOP AT w_checkline-ch_incl INTO w_incl.
+        IF w_incl-sign <> icks.
+          CLEAR kz_gwunne.
+          IF w_incl-high IS INITIAL.
+            PERFORM pruefen_einzelwert_incl.
+          ELSE.
+            PERFORM pruefen_intervall_incl.
+          ENDIF.
+          IF kz_gwunne = 1.
+            MOVE icks  TO w_incl-sign.
+          ENDIF.
+* jetzt pr¨¹fen, ob der Wert im zu excludierenden Bereich liegt, dann
+* wird ihm das 'X' wieder aberkannt!
+          IF w_incl-sign = icks.
+
+            LOOP AT i_limits INTO w_limits.
+              IF  w_incl-low GT w_limits-oben_neu
+              AND w_incl-low LT w_limits-unten_neu.
+                MOVE spass TO w_incl-sign.
+              ENDIF.
+            ENDLOOP.
+            IF w_incl-sign = icks.
+              MODIFY w_checkline-ch_incl FROM w_incl INDEX sy-tabix.
+              kz_modified = 1.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+      ENDLOOP.
+    ENDLOOP.
+    IF kz_modified = 1.
+      MODIFY i_checktab FROM w_checkline INDEX sy-tabix.
+    ENDIF.
+  ENDLOOP.
+* danach haben alle die zeilen ein 'X', die ¨¹berfl¨¹ssig einzuf¨¹gen sind
+
+* die s#tze, die jetzt kein 'X' haben, kriegen einf¨¹gesatz erzeugt
+ENDFORM.                    " check_auf_inserts.
+*&--------------------------------------------------------------------*
+*&      Form  pruefen_einzelwert_incl
+*---------------------------------------------------------------------*
+FORM pruefen_einzelwert_incl.
+  IF  w_mod_1251-high IS INITIAL.
+    IF  w_incl-low     = w_mod_1251-low.
+      kz_gwunne = 1.
+    ELSE.
+      IF  w_mod_1251-low = stern
+      AND kz_sternexcl IS INITIAL.
+        IF  p_repl1 IS NOT INITIAL AND p_repl2 IS NOT INITIAL.
+          IF p_repl1 LE w_incl-low  AND w_incl-low LE p_repl2.
+            kz_gwunne = 1.
+          ENDIF.
+        ELSE.
+          kz_gwunne = 1.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ELSE.
+    IF  w_incl-low GE w_mod_1251-low
+    AND w_incl-low LE w_mod_1251-high.
+      kz_gwunne = 1.
+    ENDIF.
+  ENDIF.
+ENDFORM.                    " pruefen_einzelwert_incl.
+*&--------------------------------------------------------------------*
+*&      Form  pruefen_intervall_incl
+*---------------------------------------------------------------------*
+FORM pruefen_intervall_incl.
+  IF  w_mod_1251-high IS INITIAL.
+    IF  w_incl-low  = w_mod_1251-low
+    AND  w_incl-high = w_mod_1251-low.
+      kz_gwunne = 1.
+    ELSE.
+      IF  w_mod_1251-low = stern
+      AND kz_sternexcl IS INITIAL.
+        IF  p_repl1 IS NOT INITIAL AND p_repl2 IS NOT INITIAL.
+          IF p_repl1 LE w_incl-low  AND w_incl-high LE p_repl2.
+            kz_gwunne = 1.
+          ENDIF.
+        ELSE.
+          kz_gwunne = 1.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ELSE.
+    IF  w_incl-low  GE w_mod_1251-low
+    AND w_incl-high LE w_mod_1251-high.
+      kz_gwunne = 1.
+    ENDIF.
+  ENDIF.
+ENDFORM.                    " pruefen_intervall_incl.
+*&--------------------------------------------------------------------*
+*&      Form  aufbau_anzeige_aend
+*---------------------------------------------------------------------*
+FORM aufbau_anzeige_aend.
+  DATA: erster_satz TYPE i VALUE 0.
+  REFRESH:  i_mod1_1251,
+            i_fehl_1251,
+            i_success.
+  LOOP AT i_mod_1251 INTO w_agr_1251.
+    MOVE w_agr_1251 TO w_save_1251.
+    erster_satz = 1.
+    IF  w_agr_1251-low(01) = stern
+    AND p_repl1 IS NOT INITIAL.
+      w_agr_1251-low  = p_repl1.
+      w_agr_1251-high = p_repl2.
+    ENDIF.
+
+    IF  w_agr_1251-low(01) = dollar.
+      APPEND w_agr_1251 TO i_fehl_1251.
+    ELSE.
+      IF  w_agr_1251-low(01) <> stern
+      AND w_agr_1251-low(01) <> spass.
+        REFRESH i_intvl.
+        LOOP AT i_limits INTO w_limits.
+          PERFORM intervall_zerstueckeln USING    w_agr_1251-low
+                                                  w_agr_1251-high
+                                         CHANGING w_limits.
+          IF  w_limits-unten_alt IS NOT INITIAL
+          OR  w_limits-oben_alt  IS NOT INITIAL.
+            PERFORM append_to_intvl USING w_limits.
+          ENDIF.
+        ENDLOOP.
+
+        SORT i_intvl.
+        DELETE ADJACENT DUPLICATES FROM i_intvl.
+
+        h_counter = w_agr_1251-counter.
+
+        LOOP AT i_intvl INTO w_intvlu.
+          IF w_intvlu-wert = loesch_kz.
+            MOVE w_agr_1251          TO w_mod1_1251.
+            MOVE loeschen            TO w_mod1_1251-variant.
+            APPEND w_mod1_1251 TO i_mod1_1251.
+          ELSE.
+            IF w_intvlu-uodero = unten.
+              idefix = sy-tabix + 1.
+              MOVE w_agr_1251    TO w_mod1_1251.
+              MOVE w_intvlu-wert TO w_mod1_1251-low.
+              READ TABLE i_intvl INDEX idefix INTO w_intvlo.
+              IF w_intvlo-uodero = unten.
+                CONTINUE.
+              ELSE.
+                IF w_intvlo-wert GT w_mod1_1251-low.
+                  MOVE w_intvlo-wert TO w_mod1_1251-high.
+                ELSE.
+                  MOVE spass         TO w_mod1_1251-high.
+                ENDIF.
+                MOVE h_counter     TO w_mod1_1251-counter.
+                IF erster_satz = 1.
+                  MOVE aendern       TO w_mod1_1251-variant.
+                ELSE.
+                  MOVE einfuegen     TO w_mod1_1251-variant.
+                ENDIF.
+                erster_satz = 0.
+                ADD  1             TO h_counter.
+                APPEND w_mod1_1251 TO i_mod1_1251.
+              ENDIF.
+            ENDIF.
+          ENDIF.
+        ENDLOOP.
+      ELSE.                 "bleibt noch die spezielle Space- und
+*                           "                          Sternbehandlung
+*       d.h. agr_1251-low(01) ist stern oder spass
+        LOOP AT i_limits INTO w_limits.
+
+          IF ( w_limits-unten_neu(05) = c_stern AND
+               w_agr_1251-low(01)     =   stern )
+          OR ( w_limits-unten_neu(05) = c_star  AND
+               w_agr_1251-low(01)     =   stern )
+          OR ( w_limits-unten_neu(05) = c_space AND
+               w_agr_1251-low(01)     =   spass ).
+            MOVE w_agr_1251          TO w_mod1_1251.
+            MOVE loeschen            TO w_mod1_1251-variant.
+            APPEND w_mod1_1251 TO i_mod1_1251.
+          ENDIF.
+        ENDLOOP.
+      ENDIF.
+    ENDIF.
+
+    AT END OF agr_name.
+      PERFORM aufbau_anzeige_isrt USING w_agr_1251-agr_name.
+    ENDAT.
+
+  ENDLOOP.
+
+ENDFORM.                    " aufbau_anzeige_aend
+*&--------------------------------------------------------------------*
+*&      Form  aufbau_anzeige_isrt
+*---------------------------------------------------------------------*
+FORM aufbau_anzeige_isrt USING p_agr_name.
+  LOOP AT i_checktab INTO w_checkline
+          WHERE agr_name = p_agr_name.
+    LOOP AT w_checkline-ch_incl INTO w_incl.
+      IF w_incl-sign <> icks.
+
+*       READ TABLE i_mod1_1251 INTO w_mod2_1251
+        READ TABLE i_mod_1251  INTO w_mod2_1251    "???????????????????
+                      WITH KEY agr_name = p_agr_name
+                                   auth = w_checkline-ch_1251-auth.
+        IF sy-subrc = 0.
+          MOVE w_checkline-ch_1251    TO w_mod1_1251.
+          MOVE w_mod2_1251-auth   TO w_mod1_1251-auth.
+          MOVE w_mod2_1251-node   TO w_mod1_1251-node.
+          MOVE w_incl-low             TO w_mod1_1251-low.
+          MOVE w_incl-high            TO w_mod1_1251-high.
+          ADD  1                      TO h_counter.
+          MOVE h_counter              TO w_mod1_1251-counter.
+          MOVE new                    TO w_mod1_1251-neu.
+          MOVE einfuegen              TO w_mod1_1251-variant.
+          APPEND w_mod1_1251          TO i_mod1_1251.
+        ENDIF.
+      ENDIF.
+    ENDLOOP.
+  ENDLOOP.
+  SORT i_mod1_1251 BY agr_name object auth
+                      variant  DESCENDING
+                      field low high node.
+  DELETE ADJACENT DUPLICATES FROM i_mod1_1251 COMPARING
+              agr_name object auth variant field low high node.
+
+
+ENDFORM.                    " aufbau_anzeige_isrt
+*&--------------------------------------------------------------------*
+*&      Form  update_rollen
+*         in i_mod1_1251 stehen alle zu l#schenden, zu #ndernden
+*                                und einzuf¨¹genden Datens#tze
+*---------------------------------------------------------------------*
+FORM update_rollen .
+  REFRESH i_success.
+
+  LOOP AT i_mod1_1251 INTO w_mod1_1251.
+    MOVE w_mod1_1251 TO w_save_1251.
+    AT NEW agr_name.
+      IF merk_rolle IS NOT INITIAL.
+        PERFORM update_rolle.
+      ENDIF.
+      MOVE w_mod1_1251-agr_name TO merk_rolle.
+      REFRESH i_mod_1251.
+      SELECT * FROM agr_1251
+         INTO  CORRESPONDING FIELDS OF TABLE i_mod_1251
+           WHERE agr_name = w_mod1_1251-agr_name.
+      SELECT MAX( counter ) FROM agr_1251 INTO h_counter
+           WHERE agr_name = w_mod1_1251-agr_name.
+
+    ENDAT.
+
+    IF w_save_1251-variant = loeschen
+    OR w_save_1251-variant = aendern.
+
+
+      READ TABLE i_mod_1251 WITH KEY mandt    = w_mod1_1251-mandt
+                                     agr_name = w_mod1_1251-agr_name
+                                     counter  = w_save_1251-counter
+                                           INTO w_mod_1251.
+      IF sy-subrc <> 0.
+        mv1 = 'Master Of Desaster - '.
+        mv2 = 'hier ist noch was fatal faul!'.
+        PERFORM message_ausgabe_e.
+      ENDIF.
+    ENDIF.
+
+    CASE  w_save_1251-variant.
+      WHEN loeschen.
+*        DELETE TABLE i_mod_1251 FROM w_mod_1251.
+        CLEAR:  w_save_1251-variant,
+                w_save_1251-low,
+                w_save_1251-high.
+        MODIFY i_mod_1251 FROM w_save_1251 INDEX sy-tabix.
+      WHEN aendern.
+        MOVE spass         TO w_save_1251-variant.
+        MODIFY i_mod_1251 FROM w_save_1251 INDEX sy-tabix.
+      WHEN einfuegen.
+        ADD 1              TO h_counter.
+        MOVE h_counter     TO w_mod1_1251-counter.
+        MOVE spass         TO w_mod1_1251-variant.
+        APPEND w_mod1_1251 TO i_mod_1251.
+    ENDCASE.
+
+  ENDLOOP.
+*  ...und f¨¹r den letzten Schleifendurchlauf:
+  IF merk_rolle IS NOT INITIAL.
+    PERFORM update_rolle.
+  ENDIF.
+
+ENDFORM.                    " update_rollen
+*&--------------------------------------------------------------------*
+*&     Form  update_rollen
+*        in i_mod_1251 stehen alle zu EINER Rolle geh#renden Datens#tze
+*---------------------------------------------------------------------*
+FORM update_rolle.
+
+  DATA: pt1251 LIKE pt1251 OCCURS 0 WITH HEADER LINE.
+  REFRESH pt1251.
+  LOOP AT i_mod_1251 INTO w_mod_1251.
+    MOVE-CORRESPONDING w_mod_1251 TO pt1251.
+    APPEND pt1251.
+  ENDLOOP.
+
+  CALL FUNCTION 'PRGN_1251_SAVE_FIELD_VALUES'
+    EXPORTING
+      activity_group = merk_rolle
+    TABLES
+      field_values   = pt1251.
+  PERFORM update_database.
+ENDFORM.                    " update_rolle
+
+*&---------------------------------------------------------------------*
+*&      Form  update_orgs
+*&---------------------------------------------------------------------*
+FORM update_orgs.
+  REFRESH i_success.
+
+  LOOP AT i_mod1_1252 ASSIGNING <fs1252>.
+    w_agr_1252 = <fs1252>.
+    AT NEW agr_name.
+      IF merk_rolle IS NOT INITIAL.
+        PERFORM update_orgebene.
+      ENDIF.
+      MOVE w_agr_1252-agr_name TO merk_rolle.
+      REFRESH i_mod_1252.
+      SELECT * FROM agr_1252
+         INTO  CORRESPONDING FIELDS OF TABLE i_mod_1252
+           WHERE agr_name = w_agr_1252-agr_name.
+      DELETE i_mod_1252 WHERE varbl = <fs1252>-varbl.
+    ENDAT.
+    APPEND <fs1252> TO i_mod_1252.
+
+  ENDLOOP.
+*  ...und f¨¹r den letzten Schleifendurchlauf:
+  IF merk_rolle IS NOT INITIAL.
+    PERFORM update_orgebene.
+  ENDIF.
+
+ENDFORM.                    "update_orgs
+*&---------------------------------------------------------------------*
+*&      Form  update_orgebene
+*&---------------------------------------------------------------------*
+FORM update_orgebene.
+
+  DATA: pt1252 LIKE pt1252 OCCURS 0 WITH HEADER LINE.
+  REFRESH pt1252.
+  LOOP AT i_mod_1252 ASSIGNING <fs1252_1>.
+    MOVE-CORRESPONDING <fs1252_1> TO pt1252.
+    APPEND pt1252.
+  ENDLOOP.
+
+  CALL FUNCTION 'PRGN_1252_SAVE_ORG_LEVELS'
+    EXPORTING
+      activity_group = merk_rolle
+    TABLES
+      org_levels     = pt1252.
+
+  PERFORM update_database.
+ENDFORM.                    "update_orgebene
+*&--------------------------------------------------------------------*
+*&      Form  update_database
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+FORM update_database.
+  CALL FUNCTION 'PRGN_UPDATE_DATABASE'.
+  IF sy-subrc = 0.
+    CALL FUNCTION 'SUPRN_PROFILE_BATCH'
+      EXPORTING
+        act_objid                   = merk_rolle
+*     LTEXT                       =
+*     ENQUEUE                     = ' '
+     EXCEPTIONS
+       objid_not_found             = 1
+       no_authorization            = 2
+       generation_not_active       = 3
+       empty_authorizations        = 4
+       enqueue_failed              = 5
+       not_generated               = 6
+       OTHERS                      = 7
+              .
+    IF sy-subrc <> 0.
+      MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+              WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+    ELSE.
+      IF p_org NE icks.
+        CALL FUNCTION 'PRGN_ACTIVITY_GROUP_USERPROFS'
+          EXPORTING
+            activity_group = merk_rolle.
+      ENDIF.
+
+      CLEAR  w_cont.
+      MOVE merk_rolle   TO w_cont-agr_name.
+      MOVE sy-uname     TO w_cont-uname.
+      MOVE sy-datum     TO w_cont-change_dat.
+      MOVE sy-uzeit     TO w_cont-change_tim.
+      APPEND w_cont     TO i_success.
+    ENDIF.
+
+  ENDIF.
+ENDFORM.                    "update_database
+**&--------------------------------------------------------------------
+**&      Form  eins_davor
+**---------------------------------------------------------------------
+FORM eins_davor USING     startwert
+                CHANGING  wert_minus.
+  DATA: off       TYPE i,
+       off_1     TYPE i,
+       pos       TYPE i.
+  DATA: feld TYPE c LENGTH 40.
+
+  MOVE startwert TO feld.
+  SHIFT feld RIGHT DELETING TRAILING spass.
+  pos = 39.
+  DO.
+    IF pos > 0.
+
+      FIND feld+pos(1) IN pettern MATCH OFFSET off.
+
+      IF off > 1.
+        IF  off = 37.                  "also stern
+          pos = pos - 1.
+        ELSE.
+          off_1 = off - 1.
+          feld+pos(1) = pettern+off_1(1).
+          SHIFT feld LEFT DELETING LEADING spass.
+          MOVE feld TO wert_minus.
+          EXIT.                        "so sollte es sein
+        ENDIF.
+      ELSE.
+        feld+pos(1) = pettern+36(1).
+        pos = pos - 1.
+      ENDIF.
+    ELSE.
+      EXIT.                            "mit fehler oder so...
+    ENDIF.
+  ENDDO.
+
+ENDFORM.                    "eins_davor
+**&--------------------------------------------------------------------
+**&      Form  eins_dahinter
+**---------------------------------------------------------------------
+FORM eins_dahinter USING     startwert
+                   CHANGING  wert_plus.
+  DATA: off       TYPE i,
+        off_1     TYPE i,
+        pos       TYPE i.
+
+  DATA: feld TYPE c LENGTH 40.
+  MOVE startwert TO feld.
+  SHIFT feld RIGHT DELETING TRAILING spass.
+  pos = 39.
+  DO.
+    IF pos > 0.
+
+      FIND feld+pos(1) IN pettern MATCH OFFSET off.
+
+      IF off  < 36.
+        off_1 = off + 1.
+        feld+pos(1) = pettern+off_1(1).
+        SHIFT feld LEFT DELETING LEADING spass.
+        MOVE feld TO wert_plus.
+        EXIT.                          "so sollte es sein
+      ELSE.
+        IF off = 37.                   "also stern
+          pos = pos - 1.
+        ELSE.
+          feld+pos(1) = pettern+1(1).
+          pos = pos - 1.
+        ENDIF.
+      ENDIF.
+    ELSE.
+      EXIT.                            "mit fehler oder so...
+    ENDIF.
+  ENDDO.
+
+
+ENDFORM.                    "eins_dahinter
+
+*&--------------------------------------------------------------------*
+*&      Form  intervall_zerstueckeln
+*---------------------------------------------------------------------*
+*      -->P_LOW         text
+*      -->P_HIGH        text
+*      <--P_intervalle  type limit_type
+*---------------------------------------------------------------------*
+FORM intervall_zerstueckeln  USING    p_low
+                                      p_high
+                             CHANGING p_limits LIKE w_limits.
+
+  IF  p_limits-unten_neu(05) = c_space
+  OR  p_limits-unten_neu(05) = c_star
+  OR  p_limits-unten_neu(05) = c_stern.
+  ELSE.
+    IF p_high IS NOT INITIAL.
+      IF  p_limits-unten_neu LE p_high
+      AND p_limits-unten_neu GT p_low.                "vorher GE
+        p_limits-oben_alt = p_high.
+      ENDIF.
+      IF  p_limits-oben_neu  GE p_low
+      AND p_limits-oben_neu  LT p_high.               "vorher LE
+        p_limits-unten_alt = p_low.
+      ENDIF.
+      IF  p_limits-oben_neu  LT p_low
+      AND p_limits-unten_neu GT p_high.
+        MOVE loesch_kz TO p_limits-unten_alt.
+      ENDIF.
+    ELSE.            "ist es Einzelwert
+      IF  p_low > p_limits-oben_neu
+      AND p_low < p_limits-unten_neu.
+        MOVE loesch_kz TO p_limits-unten_alt.
+*     bleibt alles beim alten, aber durch leere -unten_alt u. -oben_alt
+*     wird erkannt, dass Teil zum L#schen ansteht
+*                                     ... aber au#erdem doch kz setzen!
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    " intervall_zerstueckeln
+*&--------------------------------------------------------------------*
+*&      Form  append_to_intvl
+*---------------------------------------------------------------------*
+*      -->P_LIMITS    text
+*---------------------------------------------------------------------*
+FORM append_to_intvl USING p_limits LIKE w_limits.
+
+  IF p_limits-unten_alt IS NOT INITIAL.
+    MOVE p_limits-unten_alt TO w_intvlu-wert.
+    MOVE unten              TO w_intvlu-uodero.
+    APPEND w_intvlu         TO i_intvl.
+    MOVE p_limits-oben_neu  TO w_intvlo-wert.
+    MOVE oben               TO w_intvlo-uodero.
+    APPEND w_intvlo         TO i_intvl.
+  ENDIF.
+  IF p_limits-oben_alt IS NOT INITIAL.
+    MOVE p_limits-unten_neu TO w_intvlu-wert.
+    MOVE unten              TO w_intvlu-uodero.
+    APPEND w_intvlu         TO i_intvl.
+    MOVE p_limits-oben_alt  TO w_intvlo-wert.
+    MOVE oben               TO w_intvlo-uodero.
+    APPEND w_intvlo         TO i_intvl.
+  ENDIF.
+
+ENDFORM.                    " append_to_intvl
+
+*&--------------------------------------------------------------------*
+*&      Form  von_bis_werte_setzen
+*&--------------------------------------------------------------------*
+FORM von_bis_werte_setzen CHANGING unten oben.
+  DATA: change(10)      TYPE c VALUE '*0 0',
+        change_oben(10) TYPE c VALUE '*Z Z'.
+  IF oben IS INITIAL.
+    oben = unten.
+  ENDIF.
+  IF unten CA stern.
+    TRANSLATE unten USING change.
+    TRANSLATE oben  USING change_oben.
+  ENDIF.
+  IF p_high1 LT p_low1.
+    mv1 = 'Bis-Wert < Von-Wert'.
+    PERFORM message_ausgabe_w.
+  ENDIF.
+
+ENDFORM.                    "von_bis_werte_setzen
+*&--------------------------------------------------------------------*
+*&      Form  append_ecpsap
+*&--------------------------------------------------------------------*
+*       Einf¨¹gen des Eintrags in Select_options Rolle 'E CP SAP*'
+*---------------------------------------------------------------------*
+FORM append_ecpsap.
+*  IF s_rolle     IS INITIAL
+*  OR s_rolle-low =  stern.
+  s_rolle-sign   = 'E'.
+  s_rolle-option = 'CP'.
+  s_rolle-low    = 'SAP*'.
+  APPEND s_rolle.
+*  ENDIF.
+ENDFORM.                    "append_ecpsap
+*&--------------------------------------------------------------------*
+*&      Form  delete_ecpsap
+*&--------------------------------------------------------------------*
+*       L#schen des Eintrags aus Select_options Rolle
+*---------------------------------------------------------------------*
+FORM delete_ecpsap.
+  DELETE TABLE s_rolle WITH TABLE  KEY sign  = 'E'
+                                      option = 'CP'
+                                      low    = 'SAP*'
+                                      high   = spass.
+  CLEAR s_rolle.            "(l#scht nur die Felder der Kopfzeile)
+ENDFORM.                    "delete_ecpsap
+
+*&--------------------------------------------------------------------*
+*&      Form  ob_in_intervall
+*&--------------------------------------------------------------------*
+*      -->WERTVON      text
+*      -->WERTBIS      text
+*      -->GRENZEUNTEN  text
+*      -->GRENZEOBEN   text
+*      -->JA_NEIN      text
+*---------------------------------------------------------------------*
+FORM ob_in_intervall USING wertvon
+                           wertbis
+                           grenzeunten
+                           grenzeoben
+                           CHANGING ja_nein TYPE c.
+
+  CLEAR ja_nein.
+  IF wertbis IS INITIAL
+  OR wertbis  = wertvon.
+    IF wertvon = grenzeunten
+    OR ( wertvon GE grenzeunten AND
+         wertvon LE grenzeoben ) .
+      ja_nein = ja.
+    ELSE.
+      ja_nein = nein.
+    ENDIF.
+  ELSE.
+    IF  wertvon GE grenzeunten
+    AND wertbis LE grenzeoben.
+      ja_nein = ja.
+    ELSE.
+      ja_nein = nein.
+    ENDIF.
+  ENDIF.
+ENDFORM.                    "ob_in_intervall
+
+*ALVALVALVALVALVALVALVALVALVALVALVALVALVALVALVALVALVALVALVALVALVALVALVA
+*ab hier f¨¹r ALV Ged#nse:
+*&--------------------------------------------------------------------*
+*&      Form  aufbau_feldkatalog
+*&--------------------------------------------------------------------*
+*      -->LISTTYP    text
+*      -->TABLENAME  text
+*---------------------------------------------------------------------*
+FORM aufbau_feldkatalog USING listtyp tablename TYPE authx-checktable .
+  CLEAR: wa_fieldcat, fieldcat.
+
+  DEFINE fcat.
+    move: &1 to wa_fieldcat-fieldname,
+          &2 to wa_fieldcat-ref_tabname.
+    append wa_fieldcat to fieldcat.
+    clear wa_fieldcat.
+  END-OF-DEFINITION.
+  DEFINE fcat_t.
+    move: &1 to wa_fieldcat-fieldname,
+          &2 to wa_fieldcat-ref_tabname,
+    &3 to wa_fieldcat-seltext_s,
+    &3 to wa_fieldcat-seltext_m,
+    &3 to wa_fieldcat-seltext_l,
+    &4 to wa_fieldcat-ref_fieldname.
+    append wa_fieldcat to fieldcat.
+    clear wa_fieldcat.
+  END-OF-DEFINITION.
+  DEFINE fcat_x.
+    move: &1 to wa_fieldcat-fieldname,
+          &2 to wa_fieldcat-ref_tabname,
+    &3 to wa_fieldcat-seltext_s,
+    &3 to wa_fieldcat-seltext_m,
+    &3 to wa_fieldcat-seltext_l.
+    append wa_fieldcat to fieldcat.
+    clear wa_fieldcat.
+  END-OF-DEFINITION.
+  CASE listtyp.
+    WHEN 'A'.
+      fcat:   'BROBJ'  'TACTZ',
+              'ACTVT'  'TACTZ',
+              'LTEXT'  'TACTT'.
+    WHEN 'B'.
+      IF tablename = 'DD07L'.
+        fcat_x: 'DOMVALUE_L' 'DD07L'  'Wert',
+                'DDTEXT'     'DD07T'  'Kurztext'.
+      ELSE.
+        PERFORM fieldcat_aus_dd03l.
+      ENDIF.
+    WHEN 'C'.
+      PERFORM fieldcat_aus_dd03l.
+    WHEN 'D'.
+      IF sy-ucomm = 'SAMROLL'.
+        fcat: 'CHILD_AGR' 'AGR_AGRS'.
+        fcat: 'AGR_NAME'  'AGR_AGRS'.
+      ELSE.
+        fcat: 'AGR_NAME'  'AGR_AGRS'.
+        fcat: 'CHILD_AGR' 'AGR_AGRS'.
+      ENDIF.
+
+    WHEN '1'.
+      fcat:   'UNAME'     'AGR_USERS',
+              'AGR_NAME'  'AGR_USERS',
+              'PROFN'     'UST10S',
+              'AUTH'      'UST10S',
+              'TCODE'     'TSTCA',
+              'OBJCT'     'TSTCA',
+              'FIELD'     'TSTCA'.
+      fcat_t: 'VON'       'AGR_1251'  'Wert von'      'LOW',
+              'BIS'       'AGR_1251'  'Wert bis'      'HIGH',
+              'NODE'      'AGR_1251'  'Knoten intern' 'NODE'.
+    WHEN '2'.
+      fcat:   'AGR_NAME'  'AGR_USERS',
+              'AUTH'      'AGR_1251'.
+      fcat_t: 'OBJCT'     'AGR_1251'  'Objekt'        'OBJECT'.
+      fcat:   'FIELD'     'AGR_1251'.
+      fcat_t: 'VON'       'AGR_1251'  'Wert von'      'LOW',
+              'BIS'       'AGR_1251'  'Wert bis'      'HIGH',
+              'NODE'      'AGR_1251'  'Knoten intern' 'NODE'.
+    WHEN '3'.
+      fcat:   'AGR_NAME'  'AGR_USERS',
+              'AUTH'      'AGR_1251',
+              'OBJCT'     'TSTCA',
+              'FIELD'     'TSTCA'.
+      fcat_t: 'VON'       'AGR_1251'  'Wert von'    'AGR_1251-LOW',
+              'BIS'       'AGR_1251'  'Wert bis'    'AGR_1251-HIGH'.
+
+      fcat:   'UNAME'     'AGR_USERS'.
+      fcat_t: 'NAME_TEXT' 'ADRP'    'Name'           'ADRP-NAME_TEXT'.
+      fcat_t: 'ICON_ID'   'ICON'    'Ben.Status'     'ICON-ID'.
+      fcat_t: 'ICON_TEXT' 'ICONT'   'Benutzerstatus' 'ICONT-SHORTTEXT'.
+    WHEN '4'.
+      fcat:   'UNAME'     'AGR_USERS'.
+      fcat_t: 'NAME_TEXT' 'ADRP'    'Name' 'ADRP-NAME_TEXT'.
+      fcat:   'AGR_NAME'  'AGR_USERS'.
+    WHEN '5'.
+      fcat:   'AGR_NAME'  'AGR_1251',
+              'COUNTER'   'AGR_1251',
+              'AUTH'      'AGR_1251',
+              'OBJECT'    'AGR_1251',
+              'FIELD'     'AGR_1251'.
+      fcat_x: 'LOW'      'AGR_1251'      'Wert von',
+              'HIGH'     'AGR_1251'      'Wert bis',
+              'NODE'      'AGR_1251'      'Knoten intern',
+              'VARIANT'   'AGR_1251'      'l#schen/einf¨¹gen'.
+    WHEN '6'.
+      fcat:   'AGR_NAME'  'AGR_1251',
+              'COUNTER'   'AGR_1251',
+              'AUTH'      'AGR_1251',
+              'OBJECT'    'AGR_1251',
+              'FIELD'     'AGR_1251'.
+      fcat_x: 'LOW'      'AGR_1251'      'Wert von'.
+      fcat    'NODE'      'AGR_1251'.
+    WHEN '7'.
+      fcat:   'AGR_NAME'   'AGR_USERS'.
+      fcat_x: 'UNAME'      'AGR_USERS' 'ge#ndert von',
+              'CHANGE_DAT' 'AGR_USERS' 'Datum',
+              'CHANGE_TIM' 'AGR_USERS' 'Uhrzeit'.
+    WHEN '8'.
+      fcat:   'AGR_NAME'  'AGR_1252',
+              'COUNTER'   'AGR_1252'.
+      fcat_x: 'VARBL'     'AGR_1252'      'OrgElement',
+              'LOW'       'AGR_1252'      'Wert von',
+              'HIGH'      'AGR_1252'      'Wert bis'.
+    WHEN '9'.
+      fcat:   'AGR_NAME'  'AGR_1252',
+              'COUNTER'   'AGR_1252'.
+      fcat_x: 'VARBL'     'AGR_1252'      'OrgElement',
+              'LOW'       'AGR_1252'      'Wert von',
+              'HIGH'      'AGR_1252'      'Wert bis'.
+    WHEN OTHERS.
+      fcat:   'UNAME'     'AGR_USERS',
+              'AGR_NAME'  'AGR_USERS',
+              'PROFN'     'UST10S',
+              'AUTH'      'UST10S',
+              'TCODE'     'TSTCA',
+              'OBJCT'     'TSTCA',
+              'FIELD'     'TSTCA'.
+      fcat_t: 'VON'       'AGR_1251'  'Wert von'      'LOW',
+              'BIS'       'AGR_1251'  'Wert bis'      'HIGH',
+              'NODE'      'AGR_1251'  'Knoten intern' 'NODE'.
+  ENDCASE.
+ENDFORM.                    "aufbau_feldkatalog
+*&--------------------------------------------------------------------*
+*&      Form  fieldcat_aus_dd03L
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+FORM fieldcat_aus_dd03l.
+  DATA: zaehler      TYPE i,
+        h_checktable LIKE authx-checktable.
+  IF w_authx-checktable IN r_checktable.      " 'T354B' usw..
+    CONCATENATE 'H_'  w_authx-checktable INTO h_checktable.
+  ELSE.
+    h_checktable = w_authx-checktable.
+  ENDIF.
+  zaehler = 1.
+
+  DO.
+    SELECT SINGLE fieldname FROM dd03l INTO wa_fieldcat-fieldname
+     WHERE tabname = h_checktable
+       AND position = zaehler.
+    IF  sy-subrc = 0.
+      IF  wa_fieldcat-fieldname    NE 'MANDT'
+      AND wa_fieldcat-fieldname(1) NE '.'.
+        wa_fieldcat-ref_tabname = h_checktable.
+        APPEND wa_fieldcat TO fieldcat.
+        CLEAR wa_fieldcat.
+      ENDIF.
+      zaehler = zaehler + 1.
+      IF zaehler = 6.
+        EXIT.
+      ENDIF.
+    ELSE.
+      EXIT.
+    ENDIF.
+  ENDDO.
+ENDFORM.                    "fieldcat_aus_dd03L
+*&--------------------------------------------------------------------*
+*&      Form  call_alv
+*&--------------------------------------------------------------------*
+*      -->CONTENT    text
+*      -->FIELDCAT   text
+*      -->TABLENAME  text
+*---------------------------------------------------------------------*
+FORM call_alv TABLES content fieldcat USING tablename.
+
+  my_own_stack = my_own_stack + 1.
+
+  my_layout-zebra     = 'X'.
+  my_layout-colwidth_optimize = 'X'.
+  my_variant-report   = sy-cprog.
+  my_variant-username = sy-uname.
+  my_variant-handle   = '0001'.
+  repid = sy-repid.
+
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+    EXPORTING
+      i_callback_program       = repid
+      i_callback_top_of_page   = 'TOP_OF_PAGE'
+*      alternativ zu top_of_page:
+*      I_GRID_TITLE             = 'hallo world here I am'
+      it_fieldcat              = fieldcat[]
+      i_save                   = 'A'
+      i_callback_user_command  = 'USER_COMMAND'
+      i_callback_pf_status_set = 'SET_PF_STATUS'
+      is_variant               = my_variant
+      is_layout                = my_layout
+    IMPORTING
+      e_exit_caused_by_caller  = exit_by_caller
+      es_exit_caused_by_user   = exit_by_user
+    TABLES
+      t_outtab                 = content
+    EXCEPTIONS
+      program_error            = 1
+      OTHERS                   = 2.
+ENDFORM.                    " CALL_ALV
+
+*&--------------------------------------------------------------------*
+*&      Form  top_of_page (Aufruf via ALV FuBa)
+*&--------------------------------------------------------------------*
+FORM top_of_page.
+  DATA: help_anz(5) TYPE c.
+  CLEAR   wa_listheader.
+  REFRESH    listheader.
+  wa_listheader-typ = 'H'.
+  wa_listheader-info = sy-title.
+  APPEND wa_listheader TO listheader.
+  CLEAR  wa_listheader-info.
+  CASE listtyp.
+    WHEN 'A'.
+      wa_listheader-typ = 'S'.
+      IF my_ucomm = 'GUELAKT'.
+        CONCATENATE text-t01 p_obj1
+          INTO wa_listheader-info   SEPARATED BY space.
+      ELSE.
+        wa_listheader-info = text-t01.
+      ENDIF.
+    WHEN 'B'.
+      wa_listheader-typ = 'S'.
+      IF my_ucomm = 'GUELFLD'.
+        CONCATENATE text-t02 p_field
+       INTO wa_listheader-info     SEPARATED BY space.
+      ELSE.
+        wa_listheader-info = text-t03.
+      ENDIF.
+    WHEN 'C'.
+      IF my_ucomm = 'GUELORG'.
+        CONCATENATE text-t04 p_obj1
+                     ' (Feld' w_usorg-field ')'
+        INTO wa_listheader-info
+             SEPARATED BY space.
+      ELSE.
+        wa_listheader-info = text-t05.
+      ENDIF.
+    WHEN 'D'.
+      IF my_ucomm = 'SAMROLL'.
+        CONCATENATE text-t06 s_rolle-low
+        INTO wa_listheader-info
+             SEPARATED BY space.
+      ELSE.
+        CONCATENATE text-t07 s_rolle-low
+        INTO wa_listheader-info
+             SEPARATED BY space.
+      ENDIF.
+    WHEN OTHERS.
+
+      CASE  ok_code.
+        WHEN  'UZR'.
+          MOVE anz_out TO help_anz.
+*          CONCATENATE 'User zu Rollen' '(' help_anz  ' Eintr#ge)'
+          CONCATENATE 'Users assigned to Role' '(' help_anz  ' Eintr#ge)'
+                 INTO wa_listheader-info
+           SEPARATED BY space.
+        WHEN  'RZU'.
+          IF image = 4.
+            MOVE anz_out TO help_anz.
+            CONCATENATE 'Rollen zu User' '(' help_anz  ' Eintr#ge)'
+                   INTO wa_listheader-info
+           SEPARATED BY space.
+          ENDIF.
+        WHEN  'ROU'.
+          MOVE anz_out TO help_anz.
+          CONCATENATE 'Rollen ohne User' '(' help_anz  ' Eintr#ge)'
+                 INTO wa_listheader-info
+           SEPARATED BY space.
+        WHEN  'NOO'.
+          wa_listheader-info
+               = 'nicht ¨¹ber OrgEbene gepflegte Org.Elemente'.
+        WHEN  'FEHL'.
+          wa_listheader-info
+               = 'F#lle mit nicht zu #ndernden Daten in Tab AGR_1251'.
+        WHEN OTHERS.
+          CASE kz_teil1.
+            WHEN 1.
+              IF p_org = icks.
+                CONCATENATE 'OrgEbenen mit Feldwerten zu Rolle(n)'
+                             s_rolle-low
+                INTO wa_listheader-info
+                SEPARATED BY spass.
+              ELSE.
+                wa_listheader-info
+*                = 'Einzelberechtigungen mit Feldwerten zu Rolle/User'.
+                = 'Individual authorizations with field values ##to Role / User'.
+              ENDIF.
+            WHEN 2.
+              IF p_org = icks.
+                CONCATENATE 'OrgElement' p_obj1 ' zu Rolle(n)'
+                             s_rolle-low
+                INTO wa_listheader-info
+                SEPARATED BY spass.
+              ELSE.
+                wa_listheader-info
+                = 'Berechtigungsobjekte und -Felder in Rollen'.
+              ENDIF.
+            WHEN 3.
+              IF image = 5
+              OR image = 9.
+                IF b_r1 = 'X'.
+                  IF image = 5.
+                    wa_listheader-info =
+                 '... dies w#ren die ge#nderten S#tze in Tab AGR_1251'.
+                  ELSE.
+                    wa_listheader-info =
+           '... dies w#ren die ge#nderten OrgElemente in Tab AGR_1252'.
+                  ENDIF.
+                ELSE.
+                  IF ok_code = 'UPD'.
+*                (d.h. hier hat er schon ge#ndert!!!???)
+                    wa_listheader-info =
+               'folgende Rollen wurden ver#ndert >>>LISTE SICHERN!<<<'.
+                  ELSE.
+                    wa_listheader-info
+                    = '... jetzt wirds ernst!'.
+                  ENDIF.
+                ENDIF.
+              ELSE.
+                wa_listheader-info
+             = 'Berechtigungsobjekte und -Felder in Rollen (nochmals)'.
+              ENDIF.
+          ENDCASE.
+      ENDCASE.
+  ENDCASE.
+  APPEND wa_listheader TO listheader.
+
+  CALL FUNCTION 'REUSE_ALV_COMMENTARY_WRITE'
+    EXPORTING
+      it_list_commentary = listheader.
+
+ENDFORM.                    "top_of_page
+*&--------------------------------------------------------------------*
+*&      Form  set_pf_status (Aufruf via ALV FuBa)
+*&--------------------------------------------------------------------*
+FORM set_pf_status USING rt_extab TYPE slis_t_extab.
+  REFRESH         sta_tab.                 "FunktionenAusschlusstabelle
+  IF image NE 8.
+    APPEND 'NOO'      TO sta_tab.
+  ENDIF.
+  IF my_ucomm = 'GUELAKT'
+  OR my_ucomm = 'GUELFLD'
+  OR my_ucomm = 'GUELORG'
+  OR listtyp      = 'A'
+  OR listtyp      = 'B'
+  OR listtyp      = 'C'.
+    SET PF-STATUS 'STANDARD_NACKT' EXCLUDING sta_tab.
+  ELSE.
+    IF ok_code = 'ROU'.
+      APPEND 'UZR'      TO sta_tab.
+      APPEND 'RZU'      TO sta_tab.
+      APPEND 'ROU'      TO sta_tab.
+      SET PF-STATUS 'STANDARD' EXCLUDING sta_tab.
+    ELSE.
+      IF image LT 5.
+        IF image NE 3.
+          APPEND 'RZU'  TO sta_tab.
+        ELSE.
+          APPEND 'UZR'  TO sta_tab.
+        ENDIF.
+        SET PF-STATUS 'STANDARD' EXCLUDING sta_tab.
+      ELSE.
+        IF i_fehl_1251 IS INITIAL.
+          APPEND 'FEHL' TO sta_tab.
+        ENDIF.
+        IF b_r2 NE icks.
+          APPEND 'UPD'  TO sta_tab.
+        ENDIF.
+        IF ok_code = 'UPD'.
+          APPEND 'FEHL' TO sta_tab.
+          APPEND 'UPD'  TO sta_tab.
+        ENDIF.
+
+        SET PF-STATUS 'STANDARD_UPD' EXCLUDING sta_tab.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+  CLEAR listtyp.
+
+* image | buttons
+*       | UZR RZU ROU FEHL NOO ZRUCK UPD
+* ------+---------------------------------
+*  1,2  |  x   -   x  [-]   -    x   [-]
+*   3   |  -   x   x  [-]   -    x   [-]
+*   4   |  x   -   x  [-]   -    x   [-]
+*   5   |  -   -   -   x    -    x    x
+*   6   |  -   -   -   -    -    -    -
+*   7   |  -   -   -   -    -    x    -
+*   8   |  -   -   -   -    x    x    -
+*   9   |  -   -   -   -    -    x    x
+
+ENDFORM. "Set_pf_status
+
+
+
+
+*           \\\//
+*          ( ¡ãy¡ã )
+*            ---
+*           /   \                                                   dsh

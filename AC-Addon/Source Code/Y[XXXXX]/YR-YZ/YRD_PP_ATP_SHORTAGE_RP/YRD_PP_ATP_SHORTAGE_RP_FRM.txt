@@ -1,0 +1,537 @@
+*&---------------------------------------------------------------------*
+*&  Include           YRD_PP_ATP_SHORTAGE_RP_FRM
+*&---------------------------------------------------------------------*
+
+*&---------------------------------------------------------------------*
+*&      Form  FRM_GET_MAINDATA
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM frm_get_maindata .
+
+  DATA: it_jest TYPE TABLE OF jest WITH HEADER LINE.
+  DATA: wa_jest TYPE jest.
+  DATA: it_resb TYPE TABLE OF resb WITH HEADER LINE.
+  DATA: wa_resb TYPE resb.
+
+  DATA: lv_tabix TYPE sy-tabix.
+  DATA: lv_base_qty TYPE basmn.
+
+
+*Get Production Order
+  SELECT *
+    FROM jest
+    INTO TABLE it_jest
+   WHERE objnr LIKE 'OR000001%'
+     AND inact = ''
+     AND stat = 'I0001'.
+  LOOP AT it_jest.
+    SELECT SINGLE *
+      FROM jest
+     WHERE objnr = it_jest-objnr
+       AND inact = ''
+       AND stat = 'I0076'.
+    IF sy-subrc = 0.
+      DELETE it_jest.
+    ENDIF.
+  ENDLOOP.
+
+
+*Get Kit Number + Order Quantity(PSMNG)
+  LOOP AT it_jest.
+* Production Order
+    it_output-aufnr = it_jest-objnr+7(7).
+    UNPACK it_output-aufnr TO it_output-aufnr.
+
+    IF NOT s_aufnr IS INITIAL.
+      CHECK it_output-aufnr IN s_aufnr.
+    ENDIF.
+
+* Total order quantity, Kit Number
+    SELECT SINGLE psmng matnr
+      FROM afpo
+      INTO (it_output-prodq, it_output-kitnr)
+     WHERE aufnr = it_output-aufnr
+       AND dwerk = p_werks.
+    IF sy-subrc = 0.
+
+      IF NOT it_output-kitnr IS INITIAL.
+        CHECK it_output-kitnr IN s_matnr.
+      ENDIF.
+
+* Kit Description
+      SELECT SINGLE maktx
+        FROM makt
+        INTO it_output-kittx
+       WHERE matnr = it_output-kitnr
+         AND spras = 'E'.
+
+* Kit MRP Type & Kit Purchasing Group
+      SELECT SINGLE dismm ekgrp
+        FROM marc
+        INTO (it_output-kitmt,it_output-kitpg)
+       WHERE matnr = it_output-kitnr
+         AND werks = p_werks.
+
+      APPEND it_output.
+      CLEAR: it_output.
+    ENDIF.
+  ENDLOOP.
+
+
+*Get Component Number + Requirement Quantity(BDMNG)  + Qty. for avail.check(VMENG)
+  LOOP AT it_output.
+    MOVE-CORRESPONDING it_output TO it_output_alv.
+
+    CLEAR: lv_tabix.
+    lv_tabix = sy-tabix.
+
+    SELECT *
+      FROM resb
+      INTO TABLE it_resb
+     WHERE aufnr = it_output-aufnr
+       AND baugr = it_output-kitnr
+       AND werks = p_werks
+       AND matnr <> ''
+       AND bdmng <> 0.
+
+    LOOP AT it_resb.
+
+* Component Number
+      it_output_alv-comnr = it_resb-matnr.
+
+* Component Description
+      SELECT SINGLE maktx
+        FROM makt
+        INTO it_output_alv-comtx
+       WHERE matnr = it_output_alv-comnr
+         AND spras = 'E'.
+
+* Component MRP Type & Component Purchasing Group & Plant-Specific Material Status
+      SELECT SINGLE dismm ekgrp mmsta
+        FROM marc
+        INTO (it_output_alv-commt,it_output_alv-compg,it_output_alv-mmsta)
+       WHERE matnr = it_output_alv-comnr
+         AND werks = p_werks.
+
+* Stock
+      SELECT SINGLE labst
+        FROM mard
+        INTO it_output_alv-comstk
+       WHERE matnr = it_output_alv-comnr
+         AND werks = p_werks
+         AND lgort = '1000'.
+
+* Component Available Quantity
+      CLEAR: lv_base_qty.
+      lv_base_qty = it_resb-bdmng / it_output-prodq.
+      it_output_alv-comavl = it_resb-vmeng / lv_base_qty.
+
+      IF it_output_alv-comavl >= it_output_alv-prodq.
+      ELSE.
+        it_openpo-matnr = it_resb-matnr.
+        APPEND it_openpo.
+      ENDIF.
+
+      APPEND it_output_alv.
+    ENDLOOP.
+
+    CLEAR: it_output_alv.
+  ENDLOOP.
+
+  SORT it_openpo BY matnr.
+  DELETE ADJACENT DUPLICATES FROM it_openpo COMPARING matnr.
+
+
+* Get OpenPO and requested delivery date
+  LOOP AT it_openpo.
+    PERFORM frm_openpo.
+
+    READ TABLE i_purch_orders INTO wa_purch_orders INDEX 1.
+    IF sy-subrc = 0.
+      it_openpo-ebeln = wa_purch_orders-ebeln.
+      it_openpo-ebelp = wa_purch_orders-ebelp.
+      it_openpo-eindt = wa_purch_orders-eindt1.
+      MODIFY it_openpo.
+    ENDIF.
+  ENDLOOP.
+
+  SORT it_output_alv BY kitnr aufnr kitnr comavl.
+
+  LOOP AT it_output_alv.
+
+* Production Order Available
+    REFRESH it_output.
+    LOOP AT it_output_alv INTO wa_output WHERE aufnr = it_output_alv-aufnr.
+      APPEND wa_output TO it_output.
+      CLEAR wa_output.
+    ENDLOOP.
+
+    SORT it_output BY comavl.
+
+    READ TABLE it_output INTO wa_output INDEX 1.
+    IF sy-subrc = 0.
+      it_output_alv-proda = FLOOR( wa_output-comavl ).
+    ENDIF.
+
+* Kit Available Flag
+    IF it_output_alv-proda >= it_output_alv-prodq.
+      it_output_alv-kitavl = 'Y'.
+    ELSE.
+      it_output_alv-kitavl = 'N'.
+    ENDIF.
+
+* Open PO Date
+    READ TABLE it_openpo WITH KEY matnr = it_output_alv-comnr.
+    IF sy-subrc = 0.
+      it_output_alv-openpodate = it_openpo-eindt.
+    ENDIF.
+
+    MODIFY it_output_alv.
+  ENDLOOP.
+
+ENDFORM.                    " FRM_GET_MAINDATA
+*&---------------------------------------------------------------------*
+*&      Form  FRM_ALV_SHOW
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM frm_alv_show .
+
+  TYPE-POOLS: slis.
+  DATA: it_fieldcat TYPE slis_t_fieldcat_alv,
+        wa_layout   TYPE slis_layout_alv,
+        lv_variant  TYPE disvariant.
+
+
+  CALL FUNCTION 'REUSE_ALV_FIELDCATALOG_MERGE'
+    EXPORTING
+      i_program_name         = sy-repid
+      i_structure_name       = 'YRD_PP_ATP_SHORTAGE_RP_ALV'
+      i_inclname             = sy-repid
+    CHANGING
+      ct_fieldcat            = it_fieldcat
+    EXCEPTIONS
+      inconsistent_interface = 1
+      program_error          = 2
+      OTHERS                 = 3.
+  IF sy-subrc <> 0.
+*   message id sy-msgid type sy-msgty number sy-msgno
+*           with sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+
+*  wa_layout-box_fieldname = 'KITNR'.
+*  wa_layout-box_tabname = 'IT_OUTPUT_ALV'.
+  wa_layout-zebra = 'X'.
+  wa_layout-colwidth_optimize = 'X'.
+
+
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+    EXPORTING
+      i_callback_program = sy-repid
+      is_layout          = wa_layout
+      it_fieldcat        = it_fieldcat
+      i_save             = 'A'
+      is_variant         = lv_variant
+    TABLES
+      t_outtab           = it_output_alv
+    EXCEPTIONS
+      program_error      = 1
+      OTHERS             = 2.
+
+
+ENDFORM.                    " FRM_ALV_SHOW
+
+
+*&---------------------------------------------------------------------*
+*&      Form  FRM_OPENPO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_IT_OPENPO_MATNR  text
+*      -->P_P_WERKS  text
+*----------------------------------------------------------------------*
+FORM frm_openpo.
+
+  TYPES: BEGIN OF  t_ekes,
+         ebeln      TYPE ekes-ebeln,
+         ebelp      TYPE ekes-ebelp,
+         etens      TYPE ekes-etens,
+         ebtyp      TYPE ekes-ebtyp,
+         menge      TYPE ekes-menge,
+         erdat      TYPE ekes-erdat,
+         eindt      TYPE ekes-eindt,
+         END OF t_ekes.
+
+  DATA: it_ekes            TYPE TABLE OF  t_ekes.
+  DATA: i_ekes             TYPE  TABLE OF t_ekes.
+  DATA: wa_ekes            TYPE t_ekes.
+
+
+  TYPES: BEGIN OF  t_eket,
+         ebeln      TYPE eket-ebeln,
+         ebelp      TYPE eket-ebelp,
+         wemng      TYPE eket-wemng,
+         END OF t_eket.
+  TYPES: BEGIN OF  t_eket_2,
+         ebeln      TYPE eket-ebeln,
+         ebelp      TYPE eket-ebelp,
+         etenr      TYPE eket-etenr,
+         wemng      TYPE eket-wemng,
+         END OF t_eket_2.
+
+  DATA:  i_eket             TYPE  HASHED TABLE OF t_eket
+                             WITH  UNIQUE KEY ebeln ebelp.
+  DATA:  wa_eket             TYPE t_eket.
+  DATA:  wa_eket_2           TYPE t_eket_2.
+  DATA: it_eket             TYPE TABLE OF  t_eket_2.
+
+
+  TYPES: BEGIN OF  t_ekbe_invqty_aggr,
+         ebeln      TYPE ekbe-ebeln,
+         ebelp      TYPE ekbe-ebelp,
+         menge      TYPE ekbe-menge,
+         END OF t_ekbe_invqty_aggr.
+  TYPES: BEGIN OF  t_ekbe_invqty,
+         ebeln      TYPE ekbe-ebeln,
+         ebelp      TYPE ekbe-ebelp,
+         zekkn      LIKE ekbe-zekkn,
+         vgabe      LIKE ekbe-vgabe,
+         gjahr      LIKE ekbe-gjahr,
+         belnr      LIKE ekbe-belnr,
+         buzei      LIKE ekbe-buzei,
+         menge      TYPE ekbe-menge,
+         shkzg      TYPE ekbe-shkzg,
+         END OF t_ekbe_invqty.
+
+  DATA:  wa_ekbe_invqty_aggr TYPE  t_ekbe_invqty_aggr,
+         it_ekbe_invqty_aggr TYPE  HASHED TABLE OF t_ekbe_invqty_aggr
+                             WITH  UNIQUE KEY ebeln ebelp.
+  DATA:  wa_ekbe_invqty     TYPE t_ekbe_invqty.
+  DATA:  it_ekbe_invqty     TYPE TABLE OF  t_ekbe_invqty.
+
+  DATA:  qty LIKE wa_purch_orders-menge.
+
+  CLEAR: i_purch_orders,i_purch_orders[].
+
+  SELECT
+        ekko~ekorg  " PO Purch organisation
+        ekko~ekgrp  " PO Purch group
+        ekko~bsart  " PO doc type
+        ekko~aedat  " PO creation date
+        ekpo~ebeln  " PO num
+        ekpo~ebelp  " PO item  num
+        ekpo~matnr  " material
+        ekpo~werks  " plant
+        ekpo~lgort  " Storage Location
+        ekko~lifnr  " vendor number
+*        lfa1~name1  " Vendor Name
+        ekpo~afnam  " Name of Requisitioner/Requester
+        ekko~reswk  " supplying plant
+        ekpo~menge  " quantities
+        ekpo~meins  " unit of measure
+        ekpo~peinh  " price unit
+        ekpo~netpr  " net price
+        ekko~waers  " currency
+        ekpo~zztranspmode   " transportation mode
+        ekpo~zzconscode     " Consignee code
+        ekpo~zzurgcode      " Urgency code
+        ekpo~bednr
+        ekpo~infnr
+        ekpo~elikz
+        ekpo~erekz
+        ekko~ihrez
+        ekpo~zzvtweg
+        eket~eindt
+    INTO CORRESPONDING FIELDS OF TABLE i_purch_orders
+    FROM ekpo
+    INNER JOIN  ekko  ON ekpo~ebeln =  ekko~ebeln
+    INNER JOIN  eket  ON ekpo~ebeln =  eket~ebeln
+                    AND  ekpo~ebelp =  eket~ebelp
+*  JOIN lfa1 ON ekko~lifnr EQ lfa1~lifnr
+
+    WHERE ekpo~retpo    <>  'X'
+      AND ekko~ekorg     = 'CN06'
+      AND ekpo~werks     = p_werks
+      AND ekpo~matnr     = it_openpo-matnr
+      AND ekpo~loekz     EQ space
+      AND ( ekpo~elikz  NE 'X' OR ekpo~erekz NE 'X' )
+      AND eket~etenr = ( SELECT MAX( etenr )
+                           FROM eket
+                          WHERE ebeln = ekpo~ebeln
+                            AND ebelp = ekpo~ebelp ).
+*      AND eket~eindt =< sy-datum.
+
+
+  IF NOT i_purch_orders[] IS INITIAL.
+
+*  determine  Requested Delivery Date.
+    CLEAR: i_ekes,i_ekes[].
+    CLEAR: it_ekes,it_ekes[].
+    SELECT ebeln ebelp etens ebtyp menge erdat eindt
+      FROM ekes
+      INTO TABLE it_ekes
+      FOR ALL ENTRIES IN i_purch_orders
+     WHERE ebeln = i_purch_orders-ebeln
+       AND ebelp = i_purch_orders-ebelp
+       AND ebtyp = 'AB'.
+    IF sy-subrc EQ 0.
+      SORT it_ekes BY  ebeln  ebelp  etens DESCENDING.
+      DELETE ADJACENT DUPLICATES FROM it_ekes COMPARING ebeln ebelp.
+    ENDIF.
+
+    APPEND LINES OF it_ekes  TO i_ekes.
+    FREE it_ekes.
+
+* determine Last inbound delivery date
+    CLEAR: it_ekes,it_ekes[].
+    SELECT ebeln ebelp etens ebtyp menge erdat eindt
+      FROM ekes
+      INTO TABLE it_ekes
+      FOR ALL ENTRIES IN i_purch_orders
+     WHERE ebeln = i_purch_orders-ebeln
+       AND ebelp = i_purch_orders-ebelp
+       AND ebtyp = 'LA'.
+    IF sy-subrc EQ 0.
+      SORT it_ekes BY  ebeln  ebelp  erdat DESCENDING.
+      DELETE ADJACENT DUPLICATES FROM it_ekes COMPARING ebeln ebelp.
+    ENDIF.
+
+    APPEND LINES OF it_ekes  TO i_ekes.
+    FREE it_ekes.
+
+*  determine  received quantity
+    CLEAR: it_eket,it_eket[].
+
+    SELECT ebeln ebelp etenr wemng
+    FROM eket
+    INTO TABLE it_eket
+    FOR ALL ENTRIES IN i_purch_orders
+    WHERE ebeln = i_purch_orders-ebeln
+    AND  ebelp  = i_purch_orders-ebelp.
+
+    SORT it_eket BY ebeln  ebelp.
+
+    CLEAR: i_eket,i_eket[].
+    LOOP AT it_eket INTO wa_eket_2.
+      MOVE-CORRESPONDING wa_eket_2 TO wa_eket.
+      COLLECT wa_eket INTO i_eket.
+    ENDLOOP.
+    FREE it_eket.
+
+*  determine  Invoive quantity
+    CLEAR: it_ekbe_invqty,it_ekbe_invqty[].
+
+    SELECT ebeln ebelp zekkn vgabe gjahr belnr buzei menge shkzg
+    INTO TABLE it_ekbe_invqty
+     FROM ekbe
+    FOR ALL ENTRIES IN i_purch_orders
+    WHERE ebeln EQ i_purch_orders-ebeln
+      AND ebelp EQ i_purch_orders-ebelp
+      AND vgabe = '2'.       " invoice receipt
+
+    SORT  it_ekbe_invqty  BY  ebeln  ebelp.
+
+    CLEAR: it_ekbe_invqty_aggr,it_ekbe_invqty_aggr[].
+    LOOP AT  it_ekbe_invqty   INTO  wa_ekbe_invqty.
+      IF wa_ekbe_invqty-shkzg EQ 'H'.
+        wa_ekbe_invqty-menge =  wa_ekbe_invqty-menge * -1.
+      ENDIF.
+      MOVE-CORRESPONDING wa_ekbe_invqty TO wa_ekbe_invqty_aggr.
+      COLLECT wa_ekbe_invqty_aggr  INTO  it_ekbe_invqty_aggr.
+    ENDLOOP.
+    FREE it_ekbe_invqty.
+  ENDIF.
+
+
+
+
+  CLEAR wa_purch_orders.
+  LOOP AT i_purch_orders INTO wa_purch_orders.
+
+* Purchase order should not be shown if it is not open
+
+
+*   get received quantity.
+    CLEAR wa_eket.
+    READ TABLE i_eket WITH TABLE KEY ebeln = wa_purch_orders-ebeln
+                                     ebelp = wa_purch_orders-ebelp
+                      INTO wa_eket.
+
+
+*   get invoiced  quantity.
+    CLEAR wa_ekbe_invqty_aggr.
+    READ TABLE it_ekbe_invqty_aggr WITH TABLE KEY ebeln = wa_purch_orders-ebeln
+                                                  ebelp = wa_purch_orders-ebelp
+                                   INTO wa_ekbe_invqty_aggr.
+
+
+* Closed for GR point of view
+    IF ( wa_purch_orders-elikz EQ 'X'
+    OR wa_eket-wemng GE wa_purch_orders-menge )
+    AND ( wa_purch_orders-erekz EQ 'X'
+    OR wa_ekbe_invqty_aggr-menge GE wa_purch_orders-menge ).
+      DELETE TABLE i_purch_orders FROM wa_purch_orders.
+      CONTINUE.
+    ENDIF.
+
+    MOVE wa_eket-wemng TO wa_purch_orders-wemng.
+    MOVE wa_ekbe_invqty_aggr-menge TO wa_purch_orders-invqty.
+
+
+*   get requested delivery date
+    CLEAR wa_ekes.
+    READ TABLE i_ekes WITH KEY ebeln = wa_purch_orders-ebeln
+                               ebelp = wa_purch_orders-ebelp
+                               ebtyp = 'AB'
+                     INTO wa_ekes.
+*    MOVE wa_ekes-eindt     TO wa_purch_orders-eindt1.  "Madhu
+    IF sy-subrc EQ 0.
+      MOVE wa_ekes-eindt TO wa_purch_orders-eindt1.
+* Fill AB Creation date
+      MOVE wa_ekes-erdat TO wa_purch_orders-abcreationdate.
+    ENDIF.
+
+*   get last inbound delivery date
+    CLEAR wa_ekes.
+    READ TABLE i_ekes WITH KEY ebeln = wa_purch_orders-ebeln
+                               ebelp = wa_purch_orders-ebelp
+                               ebtyp = 'LA'
+                      INTO wa_ekes.
+    IF NOT wa_ekes-menge IS INITIAL.
+      MOVE wa_ekes-erdat TO wa_purch_orders-zeindt.
+    ENDIF.
+
+
+*   PO qty - GR qty >0
+    CLEAR: qty.
+    qty = wa_purch_orders-menge - wa_purch_orders-wemng.
+    IF qty > 0.
+      wa_purch_orders-openpo = qty.
+      MODIFY i_purch_orders FROM wa_purch_orders.
+    ELSE.
+      LOOP AT i_purch_orders WHERE bsart = wa_purch_orders-bsart
+                               AND aedat = wa_purch_orders-aedat
+                               AND ebeln = wa_purch_orders-ebeln
+                               AND ebelp = wa_purch_orders-ebelp.
+        DELETE i_purch_orders.
+      ENDLOOP.
+    ENDIF.
+
+    CLEAR wa_purch_orders.
+  ENDLOOP.
+
+  SORT i_purch_orders BY eindt1.
+
+  LOOP AT i_purch_orders WHERE eindt1 = '00000000'.
+    DELETE i_purch_orders.
+  ENDLOOP.
+
+ENDFORM.                    " FRM_OPENPO

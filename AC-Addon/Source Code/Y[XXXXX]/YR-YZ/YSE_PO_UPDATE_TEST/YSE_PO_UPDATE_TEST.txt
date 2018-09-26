@@ -1,0 +1,382 @@
+*&---------------------------------------------------------------------*
+* PROGRAM ID           : YSE_PO_UPDATE                                 *
+* PROGRAM TITLE        : AB Line batch update tool                     *
+* AUTHOR               : Anda Wu                                       *
+* DATE                 : 08/07/2015                                    *
+* DEVELOPMENT ID       : CD1K986165                                    *
+* CHANGE REQUEST NUMBER: CR3654                                        *
+* PROGRAM DESCRIPTION  :AB Line batch update tool                      *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME     |CORRECTION NUMBER| CHANGE REFERENCE # *
+*----------------------------------------------------------------------*
+REPORT  yse_po_update NO STANDARD PAGE HEADING
+                             LINE-SIZE 200.
+
+************************************************************************
+* TYPE POOLS  DECLARATIONS
+************************************************************************
+TYPE-POOLS : truxs.
+
+************************************************************************
+* TABLES DECLARATIONS
+************************************************************************
+TABLES : tvkwz.
+
+************************************************************************
+* TYPES DECLARATIONS
+************************************************************************
+TYPES: BEGIN OF ty_upload_abline,
+          ebeln TYPE char10,
+          ebelp TYPE char5,
+          matnr TYPE char18,
+          menge TYPE char20,
+          ihrez TYPE char12,
+          htext TYPE char200,
+          itext TYPE char200,
+          eeind TYPE char12,
+       END OF ty_upload_abline.
+
+TYPES: BEGIN OF yse_abline_upld_status,
+         matnr TYPE mvke-matnr,
+         vkorg TYPE mvke-vkorg,
+         vtweg TYPE mvke-vtweg,
+         message TYPE bapiret2-message,
+       END OF yse_abline_upld_status.
+
+************************************************************************
+* VARIABLES DECLARATIONS
+************************************************************************
+DATA : gv_number           TYPE tbtcjob-jobcount,
+       gv_jname            TYPE tbtcjob-jobname.
+
+************************************************************************
+* CONSTANTS DECLARATIONS
+************************************************************************
+CONSTANTS:  gc_x(1)         TYPE c VALUE 'X',
+            gc_max_line     TYPE i VALUE 10000.
+
+************************************************************************
+* INTERNAL TABLE DECLARATIONS
+************************************************************************
+DATA : i_tab_raw_data         TYPE  truxs_t_text_data,
+       gt_upload_abline          TYPE STANDARD TABLE OF ty_upload_abline,
+       gt_abline              TYPE STANDARD TABLE OF yse_abline_upld.
+
+************************************************************************
+* SELECTION SCREEN
+************************************************************************
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE text-002.
+PARAMETERS: p_file1  TYPE  rlgrap-filename OBLIGATORY MODIF ID one
+  DEFAULT 'C:\SAP\CR3654_AB_line.xls'.                      "#EC NOTEXT
+PARAMETERS: cb_back  AS CHECKBOX DEFAULT 'X'.
+SELECTION-SCREEN END OF BLOCK b1.
+
+************************************************************************
+* AT SELECTION SCREEN ON VALUE REQUEST FOR P_FILE1
+************************************************************************
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_file1.
+
+  CALL FUNCTION 'WS_FILENAME_GET'
+    EXPORTING
+      def_filename           = p_file1
+*   DEF_PATH               = P_FILE
+      mask                   = ',Excel Files *.XLS,*.xls.'(s01)
+      mode                   = 'O'
+      title                  = 'Please select the file for the Ac Connect'(s02)
+    IMPORTING
+      filename               = p_file1
+*   RC                     =
+    EXCEPTIONS
+      inv_winsys             = 01
+      no_batch               = 02
+      selection_cancel       = 03
+      selection_error        = 04
+      OTHERS                 = 05
+             .
+  IF sy-subrc <> 0.
+*   No authorisation to change data in sales org. / dist. channel
+    MESSAGE ID 'YSE_GENERAL' TYPE 'S' NUMBER '000' WITH text-022 DISPLAY LIKE 'E'.
+    EXPORT uname FROM space TO MEMORY ID 'AB_LINE_USERNAME'.
+    exit.
+  ENDIF.
+
+************************************************************************
+* INITIALIZATION.
+************************************************************************
+INITIALIZATION.
+* Do initialization
+  PERFORM do_init.
+
+************************************************************************
+* START-OF-SELECTION
+************************************************************************
+START-OF-SELECTION.
+
+* Check if the database table has records in it
+  PERFORM check_prodatt.
+
+* Upload the Material file into internal table.
+  PERFORM upload_files.
+
+* Optimize and sort the file uploaded and insert it in database table
+  PERFORM optimize_files.
+
+***********************************************************************
+*END-OF-SELECTION.
+***********************************************************************
+END-OF-SELECTION.
+  PERFORM run_update.
+* Clear the contents of the database table and insert these new records
+*  DELETE FROM yse_abline_upld.
+*  SET PARAMETER ID 'YSE_ABLINE_UNAME' FIELD space.
+
+*&---------------------------------------------------------------------*
+*&      Form  UPLOAD_FILES
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM upload_files .
+* Display the progress to the user in the status bar.
+  IF sy-batch <> gc_x.
+    CALL FUNCTION 'SAPGUI_PROGRESS_INDICATOR'
+      EXPORTING
+        percentage = '25'
+        text       = text-011.
+  ENDIF.
+
+* Upload the Material data from the excel file
+  CALL FUNCTION 'TEXT_CONVERT_XLS_TO_SAP'
+     EXPORTING
+* I_FIELD_SEPERATOR          =
+* I_LINE_HEADER              =
+       i_tab_raw_data             = i_tab_raw_data
+       i_filename                 = p_file1
+     TABLES
+       i_tab_converted_data       = gt_upload_abline
+   EXCEPTIONS
+    conversion_failed          = 1
+    OTHERS                     = 2
+             .
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+           WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+* Check if the uploaded files have data in them.
+  IF gt_upload_abline[] IS INITIAL.
+    MESSAGE text-005 TYPE 'E'.
+  ENDIF.
+
+  DATA: lv_lines TYPE i.
+  DESCRIBE TABLE gt_upload_abline LINES lv_lines.
+  IF lv_lines > gc_max_line.
+    MESSAGE s000(yse_general)
+      WITH text-030 gc_max_line text-031
+      DISPLAY LIKE 'E'.
+    LEAVE LIST-PROCESSING.
+  ENDIF.
+
+ENDFORM.                    " UPLOAD_FILE
+
+*&---------------------------------------------------------------------*
+*&      Form  OPTIMIZE_FILES
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM optimize_files .
+  DATA: ls_upload_acc   TYPE ty_upload_abline,
+        lv_tabix        TYPE char6,
+        ls_abline       TYPE yse_abline_upld.
+* Display the progress to the user in the status bar.
+  IF sy-batch <> gc_x.
+    CALL FUNCTION 'SAPGUI_PROGRESS_INDICATOR'
+      EXPORTING
+        percentage = '25'
+        text       = text-012.
+  ENDIF.
+  DELETE gt_upload_abline INDEX 1.
+* Sort the Materials and delete the duplicates from them.
+  SORT gt_upload_abline.
+*  DELETE ADJACENT DUPLICATES FROM gt_upload_abline COMPARING ebeln ebelp matnr.
+
+* Move the uploaded data into the final internal table
+  LOOP AT gt_upload_abline INTO ls_upload_acc.
+    lv_tabix = sy-tabix.
+    ls_abline-SEQNO = sy-tabix.
+    ls_abline-mandt = sy-mandt.
+    ls_abline-ebeln = ls_upload_acc-ebeln.
+    ls_abline-ebelp = ls_upload_acc-ebelp.
+*    CONCATENATE ls_upload_acc-matnr  lv_tabix INTO ls_abline-matnr.
+    ls_abline-matnr = ls_upload_acc-matnr.
+    ls_abline-menge = ls_upload_acc-menge.
+    ls_abline-ihrez = ls_upload_acc-ihrez.
+    ls_abline-htext = ls_upload_acc-htext.
+    ls_abline-itext = ls_upload_acc-itext.
+    WRITE ls_upload_acc-eeind to ls_abline-eeind.
+    APPEND ls_abline TO gt_abline.
+    CLEAR: ls_abline.
+  ENDLOOP.
+
+* Clear the contents of the database table and insert these new records
+  DELETE FROM yse_abline_upld.
+
+  IF NOT gt_abline[] IS INITIAL.
+    INSERT yse_abline_upld FROM TABLE gt_abline.
+    IF sy-subrc <> 0.
+      MESSAGE s000(yse_sales_log) WITH text-014
+        DISPLAY LIKE 'E'.
+      LEAVE LIST-PROCESSING.
+    ENDIF.
+  ELSE.
+    MESSAGE s000(yse_sales_log) WITH text-015
+      DISPLAY LIKE 'E'.
+    LEAVE LIST-PROCESSING.
+  ENDIF.
+
+ENDFORM.                    " OPTIMIZE_FILES
+
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_TABLES
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM check_prodatt .
+* Select the product attribute data into the internal table
+  SELECT COUNT(*) FROM yse_abline_upld.
+*   If both product Attributes table is empty, don't proceed further.
+  IF sy-subrc = 0.
+    PERFORM check_confirm.
+  ENDIF.
+
+ENDFORM.                    " CHECK_TABLES
+
+*&---------------------------------------------------------------------*
+*&      Form  DO_INIT
+*&---------------------------------------------------------------------*
+*       Do initialization
+*----------------------------------------------------------------------*
+FORM do_init .
+
+  CLEAR:
+    gv_number          ,
+    gv_jname           .
+
+  REFRESH:
+    i_tab_raw_data     ,
+    gt_upload_abline   ,
+    gt_abline  .
+
+*  gv_date_restrict = gc_x.
+
+ENDFORM.                    " DO_INIT
+*&---------------------------------------------------------------------*
+*&      Form  RUN_UPDATE
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM run_update .
+
+  DATA: gv_text TYPE char100,
+        ls_abline_upld TYPE yse_abline_upld,
+        LT_EDIDC TYPE STANDARD TABLE OF EDIDC,
+        ls_EDIDC TYPE  EDIDC,
+        LT_EDIDD  TYPE STANDARD TABLE OF EDIDD,
+        LT_BDIDOCSTAT TYPE STANDARD TABLE OF BDIDOCSTAT,
+        LT_BDWFRETVAR TYPE STANDARD TABLE OF BDWFRETVAR,
+        LT_BDI_SER  TYPE STANDARD TABLE OF BDI_SER,
+        lt_abline_upld TYPE STANDARD TABLE OF yse_abline_upld.
+
+  SELECT * FROM yse_abline_upld
+    INTO TABLE lt_abline_upld.
+  LOOP AT lt_abline_upld INTO ls_abline_upld.
+    CALL FUNCTION 'IDOC_INPUT_DESADV1'
+      EXPORTING
+        input_method                = 'X'
+        mass_processing             = 'X'
+*     IMPORTING
+*       WORKFLOW_RESULT             =
+*       APPLICATION_VARIABLE        =
+*       IN_UPDATE_TASK              =
+*       CALL_TRANSACTION_DONE       =
+      tables
+        idoc_contrl                 = LT_EDIDC
+        idoc_data                   = LT_EDIDD
+        idoc_status                 = LT_BDIDOCSTAT
+        return_variables            = LT_BDWFRETVAR
+        serialization_info          = LT_BDI_SER
+      EXCEPTIONS
+        WRONG_FUNCTION_CALLED       = 1
+        OTHERS                      = 2
+              .
+    IF sy-subrc <> 0.
+* MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*         WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+    ENDIF.
+
+  ENDLOOP.
+
+ENDFORM.                    " RUN_UPDATE
+
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_CONFIRM
+*&---------------------------------------------------------------------*
+*       confirmation check
+*----------------------------------------------------------------------*
+FORM check_confirm .
+  DATA: ls_question TYPE string,
+        lv_answer   TYPE char1.
+  ls_question = text-016.
+  CALL FUNCTION 'POPUP_TO_CONFIRM'
+    EXPORTING
+      titlebar       = text-004
+      text_question  = ls_question
+    IMPORTING
+      answer         = lv_answer
+    EXCEPTIONS
+      text_not_found = 1
+      OTHERS         = 2.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+  IF lv_answer <> '1'.
+    EXPORT uname FROM space TO MEMORY ID 'AB_LINE_USERNAME'.
+    MESSAGE s000(yse_sales_log) WITH text-004
+      DISPLAY LIKE 'E'.
+    LEAVE LIST-PROCESSING.
+  ELSE.
+    DELETE FROM yse_abline_upld.
+  ENDIF.
+
+ENDFORM.                    " CHECK_CONFIRM
+
+*Text symbol text£º
+*002:File Selections
+*004:Continue or not
+*005:The file is empty. Please check the file and upload again.
+*011:Uploading file...
+*012:Optimizing the uploaded files
+*014: Data upload failed for PO AB line table
+*015: Data not uploaded for PO AB line table
+*016:Some one running this program, do you want continue?
+*020:Batch job & has been started...
+*022:Please check the file
+*030:Maxium line
+*031:is allowed to upload!!!
+*S01:,Excel Files *.XLS,*.xls.
+
+*S02:Please select the file for the Ac Connect
+*Selection text£º
+*CB_BACK:        Run in background
+*P_FILE1:        Filename

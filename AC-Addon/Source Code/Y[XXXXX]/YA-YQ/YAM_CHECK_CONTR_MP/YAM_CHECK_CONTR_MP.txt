@@ -1,0 +1,260 @@
+*----------------------------------------------------------------------*
+* PROGRAM ID           : YAM_CHECK_CONTR_MP                            *
+* PROGRAM TITLE        : AM: Check if contracts have active Maint.plan *
+* AUTHOR               : Marc Jacobs                                   *
+* DATE                 : 19/06/2007                                    *
+*                                                                      *
+* CHANGE REQUEST NUMBER: CD1K916503                                    *
+*                                                                      *
+*  Overview of contracts and their corresponding maintenance plans     *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME     |CORRECTION NUMBER| CHANGE REFERENCE # *
+*----------------------------------------------------------------------*
+* mod-001 | 19/01/09 | J. Smets | CD1K945736      | CR-0499                                                                     *
+************************************************************************
+
+REPORT  yam_check_contr_mp MESSAGE-ID yam_re.
+
+*.................. Tables definitions................................ *
+TABLES: mpos,
+        vbak,
+        tvko,
+        jest.
+
+*** mod-001 * begin ***
+TABLES: tvak,
+        tj30t.
+*** mod-001 * end ***
+
+*.................. Variable definitions.............................. *
+TYPE-POOLS: slis.
+
+TYPES: BEGIN OF ty_cont.
+        INCLUDE STRUCTURE yam_cr342_contr_mp.
+TYPES:  kunnr TYPE kunnr,
+       END   OF ty_cont.
+
+*.. Global variables
+
+DATA: gt_cont     TYPE STANDARD TABLE OF ty_cont WITH HEADER LINE.
+
+DATA : BEGIN OF it_contracts OCCURS 0,
+       vbeln LIKE vbap-vbeln,
+       posnr LIKE vbap-posnr,
+       arktx LIKE vbap-arktx.
+DATA:   END   OF it_contracts.
+
+DATA : BEGIN OF it_equipments OCCURS 0,
+       equnr LIKE v_equi-equnr.
+DATA:   END   OF it_equipments.
+
+DATA : BEGIN OF it_mplans OCCURS 0,
+       warpl LIKE mpos-warpl.
+DATA:   END   OF it_mplans.
+
+DATA : gv_msg       TYPE c,
+       gv_answer    TYPE c,
+       gv_venddat   LIKE sy-datum,
+       gv_handle    TYPE balloghndl,
+       gv_objnr     LIKE jest-objnr,      "object number
+       gv_aufnr     LIKE viqmel-aufnr,    "order number
+       gv_qmnum     LIKE mhio-qmnum.      "notifi nr
+
+DATA: gt_errmsg  TYPE TABLE OF bdcmsgcoll,
+      wa_errmsg  LIKE LINE OF gt_errmsg.
+DATA: wa_viser02 TYPE viser02.
+DATA: i_bapiret2             TYPE STANDARD TABLE OF bapiret2.
+
+DATA: wa_notsti                    TYPE bapi2080_notsti,
+      wa_systatus                  TYPE bapi2080_notadt-systatus,
+      wa_usrstatus                 TYPE bapi2080_notadt-usrstatus.
+
+DATA: lt_fieldcat TYPE slis_t_fieldcat_alv.
+
+DATA:   BEGIN OF stat_tab OCCURS 0.    " Internal status setting table
+        INCLUDE STRUCTURE jstat.                            "
+DATA:   END   OF stat_tab.
+DATA:   g_lines   LIKE sy-tabix,
+        g_vbtyp   LIKE vbak-vbtyp.
+DATA    point_int LIKE imptt-point.
+RANGES  point     FOR  point_int.
+DATA:   tcode     LIKE sy-tcode           VALUE 'IP16'.
+*.. Global constants
+CONSTANTS: gc_charx     TYPE c            VALUE 'X',
+           gc_blank(3)  TYPE c            VALUE '   ',
+           gc_ag        TYPE parvw        VALUE 'AG',
+           gc_we        TYPE parvw        VALUE 'WE',
+           c_ok(50)     TYPE c            VALUE 'OK',
+           c_no_mplans(50) TYPE c         VALUE
+           'No active maint.plan for this contract item',
+           c_more_mplans(50) TYPE c         VALUE
+           'More then 1 active maintenance plan ',
+           c_equipment(10) TYPE c         VALUE 'EQUIPMENT',
+           c99991231    LIKE sy-datum     VALUE '99991231',
+           f_aktyp(2)   TYPE c            VALUE '02',  "change
+           c_015        LIKE imptt-psort  VALUE '015',
+           c_i0076      LIKE jest-stat    VALUE 'I0076', "stat deleted
+           c_i0320      LIKE jest-stat    VALUE 'I0320'. "stat inact
+
+
+*.................. Layout selection screen........................... *
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE text-b01.
+PARAMETERS:
+  p_vkorg LIKE a304-vkorg OBLIGATORY,     " sales org
+  p_vtweg TYPE vtweg DEFAULT '11' OBLIGATORY ,
+  p_spart TYPE spart DEFAULT '01' OBLIGATORY .
+SELECT-OPTIONS:
+  s_equnr FOR mpos-equnr MATCHCODE OBJECT equi,
+  s_vbeln FOR vbak-vbeln.
+SELECTION-SCREEN END   OF BLOCK b1.
+
+*.................. Selection screen validations...................... *
+*check plant
+AT SELECTION-SCREEN ON p_vkorg.
+  SELECT SINGLE * FROM tvko WHERE vkorg = p_vkorg.
+  IF sy-subrc <> 0.
+    MESSAGE e001(00) WITH text-e03.
+  ENDIF.
+* authority check
+  AUTHORITY-CHECK OBJECT 'V_VBAK_VKO'
+         ID 'VKORG' FIELD p_vkorg
+         ID 'VTWEG' FIELD p_vtweg
+         ID 'SPART' FIELD p_spart
+         ID 'ACTVT' FIELD f_aktyp.
+  IF sy-subrc <> 0.
+    MESSAGE e001(00) WITH text-e02 p_vkorg.
+  ENDIF.
+*...................Transaction counter...............................*
+
+  CALL METHOD ycl_statistics=>record_transaction
+    .
+*.................. Include programs.................................. *
+  INCLUDE yam_check_contr_mp_f01.
+
+  INCLUDE yam_check_contr_mp_f02.
+
+  INCLUDE yam_check_contr_mp_f03.
+
+*.................. Main program...................................... *
+INITIALIZATION.
+**.. Prepare field catalog
+  PERFORM build_field_catlog CHANGING lt_fieldcat.
+
+START-OF-SELECTION.
+
+*.. Select the relevant maintenance plans
+  PERFORM select_cont_mplans.
+
+  IF sy-batch NE space.
+    PERFORM send2spool.
+  ELSE.
+*.. Output the ALV list with selected maintenance plans
+    PERFORM output_list_cont_mplans.
+  ENDIF.
+
+
+*&---------------------------------------------------------------------*
+*&      Form  SEND2SPOOL
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM send2spool .
+
+  DATA:
+  it_out  TYPE yse_sd_kp04_output OCCURS 0 WITH HEADER LINE." Output structure for report
+
+  DATA:
+      fnam             LIKE rlgrap-filename,
+      it_dd03l         LIKE dd03l OCCURS 0 WITH HEADER LINE,
+      it_dd04t         LIKE dd04t OCCURS 0 WITH HEADER LINE,
+      it_outxls(4096)  TYPE c OCCURS 0,
+      wa_outxls(4096)  TYPE c.
+
+  CONSTANTS:
+    c_tab TYPE c VALUE cl_abap_char_utilities=>horizontal_tab.
+
+** Get fields of structure 'YSE_STOCK_OVERVIEW_ITEM'
+*  SELECT *
+*         FROM DD03L
+*         INTO TABLE IT_DD03L
+*        WHERE TABNAME = 'YSE_SD_KP04_OUTPUT'.
+*
+** Get the descriptions of the fields in the structure
+*  SELECT *
+*         FROM DD04T
+*         INTO TABLE IT_DD04T
+*          FOR ALL ENTRIES IN IT_DD03L
+*        WHERE ROLLNAME EQ IT_DD03L-ROLLNAME
+*          AND DDLANGUAGE EQ 'EN'.
+
+* Build filename
+  CONCATENATE '/var/load/' sy-sysid '/' "   '/UK/original/YSE_OPENORDERS_'
+              sy-uname '_' sy-datum '_' sy-uzeit '.TXT'
+         INTO fnam.
+
+* Make the output table ; delimited
+  CALL FUNCTION 'SAP_CONVERT_TO_CSV_FORMAT'
+    TABLES
+      i_tab_sap_data       = gt_cont  "IT_OUT
+    CHANGING
+      i_tab_converted_data = it_outxls
+    EXCEPTIONS
+      conversion_failed    = 1
+      OTHERS               = 2.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+* Open file
+  OPEN DATASET fnam FOR OUTPUT IN TEXT MODE ENCODING DEFAULT.
+  IF sy-subrc <> 0.
+    WRITE 'Error opening file. Action aborted.'(026).
+    EXIT.
+  ENDIF.
+
+* Write header line
+  CLEAR wa_outxls.
+*  SORT IT_DD03L BY POSITION.
+*  LOOP AT IT_DD03L.
+*    READ TABLE IT_DD04T WITH KEY ROLLNAME = IT_DD03L-ROLLNAME.
+*    IF WA_OUTXLS IS INITIAL.
+*      WA_OUTXLS = IT_DD04T-REPTEXT.
+*    ELSE.
+*      CONCATENATE WA_OUTXLS C_TAB IT_DD04T-REPTEXT INTO WA_OUTXLS.
+*    ENDIF.
+*  ENDLOOP.
+*  TRANSFER WA_OUTXLS TO FNAM.
+
+* Process lines
+  LOOP AT it_outxls INTO wa_outxls.
+    REPLACE ALL OCCURRENCES OF ';' IN wa_outxls WITH c_tab.
+    TRANSFER wa_outxls TO fnam.
+  ENDLOOP.
+
+  CLOSE DATASET fnam.
+
+  WRITE: 'Report output written to file:'(027),
+         fnam.
+
+ENDFORM.                                                    "SEND2SPOOL
+
+*Text symbol text£º
+*B01:Selection Screen Input
+*E02:You are not authorized for sales organisation:
+*E03:Invalid sales organisation
+*H00:Contracts - Maintenance Plans
+*H01:Selected Sales Org  :
+*H02:Selected Equipments:
+*H03:Selected Contracts    :
+*I01:Transaction is not counted
+
+*I02:No records in ZTRANS_CONFIG table.
+*Selection text£º
+*P_SPART:        Division
+*P_VKORG:        Sales organization
+*P_VTWEG:        Distribution Channel
+*S_EQUNR:        Equipment number from
+*S_VBELN:        Contract number from

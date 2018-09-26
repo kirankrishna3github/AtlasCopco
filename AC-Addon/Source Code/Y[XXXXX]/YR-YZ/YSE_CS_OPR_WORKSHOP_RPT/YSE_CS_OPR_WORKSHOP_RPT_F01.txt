@@ -1,0 +1,2600 @@
+
+*----------------------------------------------------------------------*
+***INCLUDE YSE_CS_OPR_WORKSHOP_RPT_SELF01 .
+*----------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  select_data
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM select_data .
+
+  DATA: dummy TYPE x.
+  DATA: BEGIN OF lt_tidnr OCCURS 0,
+          equnr TYPE equnr,
+          tidnr TYPE tidnr,
+        END OF lt_tidnr.
+
+  FIELD-SYMBOLS: <fs_tidnr> LIKE LINE OF lt_tidnr.
+
+  DATA: lt_tmp TYPE STANDARD TABLE OF ty_main.
+
+  FIELD-SYMBOLS: <fs_tmp> TYPE ty_main.
+
+*Empty the entire table
+  CLEAR gt_main[].
+
+**First select service order main data
+  SELECT * FROM viaufkst
+    INTO CORRESPONDING FIELDS OF TABLE gt_main
+    WHERE aufnr IN so_aufnr
+      AND idat2 IN so_date
+      AND equnr IN so_equnr
+      AND kunum IN so_kunnr.
+
+  IF sy-subrc NE 0.
+    MESSAGE s000.
+    gv_subrc = 4.
+    EXIT.
+  ENDIF.
+
+*-----------------------------------------------
+  CLEAR lt_tidnr[].
+*Next filter out the customer reference TIDNR
+  SELECT equnr tidnr FROM equz
+    INTO TABLE lt_tidnr
+    FOR ALL ENTRIES IN gt_main
+    WHERE equnr EQ gt_main-equnr
+    AND tidnr IN so_tidnr
+    AND datbi > sy-datum.        "current active
+
+
+
+  SORT gt_main BY equnr.
+  SORT lt_tidnr BY equnr.
+***************************************************************************
+* Select Construction type material of the object and Description of technical object
+**********************
+  SELECT a~equnr a~submt b~eqktx
+  FROM equz AS a
+    INNER JOIN eqkt AS b
+    ON a~equnr = b~equnr
+    INTO TABLE itt_equz
+    FOR ALL ENTRIES IN gt_main
+    WHERE a~equnr EQ gt_main-equnr.
+
+*Loop over found trdir and delete the non found from main int table or update main int table with found details
+  LOOP AT gt_main ASSIGNING <fs_main>.
+    AT NEW equnr.                                         "perform per equnr
+      READ TABLE lt_tidnr
+        WITH KEY equnr = <fs_main>-equnr
+        BINARY SEARCH
+        ASSIGNING <fs_tidnr>.
+      IF sy-subrc NE 0.                                    "if equnr not found in tidnr int table, delete from main int table
+        DELETE gt_main WHERE equnr EQ <fs_main>-equnr.
+        CONTINUE.
+      ELSE.                                                "update the main int table with found cust ref no
+        MOVE: <fs_tidnr>-equnr TO <fs_main>-equnr,
+              <fs_tidnr>-tidnr TO <fs_main>-tidnr.
+        MODIFY gt_main FROM <fs_main> TRANSPORTING tidnr    "Update all main table entries for current equnr with found customer ref
+          WHERE equnr = <fs_main>-equnr.
+        MOVE <fs_main>-equnr TO gs_equi_used-equnr.
+        APPEND gs_equi_used TO gt_equi_used.
+      ENDIF.
+    ENDAT.
+  ENDLOOP.
+
+
+*Check if any service orders left
+  IF gt_main[] IS INITIAL.
+    MESSAGE s000.
+    gv_subrc = 4.
+    EXIT.
+  ENDIF.
+
+
+*Select confirmation data
+  DATA: BEGIN OF lt_aufnr OCCURS 0,
+          aufnr TYPE aufnr,
+        END OF lt_aufnr.
+
+**First select all relevant service order numbers taking into account the plant and workcenter from the confirmations
+
+  SELECT afru~aufnr
+      FROM afru
+      INNER JOIN crhd
+    ON afru~arbid = crhd~objid
+    AND crhd~objty = 'A'
+    INTO TABLE lt_aufnr
+    FOR ALL ENTRIES IN gt_main
+    WHERE afru~aufnr EQ gt_main-aufnr
+    AND afru~werks IN so_werks
+    AND crhd~arbpl IN so_arbpl.
+
+
+*Check if any service orders left
+  IF sy-subrc ne 0.
+    MESSAGE S000.
+    GV_SUBRC = 4.
+    EXIT.
+  ENDIF.
+
+***Now select all confirmations only for the found service orders, irrelevant what their workcenter is
+***eg. if one confirmation has been found for a certain workcenter, we need to show all confirmations of that service order
+
+  SELECT afru~aufnr afru~arbid afru~werks afru~ismnw afru~ismne
+    crhd~arbpl
+* begin of insert MOD-001
+    afru~learr afru~grund afru~rueck afru~rmzhl afru~stzhl
+* end of insert MOD-001
+      FROM afru
+      INNER JOIN crhd
+    ON afru~arbid = crhd~objid
+    AND crhd~objty = 'A'
+    INTO TABLE gt_afru
+    FOR ALL ENTRIES IN lt_aufnr
+    WHERE afru~aufnr EQ lt_aufnr-aufnr AND
+          afru~werks IN so_werks.
+
+
+*Loop at found confirmations and filter out the not found or update found ones
+  DATA: lv_total_actual TYPE ismnw.
+
+*Empty the temporary table
+  CLEAR lt_tmp[].
+
+* begin of change MOD-001
+* SORT gt_afru BY aufnr arbpl.
+  SORT gt_afru BY aufnr arbpl learr grund.
+* end of change MOD-001
+  SORT gt_main BY aufnr.
+  LOOP AT gt_main ASSIGNING <fs_main>.
+    READ TABLE gt_afru WITH
+      KEY aufnr = <fs_main>-aufnr
+      BINARY SEARCH
+      ASSIGNING <fs_afru>.
+    IF sy-subrc NE 0.                                  "No service order conf found for current main service order with select options so delete
+      DELETE gt_main WHERE aufnr EQ <fs_main>-aufnr.
+      CONTINUE.
+    ELSE.                                              "Update current main service order with confirmed workcenter and plant
+      CLEAR lv_total_actual.
+      LOOP AT gt_afru ASSIGNING <fs_afru>
+        WHERE aufnr EQ <fs_main>-aufnr.
+* begin of change MOD-001
+*       IF <fs_main>-arbpl <> <fs_afru>-arbpl.
+        IF <fs_main>-arbpl <> <fs_afru>-arbpl or
+           <fs_main>-learr <> <fs_afru>-learr or
+           <fs_main>-grund <> <fs_afru>-grund.
+* end of change MOD-001
+          IF NOT <fs_main>-arbpl IS INITIAL.
+            APPEND <fs_main> TO lt_tmp.
+            CLEAR <fs_main>-ismnw.
+          ENDIF.
+
+          MOVE: <fs_afru>-werks TO <fs_main>-werks,
+                <fs_afru>-arbpl TO <fs_main>-arbpl,
+                <fs_afru>-arbid TO <fs_main>-arbid.
+* begin of insert MOD-001
+          move: <fs_afru>-learr to <fs_main>-learr,
+                <fs_afru>-grund to <fs_main>-grund.
+* end of insert MOD-001
+        ENDIF.
+        IF <fs_afru>-ismne = 'STD'.
+          if not <fs_afru>-stzhl is initial.
+            <fs_afru>-ismnw = <fs_afru>-ismnw * -1.
+          endif.
+          ADD <fs_afru>-ismnw TO <fs_main>-ismnw.
+        ENDIF.
+*          add <fs_afru>-ismnw to lv_total_actual.
+      ENDLOOP.
+      APPEND <fs_main> TO lt_tmp.
+      CLEAR <fs_main>-ismnw.
+*      loop at lt_tmp assigning <fs_tmp>
+*        where aufnr eq <fs_main>-aufnr.
+*          move lv_total_actual to <fs_tmp>-total_ismnw.
+*      endloop.
+    ENDIF.
+  ENDLOOP.
+
+
+
+  CLEAR gt_main[].
+  MOVE lt_tmp[] TO gt_main[].
+
+*If service variant report, take into account gac/pgc
+  DATA: BEGIN OF lt_mat OCCURS 0,
+          matnr TYPE matnr,
+          prdha TYPE prodh_d,
+        END OF lt_mat.
+
+  FIELD-SYMBOLS: <fs_mat> LIKE LINE OF lt_mat.
+
+
+
+  IF NOT p_ser_vr IS INITIAL.
+*   if not p_gac_pg is initial.
+    IF NOT r_prdha IS INITIAL.
+*Concatenate GAC and PGC into selection string for prod. hier.
+*      replace all occurrences of '*' in p_gac_pg with '%'.
+*      CONCATENATE '%' p_gac_pg '%' INTO gv_prdha.
+
+      SELECT matnr prdha
+        FROM mara
+        INTO TABLE lt_mat
+        FOR ALL ENTRIES IN gt_main
+        WHERE matnr = gt_main-sermat
+*        and prdha like gv_prdha.
+         AND prdha IN r_prdha.
+
+
+      SORT gt_main BY matnr.
+      LOOP AT gt_main ASSIGNING <fs_main>.
+        READ TABLE lt_mat
+          ASSIGNING <fs_mat>
+          WITH KEY matnr = <fs_main>-sermat.
+        IF sy-subrc NE 0.
+          DELETE gt_main WHERE sermat = <fs_main>-sermat.
+        ENDIF.
+      ENDLOOP.
+
+    ENDIF.
+  ENDIF.
+*Check if any service orders left
+  IF gt_main[] IS INITIAL.
+    MESSAGE s000.
+    gv_subrc = 4.
+    EXIT.
+  ENDIF.
+
+*????? beneath code???
+*select service order details for the failure report
+*  SELECT AUFNR IDAT2 FROM AUFK
+*    INTO CORRESPONDING FIELDS OF TABLE LT_AUFK
+*    WHERE AUFNR IN SO_AUFNR
+*    AND IDAT2 IN SO_DATE.
+*
+*  IF SY-SUBRC NE 0.
+*    MESSAGE S000.
+*    GV_SUBRC = 4.
+*    EXIT.
+*  ENDIF.
+
+
+ENDFORM.                    " select_data
+*&---------------------------------------------------------------------*
+*&      Form  create_fieldcat
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM create_fieldcat .
+  CASE gc_mark.
+    WHEN p_rep_st.
+      CLEAR lt_fieldcat[].
+      PERFORM rep_stat_field_cat.
+    WHEN p_ser_vr.
+      CLEAR lt_fieldcat[].
+      PERFORM serv_var_field_cat.
+    WHEN p_perf.
+      CASE gc_mark.
+        WHEN p_tech.
+          CLEAR lt_fieldcat[].
+          PERFORM tech_perf_field_cat.
+        WHEN p_rep.
+          CLEAR lt_fieldcat[].
+          PERFORM rep_perf_field_cat.
+      ENDCASE.
+    WHEN p_fail.
+      CLEAR lt_fieldcat[].
+      PERFORM rep_fail_field_cat.
+
+  ENDCASE.
+
+
+
+ENDFORM.                    " create_fieldcat
+*&---------------------------------------------------------------------*
+*&      Form  set_sort_parm
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM set_sort_parm .
+  IF NOT p_perf IS INITIAL AND p_rep IS INITIAL.
+*  IF NOT p_perf IS INITIAL.
+    ls_sort-spos = '1' .
+    ls_sort-fieldname = 'ARBPL' .
+    ls_sort-up = 'X' .
+    ls_sort-down = space .
+    ls_sort-group = 'UL' .
+    APPEND ls_sort TO lt_sort.
+  ELSE.
+    ls_sort-spos = '1' .
+    ls_sort-fieldname = 'AUFNR' .
+    ls_sort-up = 'X' .
+    ls_sort-down = space .
+    ls_sort-group = 'UL' .
+    APPEND ls_sort TO lt_sort.
+  ENDIF.
+
+ENDFORM.                    " set_sort_parm
+*&---------------------------------------------------------------------*
+*&      Form  rep_stat_field_cat
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM rep_stat_field_cat .
+
+  REFRESH lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'AUFNR'.
+  ls_fieldcat-outputlen = 18.
+  ls_fieldcat-coltext = 'Service order'(010).
+  ls_fieldcat-no_zero = 'X'.
+  ls_fieldcat-fix_column = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+  ls_fieldcat-hotspot = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+*
+*
+*
+*
+*
+*  CLEAR ls_fieldcat.
+*  ls_fieldcat-fieldname = 'MSEH_DIST'.
+*  ls_fieldcat-outputlen = 6.
+*  ls_fieldcat-coltext = 'Distance unit'(029).
+**  LS_FIELDCAT-FIX_COLUMN = 'X'.
+**  LS_FIELDCAT-EMPHASIZE = 'X'.
+*
+*  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'IDAT1'.
+  ls_fieldcat-outputlen = 10.
+  ls_fieldcat-coltext = 'Rel. date'(011).
+* LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'IDAT2'.
+  ls_fieldcat-outputlen = 10.
+  ls_fieldcat-coltext = 'TECO date'(012).
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'ERDAT_QM'.
+  ls_fieldcat-outputlen = 10.
+  ls_fieldcat-coltext = 'Creation date Notif.'(013).
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'WADAT_IST'.
+  ls_fieldcat-outputlen = 10.
+  ls_fieldcat-coltext = 'GI date'(020).
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'FKDAT'.
+  ls_fieldcat-outputlen = 10.
+  ls_fieldcat-coltext = 'Invoice date'(021).
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'KUNUM'.
+  ls_fieldcat-outputlen = 11.
+  ls_fieldcat-coltext = 'Customer'(014).
+  ls_fieldcat-no_zero = 'X'.
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'CUST_NAME'.
+  ls_fieldcat-outputlen = 18.
+  ls_fieldcat-coltext = 'Customer name'(032).
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'END'.
+  ls_fieldcat-outputlen = 12.
+  ls_fieldcat-coltext = 'End customer'(015).
+  ls_fieldcat-no_zero = 'X'.
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'END_NAME'.
+  ls_fieldcat-outputlen = 18.
+  ls_fieldcat-coltext = 'End customer name'(033).
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'EQUNR'.
+  ls_fieldcat-outputlen = 18.
+  ls_fieldcat-coltext = 'Equipment'(016).
+  ls_fieldcat-no_zero = 'X'.
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+  ls_fieldcat-hotspot = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'SERIALNR'.
+  ls_fieldcat-outputlen = 16.
+  ls_fieldcat-coltext = 'Serial'(017).
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'EQKTX'.
+  ls_fieldcat-outputlen = 18.
+  ls_fieldcat-coltext = 'Equipment description'(071).
+  ls_fieldcat-no_zero = 'X'.
+*  ls_fieldcat-no_zero = 'X'.
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+*  ls_fieldcat-hotspot = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'SUBMT'.
+  ls_fieldcat-outputlen = 18.
+  ls_fieldcat-coltext = 'Construction type material of the object'(072).
+  ls_fieldcat-no_zero = 'X'.
+*  ls_fieldcat-no_zero = 'X'.
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+*  ls_fieldcat-hotspot = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'TIDNR'.
+  ls_fieldcat-outputlen = 18.
+  ls_fieldcat-coltext = 'Cust. Ref.'(018).
+  ls_fieldcat-no_zero = 'X'.
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'ARBPL'.
+  ls_fieldcat-outputlen = 12.
+  ls_fieldcat-coltext = 'Workcenter'(019).
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'KTEXT'.
+  ls_fieldcat-outputlen = 24.
+  ls_fieldcat-coltext = 'Workcenter descr'(057).
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+* begin of insert MOD-001
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'LEARR'.
+  ls_fieldcat-outputlen = 6.
+  ls_fieldcat-coltext = 'Activity type'(079).
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'GRUND'.
+  ls_fieldcat-outputlen = 4.
+  ls_fieldcat-coltext = 'Reason Code'(080).
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+* end of insert MOD-001
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'ISMNW'.
+  ls_fieldcat-outputlen = 6.
+* begin of change MOD-001
+* ls_fieldcat-coltext = 'Actual time'(022).
+  ls_fieldcat-coltext = 'Actual Hours'(022).
+* end of change MOD-001
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'ARBEI'.
+  ls_fieldcat-outputlen = 6.
+  ls_fieldcat-coltext = 'Planned time'(023).
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+* bein of delete MOD-001
+*  CLEAR ls_fieldcat.
+*  ls_fieldcat-fieldname = 'TOTAL_ISMNW'.
+*  ls_fieldcat-outputlen = 6.
+*  ls_fieldcat-coltext = 'Total actual'(025).
+**  LS_FIELDCAT-FIX_COLUMN = 'X'.
+**  LS_FIELDCAT-EMPHASIZE = 'X'.
+*
+*  APPEND ls_fieldcat TO lt_fieldcat.
+* end of delete MOD-001
+
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'MSEH3'.
+  ls_fieldcat-outputlen = 4.
+  ls_fieldcat-coltext = 'Unit'(024).
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'WERKS'.
+  ls_fieldcat-outputlen = 8.
+  ls_fieldcat-coltext = 'Plant'(030).
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'MATNR'.
+  ls_fieldcat-outputlen = 18.
+  ls_fieldcat-coltext = 'Component'(026).
+  ls_fieldcat-no_zero = 'X'.
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'MAKTX'.
+  ls_fieldcat-outputlen = 18.
+  ls_fieldcat-coltext = 'Component description'(027).
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+* begin of insert MOD-001
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'BDMNG'.
+  ls_fieldcat-outputlen = 6.
+  ls_fieldcat-coltext = 'Component Qty'(081).
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'BWART'.
+  ls_fieldcat-outputlen = 3.
+  ls_fieldcat-coltext = 'Movement Type'(082).
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'ADD_EXP'.
+  ls_fieldcat-outputlen = 6.
+  ls_fieldcat-coltext = 'Add.Expenses'(083).
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+* end of insert MOD-001
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'DIST'.
+  ls_fieldcat-outputlen = 6.
+  ls_fieldcat-coltext = 'Distance'(028).
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'SUBC_COSTS'.
+  ls_fieldcat-outputlen = 6.
+  ls_fieldcat-coltext = 'Subcontractor costs'(058).
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'SUBC_NR'.
+  ls_fieldcat-outputlen = 13.
+  ls_fieldcat-coltext = 'Subcontractor'(060).
+  ls_fieldcat-no_zero = 'X'.
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'SUBC_NAME'.
+  ls_fieldcat-outputlen = 18.
+  ls_fieldcat-coltext = 'Subcontractor name'(059).
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+
+ENDFORM.                    " rep_stat_field_cat
+*&---------------------------------------------------------------------*
+*&      Form  serv_var_field_cat
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM serv_var_field_cat .
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'AUFNR'.
+  ls_fieldcat-outputlen = 18.
+  ls_fieldcat-coltext = 'Service order'(010).
+  ls_fieldcat-no_zero = 'X'.
+  ls_fieldcat-fix_column = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+  ls_fieldcat-hotspot = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'EQUNR'.
+  ls_fieldcat-outputlen = 18.
+  ls_fieldcat-coltext = 'Equipment'(016).
+  ls_fieldcat-no_zero = 'X'.
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+  ls_fieldcat-hotspot = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'SERIALNR'.
+  ls_fieldcat-outputlen = 16.
+  ls_fieldcat-coltext = 'Serial'(017).
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'KUNUM'.
+  ls_fieldcat-outputlen = 11.
+  ls_fieldcat-coltext = 'Customer'(014).
+  ls_fieldcat-no_zero = 'X'.
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'CUST_NAME'.
+  ls_fieldcat-outputlen = 18.
+  ls_fieldcat-coltext = 'Customer name'(032).
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'END'.
+  ls_fieldcat-outputlen = 12.
+  ls_fieldcat-coltext = 'End customer'(015).
+  ls_fieldcat-no_zero = 'X'.
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'END_NAME'.
+  ls_fieldcat-outputlen = 18.
+  ls_fieldcat-coltext = 'End customer name'(033).
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'TIDNR'.
+  ls_fieldcat-outputlen = 18.
+  ls_fieldcat-coltext = 'Cust. Ref.'(018).
+  ls_fieldcat-no_zero = 'X'.
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+*  CLEAR ls_fieldcat.
+*  ls_fieldcat-fieldname = 'WERKS'.
+*  ls_fieldcat-outputlen = 8.
+*  ls_fieldcat-coltext = 'Distance unit'(030).
+**  LS_FIELDCAT-FIX_COLUMN = 'X'.
+**  LS_FIELDCAT-EMPHASIZE = 'X'.
+*
+*  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'ARBPL'.
+  ls_fieldcat-outputlen = 12.
+  ls_fieldcat-coltext = 'Workcenter'(019).
+  ls_fieldcat-fix_column = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'KTEXT'.
+  ls_fieldcat-outputlen = 24.
+  ls_fieldcat-coltext = 'Workcenter descr'(057).
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'TOTAL_ISMNW'.
+  ls_fieldcat-outputlen = 6.
+  ls_fieldcat-coltext = 'Total actual'(025).
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'ARBEI'.
+  ls_fieldcat-outputlen = 6.
+  ls_fieldcat-coltext = 'Planned time'(023).
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+*  CLEAR ls_fieldcat.
+*  ls_fieldcat-fieldname = 'MSEH3'.
+*  ls_fieldcat-outputlen = 4.
+*  ls_fieldcat-coltext = 'Unit'(024).
+**  LS_FIELDCAT-FIX_COLUMN = 'X'.
+**  LS_FIELDCAT-EMPHASIZE = 'X'.
+*
+*  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'RATIO'.
+  ls_fieldcat-outputlen = 8.
+  ls_fieldcat-coltext = 'Ratio %'(036).
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'DELTA'.
+  ls_fieldcat-outputlen = 6.
+  ls_fieldcat-coltext = 'Delta'(034).
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+
+
+ENDFORM.                    " serv_var_field_cat
+
+
+*&---------------------------------------------------------------------*
+*&      Form  select_tech_perf
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM select_tech_perf .
+
+
+*Get all confirmations for entered selection criteria
+*  SELECT    crhd~objty
+*            crhd~objid
+*            crhd~arbpl
+*            afvc~larnt
+*            afvc~aufpl
+*            afvc~aplzl
+*            crtx~ktext
+*            afru~rueck
+*            afru~rmzhl
+*            afru~ersda   " edatu
+*            afru~ismnw
+*            afru~ismne
+*            FROM afru
+*            JOIN crhd
+*          ON afru~arbid = crhd~objid
+*          JOIN afvc
+*          ON afru~aplzl = afvc~aplzl
+*          JOIN crtx
+*          ON crhd~objid = crtx~objid
+*          INTO TABLE it_afru
+*          WHERE  afru~ersda  IN so_date
+*          AND    afvc~larnt  IN so_lar01
+*          AND    crhd~arbpl  IN so_arbpl
+*          AND    crtx~spras   EQ 'EN'.
+
+
+** Initial select of service order headers
+*  SELECT       aufnr
+*               idat2
+*               objid
+*               objnr
+*               kdauf
+*               zzequnr
+*          INTO TABLE lt_aufk
+*          FROM aufk
+*         WHERE aufk~aufnr  IN    so_aufnr.
+*  CHECK sy-subrc EQ 0.
+**Workcentre description
+*  SELECT    crhd~objid crhd~arbpl crtx~ktext
+*          INTO TABLE it_workdes
+*          FROM crhd
+*           INNER JOIN crtx
+*            ON crtx~objid  = crhd~objid
+*            AND crtx~objty = crhd~objty
+**            FOR ALL entries IN itt_afru
+*            FOR ALL entries IN it_totalwrk
+**          WHERE crhd~objid = itt_afru-arbid
+*            WHERE crhd~objid = it_totalwrk-arbid
+*          AND crhd~arbpl IN so_arbpl
+**          AND crhd~objty EQ 'A'
+*          AND crtx~spras EQ 'EN'.
+
+
+
+  SELECT crhd~arbpl crtx~ktext afru~werks afru~learr afru~bemot afru~ismnw afru~ismne
+      FROM afru
+      INNER JOIN crhd
+    ON afru~arbid = crhd~objid
+    AND crhd~objty = 'A'
+    LEFT JOIN crtx
+            ON crtx~objid  = crhd~objid
+            AND crtx~objty = crhd~objty
+            AND crtx~spras = sy-langu
+    INTO TABLE itt_afru
+*5 selection criterial from the screen
+    WHERE afru~budat IN so_date
+      AND afru~werks IN so_werks
+      AND afru~ismne EQ 'STD'
+      AND crhd~arbpl IN so_arbpl
+      AND afru~learr IN so_lar01
+      AND afru~aufnr IN so_aufnr.
+
+
+
+** Select corresp. lines from   AFRU/AUFK
+**  SELECT       rueck rmzhl budat arbid werks ismnw ismne learr aufnr bemot
+*  SELECT       arbid werks ismnw ismne learr bemot
+*
+*        INTO TABLE itt_afru
+*        FROM afru
+**           FOR ALL ENTRIES IN lt_aufk
+*        WHERE ismne EQ 'STD'   "this means only unit 'hours'
+*          AND budat IN so_date AND
+*              learr IN so_lar01 AND
+*              werks IN so_werks and
+*              aufnr in so_aufnr.
+*error
+  IF sy-subrc NE 0.
+    MESSAGE s000.
+    gv_subrc = 4.
+    EXIT.
+  ENDIF.
+
+*summed up actual hours per workcenter and accounting indicator
+  LOOP AT itt_afru INTO wa_afru.
+    COLLECT wa_afru INTO it_totalwrk.
+  ENDLOOP.
+
+
+
+**  CHECK sy-subrc EQ 0.
+**Workcentre description
+*  SELECT    crhd~objid crhd~arbpl crtx~ktext
+*          INTO TABLE it_workdes
+*          FROM crhd
+*           INNER JOIN crtx
+*            ON crtx~objid = crhd~objid
+*            AND crtx~objty = crhd~objty
+**            FOR ALL entries IN itt_afru
+*            FOR ALL entries IN it_totalwrk
+**          WHERE crhd~objid = itt_afru-arbid
+*            WHERE crhd~objid = it_totalwrk-arbid
+*          AND crhd~arbpl IN so_arbpl
+**          AND crhd~objty EQ 'A'
+*          AND crtx~spras EQ 'EN'.
+*  CHECK sy-subrc EQ 0.
+************************************
+  LOOP AT it_totalwrk INTO wa_totalwrk.
+    MOVE-CORRESPONDING wa_totalwrk TO it_tech.
+*    it_tech-arbpl    =  it_workdes-arbpl.
+*    it_tech-ktext    =  it_workdes-ktext.
+*    it_tech-ismnw    =  wa_totalwrk-ismnw.
+*    it_tech-ismne    =  wa_totalwrk-ismne.
+*    it_tech-learr    =  wa_totalwrk-learr.
+*    it_tech-bemot    =  wa_totalwrk-bemot.
+*    it_tech-werks    =  wa_totalwrk-werks.
+
+*    read table itt_afru with key objid =
+
+*    READ TABLE it_workdes WITH KEY objid = wa_totalwrk-arbid.
+*    IF sy-subrc EQ 0.
+*    ELSE.
+*ok, this continue is justified
+*      CONTINUE.
+*    ENDIF.
+    APPEND it_tech.
+    CLEAR: it_tech, wa_totalwrk.
+  ENDLOOP.
+ENDFORM.                    " select_tech_perf
+
+
+*&---------------------------------------------------------------------*
+*&      Form  tech_perf_field_cat
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM tech_perf_field_cat
+ .
+
+  " objty TYPE crhd-objty,
+  " objid TYPE crhd-objid,
+  " arbpl TYPE crhd-arbpl,
+  "larnt TYPE afvc-larnt,
+  " aufpl TYPE afvc-aufpl,
+  " aplzl TYPE afvc-aplzl,
+  " objid TYPE crtx~objid,
+  " ktext TYPE crtx~ktext,
+  " arbid TYPE afru-arbid,
+  " rueck TYPE afru-rueck,
+  "ersda TYPE afru-ersda,
+  "ismnw TYPE afru-ismnw,
+  "ismne TYPE afru-ismne,
+
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'ARBPL'.
+  ls_fieldcat-outputlen = 18.
+  ls_fieldcat-coltext = 'Workcenter'(019).
+  ls_fieldcat-fix_column = 'X'.
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'KTEXT'.
+  ls_fieldcat-outputlen = 40.
+  ls_fieldcat-coltext = 'Workcenter descr'(057).
+  ls_fieldcat-fix_column = 'X'.
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'WERKS'.
+  ls_fieldcat-outputlen = 15.
+  ls_fieldcat-coltext = 'Plant'(030).
+*  ls_fieldcat-fix_column = 'X'.
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'LEARR'.
+  ls_fieldcat-outputlen = 15.
+  ls_fieldcat-coltext = 'Activity Type'(056).
+*  ls_fieldcat-fix_column = 'X'.
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'BEMOT'.
+  ls_fieldcat-outputlen = 10.
+  ls_fieldcat-coltext = 'Accounting indicator'(061).
+*  ls_fieldcat-fix_column = 'X'.
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'ISMNW'.
+  ls_fieldcat-outputlen = 10.
+  ls_fieldcat-coltext = 'Actual work'(068).
+*  ls_fieldcat-fix_column = 'X'.
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'ISMNE'(069).
+  ls_fieldcat-outputlen = 10.
+  ls_fieldcat-coltext = 'Labour unit'(070).
+*  ls_fieldcat-fix_column = 'X'.
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+
+ENDFORM.              " tech_perf_field_cat
+
+
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  select_rep_perf
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM select_rep_perf .
+*  PERFORM FILL_GAC_PGC_TABLE.
+
+  RANGES r_objid FOR crhd-objid.
+
+  DATA:                    " internal table type crhd
+    BEGIN OF it_crhd OCCURS 0,
+      objid  TYPE cr_objid,
+    END OF it_crhd.
+
+
+* Initial select of service order headers based on select. param.
+  SELECT       aufnr
+               idat2
+               objid
+               objnr
+               kdauf
+               zzequnr
+               kunum
+          INTO TABLE lt_aufk
+          FROM viaufkst
+         WHERE viaufkst~aufnr  IN    so_aufnr
+           AND viaufkst~idat2    IN  so_date
+           AND viaufkst~werks    IN  so_werks
+           AND viaufkst~kunum    IN so_kunnr.
+*  CHECK sy-subrc EQ 0.
+
+*error
+  IF sy-subrc NE 0.
+    MESSAGE s000.
+    gv_subrc = 4.
+    EXIT.
+  ENDIF.
+
+
+
+  PERFORM status_teco.
+
+
+  IF NOT so_werks IS INITIAL OR NOT so_arbpl IS INITIAL.
+
+    SELECT    objid
+            INTO TABLE it_crhd
+            FROM crhd
+            WHERE arbpl IN so_arbpl
+            AND werks IN so_werks.
+
+    LOOP AT it_crhd.
+      r_objid-sign = 'I'.
+      r_objid-option = 'EQ'.
+      r_objid-low = it_crhd-objid.
+
+      APPEND r_objid.
+
+    ENDLOOP.
+  ENDIF.
+
+* Select corresponding lines from AFIH/EQUI to restrict on equinr and sernr
+  SELECT       aufnr afih~equnr gewrk kunum qmnum equi~sernr iphas
+          INTO TABLE it_afih
+          FROM afih
+          JOIN equi
+            ON afih~equnr EQ equi~equnr
+           FOR ALL entries IN lt_aufk
+         WHERE aufnr EQ lt_aufk-aufnr
+           AND afih~equnr IN so_equnr
+* original code           AND afih~gewrk IN so_arbpl.
+            AND afih~gewrk IN r_objid
+            AND afih~iphas IN so_iphas.
+*           AND afih~gewrk IN so_werks.
+
+
+  CHECK sy-subrc EQ 0.
+
+*Workcentre description
+  SELECT    crhd~objid crhd~arbpl crtx~ktext
+          INTO TABLE it_workdes
+          FROM crhd
+           LEFT JOIN crtx
+            ON  crtx~objid = crhd~objid
+            AND crtx~objty = crhd~objty
+            AND crtx~spras EQ sy-langu
+            FOR ALL entries IN it_afih
+          WHERE crhd~objid = it_afih-gewrk
+          AND crhd~arbpl IN so_arbpl
+* original code: so_werks not included
+          AND crhd~werks IN so_werks
+          AND crhd~objty EQ 'A'.
+
+*  CHECK SY-SUBRC EQ 0.
+
+
+* Select customer reference number
+
+  SELECT equnr datbi eqlfn tidnr
+          INTO  TABLE it_equz
+          FROM equz
+            FOR ALL ENTRIES IN it_afih
+          WHERE equnr EQ it_afih-equnr
+            AND tidnr   IN so_tidnr.
+*  CHECK SY-SUBRC EQ 0.
+
+* Select corresp. noticications through QMEL (link on AUFK-AUFNR)
+  SELECT       qmnum aufnr qmart erdat qmdat matnr vbeln ausbs auztb
+          INTO TABLE it_qmel
+          FROM viqmel
+           FOR ALL ENTRIES IN lt_aufk
+          WHERE aufnr EQ lt_aufk-aufnr AND
+                qmart IN so_qmart.
+*  CHECK SY-SUBRC EQ 0.
+
+* Select corresponding lines from CAUFV/IHPA to restrict on customer number
+  SELECT       objnr parvw  counter parnr
+          INTO TABLE it_ihpa
+          FROM ihpa
+           FOR ALL ENTRIES IN lt_aufk
+          WHERE objnr EQ lt_aufk-objnr
+            AND parnr IN so_parnr
+            AND parvw EQ 'ZE'.
+
+*  CHECK SY-SUBRC EQ 0.
+
+* Select corresp. lines from   AFRU/IHPA to find the total time of repairs
+  SELECT       rueck rmzhl ismnw ismne learr aufnr
+          INTO TABLE lt_afru
+          FROM afru
+           FOR ALL ENTRIES IN lt_aufk
+          WHERE aufnr EQ lt_aufk-aufnr
+           AND ismne EQ 'STD'.
+*            OR  learr = '007'.
+*OK, check justified, we need repairs
+  CHECK sy-subrc EQ 0.
+
+* Select corresponding lines from AFIH/EQUI to restrict on equnr
+  SELECT       equnr objnr matnr sernr imrc_point
+          INTO TABLE it_equi
+          FROM equi
+           FOR ALL ENTRIES IN it_afih
+          WHERE equnr EQ it_afih-equnr
+            AND sernr EQ it_afih-serialnr.
+
+*  CHECK SY-SUBRC EQ 0.
+
+* Select the notification type for all orders with notification code
+  SELECT      qmnum urtxt urgrp urcod
+          INTO TABLE it_qmur
+          FROM qmur
+            FOR ALL ENTRIES IN it_qmel
+          WHERE qmnum  EQ  it_qmel-qmnum.
+
+
+*  PERFORM fill_gac_pgc_table.
+
+* Select product hierarchy to derive GAC/PGC
+  SELECT      matnr prdha
+         INTO TABLE it_mara
+         FROM mara
+            FOR ALL ENTRIES IN it_equi
+         WHERE prdha  IN r_prdha
+            AND matnr EQ it_equi-matnr.
+*  CHECK SY-SUBRC EQ 0.
+
+*Service order Quotation -
+  SELECT      vbeln erdat  audat auart vgbel aufnr bstdk qmnum
+          INTO TABLE it_vbak
+          FROM vbak
+             FOR ALL ENTRIES IN lt_aufk
+          WHERE vbeln EQ lt_aufk-kdauf.
+*  CHECK SY-SUBRC EQ 0.
+
+*Service order Quotation - date created and date accepted
+  SELECT      vbeln erdat  audat auart vgbel
+         INTO TABLE it_zqt1
+         FROM vbak
+            FOR ALL ENTRIES IN it_vbak
+         WHERE vbeln EQ it_vbak-vgbel
+         AND auart EQ 'ZQ01'.
+*  CHECK SY-SUBRC EQ 0.
+
+*******************  LOOP lt_aufk.
+*******************    READ TABLE it_vbak WITH KEY vbeln = lt_aufk-kdauf
+*******************    IF sy-subrc EQ 0.
+*******************      READ TABLE it_zqt1 WITH KEY vbeln = it_vbak-vgbel
+*******************  ENDLOOP.
+
+*Date Invoice created
+  SELECT      vbelv posnv vbeln posnn vbtyp_n vbtyp_v erdat "#EC*
+         INTO TABLE it_vbfa  "#EC*
+         FROM vbfa  "#EC*
+           FOR ALL ENTRIES IN it_vbak    "#EC*
+         WHERE vbelv EQ it_vbak-vbeln    "#EC*
+         AND vbtyp_n EQ 'M' OR     "#EC*
+             vbtyp_n EQ 'J' OR     "#EC*
+             vbtyp_n EQ 'T'.       "#EC*
+*  CHECK SY-SUBRC EQ 0.
+  SELECT      vbeln vbtyp wadat_ist   "#EC*
+         INTO TABLE it_likp    "#EC*
+         FROM likp   "#EC*
+           FOR ALL ENTRIES IN it_vbfa    "#EC*
+         WHERE vbeln EQ it_vbfa-vbeln    "#EC*
+         AND vbtyp EQ 'J' OR     "#EC*
+             vbtyp EQ 'T'.       "#EC*
+*  CHECK SY-SUBRC EQ 0.
+
+
+*Date Spareparts arrived
+  SELECT         objnr stat udate inact
+          INTO TABLE it_jcds
+          FROM jcds
+             FOR ALL ENTRIES IN lt_aufk
+          WHERE objnr EQ lt_aufk-objnr
+          AND stat EQ 'I0010'
+          AND inact EQ ' '.
+*  CHECK SY-SUBRC EQ 0.
+*ord rel
+  SELECT         objnr stat udate inact
+          INTO TABLE it_reldat
+          FROM jcds
+             FOR ALL ENTRIES IN lt_aufk
+          WHERE objnr EQ lt_aufk-objnr
+          AND stat EQ 'I0002'
+          AND inact EQ ' '.
+*  CHECK SY-SUBRC EQ 0.
+
+
+
+***  SELECT
+***        INTO TABLE it_invoice
+***         FROM VBAK
+***            FOR ALL ENTRIES IN it_vbak
+***         WHERE vbeln EQ it_vbak-vgbel
+***         AND auart EQ 'ZQT1'.
+***  CHECK SY-SUBRC EQ 0.
+
+
+*******SELECT      vbeln erdat  audat auart vgbel
+*******         INTO TABLE it_invoice
+*******         FROM VBAK
+*******            FOR ALL ENTRIES IN it_vbak
+*******         WHERE vbeln EQ it_vbak-vgbel
+*******         AND auart EQ 'ZQT1'.
+*******  CHECK SY-SUBRC EQ 0.
+
+*******
+* Date repair is compleated
+*  SELECT     qmnum equnr ausbs auztb vbeln aufnr
+*           INTO TABLE it_viqmel
+*           FROM viqmel
+*               FOR ALL ENTRIES IN it_vbak
+*           WHERE vbeln EQ it_vbak-vbeln.
+*  CHECK SY-SUBRC EQ 0.
+
+
+**********  SELECT
+**********              vbeln vbtyp erdat
+**********           INTO TABLE it_vbrk
+**********           FROM vbrk
+**********               FOR ALL ENTRIES IN it_vbak
+**********           WHERE vbeln EQ it_vbak-vbeln.
+**********
+
+*  CHECK SY-SUBRC EQ 0.
+************************  perform status_teco.
+
+
+***SELECT
+***            vbeln vbtype erdat aufnr qmnum  vgbel
+***         INTO TABLE it_invoice
+***         FROM it_vbrk
+***             FOR ALL ENTRIES IN it_vbrk
+***         WHERE vblen EQ it_vbak-vbeln.
+
+
+
+*         AND aufnr  EQ it_qmel-aufnr.
+
+*****SELECT      vbeln posnr matnr erdat aufnr
+*****         INTO TABLE it_vbap
+*****         FROM VBAP
+*******            FOR ALL ENTRIES IN it_vbak
+*******         WHERE vbeln  EQ it_vbak-vbeln.
+*******  CHECK SY-SUBRC EQ 0.
+
+* Select corresponding lines from CAUFV/IHPA to restrict on customer number
+  SELECT       objnr parvw  counter parnr
+          INTO TABLE it_ihpa
+          FROM ihpa
+           FOR ALL ENTRIES IN lt_aufk
+          WHERE objnr EQ lt_aufk-objnr
+*            AND parnr IN so_parnr
+*on the selection screen for P_FAIL there is no restriction for end customer
+            AND parvw EQ 'ZE'.
+
+  DATA: BEGIN OF lt_customer OCCURS 0,
+          kunnr TYPE kunnr,
+          name1 TYPE name1_gp,
+        END OF lt_customer.
+
+*Get the descriptions of the customer and end customer
+*Get customer details
+  SELECT kunnr name1
+    FROM kna1
+    INTO TABLE lt_customer
+    FOR ALL ENTRIES IN lt_aufk
+    WHERE kunnr = lt_aufk-kunum.
+
+  DATA: lv_kunnr_end TYPE kunnr.
+  LOOP AT it_ihpa.
+    CLEAR lv_kunnr_end.
+    MOVE it_ihpa-parnr TO lv_kunnr_end.
+    SELECT kunnr name1
+      FROM kna1
+      APPENDING TABLE lt_customer
+      WHERE kunnr = lv_kunnr_end.
+  ENDLOOP.
+
+  DELETE ADJACENT DUPLICATES FROM lt_customer COMPARING kunnr.
+
+
+*******************
+* Loop over order headers
+  LOOP AT lt_aufk.
+
+*   Copy detail from LT_AFUK
+    it_repair-aufnr    =  lt_aufk-aufnr.
+    it_repair-idat2    =  lt_aufk-idat2.
+******    it_repair-objnr    =  lt_aufk-objnr.
+
+*  order headers
+    READ TABLE it_afih WITH KEY aufnr = lt_aufk-aufnr.
+    IF sy-subrc EQ 0.
+
+*****   Copy detail from IT_AFIH
+*     it_repair-aufnr    =  it_afih-aufnr.
+      it_repair-equnr    =  it_afih-equnr.
+      it_repair-kunum    =  it_afih-kunum.
+      it_repair-sernr    =  it_afih-serialnr.
+*        it_repair-gewrk    =  it_afih-gewrk.
+    ELSE.
+      CONTINUE.
+    ENDIF.
+
+*Workcentre desription
+    READ TABLE it_workdes WITH KEY objid = it_afih-gewrk.
+    IF sy-subrc EQ 0.
+      it_repair-arbpl  =  it_workdes-arbpl.
+      it_repair-ktext  =  it_workdes-ktext.
+    ELSE.
+*      CONTINUE.
+    ENDIF.
+
+* This is where the end customer number is!
+    READ TABLE it_ihpa WITH KEY objnr = lt_aufk-objnr.
+    IF sy-subrc EQ 0.
+*Char 12 to char 10.
+      MOVE it_ihpa-parnr TO it_repair-end.
+      it_fail-parvw   =  it_ihpa-parvw.
+    ENDIF.
+
+    MOVE lt_aufk-kunum TO it_repair-kunum.
+
+*Now get the descriptions
+    READ TABLE lt_customer WITH KEY kunnr = it_repair-kunum.
+    IF sy-subrc EQ 0.
+      it_repair-cust_name = lt_customer-name1.
+    ENDIF.
+
+*Now get the descriptions
+    READ TABLE lt_customer WITH KEY kunnr = it_repair-end.
+    IF sy-subrc EQ 0.
+      it_repair-end_name = lt_customer-name1.
+    ENDIF.
+
+
+**End customer
+*    READ TABLE IT_IHPA WITH KEY OBJNR = LT_AUFK-OBJNR.
+*    IF SY-SUBRC EQ 0.
+*      IT_REPAIR-PARNR   =  IT_IHPA-PARNR.
+**        it_repair-parvw   =  it_ihpa-parvw.
+*    ELSE.
+*      CONTINUE.
+*    ENDIF.
+
+
+
+*  Customer reference number
+    READ TABLE it_equz WITH KEY equnr = it_afih-equnr.
+    IF sy-subrc EQ 0.
+      it_repair-tidnr   =  it_equz-tidnr.
+    ELSE.
+*      CONTINUE.
+    ENDIF.
+
+* Total time of repair
+    READ TABLE lt_afru WITH KEY aufnr = lt_aufk-aufnr.
+    IF sy-subrc EQ 0.
+      it_repair-ismnw   =  lt_afru-ismnw.
+    ELSE.
+*This continue is justified because if we do not have a repair we do not need to see the line
+      CONTINUE.
+    ENDIF.
+
+
+*
+    READ TABLE it_equi WITH KEY equnr = it_afih-equnr.
+    IF sy-subrc EQ 0.
+      it_fail-imrc_point = it_equi-imrc_point.
+      READ TABLE it_mara WITH KEY matnr = it_equi-matnr.
+      IF sy-subrc EQ 0.
+        it_repair-gac = it_mara-prdha(4).
+        it_repair-pgc = it_mara-prdha+4(4).
+      ENDIF.
+    ELSE.
+      CONTINUE.
+    ENDIF.
+
+*Notification type and date of creation and also date and time completed
+    READ TABLE it_qmel WITH KEY aufnr = it_afih-aufnr.
+    IF sy-subrc EQ 0.
+*      it_fail-qmnum   =  it_qmel-qmnum.
+      it_repair-qmart  =  it_qmel-qmart.
+      it_repair-qmdat  =  it_qmel-qmdat.
+      it_repair-ausbs  =  it_qmel-ausbs.
+      it_repair-auztb  =  it_qmel-auztb.
+    ELSE.
+      CONTINUE.
+    ENDIF.
+
+* Date Quotation is created and accepted
+    READ TABLE it_vbak WITH KEY vbeln = lt_aufk-kdauf.
+    IF sy-subrc EQ 0.
+      READ TABLE it_zqt1 WITH KEY vbeln = it_vbak-vgbel.
+      IF sy-subrc EQ 0.
+        it_repair-erdat = it_zqt1-erdat.
+        it_repair-audat = it_zqt1-audat.
+      ENDIF.
+    ELSE.
+*      CONTINUE.
+    ENDIF.
+
+
+* Date Invoice created, date equipment arrived & date equi left
+    READ TABLE it_vbfa WITH KEY vbelv = it_vbak-vbeln
+                                vbtyp_n = 'M'.
+    IF sy-subrc EQ 0.
+      it_repair-invdat = it_vbfa-erdat.
+    ENDIF.
+    READ TABLE it_vbfa WITH KEY vbelv = it_vbak-vbeln
+                                vbtyp_n = 'J'.
+    IF sy-subrc EQ 0.
+      READ TABLE it_likp WITH KEY vbeln = it_vbfa-vbelv
+                                vbtyp = 'J'.
+      IF sy-subrc EQ 0.
+        it_repair-equiarr = it_likp-wadat_ist.
+      ENDIF.
+    ENDIF.
+
+    READ TABLE it_vbfa WITH KEY vbelv = it_vbak-vbeln
+                                 vbtyp_n = 'T'.
+    IF sy-subrc EQ 0.
+      READ TABLE it_likp WITH KEY vbeln = it_vbfa-vbelv
+                                 vbtyp = 'T'.
+      IF sy-subrc EQ 0.
+        it_repair-equileft = it_likp-wadat_ist.
+      ENDIF.
+    ENDIF.
+
+
+*********** Date service order is released
+*    READ TABLE it_vbrk WITH KEY vbeln = it_vbak-vbeln.
+*    IF sy-subrc EQ 0.
+*      it_repair-erdat = it_vbrk-erdat.
+*    ELSE.
+*      CONTINUE.
+*    ENDIF.
+
+    READ TABLE it_reldat WITH KEY objnr = lt_aufk-objnr.
+    IF sy-subrc EQ 0.
+      it_repair-reldat = it_jcds-udate.
+    ELSE.
+    ENDIF.
+
+
+* Date spareparts arrived
+    READ TABLE it_jcds WITH KEY objnr = lt_aufk-objnr.
+    IF sy-subrc EQ 0.
+      it_repair-udate = it_jcds-udate.
+    ELSE.
+*      CONTINUE.
+    ENDIF.
+
+
+
+** Date and time of repair compleated
+*    READ TABLE it_viqmel WITH KEY vbeln = it_vbak-vbeln.
+*    IF sy-subrc EQ 0.
+*      it_repair-ausbs = it_viqmel-ausbs.
+*      it_repair-auztb = it_viqmel-auztb.
+*    ELSE.
+*      CONTINUE.
+*    ENDIF.
+
+
+    APPEND it_repair.
+    CLEAR it_repair.
+  ENDLOOP.
+
+ENDFORM.                    " select_rep_perf
+
+*&---------------------------------------------------------------------*
+*&      Form  rep_perf_field_cat
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+
+
+
+
+FORM rep_perf_field_cat .
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'AUFNR'.
+  ls_fieldcat-outputlen = 18.
+  ls_fieldcat-coltext = 'Service order'(010).
+  ls_fieldcat-no_zero = 'X'.
+  ls_fieldcat-fix_column = 'X'.
+  ls_fieldcat-hotspot = 'X'.
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'IDAT2'.
+  ls_fieldcat-outputlen = 10.
+  ls_fieldcat-coltext = 'TECO date'(012).
+  ls_fieldcat-fix_column = 'X'.
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'KUNUM'.
+  ls_fieldcat-outputlen = 12.
+  ls_fieldcat-coltext = 'Customer No'(014).
+  ls_fieldcat-no_zero = 'X'.
+  ls_fieldcat-fix_column = 'X'.
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'CUST_NAME'.
+  ls_fieldcat-outputlen = 18.
+  ls_fieldcat-coltext = 'Customer name'(032).
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'END'.
+  ls_fieldcat-outputlen = 12.
+  ls_fieldcat-coltext = 'End customer'(015).
+  ls_fieldcat-no_zero = 'X'.
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'END_NAME'.
+  ls_fieldcat-outputlen = 18.
+  ls_fieldcat-coltext = 'End customer name'(033).
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+
+*  CLEAR LS_FIELDCAT.
+*  LS_FIELDCAT-FIELDNAME = 'PARNR'.
+*  LS_FIELDCAT-OUTPUTLEN = 18.
+*  LS_FIELDCAT-COLTEXT = 'End Customer No'(033).
+*  LS_FIELDCAT-HOTSPOT = 'X'.
+*  APPEND LS_FIELDCAT TO LT_FIELDCAT.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'EQUNR'.
+  ls_fieldcat-outputlen = 18.
+  ls_fieldcat-coltext = 'Equipment'(016).
+  ls_fieldcat-no_zero = 'X'.
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'SERNR'.
+  ls_fieldcat-outputlen = 18.
+  ls_fieldcat-coltext = 'Serial'(017).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'TIDNR'.
+  ls_fieldcat-outputlen = 18.
+  ls_fieldcat-coltext = 'Cust. Ref.'(018).
+  ls_fieldcat-no_zero = 'X'.
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'ARBPL'.
+  ls_fieldcat-outputlen = 10.
+  ls_fieldcat-coltext = 'Workcenter'(019).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'KTEXT'.
+  ls_fieldcat-outputlen = 24.
+  ls_fieldcat-coltext = 'Workcenter descr'(057).
+  ls_fieldcat-fix_column = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'ISMNW'.
+  ls_fieldcat-outputlen = 7.
+  ls_fieldcat-coltext = 'Total time of repair'(046).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'GAC'.
+  ls_fieldcat-outputlen = 6.
+  ls_fieldcat-coltext = 'GAC'(040).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'PGC'.
+  ls_fieldcat-outputlen = 6.
+  ls_fieldcat-coltext = 'PGC'(041).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'QMART'.
+  ls_fieldcat-outputlen = 14.
+  ls_fieldcat-coltext = 'Notification type'(038).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'QMDAT'.
+  ls_fieldcat-outputlen = 14.
+  ls_fieldcat-coltext = 'Notification date'(013).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'ERDAT'.
+  ls_fieldcat-outputlen = 14.
+  ls_fieldcat-coltext = 'Date Quotation created'(047).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'AUDAT'.
+  ls_fieldcat-outputlen = 14.
+  ls_fieldcat-coltext = 'Date Quote accepted'(048).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'RELDAT'.
+  ls_fieldcat-outputlen = 14.
+  ls_fieldcat-coltext = 'Date order released'(049).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'INVDAT'.
+  ls_fieldcat-outputlen = 14.
+  ls_fieldcat-coltext = 'Date invoice ceated'(050).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'equiarr'.
+  ls_fieldcat-outputlen = 14.
+  ls_fieldcat-coltext = 'Date equipment arrived'(051).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'equileft'.
+  ls_fieldcat-outputlen = 14.
+  ls_fieldcat-coltext = 'Date equipment left'(052).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'UDATE'.
+  ls_fieldcat-outputlen = 14.
+  ls_fieldcat-coltext = 'Date spareparts arrived'(053).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'AUSBS'.
+  ls_fieldcat-outputlen = 14.
+  ls_fieldcat-coltext = 'Date Repair completed'(054).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'AUZTB'.
+  ls_fieldcat-outputlen = 14.
+  ls_fieldcat-coltext = 'Time Repair completed'(055).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+
+
+
+ENDFORM.              " rep_perf_field_cat
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  select_fail_rep
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM select_fail_rep .
+  RANGES r_objid FOR crhd-objid.
+
+  DATA:                    " internal table type crhd
+    BEGIN OF it_crhd OCCURS 0,
+      objid  TYPE cr_objid,
+    END OF it_crhd.
+
+
+
+  DATA: BEGIN OF it_wrkcntr_descr OCCURS 0,
+          objid TYPE objid,
+          objty TYPE objty,
+          arbpl TYPE  arbpl,
+          ktext TYPE cr_ktext,
+        END OF it_wrkcntr_descr.
+
+  DATA: BEGIN OF it_qtyrep OCCURS 0,
+          equnr TYPE equnr,
+          qty   TYPE i,
+          iphas TYPE afih-iphas,
+        END OF it_qtyrep.
+
+  DATA: BEGIN OF it_totalhrs OCCURS 0,
+          aufnr TYPE aufnr,
+          learr TYPE learr,
+          totalhrs  TYPE i,
+        END OF it_totalhrs.
+
+  DATA: BEGIN OF itt_caufv OCCURS 0,
+          aufpl TYPE co_aufpl,
+        END OF itt_caufv.
+
+
+
+  DATA: wa_qtyrep  LIKE it_qtyrep.
+*  FIELD-SYMBOLS: <fs_wrkcntr_descr> LIKE LINE OF it_wrkcntr_descr.
+
+
+*****Select sales orders into itt_caufv
+****  select aufpl werks
+****        into table itt_caufv
+****        from caufv
+****        where aufpl eq afvc~aufpl
+****          and aufpl in so_aufnr.
+****
+****  loop at itt_caufv
+****      if itt_caufv~aufpl eq afvc~aufpl
+****        move afvc~werks to itt_caufv~werks.
+****  endloop.
+****Original code
+***** Initial select of service order headers based on select. param.
+****  SELECT       aufnr idat2 objid objnr kdauf zzequnr kunum
+****          INTO TABLE lt_aufk
+****          FROM viaufkst
+****         WHERE viaufkst~aufnr    IN  so_aufnr
+****           AND viaufkst~idat2    IN  so_date
+*****           AND viaufkst~werks    IN  so_werks
+*****           AND afvc~werks    IN  so_werks
+****           AND viaufkst~kunum    IN  so_kunnr.
+
+
+* Initial select of service order headers based on select. param.
+  SELECT       viaufkst~aufnr viaufkst~idat2 viaufkst~objid viaufkst~objnr viaufkst~kdauf viaufkst~zzequnr viaufkst~kunum
+*          INTO TABLE lt_aufk
+          FROM viaufkst
+          INNER JOIN caufv
+          ON viaufkst~aufnr EQ caufv~aufnr
+          Inner JOIN afvc
+          ON caufv~aufpl EQ afvc~aufpl
+          INTO TABLE lt_aufk
+             WHERE caufv~werks EQ afvc~werks
+             and viaufkst~aufnr    IN  so_aufnr
+             AND viaufkst~idat2    IN  so_date
+*           AND viaufkst~werks    IN  so_werks
+            AND afvc~werks    IN  so_werks
+            AND viaufkst~kunum    IN  so_kunnr.
+
+
+
+*error
+  IF sy-subrc NE 0.
+    MESSAGE s000.
+    gv_subrc = 4.
+    EXIT.
+  ENDIF.
+
+*testing purpose
+*PERFORM status_teco.
+
+
+
+  IF NOT so_arbpl IS INITIAL.
+
+
+    SELECT    objid
+            INTO TABLE it_crhd
+            FROM crhd
+            WHERE arbpl IN so_arbpl.
+
+    LOOP AT it_crhd.
+      r_objid-sign = 'I'.
+      r_objid-option = 'EQ'.
+      r_objid-low = it_crhd-objid.
+
+      APPEND r_objid.
+
+    ENDLOOP.
+  ENDIF.
+
+
+
+* Select corresponding lines from AFIH/EQUI to restrict on equinr and sernr
+  SELECT       aufnr afih~equnr gewrk kunum qmnum equi~sernr iphas
+          INTO TABLE it_afih
+          FROM afih
+          JOIN equi
+            ON afih~equnr EQ equi~equnr
+           FOR ALL entries IN lt_aufk
+         WHERE aufnr EQ lt_aufk-aufnr
+           AND afih~equnr IN so_equnr
+           AND afih~gewrk IN r_objid
+           AND afih~iphas IN so_iphas.
+  CHECK sy-subrc EQ 0.
+
+*Workcentre description
+  SELECT    crhd~objid crhd~objty crhd~arbpl crtx~ktext
+          INTO TABLE it_wrkcntr_descr
+          FROM crhd
+           LEFT JOIN crtx
+            ON crtx~objid = crhd~objid
+            AND crtx~objty = crhd~objty
+            AND crtx~spras EQ sy-langu
+            FOR ALL entries IN it_afih
+          WHERE crhd~objid = it_afih-gewrk
+          AND crhd~arbpl IN so_arbpl
+          AND crhd~objty EQ 'A'.
+
+************************************************************************************
+************************************************************************************
+* Select customer reference number
+
+  SELECT equnr datbi eqlfn tidnr
+          INTO  TABLE it_equz
+          FROM equz
+            FOR ALL ENTRIES IN it_afih
+          WHERE equnr EQ it_afih-equnr
+            AND tidnr   IN so_tidnr.
+  IF sy-subrc EQ 0.
+
+
+* Select corresp. notifications through QMEL (link on AUFK-AUFNR)
+    SELECT       qmnum aufnr qmart erdat qmdat matnr vbeln
+            INTO TABLE it_qmel
+            FROM qmel
+             FOR ALL ENTRIES IN lt_aufk
+            WHERE aufnr EQ lt_aufk-aufnr AND
+                  qmart IN so_qmart.
+    CHECK sy-subrc EQ 0.
+
+* Select corresponding lines from CAUFV/IHPA to restrict on customer number
+    SELECT       objnr parvw  counter parnr
+            INTO TABLE it_ihpa
+            FROM ihpa
+             FOR ALL ENTRIES IN lt_aufk
+            WHERE objnr EQ lt_aufk-objnr
+*            AND parnr IN so_parnr
+*on the selection screen for P_FAIL there is no restriction for end customer
+              AND parvw EQ 'ZE'.
+
+
+    DATA: BEGIN OF lt_customer OCCURS 0,
+            kunnr TYPE kunnr,
+            name1 TYPE name1_gp,
+          END OF lt_customer.
+
+*Get the descriptions of the customer and end customer
+*Get customer details
+    SELECT kunnr name1
+      FROM kna1
+      INTO TABLE lt_customer
+      FOR ALL ENTRIES IN lt_aufk
+      WHERE kunnr = lt_aufk-kunum.
+
+    DATA: BEGIN OF lt_kunn OCCURS 0,
+           kunnr TYPE kunnr.
+    DATA: END OF lt_kunn.
+    CLEAR: lt_kunn.
+    REFRESH: lt_kunn.
+    LOOP AT it_ihpa.
+      MOVE it_ihpa-parnr TO lt_kunn-kunnr.
+      APPEND lt_kunn.
+      CLEAR lt_kunn.
+    ENDLOOP.
+    IF NOT lt_kunn[] IS INITIAL.
+      SELECT kunnr name1
+        FROM kna1
+        APPENDING TABLE lt_customer
+        FOR ALL ENTRIES IN lt_kunn
+        WHERE kunnr = lt_kunn-kunnr.
+    ENDIF.
+*  ENDLOOP.
+
+    DELETE ADJACENT DUPLICATES FROM lt_customer COMPARING kunnr.
+
+*  CHECK sy-subrc EQ 0.
+
+* Select corresp. lines from   AFRU/IHPA to find the total time of repairs
+    SELECT       rueck rmzhl ismnw ismne learr aufnr
+            INTO TABLE lt_afru
+            FROM afru
+             FOR ALL ENTRIES IN lt_aufk
+            WHERE aufnr EQ lt_aufk-aufnr
+             AND ismne EQ 'STD'.
+*            OR  learr = '007'.
+
+    CHECK sy-subrc EQ 0.
+
+
+
+* Select corresponding lines from AFIH/EQUI to restrict on equnr
+    SELECT       equnr  objnr matnr sernr imrc_point
+            INTO TABLE it_equi
+            FROM equi
+             FOR ALL ENTRIES IN it_afih
+            WHERE equnr EQ it_afih-equnr
+              AND sernr EQ it_afih-serialnr.
+
+    IF sy-subrc EQ 0.
+
+
+*Select Object part description damage-code and description
+      SELECT   qmnum fegrp fecod otgrp oteil
+            INTO TABLE it_qmfe
+              FROM qmfe
+              FOR ALL ENTRIES IN it_afih
+              WHERE qmnum  EQ  it_afih-qmnum
+              AND fegrp IN so_fegrp
+              AND otgrp IN so_otgrp.
+      IF sy-subrc EQ 0.
+
+        SELECT   codegruppe code sprache kurztext
+                INTO TABLE it_qpct
+                  FROM qpct
+                  FOR ALL ENTRIES IN it_qmfe
+                  WHERE codegruppe  EQ  it_qmfe-fegrp
+                  OR codegruppe  EQ  it_qmfe-otgrp
+                  AND sprache = sy-langu.
+
+      ENDIF.
+    ENDIF.
+
+* Select the notification type for all orders with notification code
+    SELECT      qmnum urtxt urgrp urcod
+            INTO TABLE it_qmur
+            FROM qmur
+              FOR ALL ENTRIES IN it_qmel
+            WHERE qmnum  EQ  it_qmel-qmnum.
+*  CHECK sy-subrc EQ 0.
+
+*  PERFORM fill_gac_pgc_table.
+
+* Select product hierarchy to derive GAC/PGC
+    SELECT      matnr prdha
+           INTO TABLE it_mara
+           FROM mara
+              FOR ALL ENTRIES IN it_equi
+           WHERE prdha  IN r_prdha
+              AND matnr EQ it_equi-matnr.
+
+
+
+* Start processing collected data
+* *******************************
+*    ranges: r_iphas for afih-iphas.
+*
+*
+*    if p_tec = 'X'.
+*      r_iphas-sign = 'I'.
+*      r_iphas-option = 'EQ'.
+*      r_iphas-low = '3'.
+*      append r_iphas.
+*    endif.
+*
+*    if  p_hist = 'X'.
+*      r_iphas-sign = 'I'.
+*      r_iphas-option = 'EQ'.
+*      r_iphas-low = '5'.
+*      append r_iphas.
+*    endif.
+*
+*    if p_bus = 'X'.
+*      r_iphas-sign = 'I'.
+*      r_iphas-option = 'EQ'.
+*      r_iphas-low = '6'.
+*      append r_iphas.
+*    endif.
+
+* Put all equipment numbers of IT_AFIH in separate table
+    LOOP AT it_afih.
+      it_qtyrep-equnr = it_afih-equnr.
+      APPEND it_qtyrep.
+    ENDLOOP.
+    SORT it_qtyrep BY equnr.
+    DELETE ADJACENT DUPLICATES FROM it_qtyrep.
+* Count for every equipment number, how many repairs have been done (TECO)
+* Take status so_iphas into account
+    LOOP AT it_qtyrep.
+      SELECT COUNT( * )
+              FROM aufk
+              JOIN afih
+                ON aufk~aufnr EQ afih~aufnr
+              INTO it_qtyrep-qty
+             WHERE equnr EQ it_qtyrep-equnr
+               AND idat2 NE '00000000'
+*               AND afih~iphas in r_iphas.
+              AND afih~iphas in so_iphas.
+      IF sy-subrc NE 0.
+        CLEAR it_qtyrep-qty.
+      ENDIF.
+      MODIFY it_qtyrep.
+*        ENDIF.
+    ENDLOOP.
+
+* Loop over order headers
+    LOOP AT it_afih.
+
+*   Copy detail from IT_AFIH
+      it_fail-aufnr    =  it_afih-aufnr.
+      it_fail-equnr    =  it_afih-equnr.
+      it_fail-serialnr    =  it_afih-serialnr.
+*      it_fail-gewrk    =  it_afih-gewrk. //for testing
+
+*Workcentre desription
+      READ TABLE it_wrkcntr_descr WITH KEY objid = it_afih-gewrk.
+      IF sy-subrc EQ 0.
+        it_fail-arbpl  =  it_wrkcntr_descr-arbpl.
+        it_fail-ktext  =  it_wrkcntr_descr-ktext.
+      ELSE.
+*      CONTINUE
+      ENDIF.
+
+*   Find other serv order header data from IT_AUFK
+      READ TABLE lt_aufk WITH KEY aufnr = it_afih-aufnr.
+      IF sy-subrc EQ 0.
+        it_fail-idat2    =  lt_aufk-idat2.
+      ELSE.
+*OK, service orders must have TECO date filled in or otherwise
+*may not appear in report
+        CONTINUE.
+      ENDIF.
+
+* This is where the end customer number is!
+      READ TABLE it_ihpa WITH KEY objnr = lt_aufk-objnr.
+      IF sy-subrc EQ 0.
+*Char 12 to char 10.
+        MOVE it_ihpa-parnr TO it_fail-end.
+        it_fail-parvw   =  it_ihpa-parvw.
+      ELSE.
+*      CONTINUE.
+      ENDIF.
+
+      MOVE lt_aufk-kunum TO it_fail-kunum.
+
+*Now get the descriptions
+      READ TABLE lt_customer WITH KEY kunnr = it_fail-kunum.
+      IF sy-subrc EQ 0.
+        it_fail-cust_name = lt_customer-name1.
+      ENDIF.
+
+*Now get the descriptions
+      READ TABLE lt_customer WITH KEY kunnr = it_fail-end.
+      IF sy-subrc EQ 0.
+        it_fail-end_name = lt_customer-name1.
+      ENDIF.
+
+
+*  Customer reference number
+      READ TABLE it_equz WITH KEY equnr = it_afih-equnr.
+      IF sy-subrc EQ 0.
+        it_fail-tidnr   =  it_equz-tidnr.
+      ELSE.
+*      CONTINUE.
+      ENDIF.
+
+
+* Total time of repair
+      READ TABLE lt_afru WITH KEY aufnr = lt_aufk-aufnr.
+      IF sy-subrc EQ 0.
+        it_fail-ismnw   =  lt_afru-ismnw.
+      ELSE.
+*      CONTINUE.
+      ENDIF.
+
+
+*
+
+      READ TABLE it_qmel WITH KEY aufnr = it_afih-aufnr.
+      IF sy-subrc EQ 0.
+*      it_fail-qmnum   =  it_qmel-qmnum.
+        it_fail-qmart   =  it_qmel-qmart.
+      ELSE.
+*      CONTINUE.
+      ENDIF.
+
+      READ TABLE it_equi WITH KEY equnr = it_afih-equnr.
+      IF sy-subrc EQ 0.
+        it_fail-imrc_point = it_equi-imrc_point.
+        READ TABLE it_mara WITH KEY matnr = it_equi-matnr.
+        IF sy-subrc EQ 0.
+          it_fail-gac = it_mara-prdha(4).
+          it_fail-pgc = it_mara-prdha+4(4).
+        ENDIF.
+      ELSE.
+*      CONTINUE.
+      ENDIF.
+
+
+      READ TABLE it_qtyrep WITH KEY equnr = it_afih-equnr.
+      IF sy-subrc EQ 0.
+        it_fail-qty = it_qtyrep-qty.
+      ELSE.
+        CLEAR it_fail-qty.
+      ENDIF.
+
+*Object part description damage-code damage-desc
+      READ TABLE it_qmfe WITH KEY qmnum = it_afih-qmnum.
+      IF sy-subrc EQ 0.
+        it_fail-fegrp = it_qmfe-fegrp.
+        it_fail-fecod = it_qmfe-fecod.
+        it_fail-otgrp = it_qmfe-otgrp.
+        it_fail-oteil = it_qmfe-oteil.
+      ENDIF.
+
+      READ TABLE it_qpct WITH KEY codegruppe = it_qmfe-fegrp
+                                   code =  it_qmfe-fecod.
+      IF sy-subrc EQ 0.
+        it_fail-kurztext1 = it_qpct-kurztext.
+      ENDIF.
+
+      READ TABLE it_qpct WITH KEY codegruppe = it_qmfe-otgrp
+                                            code = it_qmfe-oteil.
+      IF sy-subrc EQ 0.
+        it_fail-kurztext2 = it_qpct-kurztext.
+      ENDIF.
+
+
+      READ TABLE it_qmur WITH KEY qmnum = it_qmel-qmnum.
+      IF sy-subrc EQ 0.
+        it_fail-urtxt   =  it_qmur-urtxt.
+        it_fail-urgrp   =  it_qmur-urgrp.
+        it_fail-urcod   =  it_qmur-urcod.
+      ELSE.
+        it_fail-urtxt   = space.
+        it_fail-urgrp   = space.
+        it_fail-urcod   = space.
+
+
+      ENDIF.
+      IF NOT it_fail-urcod IN so_urcod.
+        CONTINUE.
+      ENDIF.
+
+      APPEND it_fail.
+      CLEAR it_fail.
+    ENDLOOP.
+  ENDIF.
+ENDFORM.                    " select_fail_rep
+*&---------------------------------------------------------------------*
+*&      Form  rep_fail_field_cat
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM rep_fail_field_cat .
+
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'AUFNR'.
+  ls_fieldcat-outputlen = 18.
+  ls_fieldcat-coltext = 'Service order'(010).
+  ls_fieldcat-no_zero = 'X'.
+  ls_fieldcat-fix_column = 'X'.
+  ls_fieldcat-hotspot = 'X'.
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+*  CLEAR ls_fieldcat.
+*  ls_fieldcat-fieldname = 'IDAT2'.
+*  ls_fieldcat-outputlen = 10.
+*  ls_fieldcat-coltext = 'TECO date'(012).
+*  ls_fieldcat-fix_column = 'X'.
+*  APPEND ls_fieldcat TO lt_fieldcat.
+
+*  CLEAR ls_fieldcat.
+*  ls_fieldcat-fieldname = 'PARNR'.
+*  ls_fieldcat-outputlen = 12.
+*  ls_fieldcat-coltext = 'Customer No'(014).
+*  ls_fieldcat-fix_column = 'X'.
+*  APPEND ls_fieldcat TO lt_fieldcat.
+*
+*  CLEAR ls_fieldcat.
+*  ls_fieldcat-fieldname = 'PARVW'.
+*  ls_fieldcat-outputlen = 18.
+*  ls_fieldcat-coltext = 'End Customer No'(033).
+*  ls_fieldcat-hotspot = 'X'.
+*  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'KUNUM'.
+  ls_fieldcat-outputlen = 11.
+  ls_fieldcat-coltext = 'Customer'(014).
+  ls_fieldcat-no_zero = 'X'.
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'CUST_NAME'.
+  ls_fieldcat-outputlen = 18.
+  ls_fieldcat-coltext = 'Customer name'(032).
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'END'.
+  ls_fieldcat-outputlen = 12.
+  ls_fieldcat-coltext = 'End customer'(015).
+  ls_fieldcat-no_zero = 'X'.
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'END_NAME'.
+  ls_fieldcat-outputlen = 18.
+  ls_fieldcat-coltext = 'End customer name'(033).
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'EQUNR'.
+  ls_fieldcat-outputlen = 18.
+  ls_fieldcat-coltext = 'Equipment'(016).
+  ls_fieldcat-no_zero = 'X'.
+  ls_fieldcat-hotspot = 'X'.
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'SERIALNR'.
+  ls_fieldcat-outputlen = 18.
+  ls_fieldcat-coltext = 'Serial'(017).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'TIDNR'.
+  ls_fieldcat-outputlen = 18.
+  ls_fieldcat-coltext = 'Cust. Ref.'(018).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+***  CLEAR ls_fieldcat.
+***  ls_fieldcat-fieldname = 'GEWRK'.
+***  ls_fieldcat-outputlen = 10.
+***  ls_fieldcat-coltext = 'Workcenter'(019).
+***  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'ARBPL'.
+  ls_fieldcat-outputlen = 10.
+  ls_fieldcat-coltext = 'Workcenter'(019).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'KTEXT'.
+  ls_fieldcat-outputlen = 24.
+  ls_fieldcat-coltext = 'Workcenter descr'(057).
+*  LS_FIELDCAT-FIX_COLUMN = 'X'.
+*  LS_FIELDCAT-EMPHASIZE = 'X'.
+
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'ISMNW'.
+  ls_fieldcat-outputlen = 4.
+  ls_fieldcat-coltext = 'Total time of repair'(046).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'GAC'.
+  ls_fieldcat-outputlen = 24.
+  ls_fieldcat-coltext = 'GAC'(040).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'PGC'.
+  ls_fieldcat-outputlen = 24.
+  ls_fieldcat-coltext = 'PGC'(041).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'QMART'.
+  ls_fieldcat-outputlen = 17.
+  ls_fieldcat-coltext = 'Notification type'(038).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'IMRC_POINT'.
+  ls_fieldcat-outputlen = 18.
+  ls_fieldcat-coltext = 'Number of tightening'(045).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'QTY'.
+  ls_fieldcat-outputlen = 3.
+  ls_fieldcat-coltext = 'Qty of repairs'(042).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'FEGRP'.
+  ls_fieldcat-outputlen = 10.
+  ls_fieldcat-coltext = 'Damage code'(073).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'FECOD'.
+  ls_fieldcat-outputlen = 6.
+  ls_fieldcat-coltext = 'Damage desc'(074).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'KURZTEXT1'.
+  ls_fieldcat-outputlen = 6.
+  ls_fieldcat-coltext = 'Damage'(078).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'OTGRP'.
+  ls_fieldcat-outputlen = 10.
+  ls_fieldcat-coltext = 'Object Part'(075).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'OTEIL'.
+  ls_fieldcat-outputlen = 6.
+  ls_fieldcat-coltext = 'Object Part desc'(076).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'KURZTEXT2'.
+  ls_fieldcat-outputlen = 6.
+  ls_fieldcat-coltext = 'Object desc'(077).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'URTXT'.
+  ls_fieldcat-outputlen = 40.
+  ls_fieldcat-coltext = 'Cause Text'(044).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'URGRP'.
+  ls_fieldcat-outputlen = 12.
+  ls_fieldcat-coltext = 'Cause code grp'(043).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'URCOD'.
+  ls_fieldcat-outputlen = 14.
+  ls_fieldcat-coltext = 'Cause code'(037).
+  ls_fieldcat-no_zero = 'X'.
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+ENDFORM.                    " rep_fail_field_cat
+
+*&---------------------------------------------------------------------*
+*&      Form  CAUSE_CODE_SH
+*&---------------------------------------------------------------------*
+FORM cause_code_sh  CHANGING p_urcod.
+
+  DATA:
+  lt_codegrptab LIKE qpk1codegrp OCCURS 0 WITH HEADER LINE,
+  lt_qpk1cdtab  LIKE qpk1cd      OCCURS 0 WITH HEADER LINE.
+
+  lt_codegrptab-codegruppe = '*'.
+  APPEND lt_codegrptab.
+
+  CALL FUNCTION 'QPK1_GP_CODE_SELECTION'
+    EXPORTING
+      i_katalogart           = 'X'
+      i_pickup_mode          = 'X'
+    TABLES
+      t_qpk1cdtab            = lt_qpk1cdtab[]
+      t_codegrptab           = lt_codegrptab[]
+    EXCEPTIONS
+      no_match_in_range      = 1
+      no_user_selection      = 2
+      no_authorization       = 3
+      no_selection_specified = 4
+      object_locked          = 5
+      lock_error             = 6
+      object_missing         = 7
+      OTHERS                 = 8.
+
+  READ TABLE lt_qpk1cdtab INDEX 1.
+  IF sy-subrc EQ 0.
+    p_urcod = lt_qpk1cdtab-code.
+  ENDIF.
+
+ENDFORM.                    " CAUSE_CODE_SH
+*&---------------------------------------------------------------------*
+*&      Form  STATUS_TECO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM status_teco .
+
+  DATA: lv_status_line LIKE bsvx-sttxt,
+        lv_usrstatus_line LIKE bsvx-sttxt.
+
+
+  LOOP AT lt_aufk.
+
+    CLEAR lv_status_line.
+
+    CALL FUNCTION 'STATUS_TEXT_EDIT'
+      EXPORTING
+        client                  = sy-mandt
+*   flg_user_stat           = 'X'
+        objnr                   = lt_aufk-objnr
+   only_active             = 'X'
+        spras                   = sy-langu
+*   BYPASS_BUFFER           = ' '
+     IMPORTING
+*   ANW_STAT_EXISTING       =
+*   E_STSMA                 =
+       line                =  lv_status_line
+*   user_line               =  lv_usrstatus_line.
+*   STONR                   =
+   EXCEPTIONS
+   object_not_found        = 1
+   OTHERS                  = 2.
+
+    IF sy-subrc EQ 0.
+
+      SEARCH lv_status_line   FOR 'TECO'.
+      IF sy-subrc NE 0.
+        DELETE lt_aufk.
+      ENDIF.
+*      SEARCH lv_usrstatus_line  FOR 'APAV'.    "APAV status is set
+*      IF sy-subrc NE 0.
+*      ENDIF.
+    ELSE.
+*    message id sy-msgid type sy-msgty number sy-msgno
+*         WITH SY-MSGV1 SY-MSGV2.
+    ENDIF.
+
+
+  ENDLOOP.
+
+ENDFORM.                    " STATUS_TECO

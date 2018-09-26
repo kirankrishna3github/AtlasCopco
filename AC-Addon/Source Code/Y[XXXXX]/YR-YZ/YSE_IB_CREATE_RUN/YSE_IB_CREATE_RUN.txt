@@ -1,0 +1,825 @@
+*----------------------------------------------------------------------*
+* PROGRAM ID    : YSE_IB_CREATE_RUN                                    *
+* PROGRAM TITLE : Mass I/B Create                                      *
+* AUTHOR        : Anda Wu                                              *
+* DATE          : 22/07/2015                                           *
+* DEVELOPMENT ID:                                                      *
+*                                                                      *
+* CHANGE REQUEST NUMBER:                                               *
+*                                                                      *
+* Program Description: Mass I/B Create                                 *
+*                                                                      *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+*  DATE    | NAME     |TRANSPORT  | CR# and short Description          *
+*----------------------------------------------------------------------*
+*20/07/2015|Anda Wu   |CD1K986250 |CR3654: Initial version             *
+*----------------------------------------------------------------------*
+REPORT  yse_ib_create_run NO STANDARD PAGE HEADING LINE-SIZE 255.
+************************************************************************
+* TYPE SPOOLS                                                          *
+************************************************************************
+TYPE-POOLS: slis.
+
+************************************************************************
+* TYPES                                                                *
+************************************************************************
+TYPES:
+
+  BEGIN OF ty_file_line,
+    lifnr         TYPE char10,    "Vendor Account Number
+    ebeln         TYPE char10,        "Purchasing Document Number
+    ebelp         TYPE char5,         "Item Number of PO
+    lfimg         TYPE char20,        "Actual quantity delivered Q13
+    lfdat         TYPE char12,        "Delivery Date
+    verur         TYPE char35,        "Distribution delivery - Ref
+    bolnr         TYPE char35,        "Bill of lading
+    traty         TYPE char4,         "Means-of-Transport Type
+    traid         TYPE char20,        "Means of Transport ID
+    dem           TYPE char20,        "Dimension(cm)
+    btgew         TYPE char25,        "Gross Weight
+    ntgew         TYPE char25,        "Net Weight
+  END OF ty_file_line,
+
+  BEGIN OF ty_equz_iloa,
+    equnr         TYPE equz-equnr,    "equip No.
+    datbi         TYPE equz-datbi,
+    eqlfn         TYPE equz-eqlfn,
+    iloan         TYPE equz-iloan,
+    vkorg         TYPE iloa-vkorg,    "Sales Organization
+    vtweg         TYPE iloa-vtweg,    "Distribution Channel
+    spart         TYPE iloa-spart,    "Division
+  END OF ty_equz_iloa,
+
+  BEGIN OF ty_order_flow,
+    bstkd         TYPE vbkd-bstkd,    "P0 Number
+    qmnum         TYPE qmel-qmnum,    "Notification No
+    aufnr         TYPE qmel-aufnr,    "Sevice Order No
+    vbeln         TYPE qmel-vbeln,    "Sales Order Number
+    iw32_err      TYPE string,
+  END OF ty_order_flow,
+
+  BEGIN OF ty_update_log,
+    bstkd         TYPE vbkd-bstkd,    "P0 Number
+    mess          TYPE string,
+  END OF ty_update_log,
+
+  BEGIN OF ty_vbkd,
+    vbeln         TYPE vbkd-vbeln,
+    posnr         TYPE vbkd-posnr,
+    bstkd         TYPE vbkd-bstkd,    "P0 Number
+  END OF ty_vbkd,
+
+  BEGIN OF ty_alv_output,
+    ebeln         TYPE char35,        "P0 Number
+*    ebelp         TYPE ekpo-ebelp,    " po item
+    vbeln         TYPE vbeln_vl,      " I/B number
+    mess          TYPE string,        "Process message
+  END OF ty_alv_output.
+
+************************************************************************
+* WORKAREAS                                                            *
+************************************************************************
+DATA:
+  gs_update       TYPE yse_ib_upld,
+  gs_alv_output   TYPE ty_alv_output.
+
+************************************************************************
+* INTERNAL TABLES                                                      *
+************************************************************************
+DATA:
+  gt_bdcdata      TYPE STANDARD TABLE OF bdcdata,
+  gt_fieldcat     TYPE slis_t_fieldcat_alv,
+  gt_alv_output   TYPE STANDARD TABLE OF ty_alv_output,
+  gt_suc          TYPE STANDARD TABLE OF ty_alv_output,
+  gt_err          TYPE STANDARD TABLE OF ty_alv_output,
+  gt_update       TYPE STANDARD TABLE OF yse_ib_upld."Update filedata
+*  gt_update_log   TYPE STANDARD TABLE OF ty_update_log."update process log
+
+************************************************************************
+* VARIABLES                                                            *
+************************************************************************
+DATA:
+  gs_layout       TYPE slis_layout_alv,
+  gv_tot_lines    TYPE i,                           "Process lines
+  gv_suc_lines    TYPE i,                           "Success Lines
+  gv_fai_lines    TYPE i.                           "Failed lines
+
+************************************************************************
+* CONSTANTS                                                            *
+************************************************************************
+CONSTANTS:
+  gc_type_e       TYPE c VALUE 'E',
+  gc_x            TYPE c VALUE 'X'.
+
+*&---------------------------------------------------------------------*
+*& START-OF-SELECTION                                                  *
+*&---------------------------------------------------------------------*
+START-OF-SELECTION.
+* Write entry to datebase table
+  PERFORM write_db.
+* ALV display
+  PERFORM show_alv.
+
+*&---------------------------------------------------------------------*
+*& END-OF-SELECTION                                                    *
+*&---------------------------------------------------------------------*
+END-OF-SELECTION.
+  PERFORM write_log.
+  DELETE FROM yse_ib_upld.
+
+*&---------------------------------------------------------------------*
+*&      Form  WRITE_DB
+*&---------------------------------------------------------------------*
+*       Write entry to datebase table
+*----------------------------------------------------------------------*
+FORM write_db .
+
+  DATA: lv_ebeln      TYPE likp-vbeln,
+        ls_option     TYPE ctu_params ,
+        lv_method     TYPE char5,
+        ls_bdcmsg     TYPE bdcmsgcoll,
+        lv_segnum(6)  TYPE n,
+        lv_psgnum(6)  TYPE n,
+        lt_edidc TYPE STANDARD TABLE OF edidc,
+        ls_edidc TYPE  edidc,
+        lt_edidd     TYPE STANDARD TABLE OF edidd,
+        ls_edidd     TYPE edidd,
+        lflg_err      TYPE char1,
+        ls_e1edl20  TYPE  e1edl20,
+        ls_e1edt13  TYPE  e1edt13,
+        ls_e1edL18  TYPE  e1edt18,
+        ls_e1edl24  TYPE  e1edl24,
+        ls_e1edl41  TYPE  e1edl41,
+        lv_vkorg    TYPE ekko-ekorg,
+        lv_matnr    TYPE ekpo-matnr,
+        lv_posnr    TYPE posnr,
+        lflg_first  TYPE char1,
+        lt_bdidocstat TYPE STANDARD TABLE OF bdidocstat,
+        ls_bdidocstat TYPE bdidocstat,
+        lt_bdwfretvar TYPE STANDARD TABLE OF bdwfretvar,
+        lt_bdi_ser  TYPE STANDARD TABLE OF bdi_ser,
+        ls_ib_upld TYPE yse_ib_upld,
+        lv_isocode  TYPE t006-isocode,
+        lt_ib_upld TYPE STANDARD TABLE OF yse_ib_upld.
+
+  DATA: lt_bdcmsgcoll TYPE STANDARD TABLE OF bdcmsgcoll.
+
+  FIELD-SYMBOLS: <lfs_ib_upld> TYPE yse_ib_upld.
+
+  lv_method = 'IDOC'.
+  SELECT *
+    FROM yse_ib_upld
+    INTO CORRESPONDING FIELDS OF TABLE gt_update.
+
+* Check if update entries is empty
+  IF gt_update IS INITIAL.
+    MESSAGE s000(yse_sales_log) DISPLAY LIKE gc_type_e
+      WITH text-002.
+    LEAVE LIST-PROCESSING.
+  ENDIF.
+
+  LOOP AT gt_update ASSIGNING <lfs_ib_upld>.
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+      EXPORTING
+        input  = <lfs_ib_upld>-ebeln
+      IMPORTING
+        output = <lfs_ib_upld>-ebeln.
+  ENDLOOP.
+* Get Sales and Distribution info
+*  PERFORM frm_get_sd.
+  IF lv_method = 'IDOC'.
+    ls_edidc-mandt  = sy-mandt.
+    ls_edidc-status = '62'.
+    ls_edidc-direct = '2'.
+    ls_edidc-docrel = sy-saprl.
+    ls_edidc-mestyp = 'YSE_VISA_DESADV'.
+    ls_edidc-idoctp = 'DELVRY03'.
+    ls_edidc-credat = sy-datum.
+    ls_edidc-cretim = sy-uzeit.
+    ls_edidc-upddat = sy-datum.
+    ls_edidc-updtim = sy-uzeit.
+    IF sy-sysid = 'CQ1'.
+      ls_edidc-sndpor = 'SAPSD0'.
+      ls_edidc-sndprt = 'LS'.
+      ls_edidc-sndprn = 'SQ0500PI'.
+      ls_edidc-rcvpor = 'SAPCQ1'.
+      ls_edidc-rcvprt = 'LS'.
+      ls_edidc-rcvprn = 'CQ1CLNT100'.
+    ELSEIF sy-sysid = 'CP1'.
+      ls_edidc-sndpor = 'SAPSP0'.
+      ls_edidc-sndprt = 'LS'.
+      ls_edidc-sndprn = 'SP0500PI'.
+      ls_edidc-rcvpor = 'SAPCP1'.
+      ls_edidc-rcvprt = 'LS'.
+      ls_edidc-rcvprn = 'CP1CLNT100'.
+    ENDIF.
+    APPEND ls_edidc TO lt_edidc.
+    APPEND LINES OF gt_update TO lt_ib_upld.
+    SORT: gt_update BY traid,
+          lt_ib_upld BY traid.
+    DELETE ADJACENT DUPLICATES FROM lt_ib_upld COMPARING traid.
+    DESCRIBE TABLE lt_ib_upld LINES gv_tot_lines.
+    LOOP AT lt_ib_upld INTO ls_ib_upld.
+      CLEAR: gs_alv_output,
+             lv_posnr,
+             lflg_err.
+      REFRESH: "lt_edidc,
+              lt_edidd,
+              lt_bdidocstat,
+              lt_bdwfretvar,
+              lt_bdi_ser.
+      lflg_first = 'X'.
+      LOOP AT gt_update INTO gs_update
+                      WHERE traid = ls_ib_upld-traid.
+        CLEAR:  lv_vkorg,
+                lv_matnr,
+                ls_e1edl20  ,
+                ls_e1edL18  ,
+                ls_e1edt13  ,
+                ls_e1edl24  ,
+                ls_e1edl41  .
+*        SELECT SINGLE ekorg
+*          FROM ekko
+*          INTO lv_vkorg
+*          WHERE ebeln = gs_update-ebeln.
+*          IF sy-subrc <> 0.
+*            lflg_err = 'X'.
+*            EXIT.
+*          ENDIF.
+        lv_vkorg = ls_ib_upld-ekorg.
+*        SELECT SINGLE matnr
+*          FROM ekpo
+*          INTO lv_matnr
+*          WHERE ebeln = gs_update-ebeln
+*            AND ebelp = gs_update-ebelp.
+*        IF sy-subrc <> 0.
+*          lflg_err = 'X'.
+*          EXIT.
+*        ENDIF.
+        lv_matnr = gs_update-matnr.
+        IF lflg_first IS NOT INITIAL.
+          CLEAR: lflg_first.
+          lv_psgnum = '000000'.
+          lv_segnum = '000001'.
+          ls_e1edl20-vkorg = lv_vkorg.
+          ls_e1edl20-bolnr = gs_update-bolnr.
+          ls_e1edl20-parid = gs_update-lifnr.
+          ls_e1edl20-lifex = gs_update-verur.
+          ls_e1edl20-traty = gs_update-traty.
+          ls_e1edl20-traid =  gs_update-traid.
+          ls_e1edl20-btgew = gs_update-btgew.
+          ls_e1edl20-ntgew = gs_update-ntgew.
+          CLEAR: lv_isocode.
+          SELECT SINGLE ISOCODE
+            FROM T006
+            INTO lv_isocode
+            WHERE MSEHI = gs_update-gewei.
+          IF sy-subrc = 0 .
+            ls_e1edl20-gewei = lv_isocode.
+*            ls_e1edl20-gewei = gs_update-gewei.
+          ENDIF.
+          PERFORM: fill_idoc_data
+                        TABLES lt_edidd
+                        USING lv_segnum 'E1EDL20' lv_psgnum '02' ls_e1edl20.
+          ls_e1edt13-qualf = '007'.
+          ls_e1edt13-ntanf = gs_update-lfdat.
+          lv_psgnum = lv_psgnum + 1.
+          lv_segnum = lv_segnum + 1.
+          PERFORM: fill_idoc_data
+                        TABLES lt_edidd
+                        USING lv_segnum 'E1EDT13' lv_psgnum '03' ls_e1edt13.
+          lv_segnum = lv_segnum + 1.
+          ls_e1edL18-QUALF = 'CWV'.
+          PERFORM: fill_idoc_data
+                        TABLES lt_edidd
+                        USING lv_segnum 'E1EDL18' lv_psgnum '03' ls_e1edL18.
+        ENDIF.
+        lv_posnr = lv_posnr + 1.
+        ls_e1edl24-posnr = lv_posnr.
+        ls_e1edl24-kdmat =  lv_matnr.
+        ls_e1edl24-lfimg = gs_update-lfimg.
+        ls_e1edl24-vrkme = 'C62'.
+        lv_psgnum = lv_psgnum + 1.
+        lv_segnum = lv_segnum + 1.
+        PERFORM:  fill_idoc_data
+                      TABLES lt_edidd
+                      USING lv_segnum 'E1EDL24' '000001' '03' ls_e1edl24.
+        ls_e1edl41-quali = '001'.
+        ls_e1edl41-bstnr = gs_update-ebeln+4(6).
+        ls_e1edl41-posex = gs_update-ebelp.
+        lv_psgnum = lv_segnum.
+        lv_segnum = lv_segnum + 1.
+        PERFORM: fill_idoc_data
+                      TABLES lt_edidd
+                      USING lv_segnum 'E1EDL41' lv_psgnum '04' ls_e1edl41.
+
+      ENDLOOP.
+      IF lflg_err IS INITIAL.
+        CALL FUNCTION 'IDOC_INPUT_DESADV1'
+          EXPORTING
+            input_method                = 'A'
+            mass_processing             = 'X'
+*         IMPORTING
+*           WORKFLOW_RESULT             =
+*           APPLICATION_VARIABLE        =
+*           IN_UPDATE_TASK              =
+*           CALL_TRANSACTION_DONE       =
+          TABLES
+            idoc_contrl                 = lt_edidc
+            idoc_data                   = lt_edidd
+            idoc_status                 = lt_bdidocstat
+            return_variables            = lt_bdwfretvar
+            serialization_info          = lt_bdi_ser
+          EXCEPTIONS
+            wrong_function_called       = 1
+            OTHERS                      = 2
+                  .
+        READ TABLE lt_bdidocstat INTO ls_bdidocstat
+           with key msgty = 'E'.
+        IF sy-subrc = 0.
+          gs_alv_output-ebeln = gs_update-traid.
+          MESSAGE ID Ls_BDIDOCSTAT-msgid TYPE ls_bdidocstat-msgty
+            NUMBER ls_bdidocstat-msgno
+                 WITH ls_bdidocstat-msgv1 ls_bdidocstat-msgv2
+                      ls_bdidocstat-msgv3 ls_bdidocstat-msgv4
+                 INTO gs_alv_output-mess.
+          APPEND gs_alv_output TO gt_err.
+        ELSE.
+          COMMIT WORK.
+          READ TABLE lt_bdidocstat INTO ls_bdidocstat
+            with key msgty = 'S'
+                     msgid = 'ME'
+                     msgno = '780'.
+
+          gs_alv_output-ebeln = gs_update-traid.
+          gs_alv_output-mess  = 'Success to creat IB'(t88).
+          gs_alv_output-vbeln = ls_bdidocstat-msgv2.
+          APPEND gs_alv_output TO gt_suc.
+        ENDIF.
+      ELSE.
+        gs_alv_output-ebeln = gs_update-traid.
+        gs_alv_output-mess = 'Please check if the PO/Item exist'(t89).
+        APPEND gs_alv_output TO gt_err.
+      ENDIF.
+    ENDLOOP.
+  ELSEIF lv_method = 'BDC'.
+    ls_option-dismode   = 'N'.
+    ls_option-updmode   = 'S'.
+    ls_option-racommit  = 'X'.
+
+    SORT gt_update BY ebeln ebelp lifnr.
+    LOOP AT gt_update INTO gs_update.
+      CLEAR: gs_alv_output.
+      IF lv_ebeln <> gs_update-ebeln.
+        PERFORM frm_bdc_fill_ib.
+
+        CALL TRANSACTION 'VL31N'
+          USING gt_bdcdata
+          OPTIONS FROM ls_option
+          MESSAGES INTO lt_bdcmsgcoll.
+
+        READ TABLE lt_bdcmsgcoll INTO ls_bdcmsg
+            WITH KEY msgtyp = gc_type_e.
+        IF sy-subrc = 0.
+          MESSAGE ID ls_bdcmsg-msgid TYPE ls_bdcmsg-msgtyp
+            NUMBER ls_bdcmsg-msgnr
+            WITH ls_bdcmsg-msgv1 ls_bdcmsg-msgv2
+                 ls_bdcmsg-msgv3 ls_bdcmsg-msgv4
+            INTO gs_alv_output-mess.
+          gs_alv_output-ebeln  = gs_update-traid.
+          APPEND gs_alv_output TO gt_alv_output.
+          REFRESH: gt_bdcdata,lt_bdcmsgcoll.
+          CLEAR: gs_update.
+          CONTINUE.
+        ELSE.
+          READ TABLE lt_bdcmsgcoll INTO ls_bdcmsg
+            WITH KEY msgid = 'VL'
+                     msgnr = '311'.
+          IF sy-subrc = 0.
+            CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+              EXPORTING
+                input  = ls_bdcmsg-msgv2
+              IMPORTING
+                output = gs_alv_output-vbeln.
+            gs_alv_output-ebeln  = gs_update-traid.
+*            gs_alv_output-ebelp  = gs_update-ebelp.
+            PERFORM frm_change_ib.
+            APPEND gs_alv_output TO gt_alv_output.
+            IF gs_alv_output-mess IS INITIAL.
+              gv_suc_lines        = gv_suc_lines + 1.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+      lv_ebeln = gs_update-ebeln.
+      REFRESH: gt_bdcdata,lt_bdcmsgcoll.
+      CLEAR: gs_update.
+    ENDLOOP.
+  ENDIF.
+ENDFORM.                    " WRITE_DB
+
+*&---------------------------------------------------------------------*
+*&      Form  WRITE_LOG
+*&---------------------------------------------------------------------*
+*       WRITE process result message
+*----------------------------------------------------------------------*
+FORM write_log .
+  DATA: ls_err TYPE ty_alv_output.
+  DESCRIBE TABLE gt_suc LINES gv_suc_lines.
+  DESCRIBE TABLE gt_err LINES gv_fai_lines.
+  gv_tot_lines = gv_fai_lines + gv_suc_lines.
+  WRITE: 'Total Process Entries:'(005) , AT 30(6) gv_tot_lines,
+          / 'Successful Process Entries:'(006), AT 30(6) gv_suc_lines,
+          / 'Failed Process Entries:'(007), AT 30(6) gv_fai_lines.
+
+  ULINE.
+  WRITE: / 'Error ones as blow:'(095).
+  SKIP 1.
+  LOOP AT gt_err INTO ls_err.
+    WRITE: / ls_err-ebeln, ':', 40 ls_err-mess.
+  ENDLOOP.
+
+  ULINE.
+  WRITE: / 'Success ones as blow:'(096).
+  SKIP 1.
+
+  LOOP AT gt_suc INTO ls_err.
+    WRITE: / ls_err-ebeln, ':', 40 ls_err-vbeln.
+  ENDLOOP.
+
+
+ENDFORM.                    " WRITE_LOG
+
+*&---------------------------------------------------------------------*
+*&      Form  frm_bdc_fill_ib
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM frm_bdc_fill_ib .
+
+  DATA: ls_bdcdata  TYPE   bdcdata,
+        lv_lfdat    TYPE   likp-lfdat.
+
+*  lv_lfdat = gs_update-lfdat.
+  WRITE gs_update-lfdat TO lv_lfdat.
+
+  CLEAR  ls_bdcdata.
+  PERFORM  fill_bdcdata IN PROGRAM yam_common_routines
+             USING    'SAPMV50A'  '4007'  'X'  ''  ''
+             CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_CURSOR'  'LIKP-LIFNR'
+          CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_OKCODE'  '/00'
+          CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'LIKP-LIFNR'  gs_update-lifnr
+          CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'LV50C-BSTNR'  gs_update-ebeln
+          CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'RV50A-LFDAT_LA' lv_lfdat
+          CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM  fill_bdcdata IN PROGRAM yam_common_routines
+             USING    'SAPMV50A'  '1000'  'X'  ''  ''
+             CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_OKCODE' '=HDET_T'
+          CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM  fill_bdcdata IN PROGRAM yam_common_routines
+             USING    'SAPMV50A'  '2000'  'X'  ''  ''
+             CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_OKCODE' '=T\03'
+          CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM  fill_bdcdata IN PROGRAM yam_common_routines
+             USING    'SAPMV50A'  '2000'  'X'  ''  ''
+             CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_OKCODE'  '=SICH_T'
+          CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'LIKP-BOLNR' gs_update-bolnr
+          CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'LIKP-TRATY' gs_update-traty
+          CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'LIKP-TRAID' gs_update-traid
+          CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+
+ENDFORM.                    " frm_bdc_fill_ib
+*&---------------------------------------------------------------------*
+*&      Form  frm_change_ib
+*&---------------------------------------------------------------------*
+*       Maintain the head text and operation information
+*----------------------------------------------------------------------*
+FORM frm_change_ib .
+
+  DATA:  lv_wait_se TYPE i,
+*        ls_update_log TYPE ty_update_log,
+*        lt_operation TYPE STANDARD TABLE OF bapi_alm_order_operation_e,
+*        ls_operation TYPE bapi_alm_order_operation_e,
+        lt_return  TYPE STANDARD TABLE OF bapiret2,
+        ls_return   TYPE bapiret2.
+*        lt_header  TYPE STANDARD TABLE OF bapi_alm_order_headers_i,
+*        ls_header  TYPE bapi_alm_order_headers_i,
+*        lt_headup  TYPE STANDARD TABLE OF bapi_alm_order_headers_up,
+*        ls_headup  TYPE bapi_alm_order_headers_up,
+*        lt_method TYPE STANDARD TABLE OF bapi_alm_order_method,
+*        ls_method   TYPE bapi_alm_order_method,
+*        lv_flag     TYPE flag,
+*        lt_oper   TYPE STANDARD TABLE OF bapi_alm_order_operation,
+*        ls_oper   TYPE bapi_alm_order_operation,
+*        lt_operup TYPE STANDARD TABLE OF  bapi_alm_order_operation_up,
+*        ls_operup TYPE bapi_alm_order_operation_up.
+  DATA: ls_header_data      TYPE  bapiibdlvhdrchg,
+        ls_header_control   TYPE  bapiibdlvhdrctrlchg,
+        lt_lips             TYPE STANDARD TABLE OF lips,
+        ls_lips             TYPE lips,
+        lt_item_data        TYPE STANDARD TABLE OF bapiibdlvitemchg,
+        ls_item_data        TYPE bapiibdlvitemchg,
+        lt_item_control     TYPE STANDARD TABLE OF bapiibdlvitemctrlchg,
+        ls_item_control     TYPE bapiibdlvitemctrlchg.
+
+
+  lv_wait_se = 1.
+  WAIT UP TO lv_wait_se SECONDS.
+
+  SELECT *
+    FROM lips
+    INTO TABLE lt_lips
+    WHERE vbeln = gs_alv_output-vbeln.
+
+  LOOP AT lt_lips INTO ls_lips.
+    CLEAR: ls_item_data,
+           ls_item_control.
+    ls_item_data-deliv_numb = ls_lips-vbeln.
+    ls_item_data-deliv_item = ls_lips-posnr.
+    ls_item_control-deliv_numb = ls_lips-vbeln.
+    ls_item_control-deliv_item = ls_lips-posnr.
+    ls_item_data-dlv_qty = ls_lips-lfimg."gs_update-lfimg.
+    ls_item_data-dlv_qty_imunit = ls_lips-lgmng.
+    ls_item_data-del_qty_flo = ls_lips-lfimg_flo.
+    ls_item_data-dlv_qty_st_flo = ls_lips-lgmng_flo.
+    ls_item_data-fact_unit_nom = ls_lips-umvkz.
+    ls_item_data-fact_unit_denom = ls_lips-umvkn.
+    ls_item_data-conv_fact = ls_lips-umrev.
+    READ TABLE gt_update INTO gs_update
+         WITH KEY ebeln = ls_lips-vgbel
+                  ebelp = ls_lips-vgpos.
+    IF sy-subrc = 0.
+      ls_item_control-chg_delqty =  'X'.
+      ls_item_data-dlv_qty = gs_update-lfimg.
+      ls_item_data-dlv_qty_imunit = gs_update-lfimg.
+      ls_item_data-del_qty_flo = gs_update-lfimg.
+      ls_item_data-dlv_qty_st_flo = gs_update-lfimg.
+    ELSE.
+      ls_item_control-del_item = 'X'.
+    ENDIF.
+    APPEND ls_item_data TO lt_item_data.
+    APPEND ls_item_control TO lt_item_control.
+  ENDLOOP.
+
+  ls_header_data-deliv_numb = gs_alv_output-vbeln.
+  ls_header_data-gross_wt   = gs_update-btgew.
+  ls_header_data-net_weight = gs_update-ntgew.
+  ls_header_data-unit_of_wt = gs_update-gewei.
+  ls_header_data-extdelv_no = gs_update-verur.
+
+  ls_header_control-deliv_numb = gs_alv_output-vbeln.
+  ls_header_control-gross_wt_flg   = 'X'.
+  ls_header_control-net_wt_flg = 'X'.
+  ls_header_control-dlv_extid_flg = 'X'.
+
+  CALL FUNCTION 'BAPI_INB_DELIVERY_CHANGE'
+    EXPORTING
+      header_data                =  ls_header_data
+      header_control             =  ls_header_control
+      delivery                   =  gs_alv_output-vbeln
+*     TECHN_CONTROL              =
+    TABLES
+*     HEADER_PARTNER             =
+*     HEADER_PARTNER_ADDR        =
+*     HEADER_DEADLINES           =
+      item_data                  =  lt_item_data
+      item_control               =  lt_item_control
+*     ITEM_SERIAL_NO             =
+*     EXTENSION1                 =
+*     EXTENSION2                 =
+      return                     =  lt_return
+*     TOKENREFERENCE             =
+*     HANDLING_UNIT_HEADER       =
+*     HANDLING_UNIT_ITEM         =
+*     PARTIAL_GR_OBJECTS         =
+      .
+  READ TABLE lt_return INTO ls_return
+    WITH KEY type = gc_type_e.
+  IF sy-subrc = 0.
+    MESSAGE ID ls_return-id TYPE ls_return-type
+      NUMBER ls_return-number
+      WITH ls_return-message_v1 ls_return-message_v2
+           ls_return-message_v3 ls_return-message_v4
+      INTO gs_alv_output-mess.
+  ELSE.
+    CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+      EXPORTING
+        wait = 'X'.
+*     IMPORTING
+*       RETURN        =
+    .
+
+  ENDIF.
+
+ENDFORM.                    " frm_change_ib
+
+*&---------------------------------------------------------------------*
+*&      Form  SHOW_ALV
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM show_alv .
+
+* FIELDCAT set
+  PERFORM alv_fieldcat_set.
+* LAYOUT set
+  PERFORM alv_layout_set.
+* ALV display
+  PERFORM alv_display.
+
+ENDFORM.                    " SHOW_ALV
+*&---------------------------------------------------------------------*
+*&      Form  ALV_FIELDCAT_SET
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM alv_fieldcat_set .
+  DATA:
+     lv_linecnt  TYPE i,
+     ls_fieldcat TYPE slis_fieldcat_alv.
+
+  CLEAR lv_linecnt.
+* P0 Number
+  CLEAR ls_fieldcat.
+  lv_linecnt = lv_linecnt + 1.
+  ls_fieldcat-col_pos = lv_linecnt.
+  ls_fieldcat-fieldname = 'EBELN'.
+  ls_fieldcat-seltext_s = 'PO No.'(038).
+  ls_fieldcat-seltext_m = 'PO Number'(039).
+  ls_fieldcat-fix_column = gc_x.
+  APPEND ls_fieldcat TO gt_fieldcat.
+
+* Sevice Order No
+*  CLEAR ls_fieldcat.
+*  lv_linecnt = lv_linecnt + 1.
+*  ls_fieldcat-col_pos = lv_linecnt.
+*  ls_fieldcat-fieldname = 'EBELP'.
+*  ls_fieldcat-seltext_s = 'PO Item'(040).
+*  ls_fieldcat-seltext_m = 'PO Item Number'(041).
+*  ls_fieldcat-fix_column = gc_x.
+*  APPEND ls_fieldcat TO gt_fieldcat.
+
+* Sevice Order No
+  CLEAR ls_fieldcat.
+  lv_linecnt = lv_linecnt + 1.
+  ls_fieldcat-col_pos = lv_linecnt.
+  ls_fieldcat-fieldname = 'VBELN'.
+  ls_fieldcat-seltext_s = 'I/B No.'(063).
+  ls_fieldcat-seltext_m = 'I/B Number'(064).
+  ls_fieldcat-fix_column = gc_x.
+  APPEND ls_fieldcat TO gt_fieldcat.
+
+* SO item
+  CLEAR ls_fieldcat.
+  lv_linecnt = lv_linecnt + 1.
+  ls_fieldcat-col_pos = lv_linecnt.
+  ls_fieldcat-fieldname = 'MESS'.
+  ls_fieldcat-seltext_s = 'Err.Msg'(042).
+  ls_fieldcat-seltext_m = 'Error Message'(043).
+  APPEND ls_fieldcat TO gt_fieldcat.
+
+ENDFORM.                    " ALV_FIELDCAT_SET
+*&---------------------------------------------------------------------*
+*&      Form  ALV_LAYOUT_SET
+*&---------------------------------------------------------------------*
+*      LAYOUT set
+*----------------------------------------------------------------------*
+FORM alv_layout_set .
+  CLEAR: gs_layout.
+  gs_layout-zebra = gc_x.               "ALV lines cross-color display
+  gs_layout-colwidth_optimize = gc_x.   " Auto optimize column width
+  gs_layout-detail_popup = gc_x.        " Show detail screen
+*  gs_layout-box_fieldname  = 'SEL'.
+ENDFORM.                    " ALV_LAYOUT_SET
+*&---------------------------------------------------------------------*
+*&      Form  ALV_DISPLAY
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM alv_display .
+  CHECK gt_alv_output IS NOT INITIAL.
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+    EXPORTING
+      i_callback_program = sy-repid
+      is_layout          = gs_layout
+      it_fieldcat        = gt_fieldcat
+    TABLES
+      t_outtab           = gt_alv_output
+    EXCEPTIONS
+      program_error      = 1
+      OTHERS             = 2.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+ENDFORM.                    " ALV_DISPLAY
+*&---------------------------------------------------------------------*
+*&      Form  FILL_IDOC_DATA
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_LT_EDIDD  text
+*----------------------------------------------------------------------*
+FORM fill_idoc_data  TABLES   p_lt_edidd STRUCTURE edidd
+                    USING   iv_segnum
+                            iv_segnam
+                            iv_psgnum
+                            iv_hlevel
+                            iv_sdata.
+  DATA: ls_edidd TYPE edidd.
+  ls_edidd-mandt  = sy-mandt.
+  ls_edidd-segnum = iv_segnum.
+  ls_edidd-segnam = iv_segnam.
+  ls_edidd-psgnum = iv_psgnum.
+  ls_edidd-hlevel = iv_hlevel.
+  ls_edidd-dtint2 = '1000'.
+  ls_edidd-sdata = iv_sdata.
+  APPEND ls_edidd TO p_lt_edidd.
+ENDFORM.                    " FILL_IDOC_DATA
+
+*Text symbol text£º
+*002:No data to process
+*005:Total Process Entries:
+*006:Successful Process Entries:
+*007:Failed Process Entries:
+*038:PO No.
+*039:PO Number
+*042:Err.Msg
+*043:Error Message
+*063:I/B No.
+*064:I/B Number
+*095:Error ones as blow:
+*096:Success ones as blow:
+*T88:Success to creat IB
+*T89:Please check if the PO/Item exist

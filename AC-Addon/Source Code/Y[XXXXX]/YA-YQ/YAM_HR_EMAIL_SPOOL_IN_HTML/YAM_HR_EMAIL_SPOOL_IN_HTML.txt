@@ -1,0 +1,351 @@
+*&---------------------------------------------------------------------*
+*& Report  YAM_HR_EMAIL_SPOOL_IN_HTML
+*&
+*&---------------------------------------------------------------------*
+REPORT  YAM_HR_EMAIL_SPOOL_IN_HTML.
+
+TABLES: sos04,
+        rspotype,
+
+        soli.
+
+PARAMETERS: p_des         LIKE sood1-objdes.
+SELECT-OPTIONS: s_spool   FOR rspotype-rqnumber NO INTERVALS,
+                s_emails  FOR sos04-l_adr_name NO INTERVALS,
+                s_text    FOR soli-line NO INTERVALS.
+
+************************************************************************
+* DATA DEFINITION
+************************************************************************
+*TYPES
+TYPES: BEGIN OF ty_tbtcp.
+        INCLUDE STRUCTURE tsp01.
+TYPES: END OF ty_tbtcp.
+TYPES: BEGIN OF ty_objpack,
+        rqnumber   TYPE rspotype-rqnumber,
+        head_start TYPE sopcklsti1-head_start,
+        head_num   TYPE sopcklsti1-head_num,
+        body_start TYPE sopcklsti1-body_start,
+        body_num   TYPE sopcklsti1-body_num,
+        no_lines   TYPE i,
+       END OF ty_objpack.
+*INTERNAL TABLES
+DATA: lt_tbtcp       TYPE STANDARD TABLE OF ty_tbtcp,
+      lt_objpack     TYPE STANDARD TABLE OF ty_objpack,
+      lt_mess_bod    LIKE solisti1 OCCURS 0 WITH HEADER LINE,
+      lt_mess_att    LIKE solisti1 OCCURS 0 WITH HEADER LINE,
+      lt_mess_2      LIKE solisti1 OCCURS 0 WITH HEADER LINE,
+      lt_spool_list  TYPE STANDARD TABLE OF bapixmspoo WITH HEADER LINE,
+      lt_spool_2     TYPE STANDARD TABLE OF bapixmspoo WITH HEADER LINE,
+      l_spool_id     LIKE tsp01-rqident.
+DATA: ls_tbtcp       TYPE ty_tbtcp,
+      ls_objpack     TYPE ty_objpack.
+DATA  so_ali LIKE soli OCCURS 0 WITH HEADER LINE.
+DATA: it_lines LIKE tline OCCURS 0 WITH HEADER LINE.
+DATA: p_template LIKE wwwdataid-objid.
+DATA listtab LIKE abaplist OCCURS 1.
+DATA p_html LIKE bapihtml OCCURS 10 WITH HEADER LINE.
+DATA lt_html LIKE bapihtml OCCURS 10 WITH HEADER LINE.
+*STRUCTURES
+*VARIABLES
+*VARIABLES
+DATA: l_spool_nr             LIKE tsp01-rqident,
+      l_bytecount            LIKE tst01-dsize,
+      l_buffer               TYPE string,
+      l_spool_cnt            TYPE i,
+      l_cnt                  TYPE i,
+      l_line_no              TYPE i,
+      l_total_cnt            TYPE i,
+      p_cnt(3)               TYPE c,
+      p_spool_nr(10)         TYPE c.
+DATA: l_subject              LIKE sodocchgi1-obj_descr,
+      l_sender_type          LIKE soextreci1-adr_typ,
+      l_recsize              TYPE i,
+      l_receiver             TYPE sy-subrc.
+DATA: ld_sender_address      LIKE soextreci1-receiver,
+      ld_sender_address_type LIKE soextreci1-adr_typ,
+      ld_error               TYPE sy-subrc.
+DATA: t_packing_list         LIKE sopcklsti1 occurs 0 with header line,
+      t_receivers            LIKE somlreci1 occurs 0 with header line,
+      t_attachment           LIKE solisti1 occurs 0 with header line,
+      w_sent_all(1)          TYPE c,
+      w_doc_data             LIKE sodocchgi1.
+DATA: tab_lines              LIKE sy-tabix.
+************************************************************************
+* INITIALIZATION
+************************************************************************
+INITIALIZATION.
+************************************************************************
+* START-OF-SELECTION
+************************************************************************
+START-OF-SELECTION.
+* Read Spool Number
+  PERFORM Get_spool_id.
+* HTML Logic
+  PERFORM Convert_spool_to_htm.
+* E-mail need to be sent as HTML
+  PERFORM Generate_email.
+* End process
+  IF sy-subrc <> 0.
+    WRITE:/ 'Error Sending Document',
+          / 'Return Code:', sy-subrc.
+  ELSE.
+    WRITE:/ 'Document successfully sent'.
+  ENDIF.
+************************************************************************
+*END-OF-SELECTON
+************************************************************************
+END-OF-SELECTION.
+*&---------------------------------------------------------------------*
+*&      Form  Get_spool_id
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM Get_spool_id .
+* Capture all Spool Numbers into a internal table
+  REFRESH lt_tbtcp.
+  CLEAR   ls_tbtcp.
+  SELECT * INTO TABLE lt_tbtcp
+     FROM tsp01
+     WHERE rqident IN s_spool.
+* Sort by Spool Number
+  SORT lt_tbtcp BY rqident.
+* Capture the number of spool numbers entered
+  CLEAR l_total_cnt.
+  DESCRIBE TABLE lt_tbtcp LINES l_total_cnt.
+ENDFORM.                    " Get_spool_id
+*&---------------------------------------------------------------------*
+*&      Form  Generate_email
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM Generate_email .
+* HTML E-mail
+    DESCRIBE TABLE lt_html LINES l_recsize.
+    CHECK l_recsize > 0.
+    PERFORM Send_email.
+ENDFORM.                    " Generate_email
+*&---------------------------------------------------------------------*
+*&      Form  Send_email
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM Send_email .
+  CHECK NOT ( s_emails-low IS INITIAL ).
+  REFRESH lt_mess_bod.
+* Default subject matter
+  l_subject         = p_des.
+  IF NOT s_text-low IS INITIAL.
+    LOOP AT s_text.
+      MOVE s_text-low TO lt_mess_bod.
+      APPEND lt_mess_bod.
+      CLEAR  lt_mess_bod.
+    ENDLOOP.
+  ENDIF.
+* HTML Attachment logic
+  PERFORM Send_email_html_attachment.
+ENDFORM.                    " Send_email
+*&---------------------------------------------------------------------*
+*&      Form  Convert_spool_to_htm
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM Convert_spool_to_htm .
+  LOOP AT lt_tbtcp INTO ls_tbtcp.
+    CLEAR p_html.
+    REFRESH p_html.
+    ADD 1 TO l_cnt.
+    l_spool_id = ls_tbtcp-rqident.
+    SUBMIT rspolst2 EXPORTING LIST TO MEMORY AND RETURN
+    WITH rqident = l_spool_id.
+    CALL FUNCTION 'LIST_FROM_MEMORY'
+      TABLES
+        listobject = listtab
+      EXCEPTIONS
+        not_found  = 1
+        OTHERS     = 2.
+    IF sy-subrc <> 0.
+*      message e418 raising read_error.
+    ENDIF.
+    IF p_template IS INITIAL.
+      p_template = 'WEBREPORTING_REPORT'.
+    ENDIF.
+    CALL FUNCTION 'WWW_HTML_FROM_LISTOBJECT'
+      EXPORTING
+        template_name = p_template
+      TABLES
+        html          = p_html
+        listobject    = listtab
+      EXCEPTIONS
+        OTHERS        = 1.
+    LOOP AT p_html.
+      MOVE-CORRESPONDING p_html TO lt_html.
+      APPEND lt_html.
+    ENDLOOP.
+* Building table lt_objpack internal table for creating attachments
+    MOVE l_spool_id TO ls_objpack-rqnumber.
+    IF l_cnt = 1.
+      MOVE 1 TO ls_objpack-head_start.
+      MOVE 0 TO ls_objpack-head_num.
+      MOVE 1 TO ls_objpack-body_start.
+      DESCRIBE TABLE lt_html LINES ls_objpack-no_lines.
+      MOVE ls_objpack-no_lines TO ls_objpack-body_num.
+      APPEND ls_objpack TO lt_objpack.
+    ENDIF.
+    IF l_cnt > 1.
+      ls_objpack-head_start = ls_objpack-no_lines + 1.
+      ls_objpack-head_num = ls_objpack-no_lines + 1.
+      ls_objpack-body_start = ls_objpack-no_lines + 1.
+      DESCRIBE TABLE p_html LINES ls_objpack-no_lines.
+      MOVE ls_objpack-no_lines TO ls_objpack-body_num.
+      APPEND ls_objpack TO lt_objpack.
+* Overwrite total number of lines
+      DESCRIBE TABLE lt_html LINES ls_objpack-no_lines.
+    ENDIF.
+  ENDLOOP.
+ENDFORM.                    " Convert_spool_to_htm
+*&---------------------------------------------------------------------*
+*&      Form  Send_email_html_attachment
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM Send_email_html_attachment .
+* Fill the document data.
+  w_doc_data-doc_size = 1.
+* Fill the document data and get size of attachment
+  CLEAR w_doc_data.
+  w_doc_data-obj_langu = sy-langu.
+  w_doc_data-obj_name  = 'SAPRPT'.
+  w_doc_data-obj_descr = p_des .
+  w_doc_data-sensitivty = 'F'.
+  CLEAR t_attachment.
+  REFRESH t_attachment.
+  t_attachment[] = lt_html[].
+* Describe the body of the message
+  CLEAR t_packing_list.
+  REFRESH t_packing_list.
+  DESCRIBE TABLE lt_mess_bod LINES tab_lines.
+  READ TABLE lt_mess_bod INDEX tab_lines.
+  w_doc_data-doc_size = ( tab_lines - 1 ) * 255 + STRLEN( lt_mess_bod ).
+  CLEAR t_packing_list-transf_bin.
+  t_packing_list-head_start = 1.
+  t_packing_list-head_num = 0.
+  t_packing_list-body_start = 1.
+  t_packing_list-body_num = tab_lines.
+  t_packing_list-doc_type = 'RAW'.
+  APPEND t_packing_list.
+* Create attachment notification
+  CLEAR: l_line_no.
+  LOOP AT lt_objpack INTO ls_objpack.
+    ADD 1 TO l_line_no.
+    t_packing_list-transf_bin = 'X'.  " binary download BDB 200812
+    t_packing_list-head_start = ls_objpack-head_start.
+    t_packing_list-head_num = ls_objpack-head_num.
+    t_packing_list-body_start = ls_objpack-body_start.
+    t_packing_list-doc_type = 'HTM'.
+    p_cnt = l_line_no.
+    CONDENSE p_cnt.
+    p_spool_nr = ls_objpack-rqnumber.
+    CONCATENATE 'Attachment' p_cnt INTO t_packing_list-obj_name SEPARATED BY space.
+* Format Attachment Name.
+    PERFORM get_attachment_name USING    p_spool_nr
+                                CHANGING t_packing_list-obj_descr.
+    t_packing_list-body_num = ls_objpack-body_num.
+    t_packing_list-doc_size = t_packing_list-body_num * 255.
+    APPEND t_packing_list.
+  ENDLOOP.
+* Add the recipients email address
+  CLEAR t_receivers.
+  REFRESH t_receivers.
+  LOOP AT s_emails.
+    t_receivers-receiver = s_emails-low.
+    t_receivers-rec_type = 'U'.
+    t_receivers-com_type = 'INT'.
+*    t_receivers-notif_del = 'X'.
+*    t_receivers-notif_ndel = 'X'.
+* E-mail Delivery is selected
+*    IF NOT p_del IS INITIAL.
+*      t_receivers-notif_del = 'X'.
+*    ELSE.
+*      CLEAR t_receivers-notif_del.
+*    ENDIF.
+* E-mail Read receipt is checked
+*    IF NOT p_read IS INITIAL.
+*      t_receivers-notif_read = 'X'.
+*    ELSE.
+*      CLEAR t_receivers-notif_read.
+*    ENDIF.
+    APPEND t_receivers.
+  ENDLOOP.
+  ld_sender_address = sy-uname.
+  ld_sender_address_type = 'B'.
+  CALL FUNCTION 'SO_DOCUMENT_SEND_API1'
+    EXPORTING
+      document_data              = w_doc_data
+      put_in_outbox              = 'X'
+      sender_address             = ld_sender_address
+      sender_address_type        = ld_sender_address_type
+      commit_work                = 'X'
+    IMPORTING
+      sent_to_all                = w_sent_all
+    TABLES
+      packing_list               = t_packing_list
+      contents_bin               = t_attachment
+      contents_txt               = lt_mess_att
+      receivers                  = t_receivers
+    EXCEPTIONS
+      too_many_receivers         = 1
+      document_not_sent          = 2
+      document_type_not_exist    = 3
+      operation_no_authorization = 4
+      parameter_error            = 5
+      x_error                    = 6
+      enqueue_error              = 7
+      OTHERS                     = 8.
+* Populate error return code
+  ld_error = sy-subrc.
+* Populate zreceiver return code
+  LOOP AT t_receivers.
+    l_receiver = t_receivers-retrn_code.
+  ENDLOOP.
+ENDFORM.                    " Send_email_html_attachment
+*&---------------------------------------------------------------------*
+*&      Form  GET_ATTACHMENT_NAME
+*&---------------------------------------------------------------------*
+FORM Get_attachment_name  USING    p_spool_nr
+                          CHANGING t_packing_list_obj_descr.
+  CLEAR ls_tbtcp.
+  READ TABLE lt_tbtcp INTO ls_tbtcp
+             WITH KEY rqident = p_spool_nr
+             BINARY SEARCH.
+  IF sy-subrc EQ 0.
+    IF ls_tbtcp-rqtitle IS INITIAL.
+      ls_tbtcp-rqtitle = ls_tbtcp-rq2name.
+    ENDIF.
+    CONCATENATE p_spool_nr '-' ls_tbtcp-rqtitle '.htm' INTO t_packing_list_obj_descr SEPARATED BY space.
+  ELSE.
+    CONCATENATE p_spool_nr '- Spool.htm'  INTO t_packing_list_obj_descr SEPARATED BY space.
+  ENDIF.
+  CONDENSE t_packing_list_obj_descr.
+ENDFORM.                    " GET_ATTACHMENT_NAME
+
+*Selection text£º
+*P_DES:        Subject of email
+*S_EMAILS:        Email address
+*S_SPOOL:        Spool number
+*S_TEXT:        body of email

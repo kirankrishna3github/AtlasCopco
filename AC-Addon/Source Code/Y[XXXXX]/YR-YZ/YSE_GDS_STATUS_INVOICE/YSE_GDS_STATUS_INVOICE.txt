@@ -1,0 +1,331 @@
+*&---------------------------------------------------------------------*
+*& Report  YSE_GDS_STATUS_INVOICE
+*&
+*&---------------------------------------------------------------------*
+*&                                                                     *
+*& AC Connect : Send status '240' for invoiced orders                  *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+*  Author                : Zhang
+*  Date                  : 07.11.2014
+*  Change Request Number : CR3363
+*  Transport request Nr. : CD1K983681
+*----------------------------------------------------------------------*
+*                                                                      *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD.NR. | DATE       | NAME           | CORRECTION NR. | CHANGE REF. *
+*----------------------------------------------------------------------*
+* MOD-001 | xx.xx.201x | x              | CD1K9xxxxx     | CRxxxx      *
+*----------------------------------------------------------------------*
+
+
+************************************************************************
+
+report  yse_gds_status_invoice.
+
+* Tables
+tables: yse_sd_gds_log,
+        vbak,
+        vbfa,
+        vbrk,
+        bkpf.
+
+* Types
+types: begin of ty_log,
+         vbeln     type vbeln_va,
+         posnr     type posnr,
+         erdat     type erdat,
+         erzet     type erzet,
+         yostat    type yostat,
+       end of ty_log.
+
+types: begin of ty_inv,
+         vbeln     type vbeln_va,
+         posnr     type posnr,
+         vbeln_i   type vbeln_vf,
+         posnr_i   type posnr,
+         fkimg     type fkimg,
+       end of ty_inv.
+
+* Internal table with selected Orders
+data: gt_log       type standard table of ty_log.
+
+* Internal table with Orders (status 220)
+data: gt_log_220   type standard table of ty_log
+                        with header line.
+
+* Internal table with Orders (status 240)
+data: gt_log_240   type hashed table of ty_log
+                        with unique key vbeln posnr
+                        with header line.
+
+* Internal table with selected Invoices (Initial selection)
+data: gt_inv_i     type standard table of ty_inv.
+
+* Internal table with selected Invoices
+data: gt_inv       type hashed table of ty_inv
+                        with unique key vbeln posnr
+                        with header line.
+
+* General data fields
+data: gv_text      type char80,
+      gv_inv       type xfeld,
+      gv_tstamp1   type tzntstmps,
+      gv_tstamp2   type tzntstmps,
+      gv_ystat     type ynstat,
+      gv_yostat    type yostat.
+* Constants
+constants: c_220   type ynstat  value '220',
+           c_240   type ynstat  value '240',
+           c_m     type vbtyp   value 'M',
+           c_x     type xfeld   value 'X'.
+
+* Selections
+selection-screen  begin of block sel  with frame  title text-s01.
+select-options: s_bukrs for bkpf-bukrs obligatory,
+                s_vbeln for yse_sd_gds_log-vbeln,
+                s_budat for bkpf-budat.
+selection-screen  end of block sel.
+
+
+*&---------------------------------------------------------------------*
+*&  Main program                                                       *
+*&---------------------------------------------------------------------*
+start-of-selection.
+
+* Select data
+  perform select_data.
+
+* Check anything selected
+  if gt_log_220[] is initial.
+    message id 'YSE_GENERAL' type 'S' number '000'
+            with 'No orders selected'(e01).
+    exit.
+  endif.
+
+* Process data
+  perform process_data.
+
+
+*&---------------------------------------------------------------------*
+*&  Forms                                                              *
+*&---------------------------------------------------------------------*
+
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_DATA
+*&---------------------------------------------------------------------*
+*       Select data
+*----------------------------------------------------------------------*
+form select_data .
+  data: lt_bkpf   type table of bkpf,
+        ls_bkpf   type bkpf,
+        lt_vbeln  type table of yse_sd_gds_log-vbeln,
+        lv_vbeln  type yse_sd_gds_log-vbeln.
+
+* Progress indicator
+  if sy-batch is initial.
+    gv_text = 'Data is being selected'(i01).
+    call function 'SAPGUI_PROGRESS_INDICATOR'
+      exporting
+        text = gv_text.
+  endif.
+
+  if s_vbeln is initial.
+    "Get all the accounting document posted during the selection criteria
+    select * from bkpf into table lt_bkpf
+              where bukrs in s_bukrs and budat in s_budat
+                and awtyp = 'VBRK'.
+    "Get SO lines
+    if lt_bkpf is not initial.
+      select vbel2 from bseg into table lt_vbeln
+                  for all entries in lt_bkpf
+                  where bukrs = lt_bkpf-bukrs
+                    and belnr = lt_bkpf-belnr
+                    and gjahr = lt_bkpf-gjahr.
+      sort lt_vbeln.
+      delete adjacent duplicates from lt_vbeln.
+    endif.
+    loop at lt_vbeln into lv_vbeln.
+      if lv_vbeln is not initial.
+        s_vbeln-sign = 'I'.
+        s_vbeln-option = 'EQ'.
+        s_vbeln-low = lv_vbeln.
+        append s_vbeln.
+      endif.
+    endloop.
+  endif.
+
+  if s_vbeln[] is initial.
+    return.
+  endif.
+
+* Select orders with status 220
+  select vbeln posnr erdat erzet yostat
+         into table gt_log_220
+         from yse_sd_gds_log
+         where vbeln in s_vbeln
+           and ynstat =  c_220.
+
+  check not gt_log_220[] is initial.
+  sort gt_log_220 by vbeln posnr erdat descending erzet descending.
+  delete adjacent duplicates from gt_log_220
+         comparing vbeln posnr.
+
+* Select orders with status 240
+  select vbeln posnr erdat erzet yostat
+         into table gt_log
+         from yse_sd_gds_log
+         for all entries in gt_log_220
+         where vbeln = gt_log_220-vbeln
+           and posnr = gt_log_220-posnr
+           and ynstat = c_240.
+
+  sort gt_log by vbeln posnr erdat descending erzet descending.
+  delete adjacent duplicates from gt_log
+         comparing vbeln posnr.
+  gt_log_240[] = gt_log[].
+
+* Select invoiced orders
+  select f~vbelv f~posnv f~vbeln f~posnn p~fkimg
+         into table gt_inv_i
+         from vbfa as f
+         inner join vbrk as h
+                         on f~vbeln = h~vbeln
+         inner join vbrp as p
+                         on f~vbeln = p~vbeln and
+                            f~posnn = p~posnr
+         for all entries in gt_log_220
+         where f~vbelv   =  gt_log_220-vbeln
+           and f~posnv   =  gt_log_220-posnr
+           and f~vbtyp_n =  c_m
+           and h~fksto   ne c_x.
+
+  sort gt_inv_i by vbeln posnr vbeln_i descending posnr_i descending.
+  delete adjacent duplicates from gt_inv_i
+         comparing vbeln posnr.
+  gt_inv[] = gt_inv_i[].
+
+endform.                    " SELECT_DATA
+
+*&---------------------------------------------------------------------*
+*&      Form  PROCESS_DATA
+*&---------------------------------------------------------------------*
+*       Process data
+*----------------------------------------------------------------------*
+form process_data .
+
+  loop at gt_log_220.
+
+*   Progress indicator
+    if sy-batch is initial.
+      gv_text = 'Order &/& is being processed'(i02).
+      replace '&' with gt_log_220-vbeln into gv_text.
+      replace '&' with gt_log_220-posnr into gv_text.
+      condense gv_text.
+      call function 'SAPGUI_PROGRESS_INDICATOR'
+        exporting
+          text = gv_text.
+    endif.
+
+    clear: gt_inv,
+           gt_log_240,
+           gv_inv,
+           gv_tstamp1,
+           gv_tstamp2,
+           gv_ystat,
+           gv_yostat.
+
+*   Get timestamp for status 220
+    perform get_timestamp using gt_log_220-erdat
+                                gt_log_220-erzet
+                                gv_tstamp1.
+
+*   Check if order is invoiced
+    read table gt_inv with table key vbeln = gt_log_220-vbeln
+                                     posnr = gt_log_220-posnr.
+    if sy-subrc = 0.
+      gv_inv = 'X'.
+    endif.
+
+*   Check if status 240 exists
+    read table gt_log_240 with table key vbeln = gt_log_220-vbeln
+                                         posnr = gt_log_220-posnr.
+    if sy-subrc = 0.
+*     Get timestamp for status 240
+      perform get_timestamp using gt_log_240-erdat
+                                  gt_log_240-erzet
+                                  gv_tstamp2.
+    else.
+      if gv_inv is initial.
+        continue.
+      endif.
+    endif.
+
+*   Compare timestamps
+    if gv_inv is initial.
+*     Cancel invoice
+      if gv_tstamp1 ge gv_tstamp2.
+        continue.
+      else.
+        gv_ystat = c_220.
+        gv_yostat = gt_log_220-yostat.
+      endif.
+    else.
+*     Invoice
+      if gv_tstamp2 ge gv_tstamp1.
+        continue.
+      else.
+        gv_ystat  = c_240.
+        gv_yostat = c_220.
+      endif.
+    endif.
+
+*   Send status 240 to AC Connect
+    call function 'YSE_GDS_SD_STATUS_UPDATE'
+      exporting
+        im_vbeln  = gt_log_220-vbeln
+        im_posnr  = gt_log_220-posnr
+        im_status = gv_ystat
+        im_quan   = gt_inv-fkimg
+        im_ostat  = gv_yostat
+        im_delta  = gt_inv-fkimg.
+
+  endloop.
+
+endform.                    " PROCESS_DATA
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_TIMESTAMP
+*&---------------------------------------------------------------------*
+*       Get timestamp (Date/Time)
+*----------------------------------------------------------------------*
+*      -->P_DATE   : Date
+*      -->P_TIME   : Time
+*      -->P_TSTAMP : Timestamp
+*----------------------------------------------------------------------*
+form get_timestamp  using    p_date
+                             p_time
+                             p_tstamp.
+
+  call function 'CONVERT_INTO_TIMESTAMP'
+    exporting
+      i_datlo     = p_date
+      i_timlo     = p_time
+*      I_TZONE     = SY-ZONLO
+    importing
+      e_timestamp = p_tstamp.
+
+endform.                    " GET_TIMESTAMP
+
+*Text symbol text£º
+*E01:No orders selected
+*I01:Data is being selected
+*I02:Order &/& is being processed
+
+*S01:Selection
+*Selection text£º
+*S_BUDAT:D       .
+*S_BUKRS:D       .
+*S_VBELN:        Sales Document

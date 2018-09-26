@@ -1,0 +1,348 @@
+*&---------------------------------------------------------------------*
+*& Report  Z583602
+*&
+*&---------------------------------------------------------------------*
+*&
+*&
+*&---------------------------------------------------------------------*
+
+REPORT  Z583602.
+
+* Selection parameters
+PARAMETER: s_vbeln LIKE vbap-vbeln,
+           s_posnr LIKE vbap-posnr.
+
+* Internal tables
+DATA:      yvbap   LIKE TABLE OF vbap  WITH HEADER LINE,
+           xvbap   LIKE TABLE OF vbap  WITH HEADER LINE,
+           ytvepz  LIKE TABLE OF tvepz WITH HEADER LINE,
+           ykonv   LIKE TABLE OF konv  WITH HEADER LINE,
+           xkonv   LIKE TABLE OF konv  WITH HEADER LINE,
+           yfplt   LIKE TABLE OF fplt  WITH HEADER LINE,
+           yvbup   LIKE TABLE OF vbup  WITH HEADER LINE,
+           no_update_reason LIKE TABLE OF HLPEXT WITH HEADER LINE,
+           ytvag LIKE tvag OCCURS 1 WITH HEADER LINE.
+
+* Workareas
+DATA:      ybedar LIKE t459a-bedar,
+           yknttp LIKE t163k-knttp,
+           ykzvbr LIKE v_t459k-kzvbr,
+           yknumv LIKE vbak-knumv,
+           yfplnr LIKE vbkd-fplnr,
+           yvbak  LIKE vbak,
+           ybukrs LIKE t001k-bukrs,
+           ycmgst LIKE vbuk-cmgst.
+
+* Flags
+DATA:      no_data(1)   TYPE c,
+           no_origin(1) TYPE c,
+           da_exit(1)   TYPE c,
+           single_co(1) TYPE c,
+           loekz,
+           statistical,
+           no_update,
+           RRB,
+           SCHED.
+
+
+
+PERFORM origin_select.
+IF no_data IS INITIAL.
+  PERFORM accountassignment_check.
+  IF NOT single_co IS INITIAL.
+    PERFORM values_select.
+  ENDIF.
+  PERFORM prerequisit_check.
+ENDIF.
+PERFORM results_show.
+
+*++++++++++++++++++++++++++++++++++++++++++++++++++++
+*+            Select the origin document            +
+*++++++++++++++++++++++++++++++++++++++++++++++++++++
+FORM origin_select.
+
+  SELECT SINGLE * FROM vbap INTO yvbap
+         WHERE vbeln = s_vbeln AND
+               posnr = s_posnr.
+
+  IF sy-subrc NE 0.
+    no_data = 'X'.
+  ELSE.
+    IF yvbap-vbelv NE yvbap-vbeln OR
+       yvbap-posnv NE yvbap-posnr.
+      no_origin = 'X'.
+      DO 50 TIMES.
+        IF da_exit = 'X'.
+          EXIT.
+        ENDIF.
+        s_vbeln = yvbap-vbelv.
+        s_posnr = yvbap-posnv.
+        SELECT SINGLE * FROM vbap INTO yvbap
+                                  WHERE vbeln = s_vbeln AND
+                                        posnr = s_posnr.
+        IF sy-subrc NE 0.
+          da_exit   = 'X'.
+        ENDIF.
+        IF yvbap-vbelv EQ yvbap-vbeln AND
+           yvbap-posnv EQ yvbap-posnr.
+          da_exit = 'X'.
+        ENDIF.
+      ENDDO.
+    ENDIF.
+    APPEND yvbap TO xvbap.
+  ENDIF.
+ENDFORM.                    "
+
+*++++++++++++++++++++++++++++++++++++++++++++++++++++
+*+            Check the account assignment          +
+*++++++++++++++++++++++++++++++++++++++++++++++++++++
+FORM accountassignment_check.
+  READ TABLE xvbap INDEX 1.
+  IF NOT xvbap-objnr IS INITIAL.
+    single_co = 'X'.
+  ENDIF.
+* Which requirement class ?
+  SELECT SINGLE bedar FROM t459a INTO ybedar
+     WHERE bedae = xvbap-bedae.
+  IF sy-subrc = 0.
+*   What does the requirement class contain?
+    SELECT SINGLE knttp FROM t459k INTO yknttp
+       WHERE bedar = ybedar.
+    SELECT SINGLE kzvbr FROM t163k INTO ykzvbr
+       WHERE knttp = yknttp.
+*   How did we determine the requirement type?
+    SELECT pstyv dismm bedhk FROM tvepz
+        INTO CORRESPONDING FIELDS OF TABLE ytvepz
+        WHERE bedae = xvbap-bedae.
+  ENDIF.
+ENDFORM.                    "
+*++++++++++++++++++++++++++++++++++++++++++++++++++++
+*+            Select the order values               +
+*++++++++++++++++++++++++++++++++++++++++++++++++++++
+FORM values_select.
+
+  SELECT SINGLE knumv FROM vbak INTO yknumv
+     WHERE vbeln = xvbap-vbeln.
+  IF sy-subrc = 0.
+    SELECT kschl sakn1 kwert kstat FROM konv
+      INTO CORRESPONDING FIELDS OF TABLE ykonv
+       WHERE knumv = yknumv AND
+             kposn = xvbap-posnr.
+  ENDIF.
+
+  IF xvbap-fkrel = 'I'.
+    SELECT SINGLE fplnr FROM vbkd INTO yfplnr
+     WHERE vbeln = xvbap-vbeln AND
+           posnr = xvbap-posnr.
+    IF sy-subrc = 0.
+
+      CALL FUNCTION 'BILLING_SCHEDULE_READ'
+        EXPORTING
+          fplnr = yfplnr
+        TABLES
+          zfplt = yfplt.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    "
+
+*++++++++++++++++++++++++++++++++++++++++++++++++++++
+*+            Check the prerequisites               +
+*++++++++++++++++++++++++++++++++++++++++++++++++++++
+FORM prerequisit_check.
+
+  Select single vbtyp BUKRS_VF vbklt abdis from vbak
+       into corresponding fields of yvbak
+       where vbeln = xvbap-vbeln.
+
+  Select single bukrs from T001k
+    into ybukrs
+    where bwkey = xvbap-werks.
+
+  Select single * from vbup
+       into corresponding fields of yvbup
+       where vbeln = xvbap-vbeln and
+             posnr = xvbap-posnr.
+
+  Select single cmgst from vbuk
+       into ycmgst
+       where vbeln = xvbap-vbeln.
+* Inquiry?
+  If yvbak-VBTYP = 'A'.
+    no_update = 'X'.
+    no_update_reason-LINE = 'Inquiry'.
+    Append no_update_reason.
+  Endif.
+
+* Intercompany?
+  If ybukrs ne yvbak-bukrs_VF.
+    Loop at ykonv.
+      If ( ykonv-kntyp eq 'I' or
+           not ykonv-kfkiv is initial ).
+        Append ykonv to xkonv.
+      Endif.
+    Endloop.
+    If xkonv[] is initial.
+      no_update = 'X'.
+      no_update_reason-LINE = 'No IC condition'.
+      Append no_update_reason.
+    Endif.
+  Endif.
+* Resource related Billing?
+  if yvbak-vbklt eq 'A' or
+     ( xvbap-vkgru eq 'I02' and
+       xvbap-aufnr is initial ).
+    RRB = 'X'.
+    no_update = 'X'.
+    no_update_reason-LINE = 'Resource related billing'.
+    Append no_update_reason.
+  Endif.
+
+* Rejected items will not be updated if they are not delivered
+* completely and not invoiced or if they are delivered and
+* the reason for rejection does complete the invoice.
+  IF yvbup-absta CA 'C'.
+    IF ytvag[] IS INITIAL.
+      SELECT * FROM tvag INTO TABLE ytvag.
+    ENDIF.
+    READ TABLE ytvag WITH KEY mandt = sy-mandt
+                              abgru = xvbap-abgru.
+    READ TABLE yvbup WITH KEY VBELN = xvbap-vbeln
+                              posnr = xvbap-posnr.
+    IF ( yvbup-lfsta NA 'BC' AND yvbup-fksaa CA space ) OR
+       ( yvbup-lfsta CA 'BC' AND ytvag-fk_erl = 'X' ).
+      no_update = 'X'.
+      no_update_reason-LINE = 'Rejected'.
+      Append no_update_reason.
+    Endif.
+  Endif.
+* Credit block?
+  If ycmgst ca 'B' and yvbup-lfsta na 'BC'.
+    no_update = 'X'.
+    no_update_reason-LINE = 'Credit block'.
+    Append no_update_reason.
+  Endif.
+
+* Relevant for billing?
+  If not RRB eq 'X' and ( xvbap-fkrel ca ' DJLN' or
+    ( yvbak-vbkla(2) = 'CR' and
+      xvbap-fkrel ca 'QR' ) ).
+    no_update = 'X'.
+    no_update_reason-LINE = 'Billing relevance'.
+    Append no_update_reason.
+  Endif.
+* Scheduling agreement
+  if not yvbak-abdis  is initial.
+    SCHED = 'X'.
+  endif.
+
+Endform.                    "
+*++++++++++++++++++++++++++++++++++++++++++++++++++++
+*+            Show the results                      +
+*++++++++++++++++++++++++++++++++++++++++++++++++++++
+FORM results_show.
+
+  NEW-LINE.
+  WRITE: 'Selection:',
+          yvbap-vbeln, ' / ', yvbap-posnr, '(', xvbap-objnr, ')'.
+  ULINE.
+  IF no_data = 'X'.
+    FORMAT INTENSIFIED.
+    WRITE: 'No data could be found'.
+    FORMAT INTENSIFIED OFF.
+  ELSE.
+    IF no_origin = 'X'.
+      WRITE: 'Origin document:',
+              xvbap-vbeln, ' / ', xvbap-posnr.
+      ULINE.
+    ENDIF.
+    IF single_co IS INITIAL.
+      FORMAT INTENSIFIED.
+      WRITE: 'No single order controlling, ',
+             'therefore no planvalues.', ' - ',
+             'Please check note 0459734'.
+      FORMAT INTENSIFIED OFF.
+      NEW-LINE.
+    ELSE.
+      FORMAT INTENSIFIED.
+      WRITE: 'Values:'.
+      FORMAT INTENSIFIED OFF.
+      NEW-LINE.
+      LOOP AT ykonv.
+        WRITE: 'Condition type:     ', ykonv-kschl, ', ',
+               'G/L account number: ', ykonv-sakn1, ', ',
+               'Condition value:    ', ykonv-kwert.
+        NEW-LINE.
+        NEW-LINE.
+      ENDLOOP.
+      IF xvbap-fkrel = 'I'.
+        FORMAT INTENSIFIED.
+        WRITE: 'Billing plan dates:'.
+        FORMAT INTENSIFIED OFF.
+        LOOP AT yfplt.
+          WRITE: 'Posting date:       ', yfplt-fkdat, ', ',
+                 'Value:              ', yfplt-fakwr, ', ',
+                 'Text:               ', yfplt-tetxt, ', ',
+                 'Type:               ', yfplt-fpttp, ', '.
+          NEW-LINE.
+          NEW-LINE.
+        ENDLOOP.
+        IF sy-subrc NE 0.
+          ULINE.
+          WRITE: 'Billing plan, but no dates!'.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+    ULINE.
+    FORMAT INTENSIFIED.
+    WRITE: 'Accounting data:'.
+    FORMAT INTENSIFIED OFF.
+    NEW-LINE.
+    WRITE: 'Requirement type:      ', xvbap-bedae,
+         / 'Requirement class:     ', ybedar,
+         / 'Consumption indicator: ', ykzvbr.
+    ULINE.
+    NEW-LINE.
+    FORMAT INTENSIFIED.
+    WRITE: 'Determination of the req. type: '.
+    FORMAT INTENSIFIED OFF.
+    NEW-LINE.
+    LOOP AT ytvepz.
+      WRITE: 'Item category: ', ytvepz-pstyv, ', ',
+             'MRP type:      ', ytvepz-dismm, ', ',
+             'Source:        ', ytvepz-bedhk.
+      NEW-LINE.
+      NEW-LINE.
+    ENDLOOP.
+    IF sy-subrc NE 0.
+      WRITE: 'No determination in transaction OVZI found'.
+    ENDIF.
+    ULINE.
+    NEW-LINE.
+    FORMAT INTENSIFIED.
+    WRITE: 'Results: '.
+    FORMAT INTENSIFIED OFF.
+    NEW-LINE.
+    If not no_update is initial.
+      Loop at no_update_reason.
+        write: 'Reason for no update: ', no_update_reason-LINE.
+      Endloop.
+    endif.
+    NEW-LINE.
+    WRITE: 'If there is no planvalue update, although the following',
+                 'prerequisites are valid:',
+           / '- the selection was successful,',
+           / '- there are conditions with account no and values,',
+           / '- there are billing plan dates (in case of billing plan)',
+           / '-> Please check note 549054'.
+    New-line.
+    If SCHED = 'X'.
+      write: '-> & Please check if the cumulated required amount',
+                'is higher than 0 in the scheduling agreement.'.
+    Endif.
+  ENDIF.
+ENDFORM.                    "
+
+*Selection text£º
+*S_POSNR:D       .
+*S_VBELN:D       .

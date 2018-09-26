@@ -1,0 +1,787 @@
+************************************************************************
+*
+*             Copyright(c) 2004 Deutsche Bank AG
+* All rights reserved. This Software is proprietary to Deutsche Bank AG
+* and is protected by copyright law and international treaties. Under no
+* circumstances are you permitted to make any attempt to alter, decrypt
+* or reverse engineer this software, and any unauthorised reproduction
+* of this software or any portion thereof may result in severe civil and
+* criminal penalties, and will be prosecuted to the maximum extent
+* possible under the law.
+*
+***********************************************************************
+*----------------------------------------------------------------------*
+*  Program ID : YHFDBIBM
+*  Name       : Bank Master Upload
+*  Purpose    : This program is used to upload bank master records from
+*               a semi-colon delimited ASCII file.
+*               It is modified from standard program RFBVGB_0.
+*               Loading Options :-
+*               Standard - bankl + banklz, banka, brnch
+*               Cr Nota  - bankl, banklz, banka, brnch
+*               MEPS     - bankl, banka, swift
+*  Author     : Deutsche Bank AG
+*  Date       : Dec 2004
+*----------------------------------------------------------------------*
+REPORT YHFDBIBM MESSAGE-ID FU
+                LINE-SIZE 132
+                NO STANDARD PAGE HEADING.
+
+TABLES:  BNKA.
+TABLES:  RFPDO.                        " Parameter-docu
+TABLES:  RFSDO.
+TABLES:  T005.
+
+*------- Counters  -----------------------------------------------------
+DATA:    BEGIN OF COUNT,
+           SREADTO(6)    TYPE N,       "number of records read total
+           SINSERT(6)    TYPE N,       "number of inserted banks
+           SUPDATE(6)    TYPE N,       "number of modified banks
+           SDELETE(6)    TYPE N,    "number of banks marked for deletion
+           SNOMODI(6)    TYPE N,       "number of not modified banks
+           EINSERT(6)    TYPE N,       "number of inserted banks-errors
+           EUPDATE(6)    TYPE N,       "number of modified banks-errors
+           EDELETE(6)    TYPE N,       "no. of banks marked del.-errors
+           BANKCODE(6)    TYPE N,      "number of head-offices
+         END   OF COUNT.
+
+DATA:    CWMAX(5)       TYPE N VALUE '00100',    "COMMIT WORK: max
+         CWCNT(5)       TYPE N,        "COMMIT WORK: counter
+         ACTYPE(1)      TYPE C,        "insert,update,delete,n
+         BANKL          LIKE BNKA-BANKL,          "Bank code
+         BNKLZ          LIKE BNKA-BNKLZ,          "Bank number
+         BANKA          LIKE BNKA-BANKA.          "Bank name
+* for MEPS use
+DATA:    BANKBIC        LIKE BNKA-BANKL,
+         SWIFT          LIKE BNKA-SWIFT,
+         OLD_SWIFT      LIKE BNKA-SWIFT.
+************************************************************************
+*------- Workarea for input file    ------------------
+DATA:    BEGIN OF ITAB_ALL OCCURS 1,
+            W_STR(500) TYPE C,
+         END OF ITAB_ALL.
+
+DATA:    BEGIN OF ITAB_BNKA OCCURS 1,
+            BANKL LIKE BNKA-BANKL,
+            BNKLZ LIKE BNKA-BNKLZ,
+            BANKA LIKE BNKA-BANKA,
+            BRNCH LIKE BNKA-BRNCH,
+            BANKBIC LIKE BNKA-BANKL,  "for MEPS
+         END OF ITAB_BNKA.
+
+*------- Bank Sort Codes aus ITAB_BNKA --------------------------------*
+
+DATA:  BEGIN OF ITAB_CHECK OCCURS 1,
+          BANKL LIKE BNKA-BANKL,
+          BNKLZ LIKE BNKA-BNKLZ,
+       END   OF ITAB_CHECK.
+
+*------- Banken aus BNKA -----------------------------------------------
+DATA:    BEGIN OF IBNKA OCCURS 1.
+        INCLUDE STRUCTURE BNKA.
+DATA:    END   OF IBNKA.
+
+*------- Tables for error and succesful banks
+DATA:    BEGIN OF ERRTAB OCCURS 10,
+           BANKL LIKE BNKA-BANKL,
+           ACTYPE(1) TYPE C,
+           BANKA LIKE BNKA-BANKA,
+           BNKLZ LIKE BNKA-BNKLZ,
+           SWIFT LIKE BNKA-SWIFT,      "for meps
+           OLD_SWIFT LIKE BNKA-SWIFT,  "for meps
+         END OF ERRTAB.
+DATA:    BEGIN OF SUCTAB OCCURS 10,
+           BANKL LIKE BNKA-BANKL,
+           ACTYPE(1) TYPE C,
+           BANKA LIKE BNKA-BANKA,
+           BNKLZ LIKE BNKA-BNKLZ,
+           SWIFT LIKE BNKA-SWIFT,      "for meps
+           OLD_SWIFT LIKE BNKA-SWIFT,  "for meps
+         END OF SUCTAB.
+
+DATA: UFILE     LIKE RLGRAP-FILENAME.
+DATA: DUMMY01(60), DUMMY02(35).
+DATA: LINES_ITAB_BNKA TYPE I, LINES_ITAB_CHECK TYPE I.
+DATA: KEY_LEN TYPE N.
+
+SELECTION-SCREEN SKIP 1.
+PARAMETER:
+       BANKS          LIKE BNKA-BANKS  "Bankland
+                             OBLIGATORY,
+       DS_NAME        LIKE RLGRAP-FILENAME     "Datasetname
+                             OBLIGATORY.
+SELECTION-SCREEN SKIP 1.
+
+SELECTION-SCREEN BEGIN OF BLOCK LOAD WITH FRAME TITLE TEXT-002 NO
+                 INTERVALS.
+SELECTION-SCREEN BEGIN OF LINE.
+PARAMETER:
+   LOAD1       LIKE RFPDO-ALLGECHT RADIOBUTTON GROUP 1 DEFAULT 'X'.
+SELECTION-SCREEN:
+COMMENT 03(50) TEXT-102 FOR FIELD LOAD1,
+END OF LINE.
+SELECTION-SCREEN BEGIN OF LINE.
+PARAMETER:
+   LOAD2       LIKE RFPDO-ALLGECHT RADIOBUTTON GROUP 1.
+SELECTION-SCREEN:
+COMMENT 03(50) TEXT-103 FOR FIELD LOAD2,
+END OF LINE.
+SELECTION-SCREEN BEGIN OF LINE.
+PARAMETER:
+   LOAD3       LIKE RFPDO-ALLGECHT RADIOBUTTON GROUP 1.
+SELECTION-SCREEN:
+COMMENT 03(50) TEXT-104 FOR FIELD LOAD3,
+END OF LINE.
+SELECTION-SCREEN END OF BLOCK LOAD.
+
+SELECTION-SCREEN BEGIN OF LINE.
+PARAMETER:
+       DELE        LIKE RFPDO-F160LOEV.
+SELECTION-SCREEN:
+COMMENT 3(54) TEXT-105 FOR FIELD DELE,
+END OF LINE.
+
+SELECTION-SCREEN SKIP 1.
+PARAMETER:
+       MAX_REC(5) TYPE P DEFAULT '99999'
+                     OBLIGATORY.                "max records to process
+SELECTION-SCREEN BEGIN OF LINE.
+PARAMETER:
+   TEST        LIKE RFPDO-ALLGECHT RADIOBUTTON GROUP 2 DEFAULT 'X'.
+SELECTION-SCREEN:
+COMMENT 03(50) TEXT-003 FOR FIELD TEST,
+END OF LINE.
+SELECTION-SCREEN BEGIN OF LINE.
+PARAMETER:
+   REAL        LIKE RFPDO-ALLGECHT RADIOBUTTON GROUP 2.
+SELECTION-SCREEN:
+COMMENT 03(50) TEXT-004 FOR FIELD REAL,
+END OF LINE.
+
+CONSTANTS: LIST LIKE RFPDO-ALLGPRIN VALUE 'X'.
+
+INITIALIZATION.
+
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR DS_NAME.
+  CALL FUNCTION 'KD_GET_FILENAME_ON_F4'
+    EXPORTING
+      STATIC    = 'X'
+    CHANGING
+      FILE_NAME = DS_NAME.
+
+AT SELECTION-SCREEN.
+  MOVE DS_NAME TO UFILE.
+  IF  UFILE+1(1) NE ':'.
+    SET CURSOR FIELD 'DS_NAME'.
+    MESSAGE E706(FB).
+  ENDIF.
+
+  SELECT SINGLE * FROM T005 WHERE LAND1 = BANKS.
+  IF SY-SUBRC NE 0.
+    MESSAGE E015 WITH BANKS.
+  ENDIF.
+  IF LIST CN ' X'.
+    MESSAGE E007.
+  ENDIF.
+  IF DELE CN ' X'.
+    MESSAGE E007.
+  ENDIF.
+
+START-OF-SELECTION.
+
+  PERFORM UPLOAD_FROM_DISK.
+  PERFORM FILL_IBNKA.
+
+  REFRESH: ITAB_BNKA, ITAB_CHECK.
+  LOOP AT ITAB_ALL.
+    CLEAR: ITAB_BNKA.
+    CLEAR: DUMMY01, DUMMY02.
+
+    COUNT-SREADTO = COUNT-SREADTO + 1.
+    IF MAX_REC NE 99999 AND COUNT-SREADTO GT MAX_REC.
+      COUNT-SREADTO = COUNT-SREADTO - 1.
+      EXIT.
+    ENDIF.
+
+    IF LOAD1 = 'X' OR LOAD2 = 'X'.
+      SPLIT ITAB_ALL AT ';' INTO ITAB_BNKA-BANKL
+                                 ITAB_BNKA-BNKLZ
+                                 ITAB_BNKA-BANKA
+                                 ITAB_BNKA-BRNCH.
+    ELSE.
+      SPLIT ITAB_ALL AT ';' INTO ITAB_BNKA-BANKL
+                                 ITAB_BNKA-BANKA
+                                 ITAB_BNKA-BANKBIC.
+    ENDIF.
+
+    APPEND ITAB_BNKA.
+  ENDLOOP.
+
+  IF COUNT-SREADTO = 0.
+    MESSAGE E815 WITH COUNT-SREADTO.
+  ENDIF.
+
+  SORT ITAB_BNKA BY BANKL.
+  FREE ITAB_ALL.
+
+  LOOP AT ITAB_BNKA.
+    ITAB_CHECK-BANKL = ITAB_BNKA-BANKL.
+    IF LOAD1 = 'X' OR LOAD2 = 'X'.
+      ITAB_CHECK-BNKLZ = ITAB_BNKA-BNKLZ.
+    ELSE.
+      IF ITAB_BNKA-BANKL IS INITIAL.
+        ITAB_CHECK-BANKL = ITAB_BNKA-BANKBIC.
+      ENDIF.
+    ENDIF.
+    COLLECT ITAB_CHECK.
+  ENDLOOP.
+
+  DESCRIBE TABLE ITAB_BNKA LINES LINES_ITAB_BNKA.
+  DESCRIBE TABLE ITAB_CHECK LINES LINES_ITAB_CHECK.
+  IF LINES_ITAB_BNKA NE LINES_ITAB_CHECK.
+    MESSAGE A051.
+  ENDIF.
+  FREE ITAB_CHECK.
+
+  CLEAR:   BANKL,
+           BANKA,
+           COUNT-BANKCODE,             "number of main branches
+           SWIFT,
+           OLD_SWIFT.
+
+  LOOP AT ITAB_BNKA.
+    CHECK ( NOT ( ITAB_BNKA IS INITIAL ) ) .
+    COUNT-BANKCODE = COUNT-BANKCODE + 1.
+    IF LOAD1 = 'X'.
+      CONCATENATE ITAB_BNKA-BANKL ITAB_BNKA-BNKLZ INTO BANKL.
+      BANKA = ITAB_BNKA-BANKA.
+      PERFORM STANDARD_PROCESS_RECORD.
+    ELSEIF LOAD2 = 'X'.
+      BANKL = ITAB_BNKA-BANKL.
+      BANKA = ITAB_BNKA-BANKA.
+      BNKLZ = ITAB_BNKA-BNKLZ.
+      PERFORM CNS_PROCESS_RECORD.
+    ELSE.
+      BANKL = ITAB_BNKA-BANKL.
+      SWIFT = ITAB_BNKA-BANKBIC.
+      IF ITAB_BNKA-BANKL IS INITIAL.
+        BANKL = ITAB_BNKA-BANKBIC.
+      ENDIF.
+      BANKA = ITAB_BNKA-BANKA.
+      PERFORM MEPS_PROCESS_RECORD.
+    ENDIF.
+    CLEAR: BANKL, BANKA, SWIFT, OLD_SWIFT.
+  ENDLOOP.
+
+  PERFORM PROTOCOL.
+  COMMIT WORK.
+
+*&--------------------------------------------------------------------*
+*&      Form  STANDARD_PROCESS_RECORD
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+FORM STANDARD_PROCESS_RECORD.
+  PERFORM BNKA_READ USING BANKL.
+  IF SY-SUBRC = 0.
+    IF ITAB_BNKA-BANKA NE BNKA-BANKA
+    OR ITAB_BNKA-BRNCH NE BNKA-BRNCH
+    OR BNKA-LOEVM = 'X'.
+      BNKA-BANKA = ITAB_BNKA-BANKA.
+      BNKA-BRNCH = ITAB_BNKA-BRNCH.
+      BNKA-BANKL = BANKL.
+      BNKA-LOEVM = ' '.
+      PERFORM BNKA_UPDATE.
+    ELSE.
+      ACTYPE = 'N'.
+      IF DELE = 'X'.
+        LOOP AT IBNKA WHERE LOEVM = SPACE.
+          IF IBNKA-BANKL = BANKL.
+            BNKA = IBNKA.
+            BNKA-BANKL = BANKL.
+            PERFORM BNKA_UPDATE_LOEVM.
+            EXIT.
+          ENDIF.
+        ENDLOOP.
+      ENDIF.
+      PERFORM INS_PROTOCOL.
+    ENDIF.
+  ELSE.
+    PERFORM BNKA_INSERT_VORBEREITEN.
+    PERFORM BNKA_INSERT.
+  ENDIF.
+
+  CWCNT = CWCNT + 1.
+  IF CWCNT = CWMAX.
+    CWCNT = 0.
+    COMMIT WORK.
+  ENDIF.
+ENDFORM.                    "STANDARD_PROCESS_RECORD
+
+*&--------------------------------------------------------------------*
+*&      Form  CNS_PROCESS_RECORD
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+FORM CNS_PROCESS_RECORD.
+  PERFORM BNKA_READ USING BANKL.
+  IF SY-SUBRC = 0.
+    IF ITAB_BNKA-BANKA NE BNKA-BANKA
+    OR ITAB_BNKA-BRNCH NE BNKA-BRNCH
+    OR ITAB_BNKA-BNKLZ NE BNKA-BNKLZ
+    OR BNKA-LOEVM = 'X'.
+      BNKA-BANKA = ITAB_BNKA-BANKA.
+      BNKA-BRNCH = ITAB_BNKA-BRNCH.
+      BNKA-BANKL = BANKL.
+      BNKA-LOEVM = ' '.
+      BNKA-BNKLZ = ITAB_BNKA-BNKLZ.
+      PERFORM BNKA_UPDATE.
+    ELSE.
+      ACTYPE = 'N'.
+      IF DELE = 'X'.
+        LOOP AT IBNKA WHERE LOEVM = SPACE.
+          IF IBNKA-BANKL = BANKL
+             AND IBNKA-BNKLZ = BNKLZ.
+            BNKA = IBNKA.
+            BNKA-BANKL = BANKL.
+            BNKA-BNKLZ = BNKLZ.
+            PERFORM BNKA_UPDATE_LOEVM.
+            EXIT.
+          ENDIF.
+        ENDLOOP.
+      ENDIF.
+      PERFORM INS_PROTOCOL.
+    ENDIF.
+  ELSE.
+    PERFORM BNKA_INSERT_VORBEREITEN.
+    PERFORM BNKA_INSERT.
+  ENDIF.
+
+  CWCNT = CWCNT + 1.
+  IF CWCNT = CWMAX.
+    CWCNT = 0.
+    COMMIT WORK.
+  ENDIF.
+ENDFORM.                    "CNS_PROCESS_RECORD
+
+*&--------------------------------------------------------------------*
+*&      Form  MEPS_PROCESS_RECORD
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+FORM MEPS_PROCESS_RECORD.
+  KEY_LEN = STRLEN( BANKL ).
+
+  LOOP AT IBNKA WHERE
+    MANDT = SY-MANDT AND
+    BANKS = BANKS.
+*    AND
+*    BANKL(4) = BANKL.
+    IF IBNKA-BANKL+0(KEY_LEN) NE BANKL.
+      CONTINUE.
+    ENDIF.
+
+    BNKA = IBNKA.
+    SWIFT = ITAB_BNKA-BANKBIC.
+
+    IF BNKA-BANKA NE BANKA OR
+       BNKA-SWIFT NE SWIFT.
+      BNKA-BANKA = BANKA.
+      BNKA-SWIFT = SWIFT.                  "itab_bnka-bankbic.
+      BANKL = IBNKA-BANKL.               "!!!!
+      OLD_SWIFT = IBNKA-SWIFT.           "old swift code
+      PERFORM BNKA_UPDATE.
+    ELSE.
+      ACTYPE = 'N'.
+      PERFORM INS_PROTOCOL.
+    ENDIF.
+  ENDLOOP.
+
+  IF SY-SUBRC NE 0.
+    LOOP AT IBNKA WHERE MANDT EQ SY-MANDT
+                  AND   BANKS EQ BANKS
+                  AND   BANKL EQ BANKL.
+      ACTYPE = 'N'.
+      PERFORM INS_PROTOCOL.
+    ENDLOOP.
+    IF SY-SUBRC NE 0.
+      PERFORM BNKA_INSERT_VORBEREITEN.
+      PERFORM BNKA_INSERT.
+    ENDIF.
+  ENDIF.
+
+  CWCNT = CWCNT + 1.
+  IF CWCNT = CWMAX.
+    CWCNT = 0.
+    COMMIT WORK.
+  ENDIF.
+ENDFORM.                    "MEPS_PROCESS_RECORD
+
+*&--------------------------------------------------------------------*
+*&      Form  FILL_IBNKA
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+FORM FILL_IBNKA.
+  SELECT * FROM BNKA INTO TABLE IBNKA WHERE BANKS = BANKS.
+  SORT IBNKA.
+ENDFORM.                    "FILL_IBNKA
+
+*&--------------------------------------------------------------------*
+*&      Form  INS_PROTOCOL
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+FORM INS_PROTOCOL.
+
+  IF SY-SUBRC GT 0 AND REAL NE ' '.    "not succesful, real run
+    CASE ACTYPE.
+      WHEN 'D'.
+        COUNT-EDELETE = COUNT-EDELETE + 1.
+      WHEN 'I'.
+        COUNT-EINSERT = COUNT-EINSERT + 1.
+      WHEN 'U'.
+        COUNT-EUPDATE = COUNT-EUPDATE + 1.
+      WHEN 'N'.
+        COUNT-SNOMODI = COUNT-SNOMODI + 1.
+    ENDCASE.
+    PERFORM APPEND_ERRTAB USING ACTYPE BANKL BANKA BNKLZ
+                                       SWIFT OLD_SWIFT.
+  ELSE.
+    CASE ACTYPE.
+      WHEN 'D'.
+        COUNT-SDELETE = COUNT-SDELETE + 1.
+      WHEN 'I'.
+        COUNT-SINSERT = COUNT-SINSERT + 1.
+      WHEN 'U'.
+        COUNT-SUPDATE = COUNT-SUPDATE + 1.
+      WHEN 'N'.
+        COUNT-SNOMODI = COUNT-SNOMODI + 1.
+    ENDCASE.
+    IF LIST NE ' ' AND ACTYPE NE 'N'.
+      PERFORM APPEND_SUCTAB USING ACTYPE BANKL BANKA BNKLZ
+                                         SWIFT OLD_SWIFT.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    "INS_PROTOCOL
+
+*&--------------------------------------------------------------------*
+*&      Form  APPEND_ERRTAB
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+*      -->ACTYPE     text
+*      -->BANKL      text
+*      -->BANKA      text
+*      -->BNKLZ      text
+*      -->SWIFT      text
+*      -->OLD_SWIFT  text
+*---------------------------------------------------------------------*
+FORM APPEND_ERRTAB USING ACTYPE BANKL BANKA BNKLZ SWIFT OLD_SWIFT.
+
+  ERRTAB-BANKL     = BANKL.                "Vorsicht, evtl bnka-bankl!!!
+  ERRTAB-ACTYPE    = ACTYPE.
+  ERRTAB-BANKA     = BANKA.                "Vorsicht, evtl bnka-banka!!!
+  ERRTAB-BNKLZ     = BNKLZ.
+  ERRTAB-SWIFT     = SWIFT.
+  ERRTAB-OLD_SWIFT = OLD_SWIFT.
+  APPEND ERRTAB.
+
+ENDFORM.                    "APPEND_ERRTAB
+
+*&--------------------------------------------------------------------*
+*&      Form  APPEND_SUCTAB
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+*      -->ACTYPE     text
+*      -->BANKL      text
+*      -->BANKA      text
+*      -->BNKLZ      text
+*      -->SWIFT      text
+*      -->OLD_SWIFT  text
+*---------------------------------------------------------------------*
+FORM APPEND_SUCTAB USING ACTYPE BANKL BANKA BNKLZ SWIFT OLD_SWIFT.
+
+  SUCTAB-BANKL = BANKL.                "Vorsicht, evtl bnka-bankl!!!
+  SUCTAB-ACTYPE = ACTYPE.
+  SUCTAB-BANKA = BANKA.                "Vorsicht, evtl bnka-banka!!!
+  SUCTAB-BNKLZ = BNKLZ.
+  SUCTAB-SWIFT = SWIFT.
+  SUCTAB-OLD_SWIFT = OLD_SWIFT.
+  APPEND SUCTAB.
+
+ENDFORM.                    "APPEND_SUCTAB
+
+*&--------------------------------------------------------------------*
+*&      Form  PROTOCOL
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+FORM PROTOCOL.
+  FORMAT INTENSIFIED OFF.
+  IF REAL NE ' '.
+    WRITE: / TEXT-004.                 "real run
+  ELSE.
+    WRITE: / TEXT-003.                 "test run
+  ENDIF.
+  ULINE.
+
+  WRITE: / TEXT-084, 40 BANKS.
+  WRITE: / TEXT-020, 40 DS_NAME.
+
+  IF LOAD1 = 'X'.
+    WRITE: / TEXT-002, 40 TEXT-024.
+  ELSEIF LOAD2 = 'X'.
+    WRITE: / TEXT-002, 40 TEXT-025.
+  ELSE.
+    WRITE: / TEXT-002, 40 TEXT-026.
+  ENDIF.
+
+  WRITE: / TEXT-085, 40 DELE.
+  WRITE: / TEXT-050, 40 COUNT-SREADTO.
+  WRITE: / TEXT-060, 40 COUNT-SINSERT.
+  WRITE: / TEXT-061, 40 COUNT-SUPDATE.
+  WRITE: / TEXT-065, 40 COUNT-SDELETE.
+  WRITE: / TEXT-064, 40 COUNT-SNOMODI.
+  IF REAL NE ' '.
+    WRITE: / TEXT-062, 40 COUNT-EINSERT.
+    WRITE: / TEXT-063, 40 COUNT-EUPDATE.
+    WRITE: / TEXT-066, 40 COUNT-EDELETE.
+  ENDIF.
+
+  IF COUNT-EINSERT GT 0 OR COUNT-EUPDATE GT 0 OR COUNT-EDELETE GT 0.
+    SORT: ERRTAB.
+    NEW-PAGE.
+    WRITE TEXT-006.                    "error list
+    SKIP 1.
+    IF LOAD1 = 'X'.
+      WRITE: / TEXT-081, 17 TEXT-082, 78 TEXT-080.
+      ULINE.
+      LOOP AT ERRTAB.
+        WRITE: / ERRTAB-BANKL, ERRTAB-BANKA, ERRTAB-ACTYPE.
+      ENDLOOP.
+    ELSEIF LOAD2 = 'X'.
+      WRITE: / TEXT-081, 17 TEXT-091, 33 TEXT-082, 94 TEXT-080.
+      ULINE.
+      LOOP AT ERRTAB.
+        WRITE: / ERRTAB-BANKL, ERRTAB-BNKLZ,
+                 ERRTAB-BANKA, ERRTAB-ACTYPE.
+      ENDLOOP.
+    ELSE.
+      WRITE: / TEXT-080, TEXT-081, 18 TEXT-082,
+               80 TEXT-100, 92 TEXT-101.
+      ULINE.
+      LOOP AT ERRTAB.
+        WRITE: / ERRTAB-ACTYPE, ERRTAB-BANKL, ERRTAB-BANKA,
+                 ERRTAB-SWIFT, ERRTAB-OLD_SWIFT.
+      ENDLOOP.
+    ENDIF.
+  ENDIF.
+
+  IF LIST NE ' '.
+    SORT: SUCTAB.
+    NEW-PAGE.
+    WRITE TEXT-007.                    "detailed list
+    SKIP 1.
+    IF COUNT-SINSERT GT 0 OR COUNT-SUPDATE GT 0 OR COUNT-SDELETE GT 0.
+      IF LOAD1 = 'X'.
+        WRITE: / TEXT-081, 17 TEXT-082, 78 TEXT-080.
+        ULINE.
+        LOOP AT SUCTAB.
+          WRITE: / SUCTAB-BANKL, SUCTAB-BANKA, SUCTAB-ACTYPE.
+        ENDLOOP.
+      ELSEIF LOAD2 = 'X'.
+        WRITE: / TEXT-081, 17 TEXT-091, 33 TEXT-082, 94 TEXT-080.
+        ULINE.
+        LOOP AT SUCTAB.
+          WRITE: / SUCTAB-BANKL, SUCTAB-BNKLZ,
+                   SUCTAB-BANKA, SUCTAB-ACTYPE.
+        ENDLOOP.
+      ELSE.
+        WRITE: / TEXT-080, TEXT-081, 18 TEXT-082,
+                 80 TEXT-100, 92 TEXT-101.
+        ULINE.
+        LOOP AT SUCTAB.
+          WRITE: / SUCTAB-ACTYPE, SUCTAB-BANKL, SUCTAB-BANKA,
+                   SUCTAB-SWIFT, SUCTAB-OLD_SWIFT.
+        ENDLOOP.
+      ENDIF.
+      SKIP 2.
+      WRITE: / TEXT-070.               " Legende
+      WRITE: /.                        " Legende
+      WRITE: / TEXT-071.
+      WRITE: / TEXT-072.
+      WRITE: / TEXT-073.
+
+    ELSE.
+      WRITE: / TEXT-008.               "no banks modified
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    "PROTOCOL
+
+*&--------------------------------------------------------------------*
+*&      Form  BNKA_READ
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+*      -->BANKL      text
+*---------------------------------------------------------------------*
+FORM BNKA_READ USING BANKL.
+* if load2 = 'X'.
+*   read table ibnka with key mandt = sy-mandt
+*                             banks = banks
+*                             bankl = bankl
+*                             bnklz = itab_bnka-bnklz
+*                    binary search.
+* else.
+  READ TABLE IBNKA WITH KEY MANDT = SY-MANDT
+                            BANKS = BANKS
+                            BANKL = BANKL
+                   BINARY SEARCH.
+* endif.
+  IF SY-SUBRC = 0.
+    BNKA = IBNKA.
+  ENDIF.
+ENDFORM.                    "BNKA_READ
+
+*&--------------------------------------------------------------------*
+*&      Form  BNKA_UPDATE
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+FORM BNKA_UPDATE.
+  IF REAL NE SPACE.
+    UPDATE BNKA.
+  ENDIF.
+  ACTYPE = 'U'.
+  PERFORM INS_PROTOCOL.
+
+ENDFORM.                               " BNKA_UPDATE
+
+*&--------------------------------------------------------------------*
+*&      Form  BNKA_INSERT_VORBEREITEN
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+FORM BNKA_INSERT_VORBEREITEN.
+  CLEAR: BNKA.
+  BNKA-MANDT = SY-MANDT.
+  BNKA-BANKS = BANKS.
+  BNKA-BANKL = BANKL.
+  BNKA-ERDAT = SY-DATUM.
+  BNKA-ERNAM = TEXT-001.
+  BNKA-BANKA = ITAB_BNKA-BANKA.
+  BNKA-BRNCH = ITAB_BNKA-BRNCH.
+  BNKA-SWIFT = SWIFT.
+  IF LOAD2 = 'X'.
+    BNKA-BNKLZ = ITAB_BNKA-BNKLZ.
+  ENDIF.
+ENDFORM.                               " BNKA_INSERT_VORBEREITEN
+
+*&--------------------------------------------------------------------*
+*&      Form  BNKA_INSERT
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+FORM BNKA_INSERT.
+  CHECK BNKA-BANKL CN ' 0'.
+  IF REAL NE SPACE.
+    INSERT BNKA.
+  ENDIF.
+  ACTYPE = 'I'.
+  PERFORM INS_PROTOCOL.
+ENDFORM.                               " BNKA_INSERT
+
+*&--------------------------------------------------------------------*
+*&      Form  BNKA_UPDATE_LOEVM
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+FORM BNKA_UPDATE_LOEVM.
+  IF REAL NE SPACE.
+    BNKA-LOEVM = 'X'.
+    UPDATE BNKA.
+  ENDIF.
+  ACTYPE = 'D'.
+ENDFORM.                               " BNKA_UPDATE_LOEVM
+
+*&--------------------------------------------------------------------*
+*&      Form  UPLOAD_FROM_DISK
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+FORM UPLOAD_FROM_DISK.
+  REFRESH: ITAB_ALL.
+
+  CALL FUNCTION 'WS_UPLOAD'
+    EXPORTING
+      FILENAME        = UFILE
+      FILETYPE        = 'DAT'
+    TABLES
+      DATA_TAB        = ITAB_ALL
+    EXCEPTIONS
+      FILE_OPEN_ERROR = 1
+      FILE_READ_ERROR = 2.
+  CASE SY-SUBRC.
+    WHEN 1.
+      MESSAGE E704(FB) WITH UFILE+2 UFILE+0(2).
+    WHEN 2.
+      MESSAGE E705(FB) WITH UFILE+2 UFILE+0(2).
+    WHEN OTHERS.
+  ENDCASE.
+
+ENDFORM.                    " UPLOAD_FROM_DISK
+
+*Text symbol text£º
+*001:Transfer
+*002:Loading Options
+*003:Test Run
+*004:Live Run
+*006:Error list
+*007:Detail list
+*008:No banks were created, changed or marked for deletion
+*020:Dataset name:
+*024:Giro Bank Master
+*025:Credit Nota Bank Master
+*026:MEPSB
+*050:Number of records read:
+*051:No.of head offices (dif.bank nos):
+*060:Number of banks created:
+*061:Number of banks changed:
+*062:Number of errors when creating:
+*063:Number of errors when changing:
+*064:Number of banks not changed:
+*065:Number of banks marked for deletion:
+*066:Number of errors marked for deletion:
+*070:Key
+*071:I = Insert
+*072:U = Change
+*073:D = Mark for deletion
+*080:A
+*081:Bank key
+*082:Name
+*083:Great Britain
+*084:Bank Country
+*085:Mark for Deletion
+*090:Mark for Deletion (for Giro & Credit Nota only)
+*091:Bank number
+*100:Swift
+*101:Old swift
+*102: 1.  Bank List with Local Clearing Codes
+*103: 2.  Credit Nota Bank List
+*104: 3.  Bank List with Local Clearing and SWIFT codes
+
+*105: Mark for Deletion (for Option 1 & Option 2 only)
+*Selection text£º
+*BANKS:        Bank country
+*DELE:
+*DS_NAME:        File Path Name
+*LOAD1:
+*LOAD2:
+*LOAD3:
+*MAX_REC:        Maximum number of records
+*REAL:
+*TEST:

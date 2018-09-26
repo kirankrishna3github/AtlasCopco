@@ -1,0 +1,284 @@
+*&---------------------------------------------------------------------*
+*& Report  ZPSFC127                                                    *
+*&---------------------------------------------------------------------*
+*& This report is supposed to repair orders that create error CO 888   *
+*& when creating ITAB because of duplicate operation numbers VORNR.    *
+*& This version allows to enter order number ranges and choice of      *
+*& order type. Please refer to note 133342.                            *
+*&---------------------------------------------------------------------*
+*& Version 2.1                                                         *
+*& Version list:                                                       *
+*& 1.0 - CJ - original version, works for one order                    *
+*& 2.0 - AK - new UI, works for multiple orders                        *
+*& 2.1 - AK - added package building for commit and dequeue            *
+*& 2.2 - AK - allow duplicates in different sequences                  *
+*&---------------------------------------------------------------------*
+
+REPORT  ZPSFC127.
+
+TABLES: caufv.
+
+SELECTION-SCREEN COMMENT /1(80) text1.
+SELECTION-SCREEN COMMENT /1(80) text2.
+
+SELECTION-SCREEN BEGIN OF BLOCK block1 WITH FRAME TITLE title1.
+SELECT-OPTIONS: r_orders FOR caufv-aufnr.
+SELECTION-SCREEN END OF BLOCK block1.
+SELECTION-SCREEN BEGIN OF BLOCK block2 WITH FRAME TITLE title2.
+SELECTION-SCREEN BEGIN OF LINE.
+PARAMETERS ra_fert RADIOBUTTON GROUP typ DEFAULT 'X'.
+SELECTION-SCREEN COMMENT 4(30) text3.
+SELECTION-SCREEN END OF LINE.
+SELECTION-SCREEN BEGIN OF LINE.
+PARAMETERS ra_bord RADIOBUTTON GROUP typ.
+SELECTION-SCREEN COMMENT 4(30) text4.
+SELECTION-SCREEN END OF LINE.
+SELECTION-SCREEN END OF BLOCK block2.
+SELECTION-SCREEN BEGIN OF BLOCK block3 WITH FRAME TITLE title3.
+SELECTION-SCREEN BEGIN OF LINE.
+PARAMETERS testmode RADIOBUTTON GROUP mode DEFAULT 'X'.
+SELECTION-SCREEN COMMENT 4(30) text5.
+SELECTION-SCREEN END OF LINE.
+SELECTION-SCREEN BEGIN OF LINE.
+PARAMETERS update RADIOBUTTON GROUP mode.
+SELECTION-SCREEN COMMENT 4(30) text6.
+SELECTION-SCREEN END OF LINE.
+SELECTION-SCREEN END OF BLOCK block3.
+
+DATA: BEGIN OF order_tab OCCURS 0,
+        aufnr LIKE caufv-aufnr,
+        autyp LIKE caufv-autyp,
+        aufpl LIKE caufv-aufpl,
+      END OF order_tab.
+DATA: ls_order_tab_wa LIKE order_tab.
+DATA: BEGIN OF afvc_tab OCCURS 0.
+        INCLUDE STRUCTURE afvc.
+DATA: END OF afvc_tab.
+DATA: stammfolge LIKE afvc-aplfl VALUE '000000'.
+DATA: auftragstyp_fert LIKE caufv-autyp VALUE '10'.
+DATA: auftragstyp_bord LIKE caufv-autyp VALUE '40'.
+DATA: auftragstyp      LIKE caufv-autyp.
+
+DATA: BEGIN OF a.
+        INCLUDE STRUCTURE afvc.
+DATA: END OF a.
+
+DATA: nvornr(4) TYPE n.
+DATA: counter TYPE i.
+
+DATA: maxnumber1 LIKE afvc-vornr VALUE '3000'.
+DATA: maxnumber2 LIKE afvc-vornr VALUE '3333'.
+
+INITIALIZATION.
+  text1 = 'Check orders for ITAB errors and correct AFVC.'.
+  text2 = 'Please run without flag UPDATE first.'.
+  text3 = 'Production orders'.
+  text4 = 'Process orders'.
+  text5 = 'Testmode'.
+  text6 = 'Update Mode'.
+  title1 = 'Order number range'.
+  title2 = 'Order category'.
+  title3 = 'Mode'.
+
+START-OF-SELECTION.
+
+* determine order type
+  IF NOT ra_fert IS INITIAL.
+    auftragstyp = auftragstyp_fert.
+  ELSEIF NOT ra_bord IS INITIAL.
+    auftragstyp = auftragstyp_bord.
+  ENDIF.
+
+* read orders
+  SELECT aufnr autyp aufpl
+         FROM  caufv
+         INTO  TABLE order_tab
+         WHERE aufnr IN r_orders
+         AND   autyp = auftragstyp.
+  PERFORM send_message USING sy-subrc.
+
+  LOOP AT order_tab INTO ls_order_tab_wa.
+*   initialization
+    maxnumber1 = '3000'.
+    maxnumber2 = '3333'.
+    CLEAR   afvc_tab.
+    REFRESH afvc_tab.
+*   lock order
+    PERFORM lock_order.
+*   read operations
+    SELECT * FROM afvc
+                 INTO TABLE afvc_tab
+             WHERE aufpl = ls_order_tab_wa-aufpl.
+    PERFORM send_message_op USING sy-subrc.
+*   check operation numbers
+    PERFORM check_number.
+*   update database entries, if required
+    PERFORM afvc_to_db.
+*   commit work and release lock
+    PERFORM commit.
+  ENDLOOP.
+
+* handle final (incomplete) package
+  counter = 100.
+  PERFORM commit.
+
+  WRITE: / '********** END OF PROGRAM ************'.
+
+
+***********************************************************************
+*    SUBROUTINES
+***********************************************************************
+
+*&****************************************************
+*&   Form  CHECK_NUMBER
+*&****************************************************
+FORM check_number.
+
+  DATA: rc LIKE sy-subrc.
+  DATA: hvornr LIKE afvc-vornr.
+  DATA: h_folge LIKE afvc-aplfl.
+
+  LOOP AT afvc_tab.
+    IF afvc_tab-vornr CA space.
+      WRITE: / 'order', ls_order_tab_wa-aufnr.
+      hvornr = afvc_tab-vornr.
+      WRITE: / 'must change operation number OLD' , hvornr.
+      afvc_tab-vornr = maxnumber2.
+      MODIFY afvc_tab.
+      WRITE: / 'operationnumber NEW', maxnumber2.
+      maxnumber2 = maxnumber2 + 1.
+    ENDIF.
+  ENDLOOP.
+
+  LOOP AT afvc_tab.
+    a = afvc_tab.
+    PERFORM check_duprec TABLES afvc_tab
+                         USING  a-vornr
+                                a-sumnr
+                                a-aplzl
+                                a-aplfl
+                                rc.
+*   RC = 0 ===> same Number
+    IF rc = 0.
+      hvornr = a-vornr.
+*     letters in operationnumber ?
+      IF a-vornr CN '0123456789'.
+*       delete from database
+        IF NOT update IS INITIAL.
+          DELETE afvc FROM a.
+        ENDIF.
+*       clear number
+        DELETE afvc_tab WHERE vornr = a-vornr AND
+                              sumnr = a-sumnr AND
+                              aplzl = a-aplzl.
+        WRITE: / 'order', ls_order_tab_wa-aufnr.
+        WRITE: / 'delete operation ', a-vornr.
+      ELSE.
+*       set new number
+        a-vornr = maxnumber1 = nvornr = maxnumber1 + 1.
+        h_folge = a-aplfl.
+        IF a-aplfl IS INITIAL.
+          a-aplfl = stammfolge.
+        ENDIF.
+        afvc_tab = a.
+        MODIFY afvc_tab.
+        WRITE: / 'order', ls_order_tab_wa-aufnr.
+        WRITE: / 'OLD operation number', hvornr,
+                 'sequence', h_folge.
+        WRITE: / 'NEW operation number', nvornr,
+                 'sequence', a-aplfl.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                                "CHECK_NUMBER
+
+*&*************************************************************
+*&   Form  CHECK_DUPREC
+*&*************************************************************
+FORM check_duprec TABLES afvc_t STRUCTURE afvc
+                         USING xvornr TYPE vornr
+                               xsumnr TYPE sumkntnr
+                               xaplzl TYPE co_aplzl
+                               xaplfl TYPE plnfolge
+                               xrc    TYPE sysubrc.
+
+  LOOP AT afvc_t WHERE vornr = xvornr
+                 AND   sumnr = xsumnr
+                 AND   aplfl = xaplfl
+                 AND   aplzl <> xaplzl.
+  ENDLOOP.
+  xrc = sy-subrc.
+
+ENDFORM.                               "CHECK_DUPREC
+
+*&*****************************************************************
+*&   Form  SEND_MESSAGE
+*&*****************************************************************
+FORM send_message USING rc TYPE sysubrc.
+
+  IF rc <> 0.
+    WRITE: / 'No orders found.'.
+    EXIT.
+  ENDIF.
+
+ENDFORM.                               " SEND_MESSAGE
+
+*&*****************************************************************
+*&   Form  SEND_MESSAGE_OP
+*&*****************************************************************
+FORM send_message_op USING rc TYPE sysubrc.
+
+  IF rc <> 0.
+    WRITE: / 'order', ls_order_tab_wa-aufnr, '- no operation found.'.
+    EXIT.
+  ENDIF.
+
+ENDFORM.                               " SEND_MESSAGE_OP
+
+*&*****************************************************************
+*&   Form  LOCK_ORDER
+*&*****************************************************************
+FORM lock_order.
+
+  IF NOT update IS INITIAL.
+    CALL FUNCTION 'CO_ZF_ORDER_LOCK'
+      EXPORTING
+        autyp = auftragstyp
+        aufnr = ls_order_tab_wa-aufnr.
+  ENDIF.
+
+ENDFORM.                    " LOCK_ORDER
+
+*&*******************************************************************
+*&   Form  AFVC_TO_DB
+*&*******************************************************************
+FORM afvc_to_db.
+
+* update AFVC on data base?
+  IF NOT update IS INITIAL.
+    UPDATE afvc FROM TABLE afvc_tab.
+  ENDIF.
+
+ENDFORM.                    " AFVC_TO_DB
+
+*&*******************************************************************
+*&      Form  commit
+*&*******************************************************************
+FORM commit .
+
+  IF NOT update IS INITIAL.
+*   commit after 100 orders - this will also release the locks
+    ADD 1 TO counter.
+    IF counter > 99.
+      CLEAR counter.
+      COMMIT WORK AND WAIT.
+      CALL FUNCTION 'DEQUEUE_ALL'.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    " commit
+
+
+*Selection text£º
+*R_ORDERS:D       .

@@ -1,0 +1,535 @@
+*----------------------------------------------------------------------*
+* PROGRAM ID    : YSE_UPLOAD_PIR_SL                                    *
+* PROGRAM TITLE : Mass upload PIR and sourcing list for Nanjing CC     *
+* AUTHOR        : Johnny Wu                                            *
+* DATE          : 17/01/2012                                           *
+* DEVELOPMENT ID:                                                      *
+*                                                                      *
+* CHANGE REQUEST NUMBER: CR2392                                        *
+*                                                                      *
+* Program Description: Mass upload PIR and sourcing list for Nanjing CC*
+*                                                                      *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+*  DATE    | NAME     |TRANSPORT  | CR# and short Description          *
+*----------------------------------------------------------------------*
+*
+*17/01/2012|Johnny Wu |CD1K969899 |CR2392: Initial version             *
+*18/01/2012|Johnny Wu |CD1K969907 |CR2392: Buf Fix                     *
+*18/01/2012|Johnny Wu |CD1K969909 |CR2392: Buf Fix                     *
+*19/01/2012|Johnny Wu |CD1K969925 |CR2392: Buf Fix                     *
+*20/01/2012|Johnny Wu |CD1K969961 |CR2392: Enable background upload    *
+*21/01/2012|Johnny Wu |CD1K969993 |CR2392: Enable background upload    *
+*----------------------------------------------------------------------*
+report yse_upload_pir_sl
+       no standard page heading line-size 255.
+
+tables: eord.
+
+*---------------------------------------------------------------------*
+* TYPES                                                               *
+*---------------------------------------------------------------------*
+types: begin of ty_item,
+          lifnr like eord-lifnr,
+          matnr like eord-matnr,
+          ekorg like eine-ekorg,
+          werks like eord-werks,
+          seperator(1) type c,
+          kbetr(11) type c, "like konp-kbetr,"100
+          konwa like konp-konwa,"RMB
+          kpein(5) type c," like konp-kpein,"1
+          kmein like konp-kmein,"PC
+          datab like rv13a-datab,"Date Begin
+       end of ty_item.
+
+data: gt_item_list type table of ty_item.
+
+*include bdcrecx1.
+********************************************************************
+load-of-program.
+  include yse_bdcrecx1_backup1.
+
+*----------------------------------------------------------------------*
+*                          SELECTION SCREEN VARIABLES                  *
+*----------------------------------------------------------------------*
+  selection-screen begin of block bk2 with frame title text-bk2.
+  parameters: p_sess radiobutton group gp2.
+*  SELECTION-SCREEN COMMENT 3(20) TEXT-S01 FOR FIELD p_GROUP.
+
+  parameters p_group(12).                      "group name of session
+  parameters: p_ctu radiobutton group gp2 default 'X'.
+  selection-screen end of block bk2.
+
+  parameters: dataset(132) lower case.
+
+  selection-screen begin of block bk1 with frame title text-bk1.
+  parameters: p_pir_up radiobutton group gp1,
+              p_sl_del radiobutton group gp1,
+              p_sl_cre radiobutton group gp1.
+  selection-screen end of block bk1.
+
+at selection-screen.
+* group and user must be filled for create session
+  if p_sess = 'X' and p_group = space.
+    message e000(yse_general) with 'Please enter the session name'.
+  endif.
+
+start-of-selection.
+
+  perform set_bdc_para.
+  perform open_dataset using dataset.
+  perform get_item_list.
+
+  perform open_group.
+
+  if p_pir_up = 'X'.
+    perform handle_pir.
+  endif.
+
+  if p_sl_del = 'X'.
+    perform delete_sourcing_list."Delete Source List
+  endif.
+
+  if p_sl_cre = 'X'.
+    perform create_sourcing_list.
+  endif.
+
+  perform close_group.
+  perform close_dataset using dataset.
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_ITEM_LIST
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+form get_item_list .
+  constants:
+      con_tab  type c value cl_abap_char_utilities=>horizontal_tab.
+  data: ls_item type ty_item,
+        lv_string type string,
+        lv_counter type i value 0.
+
+  do.
+    lv_counter = lv_counter + 1.
+    read dataset dataset into lv_string.
+    if sy-subrc <> 0.
+      exit.
+    endif.
+
+    if lv_counter = 1.
+      continue.
+    endif.
+
+    split lv_string at con_tab
+     into ls_item-lifnr ls_item-matnr
+          ls_item-ekorg ls_item-werks
+          ls_item-seperator ls_item-kbetr
+          ls_item-konwa ls_item-kpein
+          ls_item-kmein ls_item-datab.
+
+    "Material Number
+    call function 'CONVERSION_EXIT_MATN1_INPUT'
+      exporting
+        input        = ls_item-matnr
+      importing
+        output       = ls_item-matnr
+      exceptions
+        length_error = 1
+        others       = 2.
+    if sy-subrc <> 0.
+* MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*         WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+    endif.
+
+    "Vendor Number
+    call function 'CONVERSION_EXIT_ALPHA_INPUT'
+      exporting
+        input  = ls_item-lifnr
+      importing
+        output = ls_item-lifnr.
+    append ls_item to gt_item_list.
+  enddo.
+endform.                    " GET_ITEM_LIST
+*&---------------------------------------------------------------------*
+*&      Form  DELETE_SOURCING_LIST
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+form delete_sourcing_list .
+  data: ls_item type ty_item.
+
+  loop at gt_item_list into ls_item.
+
+    select single * from eord where matnr = ls_item-matnr
+                                and werks = ls_item-werks.
+    if sy-subrc <> 0 ."Not Sourcing List
+      continue.
+    endif.
+
+    clear: bdcdata[].
+    perform bdc_dynpro      using 'SAPLMEOR' '0200'.
+    perform bdc_field       using 'BDC_CURSOR'
+                                  'EORD-MATNR'.
+    perform bdc_field       using 'BDC_OKCODE'
+                                  '/00'.
+    perform bdc_field       using 'EORD-MATNR'
+                                  ls_item-matnr.
+    perform bdc_field       using 'EORD-WERKS'
+                                  ls_item-werks.
+    perform bdc_dynpro      using 'SAPLMEOR' '0205'.
+    perform bdc_field       using 'BDC_CURSOR'
+                                  'EORD-EBELP(01)'.
+    perform bdc_field       using 'BDC_OKCODE'
+                                  '=SA'.
+    perform bdc_dynpro      using 'SAPLMEOR' '0205'.
+    perform bdc_field       using 'BDC_CURSOR'
+                                  'EORD-EBELP(01)'.
+    perform bdc_field       using 'BDC_OKCODE'
+                                  '=LOES'.
+
+    perform bdc_dynpro      using 'SAPLSPO1' '0200'.
+    perform bdc_field       using 'BDC_OKCODE'
+                                  '=YES'.
+
+    perform bdc_dynpro      using 'SAPLMEOR' '0205'.
+    perform bdc_field       using 'BDC_CURSOR'
+                                  'EORD-EBELP(01)'.
+    perform bdc_field       using 'BDC_OKCODE'
+                                  '=BU'.
+    perform bdc_transaction using 'ME01'.
+  endloop.
+endform.                    " DELETE_SOURCING_LIST
+*&---------------------------------------------------------------------*
+*&      Form  CREATE_SOURCING_LIST
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+form create_sourcing_list .
+  data: ls_item type ty_item,
+        lv_fval type bdcdata-fval.
+
+  loop at gt_item_list into ls_item.
+    clear: bdcdata[].
+    perform bdc_dynpro      using 'SAPLMEOR' '0200'.
+    perform bdc_field       using 'BDC_CURSOR'
+                                  'EORD-MATNR'.
+    perform bdc_field       using 'BDC_OKCODE'
+                                  '/00'.
+    perform bdc_field       using 'EORD-MATNR'
+                                  ls_item-matnr.
+    perform bdc_field       using 'EORD-WERKS'
+                                  ls_item-werks.
+
+    perform bdc_dynpro      using 'SAPLMEOR' '0205'.
+    perform bdc_field       using 'BDC_CURSOR'
+                                  'EORD-AUTET(01)'.
+    perform bdc_field       using 'BDC_OKCODE'
+                                  '=BU'.
+    write sy-datum to lv_fval dd/mm/yyyy.
+    perform bdc_field       using 'EORD-VDATU(01)'
+                                  lv_fval.
+    perform bdc_field       using 'EORD-BDATU(01)'
+                                  '31.12.9999'.
+    perform bdc_field       using 'EORD-LIFNR(01)'
+                                  ls_item-lifnr.
+    perform bdc_field       using 'EORD-EKORG(01)'
+                                  ls_item-ekorg.
+    perform bdc_field       using 'RM06W-FESKZ(01)'
+                                  'X'.
+    perform bdc_field       using 'EORD-AUTET(01)'
+                                  '1'.
+
+    perform bdc_transaction using 'ME01'.
+  endloop.
+endform.                    " CREATE_SOURCING_LIST
+*&---------------------------------------------------------------------*
+*&      Form  HANDLE_PIR
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+form handle_pir .
+  data: ls_item type ty_item,
+        lv_exist(1) type c.
+
+  loop at gt_item_list into ls_item.
+
+    perform check_pir_exist using ls_item changing lv_exist.
+
+    if lv_exist = ''.
+      "Create
+      perform create_pir using ls_item.
+    else.
+      "Change
+      perform change_pir using ls_item.
+    endif.
+
+  endloop.
+endform.                    " HANDLE_PIR
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_PIR_EXIST
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_LS_ITEM  text
+*----------------------------------------------------------------------*
+form check_pir_exist  using    p_item type ty_item changing p_exist type c.
+  data: ls_meico type meico,
+        ls_eina type eina,
+        ls_eine type eine,
+        ls_meicr type meicr.
+
+  ls_meico-lifnr = p_item-lifnr.
+  ls_meico-matnr = p_item-matnr.
+  ls_meico-leina = 'X'.
+
+  p_exist = 'X'.
+  "EINA
+  call function 'ME_READ_INFORECORD'
+    exporting
+      incom          = ls_meico
+      i_no_other_org = 'X'
+      i_really_exist = 'X'
+    importing
+      einadaten      = ls_eina
+      excom          = ls_meicr
+    exceptions
+      not_found      = 1.
+
+  if sy-subrc <> 0 .
+    p_exist = ''.
+  else.
+    "EINE
+    ls_meico-infnr = ls_eina-infnr.
+    ls_meico-esokz = 0.
+    ls_meico-ekorg = p_item-ekorg.
+    ls_meico-werks = p_item-werks.
+    ls_meico-onlye = 'X'.
+    ls_meico-onlyw = 'X'.
+    ls_meico-skipdl = 'X'.
+    call function 'ME_READ_INFORECORD'
+      exporting
+        incom          = ls_meico
+        i_no_other_org = ' '
+        i_really_exist = 'X'
+      importing
+        einedaten      = ls_eine
+        excom          = ls_meicr
+      exceptions
+        not_found      = 1.
+    if sy-subrc <> 0.
+      p_exist = ''.
+    endif.
+  endif.
+endform.                    " CHECK_PIR_EXIST
+*&---------------------------------------------------------------------*
+*&      Form  CREATE_PIR
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+form create_pir using    p_item type ty_item .
+  data: lv_fval type bdcdata-fval.
+
+  clear: bdcdata[].
+  perform bdc_dynpro      using 'SAPMM06I' '0100'.
+  perform bdc_field       using 'BDC_CURSOR'
+                                'EINA-LIFNR'.
+  perform bdc_field       using 'BDC_OKCODE'
+                                '/00'.
+  perform bdc_field       using 'EINA-LIFNR'
+                                p_item-lifnr.
+  perform bdc_field       using 'EINA-MATNR'
+                                p_item-matnr.
+  perform bdc_field       using 'EINE-EKORG'
+                                p_item-ekorg.
+  perform bdc_field       using 'EINE-WERKS'
+                                p_item-werks.
+  perform bdc_field       using 'RM06I-NORMB'
+                                'X'.
+
+  perform bdc_dynpro      using 'SAPMM06I' '0101'.
+  perform bdc_field       using 'BDC_CURSOR'
+                                'EINA-MAHN3'.
+  perform bdc_field       using 'BDC_OKCODE'
+                                '/00'.
+  perform bdc_field       using 'EINA-MAHN1'
+                                '7'.
+  perform bdc_field       using 'EINA-MAHN2'
+                                  '14'.
+  perform bdc_field       using 'EINA-MAHN3'
+                                  '28'.
+
+  perform bdc_dynpro      using 'SAPMM06I' '0102'.
+  perform bdc_field       using 'BDC_CURSOR'
+                                'EINE-NETPR'.
+  perform bdc_field       using 'BDC_OKCODE'
+                                '=KO'.
+
+  perform bdc_field       using 'EINE-EKGRP'
+                                  '002'.
+  perform bdc_field       using 'EINE-NORBM'
+                                '1'.
+
+  perform bdc_field       using 'EINE-NETPR'
+                                  p_item-kbetr.
+  perform bdc_field       using 'EINE-WAERS'
+                                  p_item-konwa.
+
+  perform bdc_field       using 'EINE-PEINH'
+                                  p_item-kpein.
+  perform bdc_field       using 'EINE-BPRME'
+                                  p_item-kmein.
+
+
+  perform bdc_dynpro      using 'SAPMV13A' '0201'.
+  perform bdc_field       using 'BDC_CURSOR'
+                                'RV13A-DATAB'.
+  perform bdc_field       using 'BDC_OKCODE'
+                                '=SICH'.
+  write sy-datum to lv_fval dd/mm/yyyy.
+  perform bdc_field       using 'RV13A-DATAB'
+                                lv_fval.
+  perform bdc_field       using 'RV13A-DATBI'
+                                '31.12.9999'.
+
+  perform bdc_transaction using 'ME11'.
+endform.                    " CREATE_PIR
+*&---------------------------------------------------------------------*
+*&      Form  CHANGE_PIR
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_LS_ITEM  text
+*----------------------------------------------------------------------*
+form change_pir  using    p_item type ty_item.
+  data: lv_fval type bdcdata-fval.
+
+  clear: bdcdata[].
+  perform bdc_dynpro      using 'SAPMM06I' '0100'.
+  perform bdc_field       using 'BDC_CURSOR'
+                                'EINA-LIFNR'.
+  perform bdc_field       using 'BDC_OKCODE'
+                                '/00'.
+  perform bdc_field       using 'EINA-LIFNR'
+                                p_item-lifnr.
+  perform bdc_field       using 'EINA-MATNR'
+                                p_item-matnr.
+  perform bdc_field       using 'EINE-EKORG'
+                                p_item-ekorg.
+  perform bdc_field       using 'EINE-WERKS'
+                                p_item-werks.
+  perform bdc_field       using 'RM06I-NORMB'
+                                'X'.
+
+  perform bdc_dynpro      using 'SAPMM06I' '0101'.
+  perform bdc_field       using 'BDC_CURSOR'
+                                'EINA-MAHN1'.
+  perform bdc_field       using 'BDC_OKCODE'
+                                '=KO'.
+  perform bdc_field       using 'EINA-MAHN1'
+                                '7'.
+  perform bdc_field       using 'EINA-MAHN2'
+                                  '14'.
+  perform bdc_field       using 'EINA-MAHN3'
+                                  '28'.
+
+  perform bdc_dynpro      using 'SAPLV14A' '0102'.
+  perform bdc_field       using 'BDC_CURSOR'
+                                'VAKE-DATAB(01)'.
+  perform bdc_field       using 'BDC_OKCODE'
+                                '=NEWD'.
+
+  perform bdc_dynpro      using 'SAPMV13A' '0201'.
+  perform bdc_field       using 'BDC_CURSOR'
+                                'KONP-KPEIN(01)'.
+  perform bdc_field       using 'BDC_OKCODE'
+                                '=SICH'.
+  write sy-datum to lv_fval dd/mm/yyyy.
+  perform bdc_field       using 'RV13A-DATAB'
+                                lv_fval.
+  perform bdc_field       using 'RV13A-DATBI'
+                                '31.12.9999'.
+  perform bdc_field       using 'KONP-KBETR(01)'
+                                p_item-kbetr."100
+  perform bdc_field       using 'KONP-KONWA(01)'
+                                p_item-konwa."RMB
+  perform bdc_field       using 'KONP-KPEIN(01)'
+                                p_item-kpein. "1
+  perform bdc_field       using 'KONP-KMEIN(01)'
+                                p_item-kmein. "PC
+
+  perform bdc_transaction using 'ME12'.
+endform.                    " CHANGE_PIR
+*&---------------------------------------------------------------------*
+*&      Form  SET_BDC_PARA
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+form set_bdc_para .
+*   Set default call transaction settings
+  user = sy-uname.
+
+  if p_sess = 'X'.
+    session = p_sess.
+    group = p_group.
+    keep = ''.
+  endif.
+
+  if p_ctu = 'X'.
+    ctu = 'X'.
+    ctumode = 'N'.
+    cupdate = 'L'.
+  endif.
+
+  smalllog = ''.
+  nodata = '/'.
+endform.                    " SET_BDC_PARA
+
+*Text symbol text£º
+*BK1:Upload Selection
+*BK2:BDC Parameters
+*E00:Error opening dataset, return code:
+*I01:Session name
+*I02:Open session
+*I03:Insert transaction
+*I04:Close Session
+*I05:Return code =
+*I06:Error session created
+*S01:Session name
+*S02:User
+*S03:Keep session
+*S04:Lock date
+*S05:Processing Mode
+*S06:Update Mode
+*S07:Generate session
+*S08:Call transaction
+*S09:Error sessn
+*S10:Nodata indicator
+
+*S11:Short log
+*Selection text£º
+*DATASET:        Path+file name on Appl Server
+*P_CTU:        Call transaction
+*P_GROUP:        Session Name
+*P_PIR_UP:        PIR Update
+*P_SESS:        Generate session
+*P_SL_CRE:        Source List Creation
+*P_SL_DEL:        Source List Deletion

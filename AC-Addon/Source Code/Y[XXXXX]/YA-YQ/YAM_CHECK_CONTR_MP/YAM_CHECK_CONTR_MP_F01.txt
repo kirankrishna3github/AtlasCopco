@@ -1,0 +1,510 @@
+*&---------------------------------------------------------------------*
+*&  Include           YAM_CHECK_CONTR_MP_F01                           *
+*&---------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  select_cont_mplans
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM select_cont_mplans .
+
+  REFRESH: it_contracts,
+           it_equipments,
+           gt_cont.
+
+  IF s_equnr IS INITIAL.
+
+    IF s_vbeln IS INITIAL.
+* all contracts
+      SELECT a~vbeln b~posnr b~arktx
+      INTO CORRESPONDING FIELDS OF TABLE it_contracts
+        FROM vbak AS a
+        INNER JOIN vbap AS b ON
+         a~vbeln = b~vbeln
+        WHERE  a~vkorg EQ p_vkorg
+          AND  a~vtweg EQ p_vtweg
+          AND  a~spart EQ p_spart
+          AND  a~vbtyp = 'G'.
+    ELSE.
+* selection on contracts
+      SELECT a~vbeln b~posnr b~arktx
+      INTO CORRESPONDING FIELDS OF TABLE it_contracts
+        FROM vbak AS a
+        INNER JOIN vbap AS b ON
+         a~vbeln = b~vbeln
+        WHERE  a~vkorg EQ p_vkorg
+          AND  a~vtweg EQ p_vtweg
+          AND  a~spart EQ p_spart
+          AND  a~vbtyp = 'G'
+          AND  a~vbeln IN s_vbeln.
+    ENDIF.
+  ELSE.
+* selection on equipment
+    SELECT equnr FROM v_equi
+      INTO CORRESPONDING FIELDS OF TABLE it_equipments
+      WHERE eqart = c_equipment
+      AND   datbi = c99991231
+      AND   vkorg = p_vkorg
+      AND   vtweg = p_vtweg
+      AND   spart = p_spart
+      AND   spras = sy-langu
+      AND   equnr IN s_equnr.
+
+  ENDIF.
+* fill gt_cont from it_contracts.
+  IF NOT it_contracts[] IS INITIAL.
+* only active contracts (on item level)
+    LOOP AT it_contracts.
+      CLEAR gv_venddat.
+      SELECT SINGLE venddat INTO gv_venddat
+          FROM veda
+          WHERE vbeln = it_contracts-vbeln
+          AND   vposn = it_contracts-posnr.
+* evt on header level
+      IF NOT sy-subrc = '0'.
+        SELECT SINGLE venddat INTO gv_venddat
+            FROM veda
+            WHERE vbeln = it_contracts-vbeln
+            AND   vposn = 0.
+      ENDIF.
+      IF gv_venddat IS NOT INITIAL AND
+       gv_venddat < sy-datum.
+        DELETE it_contracts.
+      ENDIF.
+    ENDLOOP.
+* search for maintenance plans
+    LOOP AT it_contracts.
+      REFRESH it_mplans.
+      CLEAR gt_cont.
+      REFRESH it_mplans.
+      MOVE-CORRESPONDING it_contracts TO gt_cont.
+* get the equipment for the contract
+      SELECT SINGLE equnr INTO gt_cont-equnr
+      FROM viser02
+      WHERE sdaufnr = gt_cont-vbeln
+      AND   posnr   = gt_cont-posnr.
+      SELECT SINGLE vbtyp INTO g_vbtyp
+      FROM vbak WHERE vbeln = gt_cont-vbeln.
+      IF g_vbtyp = 'G'.
+* get the maintenance plans
+        SELECT DISTINCT warpl INTO it_mplans
+        FROM mpos WHERE equnr = gt_cont-equnr
+                  AND NOT warpl = ' '.
+          APPEND it_mplans.
+        ENDSELECT.
+* only the active maintenance plans
+* not deleted / not inactive
+        LOOP AT it_mplans.
+          CONCATENATE 'WO' it_mplans-warpl INTO gv_objnr.
+
+          CALL FUNCTION 'STATUS_CHECK'
+            EXPORTING
+              objnr             = gv_objnr
+              status            = c_i0320
+            EXCEPTIONS
+              object_not_found  = 1
+              status_not_active = 2
+              OTHERS            = 3.
+          IF sy-subrc EQ 0.
+            DELETE it_mplans.
+          ELSE.
+            CALL FUNCTION 'STATUS_CHECK'
+              EXPORTING
+                objnr             = gv_objnr
+                status            = c_i0076
+              EXCEPTIONS
+                object_not_found  = 1
+                status_not_active = 2
+                OTHERS            = 3.
+            IF sy-subrc EQ 0.
+              DELETE it_mplans.
+            ENDIF.
+          ENDIF.
+        ENDLOOP.
+* status
+        DESCRIBE TABLE it_mplans LINES g_lines.
+        IF g_lines IS INITIAL.
+          gt_cont-status = c_no_mplans.
+        ELSE.
+          IF g_lines > 1.
+            gt_cont-status = c_more_mplans.
+          ELSE.
+            IF g_lines = 1.
+              READ TABLE it_mplans INDEX 1.
+              IF sy-subrc = '0'.
+                gt_cont-warpl = it_mplans-warpl.
+                SELECT strat plan_sort FROM mpla
+                INTO CORRESPONDING FIELDS OF gt_cont
+                 WHERE warpl = gt_cont-warpl.
+                ENDSELECT.
+                gt_cont-status = c_ok.
+              ENDIF.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+        CLEAR gt_cont-point.
+        CONCATENATE 'IE' gt_cont-equnr INTO gv_objnr.
+        SELECT SINGLE point INTO gt_cont-point FROM imptt
+         WHERE mpobj = gv_objnr AND psort = c_015.
+        WRITE gt_cont-vbeln TO gt_cont-vbeln NO-ZERO.
+        WRITE gt_cont-equnr TO gt_cont-equnr NO-ZERO.
+        WRITE gt_cont-warpl TO gt_cont-warpl NO-ZERO.
+        APPEND gt_cont.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+* fill gt_cont from it_equipments.
+  IF NOT it_equipments[] IS INITIAL.
+    LOOP AT it_equipments.
+      REFRESH it_mplans.
+      CLEAR gt_cont.
+      gt_cont-equnr = it_equipments-equnr.
+      SELECT * FROM viser02 INTO wa_viser02
+       WHERE equnr = gt_cont-equnr.
+        SELECT SINGLE * FROM vbak
+         WHERE vbeln = wa_viser02-sdaufnr
+         AND   vbtyp = 'G'.
+        IF sy-subrc = '0'.
+          gt_cont-vbeln = wa_viser02-sdaufnr.
+          gt_cont-posnr = wa_viser02-posnr.
+        ENDIF.
+      ENDSELECT.
+      SELECT SINGLE arktx INTO
+      CORRESPONDING FIELDS OF gt_cont
+      FROM vbap
+       WHERE vbeln = gt_cont-vbeln
+       AND   posnr = gt_cont-posnr.
+* get the maintenance plans
+      SELECT DISTINCT warpl INTO it_mplans
+      FROM mpos WHERE equnr = gt_cont-equnr
+                AND NOT warpl = ' '.
+        APPEND it_mplans.
+      ENDSELECT.
+* only the active maintenance plans
+      LOOP AT it_mplans.
+        CONCATENATE 'WO' it_mplans-warpl INTO gv_objnr.
+
+        CALL FUNCTION 'STATUS_CHECK'
+          EXPORTING
+            objnr             = gv_objnr
+            status            = c_i0320
+          EXCEPTIONS
+            object_not_found  = 1
+            status_not_active = 2
+            OTHERS            = 3.
+        IF sy-subrc EQ 0.
+          DELETE it_mplans.
+        ELSE.
+          CALL FUNCTION 'STATUS_CHECK'
+            EXPORTING
+              objnr             = gv_objnr
+              status            = c_i0076
+            EXCEPTIONS
+              object_not_found  = 1
+              status_not_active = 2
+              OTHERS            = 3.
+          IF sy-subrc EQ 0.
+            DELETE it_mplans.
+          ENDIF.
+        ENDIF.
+      ENDLOOP.
+* status
+      DESCRIBE TABLE it_mplans LINES g_lines.
+      IF g_lines IS INITIAL.
+        gt_cont-status = c_no_mplans.
+      ELSE.
+        IF g_lines > 1.
+          gt_cont-status = c_more_mplans.
+        ELSE.
+          IF g_lines = 1.
+            READ TABLE it_mplans INDEX 1.
+            IF sy-subrc = '0'.
+              gt_cont-warpl = it_mplans-warpl.
+              SELECT strat plan_sort FROM mpla
+              INTO CORRESPONDING FIELDS OF gt_cont
+               WHERE warpl = gt_cont-warpl.
+              ENDSELECT.
+              gt_cont-status = c_ok.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+      CLEAR gt_cont-point.
+      CONCATENATE 'IE' gt_cont-equnr INTO gv_objnr.
+      SELECT SINGLE point INTO gt_cont-point FROM imptt
+         WHERE mpobj = gv_objnr AND psort = c_015.
+      APPEND gt_cont.
+    ENDLOOP.
+* contract parameter filled in
+    IF NOT s_vbeln IS INITIAL.
+      LOOP AT gt_cont.
+        IF NOT gt_cont-vbeln IN s_vbeln.
+          DELETE gt_cont.
+        ENDIF.
+      ENDLOOP.
+    ENDIF.
+  ENDIF.
+* delete adjacent records
+
+*  DELETE ADJACENT DUPLICATES FROM gt_cont
+*   COMPARING vbeln posnr warpl.
+
+* check status not deleted or inactive
+
+  LOOP AT gt_cont.
+    CONCATENATE 'WO' gt_cont-warpl INTO gv_objnr.
+
+    CALL FUNCTION 'STATUS_CHECK'
+      EXPORTING
+        objnr             = gv_objnr
+        status            = c_i0320
+      EXCEPTIONS
+        object_not_found  = 1
+        status_not_active = 2
+        OTHERS            = 3.
+    IF sy-subrc EQ 0.
+      DELETE gt_cont.
+    ENDIF.
+
+  ENDLOOP.
+* only active contracts (on item level)
+  LOOP AT gt_cont.
+    CLEAR gv_venddat.
+*** mod-001 * begin ***
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+      EXPORTING
+        input  = gt_cont-vbeln
+      IMPORTING
+        output = gt_cont-vbeln.
+*** mod-001 * end ***
+    SELECT SINGLE venddat INTO gv_venddat
+        FROM veda
+        WHERE vbeln = gt_cont-vbeln
+        AND   vposn = gt_cont-posnr.
+* evt on header level
+    IF NOT sy-subrc = '0'.
+      SELECT SINGLE venddat INTO gv_venddat
+          FROM veda
+          WHERE vbeln = gt_cont-vbeln
+          AND   vposn = 0.
+    ENDIF.
+    IF gv_venddat IS NOT INITIAL AND
+     gv_venddat < sy-datum.
+      DELETE gt_cont.
+    ELSE.
+*** mod-001 * begin ***
+      gt_cont-venddat = gv_venddat.
+*     Get user status
+      PERFORM get_user_status.
+*** mod-001 * end ***
+      WRITE gt_cont-vbeln TO gt_cont-vbeln NO-ZERO.
+      WRITE gt_cont-equnr TO gt_cont-equnr NO-ZERO.
+      WRITE gt_cont-warpl TO gt_cont-warpl NO-ZERO.
+      MODIFY gt_cont.
+    ENDIF.
+  ENDLOOP.
+
+* sorting output-table
+  SORT gt_cont BY vbeln posnr warpl.
+
+ENDFORM.                    "select_cont_mplans
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_USER_STATUS                    "mod-001
+*&---------------------------------------------------------------------*
+*       Get user status of the contract
+*----------------------------------------------------------------------*
+FORM get_user_status .
+
+  DATA: lv_objnr  TYPE objko,
+        lv_auart  TYPE auart,
+        lv_stsma  TYPE j_stsma,
+        lv_estat  TYPE j_status,
+        lv_txt04  TYPE j_txt04.
+
+
+  CLEAR: gt_cont-txt04.
+
+* Document type
+  SELECT SINGLE auart objnr INTO (lv_auart, lv_objnr)
+         FROM vbak
+         WHERE vbeln = gt_cont-vbeln.
+
+* Status profile
+  SELECT SINGLE stsma INTO lv_stsma
+         FROM tvak
+         WHERE auart = lv_auart.
+
+* User status
+  SELECT stat INTO lv_estat
+         FROM jest
+         WHERE objnr = lv_objnr
+           AND inact = space.
+*    Description
+    SELECT SINGLE txt04 INTO lv_txt04
+           FROM tj30t
+           WHERE stsma = lv_stsma
+             AND estat = lv_estat.
+    IF sy-subrc = 0.
+      gt_cont-txt04 = lv_txt04.
+      EXIT.
+    ENDIF.
+  ENDSELECT.
+
+ENDFORM.                    " GET_USER_STATUS
+
+*&---------------------------------------------------------------------*
+*&      Form  output_list_cont_mplans
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM output_list_cont_mplans.
+
+*.. Local variables
+  DATA: ls_layout TYPE slis_layout_alv,
+        ls_grid   TYPE lvc_s_glay,
+        ls_events TYPE slis_alv_event.
+
+  DATA: lt_events TYPE slis_t_event,
+        lt_event_exits TYPE slis_t_event_exit.
+*        lt_fieldcat TYPE slis_t_fieldcat_alv.
+
+*.. Fill events
+  REFRESH lt_events.
+  ls_events-name = 'USER_COMMAND'.
+  ls_events-form = 'USER_COMMAND_CONT'.
+  APPEND ls_events TO lt_events.
+  ls_events-name = 'PF_STATUS_SET'.
+  ls_events-form = 'PF_STATUS_SET_CONT'.
+  APPEND ls_events TO lt_events.
+  ls_events-name = 'TOP_OF_PAGE'.
+  ls_events-form = 'TOP_OF_PAGE_CONT'.
+  APPEND ls_events TO lt_events.
+*  ls_events-form = ls_events-name = 'END_OF_LIST'.
+*  APPEND ls_events TO lt_events.
+
+*.. Define layout
+  CLEAR ls_layout.
+  ls_layout-get_selinfos      = gc_charx.
+  ls_layout-colwidth_optimize = gc_charx.
+  ls_layout-detail_popup      = gc_charx.
+  ls_layout-box_fieldname     = 'SELKZ'.
+  ls_layout-no_keyfix         = gc_charx.
+  ls_layout-info_fieldname    = 'ZZCOL'.
+
+*.. Define grid settings
+  ls_grid-coll_end_l = gc_charx.
+
+**.. Prepare field catalog
+*  PERFORM build_field_catlog CHANGING lt_fieldcat.
+
+*  CALL FUNCTION 'REUSE_ALV_FIELDCATALOG_MERGE'
+*    EXPORTING
+*      i_structure_name       = 'YAM_CR342_CONT_MP'
+*      i_client_never_display = 'X'
+*    CHANGING
+*      ct_fieldcat            = lt_fieldcat
+*    EXCEPTIONS
+*      inconsistent_interface = 1
+*      program_error          = 2
+*      OTHERS                 = 3.
+*  IF sy-subrc <> 0.
+*    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+*            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+*  ENDIF.
+
+*.. Call ALV grid output
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+    EXPORTING
+      i_callback_program = 'YAM_CHECK_CONTR_MP'
+*      i_structure_name   = 'YAM_CR342_CONTR_MP'
+*      i_grid_settings    = ls_grid
+*      is_layout          = ls_layout
+      i_save             = 'A'
+      it_fieldcat        = lt_fieldcat
+      it_events          = lt_events
+    TABLES
+      t_outtab           = gt_cont
+    EXCEPTIONS
+      program_error      = 1
+      OTHERS             = 2.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+ENDFORM.                    "output_list_cont_mplans
+*&---------------------------------------------------------------------*
+*&      Form  build_field_catlog
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->PT_FIELDCAT  text
+*----------------------------------------------------------------------*
+FORM build_field_catlog  CHANGING lt_fieldcat TYPE slis_t_fieldcat_alv.
+
+  DATA : ls_fcat TYPE slis_fieldcat_alv.
+*------------ Sales Document --------------*
+  ls_fcat-fieldname = 'VBELN'.
+  ls_fcat-seltext_l = 'Sales Document'.
+  ls_fcat-outputlen = '14'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*------------- Item ---------------*
+  ls_fcat-fieldname = 'POSNR'.
+  ls_fcat-seltext_l = 'Item'.
+  ls_fcat-outputlen = '6'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*---------------Description-----------*
+  ls_fcat-fieldname = 'ARKTX'.
+  ls_fcat-seltext_l = 'Description'.
+  ls_fcat-outputlen = '40'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*-----------Equipment number------------*
+  ls_fcat-fieldname = 'EQUNR'.
+  ls_fcat-rollname = 'EQUNR'.
+  ls_fcat-outputlen = '15'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*-----------Maintenance Plan------------*
+  ls_fcat-fieldname = 'WARPL'.
+  ls_fcat-rollname = 'WARPL'.
+  ls_fcat-outputlen = '10'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*-----------Strategy-----------*
+  ls_fcat-fieldname = 'STRAT'.
+  ls_fcat-rollname = 'STRAT'.
+  ls_fcat-outputlen = '10'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*---------Sort field--------*
+  ls_fcat-fieldname = 'PLAN_SORT'.
+  ls_fcat-rollname = 'PLAN_SORT'.
+  ls_fcat-outputlen = '20'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*---------------Description-----------*
+  ls_fcat-fieldname = 'STATUS'.
+  ls_fcat-seltext_l = 'Status'.
+  ls_fcat-outputlen = '50'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*** mod-001 * begin ***
+*-----------Strategy-----------*
+  ls_fcat-fieldname = 'VENDDAT'.
+  ls_fcat-rollname = 'VNDAT_VEDA'.
+  ls_fcat-outputlen = '10'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*---------------Description-----------*
+  ls_fcat-fieldname = 'TXT04'.
+  ls_fcat-seltext_l = 'User Status'.
+  ls_fcat-outputlen = '10'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*** mod-001 * end ***
+
+ENDFORM.                    " build_field_catlog

@@ -1,0 +1,769 @@
+*&---------------------------------------------------------------------*
+*& Report  YEM_MAM_AUTOM_ORDER_CREA
+*&
+*&---------------------------------------------------------------------*
+*&
+*& MAM : Automatic Order creation from Notification
+*&
+*&---------------------------------------------------------------------*
+*  Author                : Jules Smets
+*  Date                  : 20.05.2010
+*  Change Request Number : CR0334
+*  Transport request Nr. : CD1K956758
+*----------------------------------------------------------------------*
+*                                                                      *
+* CHANGE HISTORY LOG
+*----------------------------------------------------------------------*
+* MOD. NR.|  DATE      | NAME             | CORR. NR.  | CHANGE REF. # *
+*----------------------------------------------------------------------*
+* MOD-001 | xx/xx/xxxx | X                | CD1K9xxxxx | CRxxxx        *
+* MOD-001 | 25/04/2011 | Lakshmi Reddy    | CD1K964642 | CR0334        *
+*----------------------------------------------------------------------*
+
+REPORT  yem_mam_autom_order_crea.
+
+TABLES: viqmel,
+        jest,
+        equi,
+        bgmkobj.
+
+* Internal table with notifications
+DATA: BEGIN OF t_notif  OCCURS 0,
+        qmnum     TYPE qmnum,
+        msaus     TYPE msaus,       "insert MOD-001
+        qmart     TYPE qmart,
+        equnr     TYPE equnr,
+        objnr_n   TYPE qmobjnr,
+        objnr_e   TYPE j_objnr,
+      END OF t_notif.
+
+* Internal table with contract (status)
+DATA: BEGIN OF t_contr  OCCURS 0,
+        objnr     TYPE j_objnr,
+        stat      TYPE j_estat,
+      END OF t_contr.
+
+* Internal table with warranty dates
+DATA: BEGIN OF t_warr  OCCURS 0,
+        objnr     TYPE j_objnr,
+        gaart     TYPE gaart,
+        gwldt     TYPE gwldt,
+        gwlen     TYPE gwlen,
+      END OF t_warr.
+
+DATA: BEGIN OF it_vbap OCCURS 0,
+        vbeln TYPE vbeln_va,
+        posnr TYPE posnr_va,
+        werks TYPE werks_ext,
+      END OF it_vbap.
+
+* Batch input
+DATA: i_bdcdata LIKE bdcdata OCCURS 0 WITH HEADER LINE,
+      struct_bdcdata TYPE bdcdata,
+      i_bdcmsgcoll   TYPE STANDARD TABLE OF bdcmsgcoll.
+
+* Global variables
+DATA: gv_mode(1)    TYPE c       VALUE 'N',
+      gv_contract   TYPE xfeld,
+      gv_warranty   TYPE xfeld,
+      gv_aufart     TYPE aufart,
+      gv_bemot      TYPE bemot,
+      gv_aufnr      TYPE aufk-aufnr.
+
+* Constants
+CONSTANTS: c_mobi  TYPE j_status  VALUE 'I0630',  "Data on Mobile Device
+           c_znoc  TYPE j_estat   VALUE 'E0002',  "Without contract
+           c_zwwc  TYPE j_estat   VALUE 'E0001',  "With contract
+           c_seed  TYPE qmart     VALUE 'X3',     "SEED: Egineer request
+           c_am    TYPE qmart     VALUE 'Z3',     "AM: Egineer request
+           c_zsm1  TYPE aufart    VALUE 'ZSM1',   "AM: SO (with contr)
+           c_zsm2  TYPE aufart    VALUE 'ZSM2',   "AM: SO (with rev)
+           c_zam1  TYPE aufart    VALUE 'ZAM1',                           "insert MOD-001
+           c_1e    TYPE bemot     VALUE '1E',                             "insert MOD-001
+           c_ch    TYPE bemot     VALUE 'CH',     "Chargeable
+           c_sb    TYPE bemot     VALUE 'SB',     "Servicepl. Breakdown
+           c_wg    TYPE bemot     VALUE 'WG',     "Serv./Workshop Guar.
+           c_1     TYPE gaart     VALUE '1',      "Customer warranty
+           c_zp00  TYPE kschl     VALUE 'ZP00'.   "Pricing condition
+
+* Selections
+SELECTION-SCREEN  BEGIN OF BLOCK sel  WITH FRAME  TITLE text-s01.
+SELECT-OPTIONS: so_qmnum  FOR viqmel-qmnum,           "Notification nr.
+                so_qmart  FOR viqmel-qmart            "Notification type
+                              NO-EXTENSION  NO INTERVALS,
+                so_erdat  FOR viqmel-erdat.           "Creation date              .
+SELECTION-SCREEN  END OF BLOCK sel.
+
+
+*&---------------------------------------------------------------------*
+*&  Main program                                                       *
+*&---------------------------------------------------------------------*
+START-OF-SELECTION.
+
+* Select notifications
+*  SELECT n~qmnum n~qmart n~equnr n~objnr e~objnr           "comment MOD-001
+  SELECT n~qmnum n~msaus n~qmart n~equnr n~objnr e~objnr    "insert MOD-001
+         INTO TABLE t_notif
+         FROM viqmel AS n
+         INNER JOIN jest AS s
+                    ON s~objnr = n~objnr
+         LEFT OUTER JOIN equi AS e
+                    ON e~equnr = n~equnr
+         WHERE ( ( n~qmart = c_am   AND n~aufnr = ' ' )   OR
+                 ( n~qmart = c_seed AND n~vbeln = ' ' ) )
+           AND s~stat = c_mobi
+           AND s~inact = ' '
+           AND n~qmnum IN so_qmnum
+           AND n~qmart IN so_qmart
+           AND n~erdat IN so_erdat.
+
+* Notifications selected ?
+  CHECK NOT t_notif[] IS INITIAL.
+
+* Get equipments with status "With Contract"
+  SELECT objnr stat INTO TABLE t_contr
+         FROM jest
+         FOR ALL ENTRIES IN t_notif
+         WHERE objnr = t_notif-objnr_e
+           AND stat  = c_zwwc.
+
+* Get warranty dates for equipments
+  SELECT j_objnr gaart gwldt gwlen INTO TABLE t_warr
+         FROM bgmkobj
+         FOR ALL ENTRIES IN t_notif
+         WHERE j_objnr = t_notif-objnr_e
+           AND gaart   = c_1.
+
+* Sort int. tables
+  SORT: t_notif,
+        t_contr,
+        t_warr.
+
+* Process notifications
+  LOOP AT t_notif.
+    CASE t_notif-qmart.
+      WHEN 'Z3'.
+*       AM
+        PERFORM process_am.
+      WHEN 'X3'.
+*       SEED
+        PERFORM process_seed.
+    ENDCASE.
+  ENDLOOP.
+
+
+*&---------------------------------------------------------------------*
+*&  Forms                                                              *
+*&---------------------------------------------------------------------*
+
+*&---------------------------------------------------------------------*
+*&      Form  PROCESS_AM
+*&---------------------------------------------------------------------*
+*       Process AM Notifications
+*----------------------------------------------------------------------*
+FORM process_am .
+
+  CLEAR: gv_aufart,
+         gv_bemot.
+*Begin of comment MOD-001
+*  gv_bemot = c_ch.
+
+** Check contract on equipment
+*  READ TABLE t_contr WITH KEY objnr = t_notif-objnr_e
+*                              stat  = c_zwwc
+*                     BINARY SEARCH.
+*  IF sy-subrc = 0.
+*    gv_aufart =  c_zsm1.
+*    gv_bemot  =  c_sb.
+*  ELSE.
+*    gv_aufart = c_zsm2.
+*  ENDIF.
+*
+** Check warranty on equipment
+*  READ TABLE t_warr WITH KEY objnr = t_notif-objnr_e
+*                             gaart = c_1
+*                     BINARY SEARCH.
+*  IF sy-subrc = 0.
+*    IF sy-datum BETWEEN t_warr-gwldt AND t_warr-gwlen.
+*      gv_bemot  =  c_wg.
+*    ENDIF.
+*  ENDIF.
+*End of comment MOD-001
+
+*Begin of insert MOD-001
+  gv_bemot  = c_ch.
+  gv_aufart = c_zsm2.
+*End of insert MOD-001
+
+* Create Service Order
+  PERFORM create_so_am.
+  PERFORM release_so.
+
+ENDFORM.                    " PROCESS_AM
+
+*&---------------------------------------------------------------------*
+*&      Form  CREATE_SO_AM
+*&---------------------------------------------------------------------*
+*       Create Service Order
+*----------------------------------------------------------------------*
+FORM create_so_am.
+
+  REFRESH: i_bdcdata.
+
+  IF t_notif-msaus EQ 'X'.   "insert MOD-001
+* Notification
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                         USING  'SAPLIQS0'  '0100'  'X'  ''   ''
+                         CHANGING struct_bdcdata.
+    APPEND struct_bdcdata  TO i_bdcdata.
+    CLEAR  struct_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                         USING  ''  ''  ''  'RIWO00-QMNUM'  t_notif-qmnum
+                         CHANGING struct_bdcdata.
+    APPEND struct_bdcdata  TO i_bdcdata.
+    CLEAR  struct_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                         USING  ''  ''  ''  'BDC_OKCODE'  '/00'
+                         CHANGING struct_bdcdata.
+    APPEND struct_bdcdata  TO i_bdcdata.
+    CLEAR  struct_bdcdata.
+
+* Go to Service Order
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                         USING  'SAPLIQS0'  '7200'  'X'  ''   ''
+                         CHANGING struct_bdcdata.
+    APPEND struct_bdcdata  TO i_bdcdata.
+    CLEAR  struct_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                         USING  ''  ''  ''  'BDC_OKCODE'  '=COAE'
+                         CHANGING struct_bdcdata.
+    APPEND struct_bdcdata  TO i_bdcdata.
+    CLEAR  struct_bdcdata.
+
+* Order type
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                         USING  'SAPLIQS0'  '8030'  'X'  ''   ''
+                         CHANGING struct_bdcdata.
+    APPEND struct_bdcdata  TO i_bdcdata.
+    CLEAR  struct_bdcdata.
+
+*Begin of insert MOD-001
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                         USING  ''  ''  ''  'BDC_CURSOR'  'RIWO00-AUART'
+                         CHANGING struct_bdcdata.
+    APPEND struct_bdcdata  TO i_bdcdata.
+    CLEAR  struct_bdcdata.
+*End of insert MOD-001
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                         USING  ''  ''  ''  'RIWO00-AUART'  gv_aufart
+                         CHANGING struct_bdcdata.
+    APPEND struct_bdcdata  TO i_bdcdata.
+    CLEAR  struct_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                         USING  ''  ''  ''  'BDC_OKCODE'  '=WEIT'
+                         CHANGING struct_bdcdata.
+    APPEND struct_bdcdata  TO i_bdcdata.
+    CLEAR  struct_bdcdata.
+
+*Begin of insert MOD-001
+*    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+*                         USING  'SAPLCOSD'  '3300'  'X'  ''   ''
+*                         CHANGING struct_bdcdata.
+*    APPEND struct_bdcdata  TO i_bdcdata.
+*    CLEAR  struct_bdcdata.
+*
+*    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+*                         USING  ''  ''  ''  'BDC_OKCODE'  '=TALL'
+*                         CHANGING struct_bdcdata.
+*    APPEND struct_bdcdata  TO i_bdcdata.
+*    CLEAR  struct_bdcdata.
+*End of insert MOD-001
+
+* Fill accounting indicator
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                         USING  'SAPLCOIH'  '3000'  'X'  ''   ''
+                         CHANGING struct_bdcdata.
+    APPEND struct_bdcdata  TO i_bdcdata.
+    CLEAR  struct_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                         USING  ''  ''  ''  'BDC_CURSOR'  'CAUFVD-BEMOT'
+                         CHANGING struct_bdcdata.
+    APPEND struct_bdcdata  TO i_bdcdata.
+    CLEAR  struct_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                         USING  ''  ''  ''  'CAUFVD-BEMOT'  gv_bemot
+                         CHANGING struct_bdcdata.
+    APPEND struct_bdcdata  TO i_bdcdata.
+    CLEAR  struct_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                         USING  ''  ''  ''  'BDC_OKCODE'  '=FREI'
+                         CHANGING struct_bdcdata.
+    APPEND struct_bdcdata  TO i_bdcdata.
+    CLEAR  struct_bdcdata.
+
+* Save
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                         USING  'SAPLCOIH'  '3000'  'X'  ''   ''
+                         CHANGING struct_bdcdata.
+    APPEND struct_bdcdata  TO i_bdcdata.
+    CLEAR  struct_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                         USING  ''  ''  ''  'BDC_OKCODE'  '=BU'
+                         CHANGING struct_bdcdata.
+    APPEND struct_bdcdata  TO i_bdcdata.
+    CLEAR  struct_bdcdata.
+
+* Call transation IW52
+    CALL TRANSACTION 'IW52' USING i_bdcdata
+                            UPDATE 'S'
+                            MODE gv_mode
+                            MESSAGES INTO i_bdcmsgcoll.      "insert MOD-001
+  ENDIF.       "insert MOD-001
+
+ENDFORM.                    " CREATE_SO
+
+*&---------------------------------------------------------------------*
+*&      Form  PROCESS_SEED
+*&---------------------------------------------------------------------*
+*       Process SEED Notifications
+*----------------------------------------------------------------------*
+FORM process_seed .
+
+*Begin of insert MOD-001
+  DATA: lv_equnr TYPE equnr,
+        lv_matnr TYPE matnr,
+        lv_prdha TYPE prodh_d,
+        lv_gac   TYPE yam_gacid,
+        lv_pgc   TYPE yam_pgcid,
+        lv_servprod TYPE matnr.
+
+* Notification
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                       USING  'SAPLIQS0'  '0100'  'X'  ''   ''
+                       CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                       USING  ''  ''  ''  'RIWO00-QMNUM'  t_notif-qmnum
+                       CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                       USING  ''  ''  ''  'BDC_OKCODE'  '/00'
+                       CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+* Go to Sales Order
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                       USING  'SAPLIQS0'  '7200'  'X'  ''   ''
+                       CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+         USING    ''  ''  ''  'BDC_OKCODE'  '/00'
+         CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                       USING  ''  ''  ''  'BDC_OKCODE'  '=VA02'
+                       CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+* Enter Material Number and PO Number
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                       USING  'SAPMV45A'  '4001'  'X'  ''   ''
+                       CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+* Enter the notification number as PO number
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                       USING  ''  ''  ''  'BDC_CURSOR'  'VBKD-BSTKD'
+                       CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                       USING  ''  ''  ''  'VBKD-BSTKD'  t_notif-qmnum
+                       CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  CLEAR:lv_equnr,
+        lv_matnr,
+        lv_prdha,
+        lv_gac,
+        lv_pgc,
+        lv_servprod.
+
+  SELECT SINGLE equnr
+  FROM   qmih
+  INTO   lv_equnr
+  WHERE  qmnum EQ t_notif-qmnum.
+  IF sy-subrc EQ 0.
+    SELECT SINGLE matnr
+    FROM   equi
+    INTO   lv_matnr
+    WHERE  equnr EQ lv_equnr.
+    IF sy-subrc EQ 0.
+      SELECT SINGLE prdha
+      FROM   mara
+      INTO   lv_prdha
+      WHERE  matnr EQ lv_matnr.
+      IF sy-subrc EQ 0.
+        lv_gac = lv_prdha+0(4).
+        lv_pgc = lv_prdha+4(4).
+
+        SELECT SINGLE matnr
+        FROM   yse_sp_select
+        INTO   lv_servprod
+        WHERE  gac EQ lv_gac
+        AND    pgc EQ lv_pgc
+        AND    matkl EQ '043ZSR'.
+        IF sy-subrc NE 0.
+          SELECT SINGLE matnr
+          FROM   yse_sp_select
+          INTO   lv_servprod
+          WHERE  gac EQ lv_gac
+          AND    pgc EQ '*'
+          AND    matkl EQ '043ZSR'.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                       USING  ''  ''  ''  'RV45A-MABNR(01)'  lv_servprod
+                       CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                       USING  ''  ''  ''  'RV45A-KWMENG(01)'  '1'
+                       CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+* EM step disabled, jump directly to SAPLSPO4 - 0300
+*  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+*                       USING  ''  ''  ''  'BDC_OKCODE'  '/EBAC1'
+*                       CHANGING struct_bdcdata.
+*  APPEND struct_bdcdata  TO i_bdcdata.
+*  CLEAR  struct_bdcdata.
+
+*Accounting Indicator
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                       USING  'SAPLSPO4'  '0300'  'X'  ''   ''
+                       CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                       USING  ''  ''  ''  'BDC_CURSOR'  'SVALD-VALUE(01)'
+                       CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                       USING  ''  ''  ''  'SVALD-VALUE(01)'  '1E'
+                       CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                       USING  ''  ''  ''  'BDC_OKCODE'  '=FURT'
+                       CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+*   go back
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                       USING    'SAPMV45A'  '4001'  'X'  ''   ''
+                       CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_OKCODE'  '/EBAC1'
+          CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+
+*Save Notification
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                       USING  'SAPLIQS0'  '7200'  'X'  ''   ''
+                       CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                       USING  ''  ''  ''  'BDC_OKCODE'  '=BUCH'
+                       CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+*Call transation IW52
+  CALL TRANSACTION 'IW52' USING i_bdcdata
+                          UPDATE 'S'
+                          MODE gv_mode
+                          MESSAGES INTO i_bdcmsgcoll.
+
+  CLEAR: gv_bemot,
+         gv_aufart.
+
+  GET PARAMETER ID 'AUN' FIELD viqmel-vbeln.
+
+  gv_bemot  = c_1e.
+  gv_aufart = c_zam1.
+
+* Create Service Order
+  PERFORM create_so_seed.
+  PERFORM release_so.
+
+*End of insert MOD-001
+ENDFORM.                    " PROCESS_SEED
+
+*&---------------------------------------------------------------------*
+*&      Form  CREATE_SO_SEED
+*&---------------------------------------------------------------------*
+*       Create SEED Service Order
+*----------------------------------------------------------------------*
+FORM create_so_seed.
+
+  REFRESH : it_vbap.
+
+  SELECT vbeln posnr werks FROM vbap INTO TABLE it_vbap
+                  WHERE vbeln = viqmel-vbeln.
+
+  LOOP AT it_vbap.
+
+  ENDLOOP.
+
+* Call BAPI for Sales Order change via submit
+  SUBMIT yse_call_bapisalesorderchange
+    WITH p_vbeln = viqmel-vbeln
+    WITH p_posnr = it_vbap-posnr
+    WITH p_werks = it_vbap-werks
+    AND RETURN.
+
+  DATA: reprice_handle TYPE REF TO ycl_se_seo_crea_reprice,
+        reprice_root   TYPE REF TO ycl_se_seo_crea_reprice_root,
+        lv_vbeln       TYPE vbeln,
+        et_return      LIKE bapiret2 OCCURS 0 WITH HEADER LINE,
+        lv_vbtyp       TYPE vbtyp,
+        lv_count       TYPE sytabix,
+        rspar_tab      TYPE TABLE OF rsparams,
+        rspar_line     TYPE rsparams,
+        lv_qmnum       TYPE qmnum.
+
+  lv_vbeln = viqmel-vbeln.
+  CLEAR lv_qmnum.
+  GET PARAMETER ID 'IQM' FIELD lv_qmnum.
+
+  CALL FUNCTION 'YSE_CHECK_LOCKS_SERV'
+      EXPORTING
+*        AUFNR         = LV_AUFNR1
+        vbeln         = lv_vbeln
+      IMPORTING
+        number        = lv_count
+      TABLES
+        it_return     = et_return.
+
+  IF lv_count = 0.
+    SELECT SINGLE vbtyp FROM vbak INTO lv_vbtyp
+               WHERE vbeln EQ lv_vbeln.
+
+    IF lv_vbtyp = 'C'.  "Sales order
+      TRY.
+          reprice_handle = ycl_se_seo_crea_reprice=>attach_for_write( ).
+          CREATE OBJECT reprice_root AREA HANDLE reprice_handle.
+          reprice_handle->set_root( reprice_root ).
+          reprice_root->set_reprice( ).
+          reprice_handle->detach_commit( ).
+        CATCH cx_shm_attach_error.
+      ENDTRY.
+
+      CALL FUNCTION 'YSE_SDI_COST_ESTIMATE_CREA'
+        EXPORTING
+          im_vbeln = lv_vbeln.
+
+      TRY.
+          reprice_handle = ycl_se_seo_crea_reprice=>attach_for_write( ).
+          CREATE OBJECT reprice_root AREA HANDLE reprice_handle.
+          reprice_handle->set_root( reprice_root ).
+          reprice_root->clear_reprice( ).
+          reprice_handle->detach_commit( ).
+        CATCH cx_shm_attach_error.
+      ENDTRY.
+    ENDIF.  "Sales order
+  ENDIF.
+
+*.. For all relevant lines in the service sales order update the seo with
+*.. defaults
+  CALL FUNCTION 'YSE_CHECK_LOCKS_SERV'
+    EXPORTING
+*        AUFNR         = LV_AUFNR1
+      vbeln         = lv_vbeln
+    IMPORTING
+      number        = lv_count
+    TABLES
+      it_return       = et_return.
+
+  IF lv_count = 0.
+    LOOP AT it_vbap.
+
+*        CALL FUNCTION 'YSE_SEO_UPDATE_DEFAULTS_CREA'
+*          EXPORTING
+*            IM_VBELN       = it_vbap-vbeln
+*            IM_POSNR       = it_vbap-posnr.
+* begin of insert MOD-006
+      REFRESH rspar_tab.
+* end of insert MOD-006
+      rspar_line-selname = 'SO_VBELN'.
+      rspar_line-kind    = 'S'.
+      rspar_line-sign    = 'I'.
+      rspar_line-option  = 'EQ'.
+      rspar_line-low     = it_vbap-vbeln.
+      APPEND rspar_line TO rspar_tab.
+
+      rspar_line-selname = 'SO_POSNR'.
+      rspar_line-kind    = 'S'.
+      rspar_line-sign    = 'I'.
+      rspar_line-option  = 'EQ'.
+      rspar_line-low     = it_vbap-posnr.
+      APPEND rspar_line TO rspar_tab.
+
+      SUBMIT yse_seo_update_at_crea WITH SELECTION-TABLE rspar_tab
+        AND RETURN.
+    ENDLOOP.
+  ENDIF.
+
+  CALL FUNCTION 'YSE_CHECK_LOCKS_SERV'
+  EXPORTING
+*       AUFNR         = LV_AUFNR1
+     vbeln         = lv_vbeln
+  IMPORTING
+     number        = lv_count
+  TABLES
+    it_return      = et_return.
+
+  IF lv_count = 0.
+*.... Link the notif to the seo
+    LOOP AT it_vbap.
+*        CALL FUNCTION 'YSE_SEO_LINK_TO_NOTIF'
+*          EXPORTING
+*            im_qmnum = lv_qmnum
+*            im_vbeln = it_vbap-vbeln
+*            im_posnr = it_vbap-posnr.
+* begin of insert MOD-006
+      REFRESH rspar_tab.
+* end of insert MOD-006
+      rspar_line-selname = 'SO_QMNUM'.
+      rspar_line-kind    = 'S'.
+      rspar_line-sign    = 'I'.
+      rspar_line-option  = 'EQ'.
+      rspar_line-low     = lv_qmnum.
+      APPEND rspar_line TO rspar_tab.
+
+      rspar_line-selname = 'SO_VBELN'.
+      rspar_line-kind    = 'S'.
+      rspar_line-sign    = 'I'.
+      rspar_line-option  = 'EQ'.
+      rspar_line-low     = it_vbap-vbeln.
+      APPEND rspar_line TO rspar_tab.
+
+      rspar_line-selname = 'SO_POSNR'.
+      rspar_line-kind    = 'S'.
+      rspar_line-sign    = 'I'.
+      rspar_line-option  = 'EQ'.
+      rspar_line-low     = it_vbap-posnr.
+      APPEND rspar_line TO rspar_tab.
+
+      SUBMIT yse_seo_link_to_notif WITH SELECTION-TABLE rspar_tab
+        AND RETURN.
+    ENDLOOP.
+  ENDIF.
+
+ENDFORM.                    "create_so_seed
+
+*&---------------------------------------------------------------------*
+*&      Form  release_so
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM release_so.
+
+  DATA:
+        it_methods     LIKE bapi_alm_order_method OCCURS 0 WITH HEADER LINE,
+        it_header      LIKE  bapi_alm_order_headers_i OCCURS 0 WITH HEADER LINE,
+        is_msg         TYPE bal_s_msg,
+        ls_return      TYPE bapiret2,
+        lt_return      TYPE TABLE OF bapiret2.
+
+  GET PARAMETER ID 'ANR' FIELD gv_aufnr.
+
+* Release SEO
+  it_methods-refnumber = '00001'.
+  it_methods-method = 'RELEASE'.
+  it_methods-objectkey = gv_aufnr.
+  it_methods-objecttype = 'HEADER'.
+
+  APPEND it_methods.
+  it_methods-refnumber = '00001'.
+  it_methods-method = 'SAVE'.
+  it_methods-objectkey = gv_aufnr.
+  it_methods-objecttype = ' '.
+  APPEND it_methods.
+
+  it_header-orderid = gv_aufnr.
+  APPEND it_header.
+
+  CALL FUNCTION 'BAPI_ALM_ORDER_MAINTAIN'
+    TABLES
+      it_methods = it_methods
+      it_header  = it_header
+      return     = lt_return.
+
+  LOOP AT lt_return INTO ls_return.
+    CLEAR is_msg.
+    is_msg-msgty = ls_return-type.
+    is_msg-msgid = ls_return-id.
+    is_msg-msgno = ls_return-number.
+    is_msg-msgv1 = ls_return-message_v1.
+    is_msg-msgv2 = ls_return-message_v2.
+    is_msg-msgv3 = ls_return-message_v3.
+    is_msg-msgv4 = ls_return-message_v4.
+    PERFORM add_message_to_log(ycs_create_invoice) USING is_msg.
+  ENDLOOP.
+
+  READ TABLE lt_return INTO ls_return WITH KEY type = 'E'.
+  IF sy-subrc = 0.
+    ROLLBACK WORK.
+  ELSE.
+    READ TABLE lt_return INTO ls_return WITH KEY type = 'A'.
+    IF sy-subrc = 0.
+      ROLLBACK WORK.
+    ELSE.
+      COMMIT WORK AND WAIT.
+    ENDIF.
+  ENDIF.
+
+
+ENDFORM.                    "release_so

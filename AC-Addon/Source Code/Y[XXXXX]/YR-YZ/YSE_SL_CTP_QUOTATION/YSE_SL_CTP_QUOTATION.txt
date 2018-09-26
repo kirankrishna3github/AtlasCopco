@@ -1,0 +1,319 @@
+report yse_sl_ctp_quot no standard page heading line-size 150.
+********************************************************************
+* Program ID         : YSE_SL_CTP_QUOT                             *
+* Program Title      : CTP quotation upload program                *
+* Author             : Luc Mertens USG Innotiv                     *
+* Date               : 05.01.2010                                  *
+* Change Request Nr. : CD1K953262                                  *
+*==================================================================*
+* Change History Log                                               *
+*------------------------------------------------------------------*
+* Mod.no.|  Date    | Name                 | Corr.Nr. |Change Ref  *
+*------------------------------------------------------------------*
+* MOD-001|08.09.2010|L. Mertens USG Innotiv|CD1K959067|CR1482/1562 *
+*     - include freight                                            *
+*     - for CMT: copy plant of CTP to SO SAP                       *
+* MOD-002|16.12.2010|L. Mertens USG Innotiv|CD1K961946|CR1683      *
+*     - wrong quantity input for availability check                *
+* MOD-003|08.08.2011|L. Mertens USG Innotiv|CD1K967066|CR2167      *
+* MOD-004|05.11.2013|Anda Wu               |CD1K978205|CR3095      *
+*   - Change logic for program YSE_SL_CTP_QUOT to handle the freight
+* MOD-005|14.11.2013|Anda Wu               |CD1K978389|CR3107      *
+*   - Exclude multiple lines in condition for whole SO
+* MOD-006|17.02.2016|Anda Wu               |CD1K988309|CR3829      *
+*   - INC45541 --- Sales Office in CMS
+*MOD-007|23.06.2016|Uma maheswararao K     |CD1K989103|CR3923      *
+*     Issues with wrong plant as well as empty plant               *
+*------------------------------------------------------------------*
+
+* Declaration of tablecontrol 'T_TABCT' itself
+CONTROLS: t_tabct TYPE TABLEVIEW USING SCREEN 9001.
+
+TYPE-POOLS: icon.
+
+TABLES: YSE_ATP_AUART,
+        YSE_ATP_ITEMCAT,
+        eord,
+        vbak,
+        knvv,
+        tvkot,
+        tvtwt,
+        tspat.
+
+CONSTANTS: C_auart TYPE auart VALUE 'ZOR ',
+           C_PC(2) TYPE C VALUE 'PC',
+           C_E(1) TYPE C VALUE 'E',
+           C_1 TYPE C VALUE '1',
+           C_X TYPE C VALUE 'X',
+           C_A(2) TYPE C VALUE 'A',
+           C_B TYPE C VALUE 'B',
+           C_D TYPE C VALUE 'D',
+           C_ZDTC(4) TYPE C VALUE 'ZDTC',
+           C_ZTAN(4) TYPE C VALUE 'ZTAN',
+           C_I TYPE C VALUE 'I',
+           C_Z1(2) TYPE C VALUE 'Z1',
+           C_BRAN(4) TYPE C VALUE 'BRAN',
+           c_filetype(10)   TYPE c VALUE 'ASC',     " FILE TYPE
+           c_blanc          TYPE c VALUE ' ',
+           c_ru02(4) TYPE C VALUE 'RU02'. "+MOD-007
+
+*---------------------------------------------------------------------*
+* TYPES                                                               *
+*---------------------------------------------------------------------*
+TYPES: BEGIN OF ty_upload,
+         v_text(250)  TYPE c,            " FILE UPLOAD TEXT
+       END OF ty_upload.
+
+*---------------------------------------------------------------------*
+* VARIABLE DECLARATIONS                                               *
+*---------------------------------------------------------------------*
+DATA: gV_LIFNR LIKE EORD-LIFNR,
+      gV_MATKL LIKE MARA-MATKL,
+      gV_MTPOS LIKE MVKE-MTPOS,
+      gV_DWERK LIKE MVKE-DWERK,
+      gV_DISMM LIKE MARC-DISMM,
+      gV_CHECK_AVAIL,
+      gV_UNIT LIKE BAPIADMM-UNIT,
+      gV_OBJECT LIKE BALHDR-OBJECT,
+      gV_WERKS LIKE MARC-WERKS,
+      gV_LASTSOURCE TYPE I,
+      gv_sdtc,
+      gs_header   LIKE BAPISDHD1,
+      gs_headerx  type BAPISDHD1X,
+      gV_YSE_ATP_CONFIG LIKE YSE_ATP_CONFIG.
+
+DATA: gV_NEW_PSTYV LIKE VBAP-PSTYV,
+      gV_NEW_WERKS LIKE VBAP-WERKS,
+      gV_TEXTLINE1(70),
+      gV_QTY(15) ,
+      gV_ITEM(50) TYPE C.
+
+DATA: gv_kvgr1       type kvgr1,
+      gv_kvgr4       type kvgr4,
+      gv_vkgrp       type vkgrp,
+      gv_vkbur       type vkbur,
+      gv_vsbed       type vsbed,
+      gv_vmsta       type vmsta,
+      gv_vbeln       type vbeln,
+* begin of insert MOD-001
+      gv_vkorg       type vkorg,
+* end of insert MOD-001
+* begin of insert MOD-002
+      gv_kwmeng      TYPE kwmeng,
+* end of insert MOD-002
+      gv_msg         TYPE c,
+      gv_filename    TYPE string.
+
+data: d9001_line(2)      type p,
+      d9001_vkorg        type vkorg,
+      d9001_vtweg        type vtweg,
+      d9001_spart        type spart,
+      d9001_quotn        type vbeln,
+      d9001_custn        type kunnr,
+      d9001_consn        type kunnr,
+      d9001_quotd        type d,
+      d9001_partn        type matnr,
+      d9001_netpr(11)    type c,
+      d9001_quant(15)    type c,
+      d9001_slman        type vkgrp,
+      d9001_qucur        type waers,
+      d9001_payte        type dzterm,
+      d9001_delt1        type inco1,
+      d9001_delt2        type inco2,
+      d9001_reqdt        type d,
+      d9001_relcd(3)     type c,
+* begin of insert MOD-001
+      d9001_freight(11)  type c,
+* end of insert MOD-001
+      d9001_vkbur        type vkbur,
+      d9001_vsbed        type vsbed,
+      d9001_pstyv        type pstyv,
+      d9001_werks        type werks_d,
+      ok_code_9001       TYPE sy-ucomm,
+      gv_ucomm           type sy-ucomm.
+
+*---------------------------------------------------------------------*
+* INTERNAL TABLES                                                     *
+*---------------------------------------------------------------------*
+DATA: IT_WMDVSX LIKE BAPIWMDVS OCCURS 0 WITH HEADER LINE,
+      IT_WMDVEX LIKE BAPIWMDVE OCCURS 0 WITH HEADER LINE,
+      IT_YSE_EM_PLANT LIKE YSE_EM_PLANT OCCURS 0 WITH HEADER LINE,
+      IT_YSE_EM_PL_DISTR LIKE YSE_EM_PL_DISTR OCCURS 0 WITH HEADER LINE.
+DATA: it_yse_em_pl_so like yse_em_pl_so occurs 0 with header line.
+
+data: gt_partner  LIKE BAPIPARNR OCCURS 0 WITH HEADER LINE.
+DATA: gS_ORDER_ITEM_IN  TYPE BAPISDITM.
+DATA: gT_ORDER_ITEM_IN  TYPE CRMT_BAPISDITM_T.
+DATA: gS_ORDER_ITEM_INX TYPE BAPISDITMX.
+DATA: gT_ORDER_ITEM_INX TYPE CRMT_BAPISDITMX_T.
+data: gt_sched_in       type standard table of BAPISCHDL,
+      gs_sched_in       type BAPISCHDL,
+      gt_sched_inx      type standard table of BAPISCHDLx,
+      gs_sched_inx      type BAPISCHDLx.
+DATA: gs_condition      TYPE  bapicond.
+DATA: gs_conditionx     TYPE  bapicondx.
+DATA: gt_condition      TYPE STANDARD TABLE OF bapicond
+                           INITIAL SIZE 0 WITH HEADER LINE.
+DATA: gt_conditionx     TYPE STANDARD TABLE OF bapicondx
+                           INITIAL SIZE 0 WITH HEADER LINE.
+DATA: gt_mestab         LIKE bapiret2 OCCURS 0 WITH HEADER LINE.
+
+DATA: gt_upload TYPE STANDARD TABLE OF ty_upload
+                INITIAL SIZE 0 WITH HEADER LINE.
+
+DATA: BEGIN OF gt_rec OCCURS 0,
+        quotn        TYPE vbeln,
+        custn        type kunnr,
+        consn        type kunnr,
+        quotd        type d,
+        partn        type matnr,
+        netpr(11)    type c,
+        quant(15)    type c,
+        slman        type vkgrp,
+        qucur        type waers,
+        payte        type dzterm,
+        delt1        type inco1,
+        delt2        type inco2,
+        reqdt        type d,
+        relcd(3)     type c,
+* begin of insert MOD-001
+        werks        TYPE werks_d,
+        freight(11)  TYPE c,
+* begin of insert MOD-006
+        vkbur        TYPE vkbur,
+* end of insert MOD-006
+* end of insert MOD-001
+      END OF gt_rec.
+
+DATA: BEGIN OF t_rec OCCURS 0,
+        quotn        TYPE vbeln,
+        relcd(3)     type c,
+        line(2)      TYPE p,
+        custn        type kunnr,
+        consn        type kunnr,
+        quotd        type d,
+        partn        type matnr,
+        netpr(11)    type c,
+        quant(15)    type c,
+        slman        type vkgrp,
+        qucur        type waers,
+        payte        type dzterm,
+        delt1        type inco1,
+        delt2        type inco2,
+        reqdt        type d,
+        vkbur        type vkbur,
+        vsbed        type vsbed,
+        kvgr1        type kvgr1,
+        kvgr4        type kvgr4,
+        mtpos        type mtpos,
+        pstyv        type pstyv,
+        werks        type werks_d,
+* begin of insert MOD-001
+        freight(11)  TYPE c,
+* end of insert MOD-001
+      END OF t_rec,
+      t_rec_det      like t_rec OCCURS 0 WITH HEADER LINE.
+
+DATA: BEGIN OF gt_valerr OCCURS 0,
+        quotn      TYPE vbeln,
+        matnr(18)  type c,
+        value(20)  type c,
+        messg(85)  TYPE c,
+        line(2)    TYPE p,
+      END OF gt_valerr,
+      gt_valerr2   like gt_valerr occurs 0 with header line.
+
+DATA: BEGIN OF gt_errmsg OCCURS 0,
+        quotn      TYPE vbeln,
+        type       type c,
+        messg(80)  TYPE c,
+      END OF gt_errmsg.
+
+*.................. Layout selection screen........................... *
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE text-b01.
+PARAMETERS:
+  p_vkorg      TYPE   vkorg OBLIGATORY,
+  p_vtweg      type   vtweg obligatory,
+  p_spart      type   spart obligatory,
+  p_infil1     LIKE   /sapdmc/lsoinp-filename OBLIGATORY.
+SELECTION-SCREEN END   OF BLOCK b1.
+
+*.................. Selection screen validations...................... *
+AT SELECTION-SCREEN ON block b1.
+
+* authority check
+  AUTHORITY-CHECK OBJECT 'V_VBAK_VKO'
+         ID 'VKORG' FIELD p_vkorg
+         ID 'VTWEG' FIELD p_vtweg
+         ID 'SPART' FIELD p_spart
+         ID 'ACTVT' FIELD '01'.
+  IF sy-subrc <> 0.
+    MESSAGE e001(00) WITH text-e99 p_vkorg.
+  ENDIF.
+
+*..................................................................... *
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_infil1.
+
+  CALL FUNCTION 'WS_FILENAME_GET'
+    EXPORTING
+      def_path = 'C:\'
+      mask     = ',*,*.txt.'
+    IMPORTING
+      filename = p_infil1
+    EXCEPTIONS
+      OTHERS   = 5.
+
+*.................. Include programs.................................. *
+  INCLUDE yse_sl_ctp_quot_f01.
+  INCLUDE yse_sl_ctp_quot_f02.
+
+*.................. Main program...................................... *
+start-of-selection.
+
+  CALL METHOD ycl_statistics=>record_transaction .
+
+*.. Initialization
+  PERFORM initialization.
+
+*.. Read inputfile
+  PERFORM read_inputfile.
+
+*.. Validate input data and retrieve additional data
+  PERFORM validate_retrieve_data.
+
+*.. Data review screen
+  PERFORM review_data.
+
+*Text symbol text£º
+*E01:Quotation does already exist
+*E02:Customer does not exist
+*E03:Ship-to does not exist
+*E04:Quotation date invalid
+*E05:Part number does not exist
+*E06:Sales man code invalid
+*E07:Quote currency invalid
+*E08:Delivery terms-part1 invalid
+*E09:Payment terms invalid
+*E10:Requested date invalid
+*E11:Quantity is not filled
+*E13:Ship-to not linked to customer
+*E14:Plant could not be derived
+*E15:Part number is superseded
+*E20:Duplicates exist in the input file
+*E21:No PR can be created for this material - missing Source List input
+*E22:No PR can be created for this material - no valid Source List input
+*E23:No PR can be created for this material - multiple input, no fixed vendor indicated
+*E51:Customer group 1 is not valid
+*E52:Customer group 4 is not valid
+*E53:Shipping condition is not valid
+*E54:Plant is not valid
+*E99:You have no authorisation for sales organisation :
+*H01:Overview validation
+*H02:Overview order creation
+
+*S01:AC Standard Order has been created :
+*Selection text£º
+*P_INFIL1:        Input filename
+*P_SPART:D       .
+*P_VKORG:D       .
+*P_VTWEG:D       .

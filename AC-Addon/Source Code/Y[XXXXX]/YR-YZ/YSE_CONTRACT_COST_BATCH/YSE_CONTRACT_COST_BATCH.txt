@@ -1,0 +1,621 @@
+********************************************************************
+* PROGRAM ID           : YSE_CONTRACT_COST_BATCH                   *
+* PROGRAM TITLE        : CONTRACT COST UPDATE IN MV45AFZZ          *
+* AUTHOR               : PIERRE MELIN                              *
+* DATE                 :                                           *
+* CHANGE REQUEST NUMBER: D233                                      *
+* DESCRIPTION          : THE PURPOSE OF THIS PROGRAM IS TO UPDATE  *
+*                        THE COST ESTIMATE FOR EACH CONTRACT AND IS
+*                        TO BE RUN IN BATCH
+* UPDATE:                Rewritten by TVO to improve performance
+*                        05/07/2007
+*==================================================================*
+*----------------------------------------------------------------------*
+*MOD. NO.|  DATE    | NAME           | CORRECTION NUMBER  | CHANGE REF *
+*-----------------------------------------------------------------------
+*MOD-001 |10/07/2007| Christophe Geerts | CD1K917471         |   Issue 2391
+*DESCRIPTION: VA42 must not be executed for every item, but for the whole contract
+*This for performance reason
+*-----------------------------------------------------------------------
+*MOD-002 |13/03/2009| M.Jacobs          | CD1K946961
+*DESCRIPTION: leap years in calculation
+*-----------------------------------------------------------------------
+*MOD-003 |16/11/2009| M.Jacobs          |  CD1K951825 | CR1088
+*
+*-----------------------------------------------------------------------
+*MOD-005 |28/10/2010| L. Mertens  USG I.| CD1K960549 | CR1581
+************************************************************************
+REPORT  yse_contract_cost_batch.
+
+TABLES:
+  yse_contract_sch,
+  konv,
+  vbap,
+  ckis.
+
+DATA :
+  BEGIN OF i_contract OCCURS 0 .
+        INCLUDE STRUCTURE yse_contract_sch. DATA :
+      END OF i_contract,
+      BEGIN OF i_vbak  OCCURS 0,
+        vbeln          LIKE vbap-vbeln,
+        knumv          LIKE konv-knumv,
+        bukrs          LIKE vbak-bukrs_vf,
+      END OF i_vbak,
+      BEGIN OF i_konv  OCCURS 0,
+        knumv          LIKE konv-knumv,
+        kposn          LIKE konv-kposn,
+        kbetr          LIKE konv-kbetr,
+      END OF i_konv,
+      BEGIN OF i_items OCCURS 0,
+        vbeln          LIKE vbap-vbeln,
+        posnr          LIKE vbap-posnr,
+        kbetr          LIKE konv-kbetr,
+        bukrs          LIKE vbak-bukrs_vf,
+      END OF i_items,
+      BEGIN OF i_vbap  OCCURS 0,
+        vbeln          LIKE vbap-vbeln,
+        posnr          LIKE vbap-posnr,
+        netwr          LIKE vbap-netwr,
+        netpr          LIKE vbap-netpr,
+        kalnr          LIKE vbap-kalnr,
+      END OF i_vbap,
+      nodata_character      VALUE '/',
+      bdcdata          LIKE bdcdata OCCURS 0 WITH HEADER LINE,
+      bdc_options      TYPE ctu_params,
+      it_messages      TYPE TABLE OF bdcmsgcoll,
+      wa_messages      LIKE bdcmsgcoll,
+      v_value          TYPE bdc_fval,
+      w_temp           TYPE bdcdata-fnam,
+      v_kalnr          TYPE ck_kalnr,
+      w_value(15)      TYPE c,
+      w_price          LIKE vbap-netwr,
+      oref             TYPE REF TO cx_root,
+      wa_items LIKE i_items,
+*      it_vbap_check LIKE i_vbap OCCURS 0,
+      v_problem TYPE c,
+      it_items_copy LIKE i_items OCCURS 0,
+*      wa_vbap_check LIKE i_vbap,
+      wa_items_copy LIKE i_items.
+
+
+DATA: BEGIN OF it_vbap_check OCCURS 0.
+        INCLUDE STRUCTURE vbap.
+DATA: price TYPE vbap-netwr.
+DATA: END OF it_vbap_check.
+
+DATA: wa_vbap_check LIKE it_vbap_check.
+
+* Raskin Kevin
+* The netprice could be changed in the pricing conditions, therefore we cannot use it to calculate the period
+* As of now the period will be calculated by using the contract start and end date
+TYPES: BEGIN OF gty_veda,
+        vbeln   TYPE vbeln_va,
+        posnr   TYPE posnr_va,
+        vbegdat TYPE vbdat_veda,
+        venddat TYPE vndat_veda,
+       END OF gty_veda,
+
+       gtty_veda TYPE STANDARD TABLE OF gty_veda,
+
+       BEGIN OF gty_vbkd,
+         vbeln TYPE vbeln_va,
+         posnr TYPE posnr_va,
+         fplnr TYPE fplnr,
+* begin of insertion MOD-003
+         kursk         LIKE vbkd-kursk,
+* end of insertion MOD-003
+       END OF gty_vbkd,
+
+       gtty_vbkd TYPE STANDARD TABLE OF gty_vbkd,
+
+       BEGIN OF gty_fpla,
+         fplnr TYPE fplnr,
+         lodat TYPE tadat,
+         tndat TYPE tbdat,
+       END OF gty_fpla,
+
+       gtty_fpla TYPE STANDARD TABLE OF gty_fpla.
+
+DATA: gt_veda TYPE gtty_veda,
+      gt_vbkd TYPE gtty_vbkd,
+      gt_fpla TYPE gtty_fpla.
+
+FIELD-SYMBOLS: <fs_veda> TYPE gty_veda,
+               <fs_vbkd> TYPE gty_vbkd,
+               <fs_fpla> TYPE gty_fpla.
+DATA: lv_period TYPE f.
+
+DATA: lv_begdat TYPE vbdat_veda,
+      lv_enddat TYPE vbdat_veda.
+* End Raskin Kevin
+* begin of insertion MOD-002
+DATA : gv_leapdays   TYPE i.
+* end of insertion MOD-002
+* begin of insertion MOD-003
+CONSTANTS: c_mrua(4) TYPE c     VALUE 'MRUA'.
+* end of insertion MOD-003
+************************************************************************
+* Selection screen
+************************************************************************
+PARAMETERS:
+  p_mode           TYPE ctu_mode OBLIGATORY DEFAULT 'N'.
+SELECT-OPTIONS:
+  so_vbeln         FOR  yse_contract_sch-vbeln.
+PARAMETERS:
+  p_kstar          LIKE rk70l-kstar OBLIGATORY.
+SELECT-OPTIONS:
+  s_kschl          FOR  konv-kschl.
+
+************************************************************************
+* Initialization Event
+************************************************************************
+INITIALIZATION.
+
+  MOVE 'VPRS' TO s_kschl-low.
+  APPEND s_kschl.
+
+************************************************************************
+* Start of selection Event
+************************************************************************
+START-OF-SELECTION.
+
+* Select candidate contracts to be updated
+  SELECT      *
+         FROM yse_contract_sch
+         INTO TABLE i_contract
+        WHERE vbeln IN so_vbeln.
+
+* Select document condition numbers for contracts found in YSE table
+  IF NOT i_contract[] IS INITIAL.
+    SELECT      vbeln knumv bukrs_vf
+           INTO TABLE i_vbak
+           FROM vbak
+            FOR ALL ENTRIES IN i_contract
+          WHERE vbeln EQ i_contract-vbeln.
+  ENDIF.
+
+* Select condition records for doc condition numbers found
+  IF NOT i_vbak[] IS INITIAL.
+    SELECT      knumv kposn kbetr
+           FROM konv
+           INTO TABLE i_konv
+            FOR ALL ENTRIES IN i_vbak
+          WHERE knumv EQ i_vbak-knumv
+            AND kschl IN s_kschl.
+* Raskin Kevin
+* The netprice could be changed in the pricing conditions, therefore we cannot use it to calculate the period
+* As of now the period will be calculated by using the contract start and end date
+    SELECT vbeln vposn vbegdat venddat
+      FROM veda
+      INTO TABLE gt_veda
+      FOR ALL ENTRIES IN i_vbak
+      WHERE vbeln = i_vbak-vbeln
+        AND vposn = '0'.
+  ENDIF.
+
+* Process data into I_ITEMS
+  SORT:
+    i_contract BY vbeln,
+    i_vbak     BY vbeln,
+    i_konv     BY knumv.
+* Loop over contracts from YSE table
+  LOOP AT i_contract.
+*   Read VBAK entry
+    READ TABLE i_vbak WITH KEY vbeln = i_contract-vbeln BINARY SEARCH.
+    i_items-vbeln = i_vbak-vbeln.
+    i_items-bukrs = i_vbak-bukrs.
+    IF sy-subrc EQ 0.
+*     Loop over corresponding conditions
+      LOOP AT i_konv WHERE knumv EQ i_vbak-knumv.
+        i_items-posnr = i_konv-kposn.
+        i_items-kbetr = i_konv-kbetr.
+        APPEND i_items.
+      ENDLOOP.
+    ENDIF.
+  ENDLOOP.
+
+* Select sales item detail from VBAP
+  IF NOT i_items[] IS INITIAL.
+    SELECT      vbeln posnr netwr netpr kalnr
+           FROM vbap
+           INTO TABLE i_vbap
+            FOR ALL ENTRIES IN i_items
+          WHERE vbeln EQ i_items-vbeln
+            AND posnr EQ i_items-posnr.
+    SORT i_vbap BY vbeln posnr.
+* Raskin Kevin
+* The netprice could be changed in the pricing conditions, therefore we cannot use it to calculate the period
+* As of now the period will be calculated by using the contract start and end date
+    SELECT vbeln vposn vbegdat venddat
+    FROM veda
+    APPENDING TABLE gt_veda
+    FOR ALL ENTRIES IN i_items
+    WHERE vbeln = i_items-vbeln
+      AND vposn = i_items-posnr.
+* End Raskin Kevin
+* begin of deletion MOD-003
+**  ENDIF.
+* end of deletion MOD-003
+
+*Select the billing plan key to get the billing plan dates
+* begin of change MOD-003
+*    SELECT vbeln posnr fplnr FROM vbkd INTO TABLE gt_vbkd
+    SELECT vbeln posnr fplnr kursk FROM vbkd INTO TABLE gt_vbkd
+* end of change MOD-003
+      FOR ALL ENTRIES IN i_items
+       WHERE vbeln = i_items-vbeln
+         AND posnr = i_items-posnr.
+
+    SELECT fplnr lodat tndat FROM fpla INTO TABLE gt_fpla
+      FOR ALL ENTRIES IN gt_vbkd
+        WHERE fplnr = gt_vbkd-fplnr.
+
+* begin of insertion MOD-003
+  ENDIF.
+* end of insertion MOD-003
+
+*================================================
+  it_items_copy[] = i_items[].
+
+  SORT: gt_veda BY vbeln posnr,
+        gt_vbkd BY vbeln posnr,
+        gt_fpla BY fplnr.
+* Start processing (contract per contract)
+  LOOP AT i_items INTO wa_items.
+    i_items = wa_items.
+
+*   Clear the local price variable
+    CLEAR: w_price.
+
+    AT NEW vbeln.
+      REFRESH: bdcdata, it_vbap_check.
+      PERFORM bdc_dynpro USING 'SAPMV45A'   '0102'.
+      PERFORM bdc_field  USING 'BDC_OKCODE' '/00'.
+      PERFORM bdc_field  USING 'VBAK-VBELN' i_items-vbeln.
+
+*      PERFORM BDC_DYNPRO USING 'SAPMV45A'   '4001'.
+*      PERFORM BDC_FIELD  USING 'BDC_OKCODE' '=T\02'.
+    ENDAT.
+
+    READ TABLE gt_veda
+            ASSIGNING <fs_veda>
+            WITH KEY vbeln = i_items-vbeln
+                     posnr = i_items-posnr
+            BINARY SEARCH.
+    IF sy-subrc EQ 0. "Item data found
+      "so keep found data
+    ELSE. "No item data found so try header data
+      READ TABLE gt_veda
+        ASSIGNING <fs_veda>
+        WITH KEY vbeln = i_items-vbeln
+                 posnr = '0'
+        BINARY SEARCH.
+    ENDIF.
+
+    lv_begdat = <fs_veda>-vbegdat.
+    lv_enddat = <fs_veda>-venddat.
+
+    IF i_items-bukrs = 'POLA'.
+      READ TABLE gt_vbkd
+        ASSIGNING <fs_vbkd>
+        WITH KEY vbeln = i_items-vbeln
+                 posnr = i_items-posnr
+                 BINARY SEARCH.
+      READ TABLE gt_fpla
+        ASSIGNING <fs_fpla>
+        WITH KEY fplnr = <fs_vbkd>-fplnr
+        BINARY SEARCH.
+      IF sy-subrc EQ 0.
+        IF NOT <fs_fpla>-lodat IS INITIAL.
+          lv_begdat = <fs_fpla>-lodat.
+        ENDIF.
+        IF NOT <fs_fpla>-tndat IS INITIAL.
+          lv_enddat = <fs_fpla>-tndat.
+        ENDIF.
+
+      ENDIF.
+    ENDIF.
+
+
+    lv_period = lv_enddat - lv_begdat.
+* begin of insertion MOD-002
+    lv_period = lv_period + 1.
+    CLEAR gv_leapdays.
+    CALL FUNCTION 'LEAP_DAYS_BETWEEN_TWO_DATES'
+      EXPORTING
+        i_datum_bis = lv_enddat
+        i_datum_von = lv_begdat
+      IMPORTING
+        e_tage      = gv_leapdays.
+    lv_period = lv_period - gv_leapdays.
+* end of insertion MOD-002
+    lv_period = lv_period / 365.
+
+
+*   Find the item's details
+    CLEAR i_vbap.
+    READ TABLE i_vbap WITH KEY vbeln = i_items-vbeln
+                               posnr = i_items-posnr
+                      BINARY SEARCH.
+*    IF SY-SUBRC NE 0.
+*      CONTINUE. " should never happen
+*    ENDIF.
+
+
+
+*   Calculate the price
+* Raskin Kevin
+* The netprice could be changed in the pricing conditions, therefore we cannot use it to calculate the period
+* As of now the period will be calculated by using the contract start and end date
+
+*    TRY.
+*        w_price = i_vbap-netwr / i_vbap-netpr.
+*      CATCH cx_sy_zerodivide INTO oref.
+*      CLEANUP.
+*        CLEAR w_price.
+*    ENDTRY.
+* End Raskin Kevin
+    w_price = lv_period * i_items-kbetr.
+* begin of delete MOD-005
+** begin of insertion MOD-004
+*    IF i_items-bukrs = c_mrua.
+* end of delete MOD-005
+
+      READ TABLE gt_vbkd  ASSIGNING <fs_vbkd>
+          WITH KEY vbeln = i_items-vbeln
+                   posnr = i_items-posnr
+          BINARY SEARCH.
+      IF sy-subrc = 0.
+        w_price = w_price * <fs_vbkd>-kursk.
+      ENDIF.
+* begin of delete MOD-005
+*    ENDIF.
+** end of insertion MOD-004
+* end of delete MOD-005
+
+    v_kalnr = i_vbap-kalnr.
+*    clear wa_Vbap_check.
+*    move-corresponding i_vbap to wa_vbap_check.
+*    wa_vbap_check-price = w_price.
+*    APPEND wa_vbap_check TO it_vbap_check.
+
+
+*   Get the bacth input to position on the first line
+    PERFORM bdc_dynpro USING 'SAPMV45A'   '4001'.
+    PERFORM bdc_field  USING 'BDC_OKCODE' '=POPO'.
+
+    PERFORM bdc_dynpro USING 'SAPMV45A'   '0251'.
+    PERFORM bdc_field  USING 'BDC_OKCODE' '=POSI'.
+    MOVE i_items-posnr TO v_value.
+    PERFORM bdc_field  USING 'RV45A-POSNR' v_value.
+
+*   Press extra costing button with the correct item selected
+    PERFORM bdc_dynpro USING 'SAPMV45A'   '4001'.
+*   Always select the first item (moved the actual one to top
+    PERFORM bdc_field  USING 'RV45A-VBAP_SELKZ(01)' 'X'.
+    PERFORM bdc_field  USING 'BDC_OKCODE' '=PKAL'.
+
+*   Now check if it's a brand new contract or an existing one
+    IF v_kalnr IS INITIAL.
+*     Unit costing
+      PERFORM bdc_dynpro USING 'SAPLSPO2'   '0100'.
+      PERFORM bdc_field  USING 'BDC_OKCODE' '=OPT1'.
+*     Enter PC04
+      PERFORM bdc_dynpro USING 'SAPLKKEA'   '1600'.
+      PERFORM bdc_field  USING 'BDC_OKCODE' '=GOON'.
+      PERFORM bdc_field  USING 'RK70_KKEA-KLVAR' 'PCO4'.
+    ELSE.
+*     First delete all the existing items, but check if there are any,
+*     because we can have an SI setup with no items (!)
+      SELECT SINGLE * FROM ckis
+                      WHERE kalnr EQ v_kalnr.               "#EC *
+      IF sy-subrc EQ 0.
+        PERFORM bdc_dynpro USING 'SAPLKKDI'   '1301'.
+        PERFORM bdc_field  USING 'BDC_OKCODE' '=AMRK'.
+        PERFORM bdc_dynpro USING 'SAPLKKDI'   '1301'.
+        PERFORM bdc_field  USING 'BDC_OKCODE' '=EDEL'.
+        PERFORM bdc_field  USING 'RK70E-LST_SETNR' '1'.
+      ENDIF.
+    ENDIF.
+
+*   Press the "New Entry" button
+    PERFORM bdc_dynpro USING 'SAPLKKDI'        '1301'.
+    PERFORM bdc_field  USING 'BDC_OKCODE'      '=PNEW'.
+    PERFORM bdc_field  USING 'RK70E-LST_SETNR' '1'.
+
+    PERFORM bdc_dynpro USING 'SAPLKKDI' '1301'.
+    PERFORM bdc_field  USING 'BDC_OKCODE' '=SICH'.
+    WRITE w_price TO w_value.                           "#EC UOM_IN_MES
+    PERFORM bdc_field  USING 'RK70L-TYPPS(01)' 'V'.
+    PERFORM bdc_field  USING 'RK70L-MENGE(01)' '1'.
+    PERFORM bdc_field  USING 'RK70L-MEEHT(01)' 'PC'.
+    PERFORM bdc_field  USING 'RK70L-LPREIS(01)' w_value.
+    PERFORM bdc_field  USING 'RK70L-KSTAR(01)' p_kstar.
+    PERFORM bdc_field  USING 'RK70E-LST_SETNR' '1'.
+
+    AT END OF vbeln.
+
+      PERFORM bdc_dynpro USING 'SAPMV45A' '4001'.
+      PERFORM bdc_field  USING 'BDC_OKCODE' '=SICH'.
+
+
+
+      bdc_options-dismode = p_mode.
+      bdc_options-updmode = 'S'.
+
+*   Call change sales order transaction
+      CALL TRANSACTION 'VA02' USING bdcdata
+                              OPTIONS FROM bdc_options
+                              MESSAGES INTO it_messages.
+
+*   Export message to custom error message table
+      CALL FUNCTION 'YSE_WRKFL_ERRORS'
+        EXPORTING
+          doc_type   = 'G'
+          vbeln      = i_items-vbeln
+        TABLES
+          it_messtab = it_messages.
+
+      CLEAR v_problem.
+
+**=======================================================================
+**if 1 = 2.
+**   If Cost Estimate Number was not known until above update, get the
+**   number now
+*
+*      LOOP AT it_vbap_check INTO wa_vbap_check.
+*        IF wa_vbap_check-kalnr IS INITIAL.
+*          CLEAR v_kalnr.
+*          SELECT SINGLE kalnr FROM vbap INTO v_kalnr
+*            WHERE vbeln EQ i_items-vbeln
+*                  AND posnr EQ wa_vbap_check-posnr.
+*        endif.
+*
+*          IF NOT v_kalnr IS INITIAL.
+*            SELECT SINGLE * FROM ckis
+*                              WHERE kalnr EQ v_kalnr.       "#EC *
+*
+*            CLEAR w_price.
+**     If price is same
+*              IF ckis-wrtfw_kpf = wa_vbap_check-price.
+**       Success
+*              ELSE.
+*                v_problem = 'X'.
+*              ENDIF.
+**   If it is initial, no success
+*          ELSE.
+*            v_problem = 'X'.
+*          ENDIF.
+*
+*        CLEAR wa_vbap_check.
+*      ENDLOOP.
+**endif.
+*=======================================================================
+      READ TABLE it_messages INTO wa_messages WITH KEY msgtyp = 'E'.
+      IF sy-subrc EQ 0.
+        PERFORM update_nosuccess.
+      ELSE.
+        PERFORM update_success.
+*       Delete the order from the YSE table
+        DELETE FROM yse_contract_sch WHERE vbeln = i_items-vbeln.
+        COMMIT WORK AND WAIT.
+      ENDIF.
+
+
+*      IF v_problem EQ 'X'.
+*        PERFORM update_nosuccess.
+*      ELSE.
+*        PERFORM update_success.
+**       Delete the order from the YSE table
+*        DELETE FROM yse_contract_sch WHERE vbeln = i_items-vbeln.
+*        COMMIT WORK AND WAIT.
+*      ENDIF.
+
+**-------------------------------------------
+*      IF V_KALNR IS INITIAL.
+*        SELECT SINGLE KALNR FROM VBAP INTO V_KALNR
+*          WHERE VBELN EQ I_ITEMS-VBELN
+*                AND POSNR EQ I_ITEMS-POSNR.
+*      ENDIF.
+*
+**   If Cost Estimate Number is not initial
+*      IF NOT V_KALNR IS INITIAL.
+**     Get the Items unit costing data after the above update
+*        SELECT SINGLE * FROM CKIS
+*                          WHERE KALNR EQ V_KALNR.           "#EC *
+**     If price is same
+*        IF CKIS-WRTFW_KPF = W_PRICE.
+**       Success
+*          PERFORM UPDATE_SUCCESS.
+**       Delete the order from the YSE table
+*          DELETE FROM YSE_CONTRACT_SCH WHERE VBELN = I_CONTRACT-VBELN.
+*          COMMIT WORK AND WAIT.
+*        ELSE.
+*          PERFORM UPDATE_NOSUCCESS.
+*        ENDIF.
+**   If it is initial, no success
+*      ELSE.
+*        PERFORM UPDATE_NOSUCCESS.
+*      ENDIF.
+      CLEAR it_messages.
+      REFRESH it_messages.
+    ENDAT.
+    CLEAR: wa_items, i_items.
+    CLEAR bdcdata.
+  ENDLOOP.
+
+*&---------------------------------------------------------------------*
+*&      FORM  BDC_DYNPRO
+*&---------------------------------------------------------------------*
+*       START NEW SCREEN
+*----------------------------------------------------------------------*
+FORM bdc_dynpro USING program dynpro.
+  CLEAR bdcdata.
+  bdcdata-program  = program.
+  bdcdata-dynpro   = dynpro.
+  bdcdata-dynbegin = 'X'.
+  APPEND bdcdata.
+ENDFORM.                    "BDC_DYNPRO
+*&---------------------------------------------------------------------*
+*&      FORM  BDC_FIELD
+*&---------------------------------------------------------------------*
+*       INSERT FIELD
+*----------------------------------------------------------------------*
+FORM bdc_field USING fnam fval.
+  IF fval <> nodata_character.
+    CLEAR bdcdata.
+    bdcdata-fnam = fnam.
+    bdcdata-fval = fval.
+    APPEND bdcdata.
+  ENDIF.
+ENDFORM.                    "BDC_FIELD
+*&---------------------------------------------------------------------*
+*&      FORM  UPDATE_NOSUCCESS
+*&---------------------------------------------------------------------*
+*       TEXT
+*----------------------------------------------------------------------*
+*  -->  P1        TEXT
+*  <--  P2        TEXT
+*----------------------------------------------------------------------*
+FORM update_nosuccess .
+
+  DATA : wl_message(200) TYPE c.
+  LOOP AT it_messages INTO wa_messages.
+    WRITE :/ i_items-vbeln.
+    MESSAGE ID wa_messages-msgid TYPE wa_messages-msgtyp NUMBER
+    wa_messages-msgnr
+    WITH wa_messages-msgv1 wa_messages-msgv2 wa_messages-msgv2
+    wa_messages-msgv3
+    INTO wl_message.
+    WRITE :/  wl_message.
+  ENDLOOP.
+
+ENDFORM.                    " UPDATE_NOSUCCESS
+*&---------------------------------------------------------------------*
+*&      FORM  UPDATE_SUCCESS
+*&---------------------------------------------------------------------*
+*       TEXT
+*----------------------------------------------------------------------*
+*  -->  P1        TEXT
+*  <--  P2        TEXT
+*----------------------------------------------------------------------*
+FORM update_success .
+  DATA : wl_message(200) TYPE c.
+  LOOP AT it_messages INTO wa_messages.
+    WRITE :/ i_items-vbeln.
+    MESSAGE ID wa_messages-msgid TYPE wa_messages-msgtyp NUMBER
+    wa_messages-msgnr
+    WITH wa_messages-msgv1 wa_messages-msgv2 wa_messages-msgv2
+    wa_messages-msgv3
+    INTO wl_message.
+    WRITE :/  wl_message.
+  ENDLOOP.
+
+ENDFORM.                    " UPDATE_SUCCESS
+
+*Selection text£º
+*P_KSTAR:D       Cost Element
+*P_MODE:D       Processing Mode
+*SO_VBELN:D       Sales document
+*S_KSCHL:D       Condition type

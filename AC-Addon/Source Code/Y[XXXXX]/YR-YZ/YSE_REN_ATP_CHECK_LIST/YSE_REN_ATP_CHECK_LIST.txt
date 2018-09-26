@@ -1,0 +1,261 @@
+************************************************************************
+* Program ID           : YSE_REN_ATP_CHECK_LIST                        *
+* Program Title        : REN: List display ATP check                   *
+* Author               : Luc Mertens      USG Innotiv                  *
+* Date                 : 12.08.2008                                    *
+* Development number   : D411                                          *
+* Change Request Number: CD1K942707                                    *
+* Description          : Overview of ATP check                         *
+************************************************************************
+* Change History Log                                                   *
+*----------------------------------------------------------------------*
+* Mod. no.|  Date    | Name           | Correction Number | Change Ref *
+*----------------------------------------------------------------------*
+*                                                                      *
+************************************************************************
+REPORT  yse_ren_atp_check_list.
+
+************************************************************************
+* TABLES                                                               *
+************************************************************************
+TABLES: vbak,
+        vbap.
+
+************************************************************************
+* TYPE-POOLS                                                           *
+************************************************************************
+TYPE-POOLS slis.
+
+************************************************************************
+* CONSTANTS                                                            *
+************************************************************************
+CONSTANTS:
+  gc_vtweg       type vtweg       value '21',
+  gc_true        TYPE c           VALUE 'X'.
+
+************************************************************************
+* DATA                                                                 *
+************************************************************************
+* Own data
+DATA:
+  gv_repid        LIKE sy-repid,
+  gv_wertu        like T134M-wertu.
+* ALV
+DATA:
+  gv_layout       TYPE slis_layout_alv. " ALV grid layout.
+
+************************************************************************
+* INTERNAL TABLES                                                      *
+************************************************************************
+DATA: it_atp          TYPE TABLE OF yse_ren_atp WITH HEADER LINE.
+
+DATA: begin of it_materials occurs 0,
+        matnr type matnr,
+      end of it_materials.
+
+DATA: begin of it_plants occurs 0,
+        werks type werks_d,
+      end of it_plants.
+
+************************************************************************
+* SELECTION SCREEN                                                     *
+************************************************************************
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE text-s01.
+PARAMETERS:
+            p_vkorg LIKE vbak-vkorg OBLIGATORY MEMORY ID VKO.
+SELECT-OPTIONS:
+            s_werks for vbap-werks no intervals,
+            s_matnr for vbap-matnr obligatory no intervals.
+PARAMETERS:
+            p_angdt like vbap-zzbegdat OBLIGATORY,
+            p_bnddt LIKE vbap-zzenddat OBLIGATORY.
+SELECTION-SCREEN END OF BLOCK b1.
+
+************************************************************************
+* AT SELECTION SCREEN                                                  *
+************************************************************************
+AT SELECTION-SCREEN.
+
+  PERFORM check_authorization.
+  if p_bnddt < p_angdt.
+    MESSAGE ID 'YSE_RENTAL' TYPE 'E' NUMBER '047'.
+  endif.
+
+************************************************************************
+* INITIALIZATION                                                       *
+************************************************************************
+INITIALIZATION.
+
+  gv_repid = sy-repid.
+
+************************************************************************
+* START OF SELECTION                                                   *
+************************************************************************
+START-OF-SELECTION.
+
+  refresh it_materials.
+  loop at s_matnr.
+    move s_matnr-low to it_materials-matnr.
+    append it_materials.
+    clear it_materials.
+  endloop.
+
+  refresh it_plants.
+  IF not s_werks[] is initial.
+    loop at s_werks.
+      move s_werks-low to it_plants-werks.
+      append it_plants.
+      clear it_plants.
+    endloop.
+  else.
+*.. Take all plants assigned to the given sales organization
+    select werks
+       into corresponding fields of table it_plants
+       from TVKWZ where vkorg = p_vkorg
+                    and vtweg = gc_vtweg.
+
+*.. Only valuated plants
+    loop at it_plants.
+      select single wertu into gv_wertu
+        from T134M
+        where bwkey = it_plants-werks
+          and mtart = 'ZMAT'
+          and wertu = 'X'.
+
+      if sy-subrc = 0.
+        delete it_plants.
+      endif.
+    endloop.
+  endif.
+
+* Call ATP check
+  CALL FUNCTION 'YSE_REN_ATP'
+    EXPORTING
+      VKORG             = p_vkorg
+      VTWEG             = gc_vtweg
+      ANGDT             = p_angdt
+      BNDDT             = p_bnddt
+    TABLES
+      T_MATERIALS       = it_materials
+      T_PLANTS          = it_plants
+      T_OUTTAB          = it_atp.
+
+  if it_atp[] is initial.
+    MESSAGE s072(yse_rental).        "no data to display
+  ENDIF.
+
+  sort it_atp by matnr datum werks.
+
+* Display data in alv grid
+  PERFORM build_alv.
+
+*&---------------------------------------------------------------------*
+*&      Form  BUILD_ALV                                                *
+*&---------------------------------------------------------------------*
+FORM build_alv.
+
+  gv_layout-colwidth_optimize = gc_true.
+
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+    EXPORTING
+         i_background_id          = 'ALV_BACKGROUND'
+         i_callback_program       = gv_repid
+*         I_CALLBACK_USER_COMMAND  = 'ALV_USER_COMMAND'
+         i_callback_top_of_page   = 'TOP-OF-PAGE'
+         i_structure_name         = 'YSE_REN_ATP'
+         is_layout                = gv_layout
+         i_save                   = 'A'
+    TABLES
+         t_outtab = it_atp
+    EXCEPTIONS
+         program_error = 1
+         OTHERS        = 2.
+
+  IF sy-subrc <> 0.
+*   MESSAGE ...
+  ENDIF.
+
+ENDFORM.                    "build_alv
+
+*-------------------------------------------------------------------*
+* Form  TOP-OF-PAGE                                                 *
+*-------------------------------------------------------------------*
+* ALV Report Header                                                 *
+*-------------------------------------------------------------------*
+FORM top-of-page.
+
+*ALV Header declarations
+  DATA: lt_header     TYPE slis_t_listheader,
+        wa_header     TYPE slis_listheader,
+        lt_line1      LIKE wa_header-info,
+        lt_line2      LIKE wa_header-info.
+
+* Sales organisation
+  wa_header-typ  = 'S'.
+  wa_header-key = 'Sales org: '.
+  wa_header-info = p_vkorg.
+  APPEND wa_header TO lt_header.
+  CLEAR wa_header.
+
+* Period
+  wa_header-typ  = 'S'.
+  wa_header-key = 'Period: '.
+  CONCATENATE  p_angdt+6(2) '.'
+               p_angdt+4(2) '.'
+               p_angdt(4)
+         INTO  lt_line1.
+
+  CONCATENATE  p_bnddt+6(2) '.'
+               p_bnddt+4(2) '.'
+               p_bnddt(4)
+         INTO lt_line2.
+
+  CONCATENATE lt_line1 'until' lt_line2
+         INTO wa_header-info
+    SEPARATED BY space.
+
+  APPEND wa_header TO lt_header.
+  CLEAR: wa_header.
+
+* Blank line
+  wa_header-typ  = 'S'.
+  wa_header-key = space.
+  wa_header-info = space.
+  APPEND wa_header TO lt_header.
+  CLEAR wa_header.
+
+  CALL FUNCTION 'REUSE_ALV_COMMENTARY_WRITE'
+    EXPORTING
+      it_list_commentary = lt_header.
+
+ENDFORM.                    "top-of-page
+*&---------------------------------------------------------------------*
+*&      Form  check_authorization
+*&---------------------------------------------------------------------*
+form check_authorization .
+
+  AUTHORITY-CHECK OBJECT 'V_VBAK_VKO'
+                      ID 'VKORG' FIELD p_vkorg
+                      ID 'VTWEG' DUMMY
+                      ID 'SPART' DUMMY
+                      ID 'ACTVT' DUMMY.
+
+  IF sy-subrc = 4.
+*   No authorisation to display data from Sales Organisation p_vkorg
+    MESSAGE ID 'YSE_RENTAL' TYPE 'E' NUMBER '049' WITH p_vkorg.
+  ELSEIF sy-subrc <> 0.
+*   Error checking authorization.
+    MESSAGE ID 'YSE_RENTAL' TYPE 'E' NUMBER '046'.
+  ENDIF.
+
+endform.                    " check_authorization
+
+*Text symbol text£º
+
+*S01:ATP check: Selection criteria
+*Selection text£º
+*P_ANGDT:        Start selection period
+*P_BNDDT:        End selection period
+*P_VKORG:D       .
+*S_MATNR:D       .
+*S_WERKS:D       .

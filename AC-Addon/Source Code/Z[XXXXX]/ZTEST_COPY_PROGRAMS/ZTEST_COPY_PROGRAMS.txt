@@ -1,0 +1,424 @@
+*&---------------------------------------------------------------------*
+*& Report  ZTEST_COPY_PROGRAMS
+*&
+*&---------------------------------------------------------------------*
+*& Select a directory. The files are opened, reports with the name same
+*& as filename (without extension) are created/modified, and the code
+*& is even adapted.
+*& Changes are stored in a new transport, but that transport request
+*& is not assigned to any project!
+*&---------------------------------------------------------------------*
+
+REPORT  ztest_copy_programs NO STANDARD PAGE HEADING LINE-SIZE 255.
+
+CONSTANTS: gc_status_success(1)  VALUE 'S',
+           gc_status_warning(1)  VALUE 'W',
+           gc_status_failed(1)   VALUE 'E',
+           gc_status_trfailed(1) VALUE 'F',
+           gc_status_complete(1) VALUE 'C'.
+
+TYPE-POOLS: trwbo.
+
+TYPES: BEGIN OF gty_output,
+         filename TYPE string,
+         result TYPE string,
+         status(1),
+       END OF gty_output.
+
+DATA: gt_files TYPE STANDARD TABLE OF file_info.
+DATA: gt_output TYPE TABLE OF gty_output.
+
+*--------------------------------------------------------------------*
+* Selection screen
+*--------------------------------------------------------------------*
+SELECTION-SCREEN BEGIN OF BLOCK bl1 WITH FRAME.
+SELECTION-SCREEN COMMENT 1(40) gv_pack.
+SELECTION-SCREEN END OF BLOCK bl1.
+PARAMETERS: p_dir TYPE string  OBLIGATORY DEFAULT 'C:\Temp'.
+PARAMETERS: p_txt TYPE as4text OBLIGATORY.
+
+*--------------------------------------------------------------------*
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_dir.
+*--------------------------------------------------------------------*
+  CALL METHOD cl_gui_frontend_services=>directory_browse
+    EXPORTING
+      window_title         = 'Select the directory containing the files with ABAP code'
+      initial_folder       = 'C:\'
+    CHANGING
+      selected_folder      = p_dir
+    EXCEPTIONS
+      cntl_error           = 1
+      error_no_gui         = 2
+      not_supported_by_gui = 3
+      OTHERS               = 4.
+  IF sy-subrc <> 0.
+    "SweepItUnderTheRug
+  ENDIF.
+
+*--------------------------------------------------------------------*
+INITIALIZATION.
+*--------------------------------------------------------------------*
+  CONCATENATE sy-datum+2(6) ':' INTO p_txt.
+  CONCATENATE p_txt 'BODS' INTO p_txt SEPARATED BY space.
+  gv_pack = '>>> Add to package Z_AFTERMARKET <<<'.
+
+*--------------------------------------------------------------------*
+START-OF-SELECTION.
+*--------------------------------------------------------------------*
+* Clear global variables
+  REFRESH: gt_files, gt_output.
+
+* Get files from the directory
+  PERFORM select_files.
+
+* Process files one by one
+  PERFORM process_files.
+
+* Create a transport request and add all successful objects
+  PERFORM generate_transport.
+
+*--------------------------------------------------------------------*
+END-OF-SELECTION.
+*--------------------------------------------------------------------*
+* Display result
+  PERFORM show_result.
+
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_FILES
+*&---------------------------------------------------------------------*
+*       Get files from the directory
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM select_files .
+
+  DATA: lv_count TYPE i.
+
+  CALL METHOD cl_gui_frontend_services=>directory_list_files
+    EXPORTING
+      directory                   = p_dir
+      filter                      = '*'
+      files_only                  = 'X'
+    CHANGING
+      file_table                  = gt_files
+      count                       = lv_count
+    EXCEPTIONS
+      cntl_error                  = 1
+      directory_list_files_failed = 2
+      wrong_parameter             = 3
+      error_no_gui                = 4
+      not_supported_by_gui        = 5
+      OTHERS                      = 6.
+  IF sy-subrc <> 0.
+    "TODO: error handling
+  ENDIF.
+
+ENDFORM.                    " SELECT_FILES
+
+*&---------------------------------------------------------------------*
+*&      Form  PROCESS_FILES
+*&---------------------------------------------------------------------*
+*       Read files and update programs
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM process_files .
+
+*  CONSTANTS: lc_path TYPE string VALUE '''/var/extract/CP1/BODS'' lower case.'.
+
+  DATA: lv_filename TYPE string,
+        lt_data TYPE STANDARD TABLE OF string,
+        lt_data_mod TYPE STANDARD TABLE OF string,
+        lv_data TYPE string.
+  DATA: ls_output TYPE gty_output.
+  DATA: lv_long_lines TYPE flag.
+  DATA: lv_progname(1024),
+        lv_extension(1024).
+
+  FIELD-SYMBOLS: <ls_file> TYPE file_info,
+                 <lv_data> TYPE string.
+
+  LOOP AT gt_files ASSIGNING <ls_file>.
+*   Check the filename
+    CLEAR: lv_progname, lv_extension.
+    SPLIT <ls_file>-filename AT '.' INTO lv_progname lv_extension.
+    IF lv_progname CN 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz1234567890_ '.
+      CLEAR ls_output.
+      ls_output-filename = <ls_file>-filename.
+      ls_output-result = 'ERROR filename should be the report name (1 extenstion allowed)'.
+      ls_output-status = gc_status_failed.
+      APPEND ls_output TO gt_output.
+      CONTINUE.
+    ENDIF.
+
+    CLEAR lv_long_lines.
+
+*   Read the file
+    CONCATENATE p_dir <ls_file>-filename INTO lv_filename SEPARATED BY '\'.
+    CALL METHOD cl_gui_frontend_services=>gui_upload
+      EXPORTING
+        filename                = lv_filename
+        filetype                = 'ASC'
+      CHANGING
+        data_tab                = lt_data
+      EXCEPTIONS
+        file_open_error         = 1
+        file_read_error         = 2
+        no_batch                = 3
+        gui_refuse_filetransfer = 4
+        invalid_type            = 5
+        no_authority            = 6
+        unknown_error           = 7
+        bad_data_format         = 8
+        header_not_allowed      = 9
+        separator_not_allowed   = 10
+        header_too_long         = 11
+        unknown_dp_error        = 12
+        access_denied           = 13
+        dp_out_of_memory        = 14
+        disk_full               = 15
+        dp_timeout              = 16
+        not_supported_by_gui    = 17
+        error_no_gui            = 18
+        OTHERS                  = 19.
+    IF sy-subrc <> 0.
+      CLEAR ls_output.
+      ls_output-filename = <ls_file>-filename.
+      ls_output-result = 'ERROR opening file'.
+      ls_output-status = gc_status_failed.
+      APPEND ls_output TO gt_output.
+      CONTINUE.
+    ENDIF.
+
+*   Modify program code
+    REFRESH lt_data_mod.
+    LOOP AT lt_data ASSIGNING <lv_data>.
+      CASE <lv_data>.
+        WHEN '''/var/load/CP1/UK/read'' lower case.'.
+          lv_data = '*''/var/load/CP1/UK/read'' lower case.'.
+          APPEND lv_data TO lt_data_mod.
+          lv_data = '''/var/load/xxx/UK/read'' LOWER CASE.'.
+          APPEND lv_data TO lt_data_mod.
+        WHEN 'start-of-selection.'.
+          lv_data = 'DATA: gv_directory     TYPE epsdirnam  VALUE ''/var/load/xxx/UK/read/'','.
+          APPEND lv_data TO lt_data_mod.
+          lv_data = '      gv_logsys        LIKE tbdlst-logsys.'.
+          APPEND lv_data TO lt_data_mod.
+          CLEAR lv_data.
+          APPEND lv_data TO lt_data_mod.
+          lv_data = 'start-of-selection.'.
+          APPEND lv_data TO lt_data_mod.
+          lv_data = '* Logical system'.
+          APPEND lv_data TO lt_data_mod.
+          lv_data = '  CALL FUNCTION ''OWN_LOGICAL_SYSTEM_GET'''.
+          APPEND lv_data TO lt_data_mod.
+          lv_data = '    IMPORTING'.
+          APPEND lv_data TO lt_data_mod.
+          lv_data = '      own_logical_system             = gv_logsys'.
+          APPEND lv_data TO lt_data_mod.
+          lv_data = '    EXCEPTIONS'.
+          APPEND lv_data TO lt_data_mod.
+          lv_data = '      own_logical_system_not_defined = 1'.
+          APPEND lv_data TO lt_data_mod.
+          lv_data = '      OTHERS                         = 2.'.
+          APPEND lv_data TO lt_data_mod.
+          lv_data = '  IF sy-subrc <> 0.'.
+          APPEND lv_data TO lt_data_mod.
+          lv_data = '    MESSAGE ID sy-msgid TYPE ''E'' NUMBER sy-msgno'.
+          APPEND lv_data TO lt_data_mod.
+          lv_data = '         WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.'.
+          APPEND lv_data TO lt_data_mod.
+          lv_data = '    STOP.'.
+          APPEND lv_data TO lt_data_mod.
+          lv_data = '  ENDIF.'.
+          APPEND lv_data TO lt_data_mod.
+          lv_data = '  REPLACE ''xxx'' IN out_dir WITH gv_logsys(3).'.
+          APPEND lv_data TO lt_data_mod.
+          lv_data = '  REPLACE ''xxx'' IN in_dir WITH gv_logsys(3).'.
+          APPEND lv_data TO lt_data_mod.
+        WHEN OTHERS.
+          lv_data = <lv_data>.
+          APPEND lv_data TO lt_data_mod.
+          IF STRLEN( lv_data ) GT 72.
+            lv_long_lines = 'X'.
+          ENDIF.
+      ENDCASE.
+    ENDLOOP.
+
+*   Save report
+    INSERT REPORT lv_progname FROM lt_data_mod.
+    IF sy-subrc NE 0.
+      CLEAR ls_output.
+      ls_output-filename = <ls_file>-filename.
+      ls_output-result = 'ERROR saving report'.
+      ls_output-status = gc_status_failed.
+      APPEND ls_output TO gt_output.
+      CONTINUE.
+    ENDIF.
+
+*   Add success/warning message
+    CLEAR ls_output.
+    IF lv_long_lines IS INITIAL.
+      ls_output-result = 'Ok'.
+      ls_output-status = gc_status_success.
+    ELSE.
+      ls_output-result = 'Ok, but manual action needed (lines >72 characters)'.
+      ls_output-status = gc_status_warning.
+    ENDIF.
+    ls_output-filename = lv_progname.
+    APPEND ls_output TO gt_output.
+  ENDLOOP. "gt_files ASSIGNING <ls_file>
+
+ENDFORM.                    " PROCESS_FILES
+
+*&---------------------------------------------------------------------*
+*&      Form  GENERATE_TRANSPORT
+*&---------------------------------------------------------------------*
+*       Create a transport request and add all successful objects
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM generate_transport .
+
+  DATA: lv_type  TYPE trfunction,
+        lt_users TYPE scts_users,
+        ls_user  TYPE scts_user.
+  DATA: ls_request_header TYPE trwbo_request_header,
+        lt_task_headers   TYPE trwbo_request_headers.
+  DATA: lt_ko200 TYPE STANDARD TABLE OF ko200,
+        ls_ko200 TYPE ko200.
+  DATA: ls_output TYPE gty_output.
+
+  FIELD-SYMBOLS: <ls_output> TYPE gty_output.
+
+* Workbench
+  lv_type = 'K'.
+
+* Tasks
+  ls_user-type = 'S'.
+  ls_user-user = sy-uname.
+  APPEND ls_user TO lt_users.
+
+* Create transport request
+  CALL FUNCTION 'TR_INSERT_REQUEST_WITH_TASKS'
+    EXPORTING
+      iv_type           = lv_type
+      iv_text           = p_txt
+      iv_owner          = sy-uname
+      it_users          = lt_users
+    IMPORTING
+      es_request_header = ls_request_header
+      et_task_headers   = lt_task_headers
+    EXCEPTIONS
+      insert_failed     = 1
+      enqueue_failed    = 2
+      OTHERS            = 3.
+  IF sy-subrc <> 0.
+    CLEAR ls_output.
+    ls_output-filename = 'N/A'.
+    ls_output-result = 'ERROR creating transport request'.
+    ls_output-status = gc_status_trfailed.
+    APPEND ls_output TO gt_output.
+    RETURN.
+  ENDIF.
+
+* Prepare objects
+  LOOP AT gt_output ASSIGNING <ls_output>
+    WHERE status EQ gc_status_success OR
+          status EQ gc_status_warning.
+    CLEAR ls_ko200.
+    ls_ko200-pgmid = 'LIMU'.
+    ls_ko200-object = 'REPS'.
+    ls_ko200-obj_name = <ls_output>-filename.
+    TRANSLATE ls_ko200-obj_name TO UPPER CASE.
+    ls_ko200-lockflag = 'X'.
+    APPEND ls_ko200 TO lt_ko200.
+  ENDLOOP.
+
+* Check objects (necessary before TR_OBJECTS_INSERT)
+  CALL FUNCTION 'TR_OBJECTS_CHECK'
+    TABLES
+      wt_ko200                = lt_ko200
+    EXCEPTIONS
+      cancel_edit_other_error = 1
+      show_only_other_error   = 2
+      OTHERS                  = 3.
+  IF sy-subrc <> 0.
+    CLEAR ls_output.
+    ls_output-filename = 'N/A'.
+    ls_output-result = 'ERROR checking objects'.
+    ls_output-status = gc_status_trfailed.
+    APPEND ls_output TO gt_output.
+    RETURN.
+  ENDIF.
+
+* Add objects to transport request
+  CALL FUNCTION 'TR_OBJECTS_INSERT'
+    EXPORTING
+      wi_order                = ls_request_header-trkorr
+      iv_no_show_option       = 'X'
+    TABLES
+      wt_ko200                = lt_ko200
+    EXCEPTIONS
+      cancel_edit_other_error = 1
+      show_only_other_error   = 2
+      OTHERS                  = 3.
+  IF sy-subrc <> 0.
+    CLEAR ls_output.
+    ls_output-filename = 'N/A'.
+    ls_output-result = 'ERROR adding objects to transport request'.
+    ls_output-status = gc_status_trfailed.
+    APPEND ls_output TO gt_output.
+    RETURN.
+  ENDIF.
+
+  CLEAR ls_output.
+  ls_output-filename = 'N/A'.
+  ls_output-result = 'Transport created successfully'.
+  ls_output-status = gc_status_complete.
+  APPEND ls_output TO gt_output.
+
+ENDFORM.                    " GENERATE_TRANSPORT
+
+*&---------------------------------------------------------------------*
+*&      Form  SHOW_RESULT
+*&---------------------------------------------------------------------*
+*       Display result
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM show_result .
+
+  FIELD-SYMBOLS: <ls_output> TYPE gty_output.
+
+  FORMAT COLOR 1.
+  WRITE: 1   'Report',
+         40  'Result',
+         100 ' '.
+  WRITE:/ '----------------------------------------------------------------------------------------------------'.
+
+  LOOP AT gt_output ASSIGNING <ls_output>.
+    CASE <ls_output>-status.
+      WHEN gc_status_success.
+        FORMAT COLOR OFF.
+      WHEN gc_status_warning.
+        FORMAT COLOR 3.
+      WHEN gc_status_complete.
+        FORMAT COLOR 5.
+      WHEN OTHERS.
+        FORMAT COLOR 6.
+    ENDCASE.
+    WRITE:/ <ls_output>-filename UNDER 'Report',
+            <ls_output>-result   UNDER 'Result',
+            space                UNDER ' '.
+  ENDLOOP.
+
+ENDFORM.                    " SHOW_RESULT
+
+*Selection text£º
+*P_DIR:        Directory
+*P_TXT:        Transport Request description

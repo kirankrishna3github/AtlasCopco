@@ -1,0 +1,410 @@
+************************************************************************
+* Program ID           : YAM_EQUI_EXPORT_STATUS                        *
+* Program Title        : Automatic setting of ZEXP status on equipment *
+* Author               : Lakshmi Reddy                                 *
+* Date                 : 29/SEP/2010                                   *
+* Change Request Number: CD1K959696                                    *
+* Description          : This program sets the status on equipment as  *
+*                        ZEXP when an equipment is exported and display*
+*                        a report with list of equiments that got the  *
+*                        user status ZEXP.                             *
+*                        If program is run in Test mode, the list of   *
+*                        equipments will be displayed as a report that *
+*                        will get the user status ZEXP.                *
+*======================================================================*
+* Copied From          : N/A                                           *
+* Title                : N/A                                           *
+* Other Related obj    : N/A                                           *
+*======================================================================*
+* Change History Log                                                   *
+*----------------------------------------------------------------------*
+* Mod. no.|Date      |Name        |Correction Number|Change Reference  *
+*----------------------------------------------------------------------*
+* MOD-001 |30/09/2010|LakshmiReddy|CD1K959696       |CR1580            *
+* Description: Initial Development                                     *
+* MOD-002 |08/10/2010|LakshmiReddy|CD1K959883       |CR1580            *
+* Description: Check SPRAS = 'EN' and DATBI = '31.12.9999' while       *
+*              fetching data from V_EQUI table                         *
+* MOD-003 |11/10/2010|LakshmiReddy|CD1K959942       |CR1580            *
+* Description: Exclude equipments if country key of equipment is empty *
+*----------------------------------------------------------------------*
+
+REPORT  yam_equi_export_status MESSAGE-ID yam_re.
+
+************************************************************************
+*                  T Y P E S  S T R U C T U R E S
+************************************************************************
+TYPES: BEGIN OF ty_eqnum,
+        equnr TYPE equnr,       "Equipment Number
+        bukrs TYPE bukrs,       "Company Code
+        vkorg TYPE vkorg,       "Sales Organization
+        adrnr TYPE ad_addrnum,  "Address Number
+        country TYPE land1,     "Country Key Equipment
+        land1   TYPE land1,     "Country key of company code
+        objnr   TYPE jest-objnr,"Object Number
+       END OF ty_eqnum.
+
+TYPES: BEGIN OF ty_log,
+        equnr  TYPE equnr,       "Equipment Number
+        msgty  TYPE char10,      "Message type (Error/Success)
+        msgdes TYPE string,      "Message Description
+       END OF ty_log.
+
+************************************************************************
+*                 I N T E R N A L  T A B L E S
+************************************************************************
+DATA: i_eqnum TYPE STANDARD TABLE OF ty_eqnum,
+      i_log   TYPE STANDARD TABLE OF ty_log.
+
+*----------------------------------------------------------------------*
+*                 V A R I A B L E S                                    *
+*----------------------------------------------------------------------*
+DATA: v_equnr  TYPE equnr,       "Equipment Number
+      wa_eqnum TYPE ty_eqnum,
+      wa_log   TYPE ty_log.
+
+*----------------------------------------------------------------------*
+*                 S E L E C T I O N  S C R E E N                       *
+*----------------------------------------------------------------------*
+SELECTION-SCREEN BEGIN OF BLOCK s1 WITH FRAME TITLE text-001.
+PARAMETERS:     p_vkorg TYPE vkorg OBLIGATORY.      "Sales Organization
+SELECT-OPTIONS: s_equnr FOR  v_equnr.               "Equipment
+SELECTION-SCREEN END OF BLOCK s1.
+
+PARAMETERS:     p_test AS CHECKBOX USER-COMMAND mode DEFAULT 'X'.
+
+************************************************************************
+*                 S T A R T - O F - S E L E C T I O N
+************************************************************************
+START-OF-SELECTION.
+
+  PERFORM f100_get_equipments.
+
+  IF NOT i_eqnum IS INITIAL.
+    PERFORM f200_set_equipment_user_status.
+  ELSE.
+    IF p_test EQ 'X'.
+      SKIP 1.
+      WRITE AT /1 'No Equipments will get the user Status ZEXP'(002).
+    ELSE.
+      SKIP 1.
+      WRITE AT /1 'No Equipments got the user Status ZEXP'(003).
+    ENDIF.
+  ENDIF.
+
+*&---------------------------------------------------------------------*
+*&      Form  F100_GET_EQUIPMENTS
+*&---------------------------------------------------------------------*
+*       Get Equipments whose user status has to be set as ZEXP
+*----------------------------------------------------------------------*
+
+FORM f100_get_equipments .
+
+  TYPES: BEGIN OF ty_adrc,
+          addrnumber TYPE ad_addrnum,
+          country    TYPE land1,
+         END OF ty_adrc.
+
+  TYPES: BEGIN OF ty_t001,
+          bukrs  TYPE bukrs,
+          land1  TYPE land1,
+         END OF ty_t001.
+
+  DATA: i_jest   TYPE STANDARD TABLE OF jest,
+        wa_jest  TYPE jest,
+        i_adrc   TYPE STANDARD TABLE OF ty_adrc,
+        wa_adrc  TYPE ty_adrc,
+        i_t001   TYPE STANDARD TABLE OF ty_t001,
+        wa_t001  TYPE ty_t001,
+        i_temp   TYPE STANDARD TABLE OF ty_eqnum,
+        lv_index TYPE sy-index.
+
+  CONSTANTS: c_stat  TYPE jest-stat VALUE 'I0076',
+             c_zexp  TYPE jest-stat VALUE 'E0007',
+             c_eqart TYPE eqart VALUE 'EQUIPMENT',
+             c_eqtyp TYPE eqtyp VALUE 'Z'.
+
+*Get Equipment numbers from V_EQUI based on selection criteria
+  REFRESH: i_eqnum.
+  SELECT equnr
+         bukrs
+         vkorg
+         adrnr
+  FROM   v_equi
+  INTO   CORRESPONDING FIELDS OF TABLE i_eqnum
+  WHERE  equnr IN s_equnr
+  AND    eqtyp EQ c_eqtyp
+  AND    eqart EQ c_eqart
+  AND    datbi EQ '99991231'
+  AND    spras EQ 'EN'
+  AND    vkorg EQ p_vkorg.
+
+*Exclude Equipments with deletion flag
+
+*Prepare OBJNR values for each Equipment number by adding 'IE' before the number
+  CLEAR: wa_eqnum.
+  LOOP AT i_eqnum INTO wa_eqnum.
+    CONCATENATE 'IE'
+                wa_eqnum-equnr
+                INTO
+                wa_eqnum-objnr.
+    MODIFY i_eqnum
+    FROM   wa_eqnum
+    INDEX sy-tabix.
+    CLEAR: wa_eqnum.
+  ENDLOOP.
+
+*Find whether Equipments have deletion flag from table JEST using Object status I0076
+  REFRESH: i_jest.
+  IF NOT i_eqnum IS INITIAL.
+    SELECT *
+    FROM   jest
+    INTO   TABLE i_jest
+    FOR    ALL ENTRIES IN i_eqnum
+    WHERE  objnr EQ i_eqnum-objnr
+    AND    stat  EQ c_stat
+    AND    inact EQ ' '.
+  ENDIF.
+
+  LOOP AT i_jest INTO wa_jest.
+*Delete the Equipment Number from internal table which has deletion flag
+    DELETE i_eqnum WHERE objnr EQ wa_jest-objnr.
+  ENDLOOP.
+
+*Find whether the equipments already have the user status ZEXP (JEST-STAT = E0007)
+  REFRESH: i_jest.
+  IF NOT i_eqnum IS INITIAL.
+    SELECT *
+    FROM   jest
+    INTO   TABLE i_jest
+    FOR    ALL ENTRIES IN i_eqnum
+    WHERE  objnr EQ i_eqnum-objnr
+    AND    stat  EQ c_zexp
+    AND    inact EQ ' '.
+  ENDIF.
+
+  LOOP AT i_jest INTO wa_jest.
+*Delete the Equipment Number from internal table which already have user status ZEXP
+    DELETE i_eqnum WHERE objnr EQ wa_jest-objnr.
+  ENDLOOP.
+
+*Exclude equipments where country key[ADRC-COUNTRY] EQ country of Company Code[T001-LAND1]
+
+*Get Country key of Equipment using Address Number from V_EQUI table and Country key from ADRC table
+  REFRESH: i_adrc.
+  IF NOT i_eqnum IS INITIAL.
+    SELECT addrnumber
+           country
+    FROM   adrc
+    INTO   TABLE i_adrc
+    FOR    ALL ENTRIES IN i_eqnum
+    WHERE  addrnumber EQ i_eqnum-adrnr.
+  ENDIF.
+
+*Get Country key of Company code
+  REFRESH: i_t001.
+  IF NOT i_eqnum IS INITIAL.
+    SELECT bukrs
+           land1
+    FROM   t001
+    INTO   TABLE i_t001
+    FOR    ALL ENTRIES IN i_eqnum
+    WHERE  bukrs EQ i_eqnum-bukrs.
+  ENDIF.
+
+*Modify internal table I_EQNUM to update Country Keys
+  CLEAR: wa_eqnum,
+         wa_adrc,
+         lv_index.
+  LOOP AT i_eqnum INTO wa_eqnum.
+    lv_index = sy-tabix.
+*Update country key of equipment
+    READ TABLE i_adrc INTO wa_adrc WITH KEY addrnumber = wa_eqnum-adrnr.
+    IF sy-subrc EQ 0.
+      wa_eqnum-country = wa_adrc-country.
+      MODIFY i_eqnum
+      INDEX  lv_index
+      FROM   wa_eqnum
+      TRANSPORTING country.
+    ENDIF.
+*Update country key of company code
+    READ TABLE i_t001 INTO wa_t001 WITH KEY bukrs = wa_eqnum-bukrs.
+    IF sy-subrc EQ 0.
+      wa_eqnum-land1 = wa_t001-land1.
+      MODIFY i_eqnum
+      INDEX  lv_index
+      FROM   wa_eqnum
+      TRANSPORTING land1.
+    ENDIF.
+    CLEAR: wa_eqnum,
+           wa_adrc,
+           wa_t001,
+           lv_index.
+  ENDLOOP.
+
+*Exclude Equipments whose country code is empty
+  DELETE i_eqnum WHERE country IS INITIAL.
+
+  REFRESH: i_temp.
+  APPEND LINES OF i_eqnum TO i_temp.
+  REFRESH: i_eqnum.
+  CLEAR: wa_eqnum.
+  LOOP AT i_temp INTO wa_eqnum.
+*Consider only Equiments where country key[ADRC-COUNTRY] NE country of Company Code[T001-LAND1]
+    IF wa_eqnum-country NE wa_eqnum-land1.
+      APPEND wa_eqnum TO i_eqnum.
+      CLEAR: wa_eqnum.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    " F100_GET_EQUIPMENTS
+
+*&---------------------------------------------------------------------*
+*&      Form  F200_SET_EQUIPMENT_USER_STATUS
+*&---------------------------------------------------------------------*
+*       Update User Staus on Equipments
+*----------------------------------------------------------------------*
+
+FORM f200_set_equipment_user_status .
+
+  CONSTANTS: c_obj TYPE c LENGTH 2 VALUE 'IE',
+             c_sts TYPE tj30t-stsma VALUE 'ZAM00004',
+             c_txt TYPE tj30t-txt04 VALUE 'ZEXP'.
+
+  DATA: i_jsto   TYPE STANDARD TABLE OF jsto,
+        wa_jsto  TYPE jsto,
+        lv_objnr TYPE jest-objnr,
+        lv_stat  TYPE tj30t-estat,
+        i_list   TYPE STANDARD TABLE OF ty_eqnum,
+        wa_list  TYPE ty_eqnum.
+
+*Get User Status code from TJ30T for User status ZEXP
+  CLEAR: lv_stat.
+  SELECT SINGLE estat
+  FROM   tj30t
+  INTO   lv_stat
+  WHERE  stsma EQ c_sts
+  AND    spras EQ sy-langu
+  AND    txt04 EQ c_txt.
+
+*Get Equipments which have status profile ZAM00004 from table JSTO
+  REFRESH: i_jsto.
+  IF NOT i_eqnum IS INITIAL.
+    SELECT *
+    FROM   jsto
+    INTO   TABLE i_jsto
+    FOR    ALL ENTRIES IN i_eqnum
+    WHERE  objnr EQ i_eqnum-objnr
+    AND    stsma EQ c_sts.
+  ENDIF.
+
+  IF p_test EQ 'X'.
+*Diplay the list of Equipments that get user status ZEXP
+    CLEAR: wa_eqnum,
+           wa_jsto,
+           wa_list.
+    REFRESH: i_list.
+
+    LOOP AT i_eqnum INTO wa_eqnum.
+      READ TABLE i_jsto INTO wa_jsto WITH KEY objnr = wa_eqnum-objnr.
+      IF sy-subrc EQ 0.
+*Consider only Equipments which have status profile ZAM00004
+        CLEAR: wa_list.
+        wa_list-equnr = wa_eqnum-equnr.
+        APPEND wa_list TO i_list.
+      ENDIF.
+      CLEAR: wa_eqnum,
+             wa_jsto,
+             wa_list.
+    ENDLOOP.
+
+    IF NOT i_list IS INITIAL.
+*Display report with list of equipments that will get user status ZEXP
+      SKIP 1.
+      WRITE:/ 'List of Equipments that will get user status ZEXP'(004).
+      SKIP 1.
+      LOOP AT i_list INTO wa_list.
+        WRITE AT /1 wa_list-equnr.
+      ENDLOOP.
+    ELSE.
+      SKIP 1.
+      WRITE AT 1 'No Equipments will get the user Status ZEXP'(002).
+    ENDIF.
+
+  ELSE.
+    CLEAR: wa_eqnum.
+    LOOP AT i_eqnum INTO wa_eqnum.
+      READ TABLE i_jsto INTO wa_jsto WITH KEY objnr = wa_eqnum-objnr.
+      IF sy-subrc EQ 0.
+*Consider only Equipments which have status profile ZAM00004
+
+        CONCATENATE c_obj wa_eqnum-equnr INTO lv_objnr.
+
+        CALL FUNCTION 'STATUS_CHANGE_EXTERN'
+          EXPORTING
+            client              = sy-mandt
+            objnr               = lv_objnr
+            user_status         = lv_stat
+          EXCEPTIONS
+            object_not_found    = 1
+            status_inconsistent = 2
+            status_not_allowed  = 3
+            OTHERS              = 4.
+        IF sy-subrc EQ 0.
+          COMMIT WORK.
+          CLEAR: wa_log.
+          wa_log-equnr  = wa_eqnum-equnr.
+          wa_log-msgty  = 'Success'(005).
+          wa_log-msgdes = 'User Status on Equipment has been set as ZEXP'(006).
+          APPEND wa_log TO i_log.
+        ELSE.
+          CLEAR: wa_log.
+          wa_log-equnr  = wa_eqnum-equnr.
+          wa_log-msgty  = 'Error'(007).
+          wa_log-msgdes = 'Error while updation;User Status has not been set.'(008).
+          APPEND wa_log TO i_log.
+        ENDIF.
+        CLEAR: wa_eqnum,
+               lv_objnr.
+      ELSE.
+*Exclude equipment that has no profile ZAM00004 and put message in the log
+        CLEAR: wa_log.
+        wa_log-equnr  = wa_eqnum-equnr.
+        wa_log-msgty  = 'Error'(007).
+        wa_log-msgdes = 'Equipment has no Status Profile ZAM00004'(009).
+        APPEND wa_log TO i_log.
+      ENDIF.
+    ENDLOOP.
+*Diplay log
+    CLEAR: wa_log.
+    IF  NOT i_log IS INITIAL.
+      SORT i_log BY msgty DESCENDING.
+      SKIP 1.
+      WRITE AT 1 'Equipment Number      Message Type       Message Description'(010).
+      WRITE /.
+      LOOP AT i_log INTO wa_log.
+        SHIFT wa_log-equnr LEFT DELETING LEADING space.
+        WRITE AT /1 wa_log-equnr.
+        WRITE AT 23 wa_log-msgty.
+        WRITE AT 42 wa_log-msgdes.
+      ENDLOOP.
+    ENDIF.
+  ENDIF.
+ENDFORM.                    " F200_SET_EQUIPMENT_USER_STATUS
+
+*Text symbol text£º
+*001:Selection Criteria
+*002:No Equipments will get the user Status ZEXP
+*003:No Equipments got the user Status ZEXP
+*004:List of Equipments that will get user status ZEXP
+*005:Success
+*006:User Status on Equipment has been set as ZEXP
+*007:Error
+*008:Error while updation;User Status has not been set.
+*009:Equipment has no Status Profile ZAM00004
+
+*010:Equipment Number      Message Type       Message Description
+*Selection text£º
+*P_TEST:        Test Result
+*P_VKORG:        Sales Organization
+*S_EQUNR:        Equipment

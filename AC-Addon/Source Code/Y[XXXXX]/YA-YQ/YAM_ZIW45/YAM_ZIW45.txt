@@ -1,0 +1,3894 @@
+*----------------------------------------------------------------------*
+* PROGRAM ID           : YAM_ZIW45                                     *
+* PROGRAM TITLE        : AM: Advanced cancellation of confirmations    *
+* AUTHOR               : Luc Mertens                                   *
+* DATE                 : 09/10/2006                                    *
+* DEVELOPMENT ID       : GAP116                                        *
+*                                                                      *
+* CHANGE REQUEST NUMBER: CD1K906974                                    *
+*                                                                      *
+* Program Description:  Program to cancel multiple confirmations at    *
+*                       once and to change the accounting indicator.   *
+*                       (copy from IW47)                               *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME     |CORRECTION NUMBER| CHANGE REFERENCE # *
+*----------------------------------------------------------------------*
+* MOD-001 |06/03/2010| AIR21243 |Move confirmations from between orders*
+*----------------------------------------------------------------------*
+* MOD-002 |29/10/2010| Lakshmi R|Update operations to another date     *
+*                                and/or another workcenter             *
+*                                CD1K960576 and CD1K961486             *
+*----------------------------------------------------------------------*
+* MOD-003 |12/01/2011| Lakshmi R|Update field AFRU-ISDD,not AFRU-BUDAT *
+*                                CD1K962285                            *
+*----------------------------------------------------------------------*
+* MOD-004 |11/04/2011| Lakshmi R|Bug Fix                               *
+*----------------------------------------------------------------------*
+* MOD-005 |08/04/2001| J. Smets | CD1K967701 | CR2007                  *
+************************************************************************
+REPORT yam_ziw45 MESSAGE-ID yam_re.
+
+*----------------------------------------------------------------------*
+* type-pool ALV                                                        *
+*----------------------------------------------------------------------*
+TYPE-POOLS: slis.
+
+*----------------------------------------------------------------------*
+* DB tables                                                            *
+*----------------------------------------------------------------------*
+TABLES: afru,                          " confirmation
+        viauf_afvc,                    " view orders & operation list
+        crhd,                          " work centers
+        t370a,                         " activity type of a transaction
+        tbmot,                         " accounting indicators
+        yam_conf_canc.                 " display structure mat. conf.
+
+*----------------------------------------------------------------------*
+* internal tables                                                      *
+*----------------------------------------------------------------------*
+* display structure
+DATA: BEGIN OF object_tab OCCURS 0.
+        INCLUDE STRUCTURE yam_conf_canc.
+DATA tplnr_int LIKE iflo-tplnr.
+DATA selected.
+DATA pm_selected TYPE pm_selected.
+DATA: END OF object_tab.
+
+*Begin of insert MOD-002
+DATA: BEGIN OF it_err_oper OCCURS 0.
+        INCLUDE STRUCTURE yam_conf_canc.
+DATA tplnr_int LIKE iflo-tplnr.
+DATA selected.
+DATA pm_selected TYPE pm_selected.
+DATA: END OF it_err_oper.
+*End of insert MOD-002
+
+* copy of object_tab because selection-flags are removed
+DATA: BEGIN OF object_tab2 OCCURS 0.
+        INCLUDE STRUCTURE yam_conf_canc.
+DATA tplnr_int LIKE iflo-tplnr.
+DATA selected.
+DATA pm_selected TYPE pm_selected.
+DATA: END OF object_tab2.
+
+* not used, needed for includes miolxtop, miolxf14, mioxf16
+DATA: sel_tab LIKE yam_conf_canc OCCURS 0 WITH HEADER LINE.
+
+DATA: BEGIN OF gt_return OCCURS 100.
+        INCLUDE STRUCTURE bapiret2.
+DATA: END OF gt_return.
+
+DATA: BEGIN OF i_logtab OCCURS 0,
+        msg(120)   TYPE c,
+      END OF i_logtab.
+
+DATA: BEGIN OF gt_canctc OCCURS 0,
+        rueck LIKE afru-rueck,
+        rmzhl LIKE afru-rmzhl,
+      END OF gt_canctc.
+
+DATA: gt_crhd LIKE crhd OCCURS 0,
+      gt_afwi LIKE afwi OCCURS 0 WITH HEADER LINE,
+      gt_conf TYPE afru OCCURS 0 WITH HEADER LINE.
+
+*----------------------------------------------------------------------*
+* global data                                                          *
+*----------------------------------------------------------------------*
+DATA: go_on VALUE '1',                                      " 0 or 1
+      gv_variant LIKE disvariant-variant,
+      gv_msg(120) TYPE c.
+
+DATA: g_header  LIKE bapi2017_gm_head_01,
+      g_headret LIKE bapi2017_gm_head_ret,
+      gt_item   TYPE bapi2017_gm_item_create OCCURS 0 WITH HEADER LINE,
+      g_goodsmvt_code_tmp TYPE bapi2017_gm_code,
+      g_mvt     TYPE bwart.
+
+* Begin of insert MOD-001
+DATA: lv_err_flag TYPE c,
+      lv_err_flag2 TYPE c,
+      lv_err_tec_clos_fr TYPE c,
+      lv_err_tec_clos_to TYPE c,
+      lv_err_from_lock_flg TYPE c,
+      lv_err_to_lock_flg TYPE c,
+      lv_err_locked_fr TYPE c,
+      lv_err_locked_to TYPE c,
+      lv_bukrs_from TYPE bukrs,
+      lv_bukrs_to TYPE bukrs,
+      lv_err_bukrs TYPE c,
+      lv_bukrs_text(50) TYPE c,
+      gv_objnr LIKE jest-objnr,
+      lt_return LIKE bapiret2 OCCURS 0 WITH HEADER LINE.
+* End of insert MOD-001
+
+*Begin of insert MOD-002
+DATA: wa_helpinfo  TYPE help_info,
+      i_dynpselect TYPE STANDARD TABLE OF dselc,
+      i_dval       TYPE STANDARD TABLE OF dval,
+      gv_selvalue  TYPE help_info-fldvalue.
+*End of insert MOD-002
+
+*Begin of insert MOD-004
+TYPES: BEGIN OF ty_delnewvornrs,
+         delvornr TYPE afvc-vornr,
+         newvornr TYPE afvc-vornr,
+       END OF ty_delnewvornrs.
+DATA:  i_delnewvornrs TYPE STANDARD TABLE OF ty_delnewvornrs,
+       wa_delnewvornrs TYPE ty_delnewvornrs.
+*End of insert MOD-004
+
+*----------------------------------------------------------------------*
+* constants                                                            *
+*----------------------------------------------------------------------*
+CONSTANTS: false           TYPE i VALUE 0,
+           true            TYPE i VALUE 1,
+           gc_time         TYPE num2       VALUE 1,
+           c_var_time      LIKE disvariant-variant VALUE '/TIME',
+           c_var_mat       LIKE disvariant-variant VALUE '/MATERIAL',
+           c_error         LIKE bapiret2-type VALUE 'E'.
+
+*----------------------------------------------------------------------*
+* selection screen                                                     *
+*----------------------------------------------------------------------*
+SELECTION-SCREEN BEGIN OF BLOCK b01 WITH FRAME TITLE text-b01.
+PARAMETERS: aufnr_o TYPE aufnr OBLIGATORY MATCHCODE OBJECT ordp.
+SELECTION-SCREEN END OF BLOCK b01.
+
+SELECTION-SCREEN SKIP.
+
+SELECTION-SCREEN BEGIN OF BLOCK b02 WITH FRAME TITLE text-b02.
+PARAMETERS: p_canct  TYPE c RADIOBUTTON GROUP radi DEFAULT 'X',
+            p_cctext TYPE afru-ltxa1,
+            p_chant  TYPE c RADIOBUTTON GROUP radi,
+            p_bemott TYPE afru-bemot.
+
+SELECTION-SCREEN ULINE.
+
+PARAMETERS: p_cancm  TYPE c RADIOBUTTON GROUP radi,
+            p_chanm  TYPE c RADIOBUTTON GROUP radi,
+            p_bemotm TYPE afru-bemot.
+
+SELECTION-SCREEN ULINE.
+
+PARAMETERS: p_rvsem  TYPE c RADIOBUTTON GROUP radi.
+
+SELECTION-SCREEN ULINE.
+
+*Begin of insert MOD-002
+PARAMETERS: p_labcon TYPE c RADIOBUTTON GROUP radi.
+PARAMETERS: p_arbpl TYPE gewrk,  "ARBPL
+            p_date  TYPE sy-datum.
+SELECTION-SCREEN ULINE.
+*End of insert MOD-002
+
+*Begin of insert MOD-001
+PARAMETERS: p_rebo TYPE c RADIOBUTTON GROUP radi.
+
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT (10) text-011 FOR FIELD p_auf_to.
+PARAMETERS: p_auf_to TYPE aufk-aufnr MATCHCODE OBJECT ordp.
+SELECTION-SCREEN POSITION 30.
+SELECTION-SCREEN COMMENT (33) text-010.
+SELECTION-SCREEN END OF LINE.
+*End of insert MOD-001
+
+SELECTION-SCREEN END   OF BLOCK b02.
+
+PARAMETERS:
+  dy_selm DEFAULT '0' NO-DISPLAY,      " selection mode
+  dy_tcode LIKE sy-tcode NO-DISPLAY,   " transaction
+  p_ocall NO-DISPLAY.                  " 'X' => prog called from
+*                                      "        pm order
+
+*----------------------------------------------------------------------*
+* includes                                                             *
+*----------------------------------------------------------------------*
+INCLUDE miolxtop.
+INCLUDE miolxf14.
+INCLUDE miolxf16.
+
+
+*Begin of insert MOD-002
+*----------------------------------------------------------------------*
+* AT SELECTION-SCREEN ON VALUE REQUEST FOR p_bemotm
+*----------------------------------------------------------------------*
+
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_arbpl.
+
+  CLEAR: wa_helpinfo,
+         gv_selvalue.
+
+  REFRESH: i_dynpselect,
+           i_dval.
+
+  wa_helpinfo-call      = 'M'.
+  wa_helpinfo-object    = 'F'.
+  wa_helpinfo-program   = sy-repid.
+  wa_helpinfo-dynpro    = sy-dynnr.
+  wa_helpinfo-tabname   = 'CAUFVD'.
+  wa_helpinfo-fieldname = 'VAPLZ'.
+  wa_helpinfo-fieldtype = 'CHAR'.
+  wa_helpinfo-keyword   = 'Mn.wk.ctr'.
+  wa_helpinfo-fldvalue  = '08'.
+  wa_helpinfo-mcobj     = '='.
+  wa_helpinfo-spras     = sy-langu.
+  wa_helpinfo-dynprofld = 'CAUFVD-VAPLZ'.
+  wa_helpinfo-tcode     = sy-tcode.
+
+  CALL FUNCTION 'DD_SHLP_CALL_FROM_DYNP'
+    EXPORTING
+      help_infos         = wa_helpinfo
+    IMPORTING
+*      SELECTION          =
+      select_value       = gv_selvalue
+*      RSMDY_RET          =
+    TABLES
+      dynpselect         = i_dynpselect
+      dynpvaluetab       = i_dval       .
+
+  IF sy-subrc EQ 0.
+    MOVE gv_selvalue TO p_arbpl.
+  ENDIF.
+*End of insert MOD-002
+
+*----------------------------------------------------------------------*
+* AT SELECTION-SCREEN ON block b02                                     *
+*----------------------------------------------------------------------*
+AT SELECTION-SCREEN ON BLOCK b02.
+
+  IF p_canct = 'X' AND
+     p_cctext IS INITIAL.
+    MESSAGE e301.
+  ENDIF.
+
+  IF p_chant = 'X' AND
+     p_bemott IS INITIAL.
+    MESSAGE e302.
+  ENDIF.
+
+  IF p_chanm = 'X' AND
+     p_bemotm IS INITIAL.
+    MESSAGE e302.
+  ENDIF.
+
+* Begin of insert MOD-001
+  IF p_rebo = 'X' AND
+     p_auf_to IS INITIAL.
+    MESSAGE e001(00) WITH text-e01.
+  ENDIF.
+
+  IF p_rebo = 'X' AND
+    p_auf_to IS NOT INITIAL.
+    PERFORM check_ord.
+  ENDIF.
+* End of insert MOD-001
+
+*Begin of insert MOD-002
+  IF p_labcon EQ 'X'.
+    IF p_arbpl IS INITIAL AND p_date IS INITIAL.
+      MESSAGE e321.
+    ENDIF.
+  ENDIF.
+*End of insert MOD-002
+
+*----------------------------------------------------------------------*
+* AT SELECTION-SCREEN ON p_bemott
+*----------------------------------------------------------------------*
+AT SELECTION-SCREEN ON p_bemott.
+
+  IF NOT p_bemott IS INITIAL.
+    SELECT SINGLE * FROM tbmot
+           WHERE bemot = p_bemott.
+    IF sy-subrc <> 0.
+      MESSAGE e058(00) WITH p_bemott '' '' 'table TBMOT'.
+    ENDIF.
+  ENDIF.
+
+*----------------------------------------------------------------------*
+* AT SELECTION-SCREEN ON p_bemotm
+*----------------------------------------------------------------------*
+AT SELECTION-SCREEN ON p_bemotm.
+
+  IF NOT p_bemotm IS INITIAL.
+    SELECT SINGLE * FROM tbmot
+           WHERE bemot = p_bemotm.
+    IF sy-subrc <> 0.
+      MESSAGE e058(00) WITH p_bemotm '' '' 'table TBMOT'.
+    ENDIF.
+  ENDIF.
+
+*----------------------------------------------------------------------*
+* at selection-screen                                                  *
+*----------------------------------------------------------------------*
+AT SELECTION-SCREEN.
+
+*--- immer Defaultvariante nehmen, da ALV-GRID diese immer nimmt
+* IF variant IS INITIAL.
+  IF p_canct = 'X' OR
+     p_chant = 'X' OR
+* Begin of insert MOD-001
+     p_rebo  = 'X' OR
+* End of insert MOD-001
+* Begin of insert MOD-002
+    p_labcon = 'X'.
+* End of insert MOD-002
+    gv_variant = c_var_time.
+    PERFORM get_default_variant_f14 USING gv_variant.
+  ELSE.
+    gv_variant = c_var_mat.
+    PERFORM get_default_variant_f14 USING gv_variant.
+  ENDIF.
+*--- Korrekte Listvariante ausgew#hlt ? -----------------------------*
+  PERFORM variant_existence_f14 USING gv_variant.
+
+
+*----------------------------------------------------------------------*
+* initialization                                                       *
+*----------------------------------------------------------------------*
+INITIALIZATION.
+
+* Transaction counter
+  CALL METHOD ycl_statistics=>record_transaction .
+
+* get aktype (display or change mode)
+  PERFORM get_acttype_afru_l.
+
+* initializes g_variant
+  PERFORM variant_init_f14 USING 'RMEL' 'RMEL' 'RMEL'.
+
+* fill g_fieldcat_tab
+  PERFORM create_fieldcat_f14 USING 'YAM_CONF_CANC'.
+
+* set parameters for portfolio
+  g_second_value = 'ISMNW'.
+  g_port_title1 = 'Hohe Anzahl, hohe Istarbeit'(po1).
+  g_port_title2 = 'Niedrige Anzahl, hohe Istarbeit'(po2).
+  g_port_title3 = 'Hohe Anzahl, niedrige Istarbeit'(po3).
+  g_port_title4 = 'Niedrige Anzahl, niedrige Istarbeit'(po4).
+  g_port_value_text = 'Istarbeit (h)'(p05).
+
+
+*----------------------------------------------------------------------*
+* start-of-selection                                                   *
+*----------------------------------------------------------------------*
+START-OF-SELECTION.
+
+  g_form_set_pf_stat = 'PF_STATUS_L'.
+
+* Begin of insert MOD-001
+  IF p_rebo = 'X'.
+    sy-title = 'AM: Advanced Rebooking of confirmations'.
+  ELSE.
+    sy-title = 'AM: Advanced cancellations of confirmations'.
+  ENDIF.
+* End of insert MOD-001
+* Begin of insert MOD-002
+  IF p_labcon = 'X'.
+    sy-title = 'AM: Updation of labour confirmations'.
+  ENDIF.
+*End of insert MOD-002
+
+  PERFORM determine_g_tcode_f16.
+  PERFORM get_acttype_afru_l.
+  PERFORM prepare_display_list_f14.
+  PERFORM update_fieldcat_variant_f14.
+  PERFORM check_fieldcat_variant_l.
+  PERFORM select_l.
+
+
+*----------------------------------------------------------------------*
+* end-of-selection                                                     *
+*----------------------------------------------------------------------*
+END-OF-SELECTION.
+
+  PERFORM display_list.
+
+
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_L
+*&---------------------------------------------------------------------*
+*       select data from the db
+*----------------------------------------------------------------------*
+FORM select_l.
+
+  REFRESH object_tab. CLEAR object_tab.
+
+  IF p_canct  = 'X'  OR
+     p_chant  = 'X'  OR
+     p_rebo   = 'X'  OR                "insert MOD-001
+     p_labcon = 'X'.                   "insert MOD-002
+    PERFORM select_1.                " operation list->time confirmation
+  ELSE.
+    PERFORM select_2.                " order->material confirmation
+  ENDIF.
+
+  DESCRIBE TABLE object_tab LINES sy-tabix.
+  IF sy-tabix = 0.
+    go_on = '0'.
+    MESSAGE s047(ih).
+  ENDIF.
+
+*--- Default sort -----------
+  IF p_canct  = 'X'  OR
+     p_chant  = 'X'  OR
+     p_rebo   = 'X'  OR                "insert MOD-001
+     p_labcon = 'X'.                   "insert MOD-002
+
+    SORT object_tab BY aufnr rueck rmzhl.
+  ELSE.
+    SORT object_tab BY aufnr mblnr mjahr zeile.
+  ENDIF.
+
+ENDFORM.                               " SELECT_L
+
+*&---------------------------------------------------------------------*
+*&      Form  USER_COMMAND_L
+*&---------------------------------------------------------------------*
+*       event user_command, called from ALV
+*----------------------------------------------------------------------*
+FORM user_command_l USING p_ucomm    LIKE sy-ucomm
+                          p_selfield TYPE slis_selfield.
+
+  DATA: lv_retcd LIKE sy-subrc.
+
+*Begin of insert MOD-002
+  TYPES: BEGIN OF ty_vornr2,
+           aufnr TYPE afko-aufnr,
+           aufpl TYPE afvc-aufpl,
+           vornr TYPE afvc-vornr,
+           objnr TYPE afvc-objnr,    "insert MOD-004
+         END OF ty_vornr2.
+
+  TYPES: BEGIN OF ty_afvc1,
+           aufnr TYPE afko-aufnr,
+           aufpl TYPE afvc-aufpl,
+           vornr TYPE afvc-vornr,
+           steus TYPE afvc-steus,
+           ltxa1 TYPE afvc-ltxa1,
+           waers TYPE afvc-waers,
+           anzzl TYPE afvc-anzzl,
+         END OF ty_afvc1.
+
+  DATA: i_vornr2     TYPE STANDARD TABLE OF ty_vornr2,
+        i_afvc1      TYPE STANDARD TABLE OF ty_afvc1,
+        wa_vornr2    TYPE ty_vornr2,
+        wa_afvc1     TYPE ty_afvc1.
+
+  DATA: i_methods   TYPE STANDARD TABLE OF bapi_alm_order_method,
+        i_operation TYPE STANDARD TABLE OF bapi_alm_order_operation,
+        i_operation_up  TYPE STANDARD TABLE OF bapi_alm_order_operation_up,
+        i_return        TYPE STANDARD TABLE OF bapiret2,
+        wa_methods      TYPE bapi_alm_order_method,
+        wa_return       TYPE bapiret2,
+        wa_operation    TYPE bapi_alm_order_operation,
+        wa_operationup  TYPE bapi_alm_order_operation_up,
+        lv_vaplz        TYPE gewrk.
+
+  DATA: BEGIN OF object_tab3 OCCURS 0.
+          INCLUDE STRUCTURE yam_conf_canc.
+  DATA tplnr_int LIKE iflo-tplnr.
+  DATA selected.
+  DATA pm_selected TYPE pm_selected.
+  DATA: END OF object_tab3.
+*End of insert MOD-002
+
+*Begin of MOD-004
+  TYPES: BEGIN OF ty_jest,
+           objnr TYPE j_objnr,
+           stat  TYPE j_status,
+           inact TYPE j_inact,
+         END OF ty_jest.
+  DATA: i_jest  TYPE STANDARD TABLE OF ty_jest,
+        wa_jest TYPE ty_jest.
+  DATA: lv_nextvornr TYPE afvc-vornr.
+*End of MOD-004
+
+  p_selfield-refresh = g_s.
+
+*--- pf2 umbiegen je nach modus (Ausw#hlen/Anzeigen) ---------------
+  PERFORM check_pf2_with_object_f16 USING p_ucomm.
+
+  PERFORM set_p_selfield_general_f16 USING p_selfield.
+
+  CASE p_ucomm.
+*   update list
+    WHEN 'AKTU'.
+      p_selfield-refresh = g_x.
+      PERFORM select_l.
+
+*   show order
+    WHEN 'AUFK'.
+      PERFORM fcodes_with_mark_f16 USING p_ucomm p_selfield.
+
+*   show confirmation
+    WHEN 'RMEL'.
+      PERFORM fcodes_with_mark_f16 USING p_ucomm p_selfield.
+
+*   show detail confirmation
+    WHEN 'IOBJ'.
+      p_ucomm = 'RMEL'.
+      PERFORM fcodes_with_mark_f16 USING p_ucomm p_selfield.
+
+*   cancel confirmation
+    WHEN 'STOR'.
+*.... copy object_tab because selection-flags will be removed
+      REFRESH object_tab2.
+      object_tab2[] = object_tab[].
+*.... check if no objects were selected
+      LOOP AT object_tab2 WHERE selected = 'X'.
+        EXIT.
+      ENDLOOP.
+      IF sy-subrc <> 0.
+        MESSAGE i011(ih).
+        CLEAR p_ucomm.
+      ENDIF.
+
+      PERFORM fcodes_with_mark_f16 USING p_ucomm p_selfield.
+
+      IF p_cancm = 'X'.
+*...... create GM for the ones which are NOT selected
+        LOOP AT object_tab2.
+          READ TABLE gt_canctc WITH KEY rueck = object_tab2-rueck
+                                        rmzhl = object_tab2-rmzhl.
+          IF sy-subrc = 0.
+            IF object_tab2-selected <> 'X'.
+*............ check if material is still locked
+              PERFORM check_mat_locked.
+
+              MOVE object_tab2 TO object_tab.
+              PERFORM create_goodsmvt USING object_tab2-bwart
+                                            'CRE'
+                                            object_tab2-yam_bemot_mat
+                                   CHANGING lv_retcd.
+            ELSE.
+*............ write message for the selected ones
+*............ Confirmation &1 &2 &3 has been cancelled
+              MESSAGE s303 WITH object_tab2-mblnr object_tab2-mjahr
+                                object_tab2-zeile
+                           INTO gv_msg.
+              PERFORM add_message_to_tab.
+            ENDIF.
+          ENDIF.
+        ENDLOOP.
+      ENDIF.
+      IF NOT i_logtab[] IS INITIAL.
+        PERFORM list_logtab.
+      ENDIF.
+
+*   change acc.indicator (= cancel + create new confirmation)
+    WHEN 'CHAN'.                       " change confirmation
+*.... copy object_tab because selection-flags will be removed
+      REFRESH object_tab2.
+      object_tab2[] = object_tab[].
+*.... check if no objects were selected
+      LOOP AT object_tab2 WHERE selected = 'X'.
+        EXIT.
+      ENDLOOP.
+      IF sy-subrc <> 0.
+        MESSAGE i011(ih).
+        CLEAR p_ucomm.
+      ENDIF.
+
+      PERFORM fcodes_with_mark_f16 USING p_ucomm p_selfield.
+
+      IF p_chanm = 'X'.
+*...... create GM for the ones which are selected and not selected
+        LOOP AT object_tab2.
+          READ TABLE gt_canctc WITH KEY rueck = object_tab2-rueck
+                                        rmzhl = object_tab2-rmzhl.
+          IF sy-subrc = 0.
+            IF object_tab2-selected = 'X'.
+*............ check if material is still locked
+              PERFORM check_mat_locked.
+
+              MOVE object_tab2 TO object_tab.
+              PERFORM create_goodsmvt USING object_tab2-bwart
+                                            'CRE'
+                                            p_bemotm
+                                   CHANGING lv_retcd.
+              IF lv_retcd = 0.
+*.............. Conf. &1 &2 has been created for &3 with acc.ind &4
+                MESSAGE s305 WITH g_headret-mat_doc g_headret-doc_year
+                          object_tab2-mblnr p_bemotm INTO gv_msg.
+                PERFORM add_message_to_tab.
+              ELSE.
+*.............. Conf. has not been created for &1 with acc.ind &2: &3
+                MESSAGE i306 WITH object_tab2-mblnr p_bemotm INTO gv_msg.
+                PERFORM add_message_to_tab.
+                CONCATENATE '   --> ' gt_return-message
+                            INTO gv_msg  SEPARATED BY space.
+                PERFORM add_message_to_tab.
+              ENDIF.
+            ELSE.
+*............ check if material is still locked
+              PERFORM check_mat_locked.
+
+              MOVE object_tab2 TO object_tab.
+              PERFORM create_goodsmvt USING object_tab2-bwart
+                                            'CRE'
+                                            object_tab2-yam_bemot_mat
+                                   CHANGING lv_retcd.
+            ENDIF.
+          ENDIF.
+        ENDLOOP.
+      ENDIF.
+      IF NOT i_logtab[] IS INITIAL.
+        PERFORM list_logtab.
+      ENDIF.
+
+*   reverse material confirmation
+    WHEN 'RVSE'.
+      PERFORM fcodes_with_mark_f16 USING p_ucomm p_selfield.
+      IF NOT i_logtab[] IS INITIAL.
+        PERFORM list_logtab.
+      ENDIF.
+
+* Begin of insert MOD-001
+*   rebook time confirmations between orders
+    WHEN 'REBO'.
+* Check if the order is locked or TECO/CLOSED
+      PERFORM check_ord.
+*.... copy object_tab because selection-flags will be removed
+      REFRESH object_tab2.
+      object_tab2[] = object_tab[].
+*.... check if no objects were selected
+      LOOP AT object_tab2 WHERE selected = 'X'.
+        EXIT.
+      ENDLOOP.
+      IF sy-subrc <> 0.
+        MESSAGE i011(ih).
+        CLEAR p_ucomm.
+      ENDIF.
+
+*Begin of insert MOD-002
+*If the operation line does not exist in new Service Order, create it
+      REFRESH: i_vornr2.
+      SELECT afko~aufnr
+             afvc~aufpl
+             afvc~vornr
+             afvc~objnr                               "insert MOD-004
+             INTO CORRESPONDING FIELDS OF TABLE i_vornr2
+             FROM afko
+             INNER JOIN afvc
+                        ON afko~aufpl = afvc~aufpl
+             WHERE afko~aufnr = p_auf_to.
+
+      REFRESH: i_jest.
+      IF NOT i_vornr2 IS INITIAL.
+        SELECT objnr
+               stat
+               inact
+               FROM jest
+               INTO TABLE i_jest
+               FOR ALL ENTRIES IN i_vornr2
+               WHERE objnr = i_vornr2-objnr
+                 AND stat  = 'I0013'
+                 AND inact = ' '.
+      ENDIF.
+
+      REFRESH: i_afvc1.
+      SELECT afko~aufnr
+             afvc~aufpl
+             afvc~vornr
+             afvc~steus
+             afvc~ltxa1
+             afvc~waers
+             afvc~anzzl
+             INTO CORRESPONDING FIELDS OF TABLE i_afvc1
+             FROM afko
+             INNER JOIN afvc
+                        ON afko~aufpl = afvc~aufpl
+             WHERE afko~aufnr = aufnr_o.
+
+      REFRESH:i_delnewvornrs.
+      LOOP AT object_tab2 WHERE selected = 'X'.
+        CLEAR wa_vornr2.
+*Check the operation exists in the new order
+        READ TABLE i_vornr2 INTO wa_vornr2
+                            WITH KEY vornr = object_tab2-vornr.
+        IF sy-subrc NE 0.
+          REFRESH: i_methods,
+                   i_operation,
+                   i_operation_up,
+                   i_return.
+          CLEAR:   wa_methods,
+                   wa_operation,
+                   wa_operationup.
+
+          wa_methods-objecttype = 'OPERATION'.
+          wa_methods-method     = 'CREATE'.
+          CONCATENATE p_auf_to
+                      object_tab2-vornr
+                      INTO wa_methods-objectkey.
+          wa_methods-refnumber  = '000001'.
+          APPEND wa_methods TO i_methods.
+
+          CLEAR wa_methods.
+          wa_methods-method = 'SAVE'.
+          APPEND wa_methods TO i_methods.
+
+          wa_operation-activity      = object_tab2-vornr.
+          wa_operation-work_cntr     = object_tab2-iarbpl.
+          wa_operation-plant         = object_tab2-werki.
+          wa_operation-acttype       = object_tab2-learr.
+          wa_operation-work_activity = object_tab2-arbei.
+          CLEAR: wa_afvc1.
+          READ TABLE i_afvc1 INTO wa_afvc1
+                             WITH KEY vornr = object_tab2-vornr.
+          IF sy-subrc EQ 0.
+            wa_operation-control_key  = wa_afvc1-steus.
+            wa_operation-description  = wa_afvc1-ltxa1.
+            wa_operation-currency     = wa_afvc1-waers.
+            wa_operation-number_of_capacities = wa_afvc1-anzzl.
+          ENDIF.
+          APPEND wa_operation TO i_operation.
+
+          wa_operationup-activity     = 'X'.
+          wa_operationup-control_key  = 'X'.
+          wa_operationup-work_cntr    = 'X'.
+          wa_operationup-plant        = 'X'.
+          wa_operationup-description  = 'X'.
+          wa_operationup-currency     = 'X'.
+          wa_operationup-number_of_capacities = 'X'.
+          wa_operationup-acttype       = 'X'.
+          wa_operationup-work_activity = 'X'.
+          APPEND wa_operationup TO i_operation_up.
+
+          CALL FUNCTION 'BAPI_ALM_ORDER_MAINTAIN'
+            TABLES
+              it_methods      = i_methods[]
+              it_operation    = i_operation[]
+              it_operation_up = i_operation_up[]
+              return          = i_return[].
+
+          LOOP AT i_return INTO wa_return
+                           WHERE type = 'E' OR type = 'A'.
+*............ Operation &1 has not been created for &2
+            MESSAGE i322 WITH object_tab2-vornr p_auf_to INTO gv_msg.
+            PERFORM add_message_to_tab.
+            CONCATENATE '   --> ' wa_return-message INTO gv_msg.
+            PERFORM add_message_to_tab.
+            APPEND object_tab2 TO it_err_oper.
+            EXIT.
+          ENDLOOP.
+          IF sy-subrc = 0.
+          ELSE.
+*.. commit the change
+            CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+              EXPORTING
+                wait = 'X'.
+*** MOD-005 * begin ***
+*           Store the created operation
+            CLEAR wa_vornr2.
+            wa_vornr2-aufnr = p_auf_to.
+            wa_vornr2-vornr = object_tab2-vornr.
+            APPEND wa_vornr2 TO i_vornr2.
+            SORT i_vornr2 BY vornr.
+*** MOD-005 * end ***
+          ENDIF.
+*Begin of insert MOD-004
+        ELSE.
+          CLEAR wa_jest.
+*Check the Deletion Flag is active for operation in the second order
+          READ TABLE i_jest INTO wa_jest
+                            WITH KEY objnr = wa_vornr2-objnr.
+          IF sy-subrc EQ 0.
+            CLEAR: wa_delnewvornrs.
+            READ TABLE i_delnewvornrs INTO wa_delnewvornrs
+                                      WITH KEY delvornr = object_tab2-vornr.
+            IF sy-subrc NE 0.
+*Create a new operation in the order with next free Operation Number
+              SORT i_vornr2 BY vornr DESCENDING.
+              CLEAR: lv_nextvornr.
+              lv_nextvornr = object_tab2-vornr + 1.
+              CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+                EXPORTING
+                  input  = lv_nextvornr
+                IMPORTING
+                  output = lv_nextvornr.
+              DO.
+                CLEAR: wa_vornr2.
+                READ TABLE i_vornr2 INTO wa_vornr2
+                                    WITH KEY vornr = lv_nextvornr.
+                IF sy-subrc EQ 0.
+                  lv_nextvornr = lv_nextvornr + 1.
+                  CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+                    EXPORTING
+                      input  = lv_nextvornr
+                    IMPORTING
+                      output = lv_nextvornr.
+                ELSE.
+                  EXIT.
+                ENDIF.
+              ENDDO.
+              CLEAR:  wa_delnewvornrs.
+              wa_delnewvornrs-delvornr = object_tab2-vornr.
+              CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+                EXPORTING
+                  input  = lv_nextvornr
+                IMPORTING
+                  output = lv_nextvornr.
+              wa_delnewvornrs-newvornr = lv_nextvornr.
+              APPEND wa_delnewvornrs TO i_delnewvornrs.
+
+              REFRESH: i_methods,
+                       i_operation,
+                       i_operation_up,
+                       i_return.
+              CLEAR:   wa_methods,
+                       wa_operation,
+                       wa_operationup.
+
+              wa_methods-objecttype = 'OPERATION'.
+              wa_methods-method     = 'CREATE'.
+              CONCATENATE p_auf_to
+                          lv_nextvornr
+                          INTO wa_methods-objectkey.
+              wa_methods-refnumber  = '000001'.
+              APPEND wa_methods TO i_methods.
+
+              CLEAR wa_methods.
+              wa_methods-method = 'SAVE'.
+              APPEND wa_methods TO i_methods.
+
+              wa_operation-activity      = lv_nextvornr.
+              wa_operation-work_cntr     = object_tab2-iarbpl.
+              wa_operation-plant         = object_tab2-werki.
+              wa_operation-acttype       = object_tab2-learr.
+              wa_operation-work_activity = object_tab2-arbei.
+              CLEAR: wa_afvc1.
+              READ TABLE i_afvc1 INTO wa_afvc1
+                                 WITH KEY vornr = object_tab2-vornr.
+              IF sy-subrc EQ 0.
+                wa_operation-control_key  = wa_afvc1-steus.
+                wa_operation-description  = wa_afvc1-ltxa1.
+                wa_operation-currency     = wa_afvc1-waers.
+                wa_operation-number_of_capacities = wa_afvc1-anzzl.
+              ENDIF.
+              APPEND wa_operation TO i_operation.
+
+              wa_operationup-activity     = 'X'.
+              wa_operationup-control_key  = 'X'.
+              wa_operationup-work_cntr    = 'X'.
+              wa_operationup-plant        = 'X'.
+              wa_operationup-description  = 'X'.
+              wa_operationup-currency     = 'X'.
+              wa_operationup-number_of_capacities = 'X'.
+              wa_operationup-acttype       = 'X'.
+              wa_operationup-work_activity = 'X'.
+              APPEND wa_operationup TO i_operation_up.
+
+              CALL FUNCTION 'BAPI_ALM_ORDER_MAINTAIN'
+                TABLES
+                  it_methods      = i_methods[]
+                  it_operation    = i_operation[]
+                  it_operation_up = i_operation_up[]
+                  return          = i_return[].
+
+              LOOP AT i_return INTO wa_return
+                               WHERE type = 'E' OR type = 'A'.
+*............ Operation &1 has not been created for &2
+                MESSAGE i322 WITH object_tab2-vornr p_auf_to INTO gv_msg.
+                PERFORM add_message_to_tab.
+                CONCATENATE '   --> ' wa_return-message INTO gv_msg.
+                PERFORM add_message_to_tab.
+                APPEND object_tab2 TO it_err_oper.
+                EXIT.
+              ENDLOOP.
+              IF sy-subrc = 0.
+              ELSE.
+*.. commit the change
+                CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+                  EXPORTING
+                    wait = 'X'.
+*** MOD-005 * begin ***
+*               Store the created operation
+                CLEAR wa_vornr2.
+                wa_vornr2-aufnr = p_auf_to.
+                wa_vornr2-vornr = lv_nextvornr.
+                APPEND wa_vornr2 TO i_vornr2.
+                SORT i_vornr2 BY vornr.
+*** MOD-005 * end ***
+              ENDIF.
+            ENDIF.
+          ENDIF.
+*End of insert MOD-004
+        ENDIF.
+      ENDLOOP.
+*End of insert MOD-002
+      PERFORM fcodes_with_mark_f16 USING p_ucomm p_selfield.
+
+      IF NOT i_logtab[] IS INITIAL.
+        PERFORM list_logtab.
+      ENDIF.
+* End of insert MOD-001
+
+*Begin of insert MOD-002
+    WHEN 'UPDA'.
+*.... copy object_tab because selection-flags will be removed
+      REFRESH object_tab2.
+      object_tab2[] = object_tab[].
+*.... check if no objects were selected
+      LOOP AT object_tab2 WHERE selected = 'X'.
+        EXIT.
+      ENDLOOP.
+      IF sy-subrc <> 0.
+        MESSAGE i011(ih).
+        CLEAR p_ucomm.
+      ENDIF.
+
+      PERFORM fcodes_with_mark_f16 USING p_ucomm p_selfield.
+
+      IF NOT i_logtab[] IS INITIAL.
+        PERFORM list_logtab.
+      ENDIF.
+*End of insert MOD-002
+
+*   display funtional location
+    WHEN 'TPAZ'.
+      PERFORM check_object_tab_marked_f14 USING p_ucomm p_selfield.
+      PERFORM func_location_l.
+
+*   display equipment
+    WHEN 'EQUI'.
+      PERFORM check_object_tab_marked_f14 USING p_ucomm p_selfield.
+      PERFORM equi_l.
+
+*   show longtext
+    WHEN 'LGTX'.
+      PERFORM fcodes_with_mark_f16 USING p_ucomm p_selfield.
+
+*   choose fields
+    WHEN g_ol0.
+      PERFORM refresh_l.
+
+*   choose fields
+    WHEN g_olx.
+      PERFORM refresh_l.
+
+*   change list variant
+    WHEN g_oad.
+      PERFORM refresh_l.
+
+*   display basic list
+    WHEN g_lis.
+      PERFORM refresh_l.
+
+*   others
+    WHEN OTHERS.
+      PERFORM user_command_f16 USING p_ucomm p_selfield.
+  ENDCASE.
+
+*--- If list is empty now - leave ALV
+  IF object_tab[] IS INITIAL AND g_variant_save NE g_x.
+    p_selfield-exit = g_x.
+    MESSAGE s047(ih).
+  ENDIF.
+
+ENDFORM.                               " USER_COMMAND_L
+
+*&---------------------------------------------------------------------*
+*&      Form  PF_STATUS_L
+*&---------------------------------------------------------------------*
+*       set pf-status, called from ALV
+*----------------------------------------------------------------------*
+*----------------------------------------------------------------------*
+FORM pf_status_l USING extab TYPE slis_t_extab.
+
+  APPEND 'V-A' TO extab.
+
+* Begin of insert MOD-001
+  IF NOT p_rebo IS INITIAL.
+    APPEND 'CHAN' TO extab.
+    APPEND 'EQUI' TO extab.
+    APPEND 'TPAZ' TO extab.
+    APPEND 'RVSE' TO extab.
+    APPEND 'STOR' TO extab.
+    APPEND 'UPDA' TO extab.     "insert MOD-002
+  ENDIF.
+* End of insert MOD-001
+* Begin of insert MOD-002
+  IF NOT p_labcon IS INITIAL.
+    APPEND 'CHAN' TO extab.
+    APPEND 'EQUI' TO extab.
+    APPEND 'TPAZ' TO extab.
+    APPEND 'RVSE' TO extab.
+    APPEND 'STOR' TO extab.
+    APPEND 'REBO' TO extab.
+  ENDIF.
+* End of insert MOD-002
+  IF NOT p_canct IS INITIAL.
+    APPEND 'CHAN' TO extab.
+    APPEND 'RVSE' TO extab.
+    APPEND 'REBO' TO extab.
+    APPEND 'UPDA' TO extab.     "insert MOD-002
+  ENDIF.
+
+  IF NOT p_chant IS INITIAL.
+    APPEND 'STOR' TO extab.
+    APPEND 'RVSE' TO extab.
+    APPEND 'REBO' TO extab.
+    APPEND 'UPDA' TO extab.     "insert MOD-002
+  ENDIF.
+
+  IF NOT p_cancm IS INITIAL.
+    APPEND 'CHAN' TO extab.
+    APPEND 'EQUI' TO extab.
+    APPEND 'TPAZ' TO extab.
+    APPEND 'RVSE' TO extab.
+    APPEND 'REBO' TO extab.
+    APPEND 'UPDA' TO extab.     "insert MOD-002
+  ENDIF.
+
+  IF NOT p_chanm IS INITIAL.
+    APPEND 'STOR' TO extab.
+    APPEND 'EQUI' TO extab.
+    APPEND 'TPAZ' TO extab.
+    APPEND 'RVSE' TO extab.
+    APPEND 'REBO' TO extab.
+    APPEND 'UPDA' TO extab.     "insert MOD-002
+  ENDIF.
+
+  IF NOT p_rvsem IS INITIAL.
+    APPEND 'CHAN' TO extab.
+    APPEND 'STOR' TO extab.
+    APPEND 'EQUI' TO extab.
+    APPEND 'TPAZ' TO extab.
+    APPEND 'REBO' TO extab.
+    APPEND 'UPDA' TO extab.     "insert MOD-002
+  ENDIF.
+
+  SET PF-STATUS 'MAIN' EXCLUDING extab.
+
+ENDFORM.                               " PF_STATUS_L
+
+*&---------------------------------------------------------------------*
+*&      Form  DISPLAY_LIST
+*&---------------------------------------------------------------------*
+*       display list
+*----------------------------------------------------------------------*
+FORM display_list.
+
+  DATA subrc LIKE sy-subrc.
+  DATA line  TYPE slis_fieldcat_alv.
+  DATA ucomm LIKE sy-ucomm.
+
+* do not allow sum
+  READ TABLE g_fieldcat_tab INTO line
+                            WITH KEY fieldname = 'ARBEI'.
+  line-no_sum = 'X'.
+  MODIFY g_fieldcat_tab FROM line INDEX sy-tabix.
+
+* ucomm = 'RMEL'.
+  CLEAR ucomm.
+  PERFORM display_list_f14 USING ucomm.
+
+ENDFORM.                               " DISPLAY_LIST
+
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_1
+*&---------------------------------------------------------------------*
+*       operation list-> time confirmation
+*----------------------------------------------------------------------*
+FORM select_1.
+
+  FIELD-SYMBOLS: <task> TYPE viauf_afvc_iflos,
+                 <conf> TYPE afru.
+
+  DATA: lt_task     TYPE STANDARD TABLE OF viauf_afvc_iflos,
+        lt_conf     TYPE STANDARD TABLE OF afru,
+        lt_jsto_pre TYPE STANDARD TABLE OF jsto_pre,
+        l_jsto_pre  TYPE jsto_pre,
+        ls_crid     TYPE crid,
+        lt_crid     TYPE crid_tab.
+
+  g_viewname = 'VIAUF_AFVC'.
+
+  SELECT * FROM (g_viewname)
+           INTO CORRESPONDING FIELDS OF TABLE lt_task
+           WHERE aufnr = aufnr_o.
+
+  ls_crid-objty = 'A'.
+  LOOP AT lt_task ASSIGNING <task>.
+    l_jsto_pre-objnr = <task>-objnr.
+    APPEND l_jsto_pre TO lt_jsto_pre.
+    ls_crid-objid = <task>-arbid.
+    COLLECT ls_crid INTO lt_crid.
+  ENDLOOP.
+
+  CALL FUNCTION 'STATUS_PRE_READ'
+    TABLES
+      jsto_pre_tab = lt_jsto_pre.
+
+  IF NOT lt_task[] IS INITIAL.
+    SELECT * FROM afru
+             INTO TABLE lt_conf
+             FOR ALL ENTRIES IN lt_task
+             WHERE rueck = lt_task-rueck.
+  ENDIF.
+
+*--- fill table for prefetch of workcenter
+  LOOP AT lt_conf ASSIGNING <conf>.
+    ls_crid-objid = <conf>-arbid.
+    COLLECT ls_crid INTO lt_crid.
+  ENDLOOP.
+
+* preselect work centers
+  PERFORM preselect_crhd USING lt_crid.
+
+* preselect AFWI
+  PERFORM preselect_afwi TABLES lt_conf.
+
+  SORT lt_task BY rueck.
+
+  LOOP AT lt_conf ASSIGNING <conf>.
+    IF <task> IS ASSIGNED.
+      IF <conf>-rueck NE <task>-rueck.
+        READ TABLE lt_task WITH KEY rueck = <conf>-rueck
+                           ASSIGNING <task>
+                           BINARY SEARCH.
+        CHECK sy-subrc IS INITIAL.
+      ENDIF.
+    ELSE.
+      READ TABLE lt_task WITH KEY rueck = <conf>-rueck
+                         ASSIGNING <task>
+                         BINARY SEARCH.
+      CHECK sy-subrc IS INITIAL.
+    ENDIF.
+
+    <task>-tplnr_int = <task>-tplnr.
+
+    PERFORM fill_object_tab USING <task>
+                                  <conf>.
+  ENDLOOP.
+
+ENDFORM.                                                    " SELECT_1
+
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_2
+*&---------------------------------------------------------------------*
+*       order-> material confirmation + time confirmation
+*----------------------------------------------------------------------*
+FORM select_2.
+
+  FIELD-SYMBOLS: <aufm> TYPE aufm.
+
+  DATA: lt_afwi  TYPE STANDARD TABLE OF afwi,
+        lt_aufm  TYPE STANDARD TABLE OF aufm.
+
+* Select material confirmations
+  SELECT * FROM aufm
+           INTO TABLE lt_aufm
+           WHERE aufnr = aufnr_o
+             AND bwart IN ('261', '262', '961', '962').
+
+* Preselect time confirmations
+  SELECT * FROM afru
+           INTO TABLE gt_conf
+           WHERE aufnr = aufnr_o.
+  SORT gt_conf BY rueck rmzhl.
+
+  IF NOT lt_aufm[] IS INITIAL.
+    PERFORM preselect_afwi TABLES gt_conf.
+  ENDIF.
+
+  SORT lt_aufm BY mblnr mjahr zeile.
+
+  LOOP AT lt_aufm ASSIGNING <aufm>.
+    PERFORM fill_object_tab_2 USING <aufm>.
+  ENDLOOP.
+
+ENDFORM.                                                    " SELECT_2
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_STATUS
+*&---------------------------------------------------------------------*
+*       get status text
+*----------------------------------------------------------------------*
+*      -->P_OBJNR  object number                                       *
+*----------------------------------------------------------------------*
+FORM get_status USING    p_objnr.
+
+  DATA: sttxt LIKE rihafvr-sttxt,      " system status
+        ustxt LIKE rihafvr-ustxt.      " user status
+
+  CALL FUNCTION 'STATUS_TEXT_EDIT'
+       EXPORTING
+*            CLIENT            = SY-MANDT
+            flg_user_stat     = 'X'
+            objnr             = p_objnr
+*            ONLY_ACTIVE       = 'X'
+            spras             = sy-langu
+       IMPORTING
+*            ANW_STAT_EXISTING =
+*            E_STSMA           =
+            line              = sttxt
+            user_line         = ustxt
+       EXCEPTIONS
+            object_not_found  = 1
+            OTHERS            = 2.
+
+  MOVE sttxt TO object_tab-sttxt.
+  MOVE ustxt TO object_tab-ustxt.
+
+ENDFORM.                               " GET_STATUS
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_ARBPL
+*&---------------------------------------------------------------------*
+*       read working center
+*----------------------------------------------------------------------*
+*  -->  arbid
+*  <--  arbpl
+*----------------------------------------------------------------------*
+FORM get_arbpl USING    arbid TYPE cr_objid
+               CHANGING arbpl TYPE arbpl.
+
+  DATA: l_crhd LIKE crhd.
+
+  READ TABLE gt_crhd INTO l_crhd
+                     WITH KEY objid = arbid
+                     BINARY SEARCH.
+
+  arbpl = l_crhd-arbpl.
+
+ENDFORM.                               " GET_ARBPL
+
+*&---------------------------------------------------------------------*
+*&      Form  FILL_OBJECT_TAB
+*&---------------------------------------------------------------------*
+*       fill object_tab with selected data
+*----------------------------------------------------------------------*
+FORM fill_object_tab USING i_task TYPE viauf_afvc_iflos
+                           i_conf TYPE afru.
+
+  DATA: idx TYPE i,
+        wa LIKE object_tab,
+        lt_afwi TYPE afwi,
+        l_vornr LIKE afvc-vornr.
+
+* get status
+  PERFORM get_status USING i_task-objnr.
+
+* if cancel
+  IF NOT i_conf-stzhl IS INITIAL.
+    i_conf-idaur = ( -1 ) * i_conf-idaur.
+    i_conf-odaur = ( -1 ) * i_conf-odaur.
+    i_conf-ofmnw = ( -1 ) * i_conf-ofmnw.
+    i_conf-ismnw = ( -1 ) * i_conf-ismnw.
+  ENDIF.
+
+  CLEAR object_tab.
+  MOVE-CORRESPONDING i_task TO object_tab.
+  MOVE-CORRESPONDING i_conf TO object_tab.
+
+* Systemstatus
+  PERFORM get_status USING i_task-objnr.
+
+* sub-operation ?
+  IF NOT i_task-sumnr IS INITIAL.
+    object_tab-uvorn = i_task-vornr.
+    SELECT SINGLE vornr INTO l_vornr
+           FROM afvc
+           WHERE aufpl = i_task-aufpl
+             AND aplzl = i_task-sumnr.
+    object_tab-vornr = l_vornr.
+  ELSE.
+    CLEAR object_tab-uvorn.
+  ENDIF.
+
+* check if material confirmation is linked
+  IF NOT i_conf-wablnr IS INITIAL.
+    MOVE 'X' TO object_tab-yam_mat_conf.
+  ELSE.
+    LOOP AT gt_afwi WHERE rueck = i_conf-rueck
+                      AND rmzhl = i_conf-rmzhl.
+      EXIT.
+    ENDLOOP.
+    IF sy-subrc = 0.
+      MOVE 'X' TO object_tab-yam_mat_conf.
+    ENDIF.
+  ENDIF.
+
+* name of employee and personal area
+  IF NOT object_tab-pernr IS INITIAL.
+    CALL FUNCTION 'RP_CHECK_PERNR'
+      EXPORTING
+        beg               = sy-datum
+        pnr               = object_tab-pernr
+      IMPORTING
+        name              = object_tab-name
+        persa             = object_tab-persa
+      EXCEPTIONS
+        data_fault        = 1
+        person_not_active = 2
+        person_unknown    = 3
+        exit_fault        = 4
+        pernr_missing     = 5
+        date_missing      = 6
+        OTHERS            = 7.
+  ENDIF.
+
+  IF NOT i_conf-ismnu IS INITIAL   AND
+     i_conf-ismne NE i_conf-ismnu.
+    CALL FUNCTION 'UNIT_CONVERSION_SIMPLE'
+      EXPORTING
+        input    = i_conf-ismnw
+        unit_in  = i_conf-ismne
+        unit_out = i_conf-ismnu
+      IMPORTING
+        output   = object_tab-ismnw.
+    object_tab-ismne = i_conf-ismnu.
+  ENDIF.
+
+  IF NOT i_conf-ofmnu IS INITIAL AND
+      i_conf-ofmne NE i_conf-ofmnu.
+    CALL FUNCTION 'UNIT_CONVERSION_SIMPLE'
+      EXPORTING
+        input    = i_conf-ofmnw
+        unit_in  = i_conf-ofmne
+        unit_out = i_conf-ofmnu
+      IMPORTING
+        output   = object_tab-ofmnw.
+    object_tab-ofmne = i_conf-ofmnu.
+  ENDIF.
+
+  PERFORM get_arbpl USING i_conf-arbid object_tab-iarbpl.
+  PERFORM get_arbpl USING i_task-arbid object_tab-parbpl.
+
+  object_tab-werki = i_conf-werks.
+  object_tab-pwerk = i_task-werks.
+
+* conversion exit func. loc.
+  WRITE i_task-tplnr_int TO object_tab-tplnr.
+
+  IF NOT i_conf-stzhl IS INITIAL.
+    READ TABLE object_tab INTO wa
+                          WITH KEY rueck = i_conf-rueck
+                                   rmzhl = i_conf-stzhl.
+    IF sy-subrc = 0.
+      idx = sy-tabix + 1.
+      INSERT object_tab INDEX idx.
+    ELSE.
+      APPEND object_tab.
+    ENDIF.
+  ELSE.
+    APPEND object_tab.
+  ENDIF.
+
+ENDFORM.                               " FILL_OBJECT_TAB
+
+*&---------------------------------------------------------------------*
+*&      Form  FILL_OBJECT_TAB_2
+*&---------------------------------------------------------------------*
+*       fill object_tab with selected data
+*----------------------------------------------------------------------*
+FORM fill_object_tab_2 USING i_aufm TYPE aufm.
+
+  DATA: lv_bemot LIKE mseg-bemot.
+
+  CLEAR object_tab.
+  MOVE-CORRESPONDING i_aufm TO object_tab.
+  MOVE i_aufm-budat TO object_tab-yam_budat.
+  IF i_aufm-shkzg = 'S'.
+    object_tab-menge = i_aufm-erfmg * -1.
+  ELSE.
+    object_tab-menge = i_aufm-erfmg.
+  ENDIF.
+
+* look for info from time confirmations
+  LOOP AT gt_conf WHERE wablnr = i_aufm-mblnr.
+    MOVE-CORRESPONDING gt_conf TO object_tab.
+    EXIT.
+  ENDLOOP.
+
+  IF sy-subrc NE 0.
+    LOOP AT gt_afwi WHERE mblnr = i_aufm-mblnr
+                      AND mjahr = i_aufm-mjahr
+                      AND mblpo = i_aufm-zeile.
+      MOVE gt_afwi-rueck TO object_tab-rueck.
+      MOVE gt_afwi-rmzhl TO object_tab-rmzhl.
+      EXIT.
+    ENDLOOP.
+    READ TABLE gt_conf WITH KEY rueck = object_tab-rueck
+                                rmzhl = object_tab-rmzhl.
+    IF sy-subrc = 0.
+      MOVE-CORRESPONDING gt_conf TO object_tab.
+    ENDIF.
+  ENDIF.
+
+  CLEAR lv_bemot.
+  SELECT SINGLE bemot
+         INTO lv_bemot
+         FROM mseg
+         WHERE mblnr = i_aufm-mblnr
+           AND mjahr = i_aufm-mjahr
+           AND zeile = i_aufm-zeile.
+
+  MOVE lv_bemot TO object_tab-yam_bemot_mat.
+
+  APPEND object_tab.
+
+ENDFORM.                               " FILL_OBJECT_TAB_2
+
+*---------------------------------------------------------------------*
+*       FORM FCODES_WITH_MARK_L                                       *
+*---------------------------------------------------------------------*
+*       FCodes, which can be proccessed in a loop                     *
+*---------------------------------------------------------------------*
+FORM fcodes_with_mark_l USING p_ucomm    LIKE sy-ucomm
+                              p_selfield TYPE slis_selfield.
+
+  DATA: h_ucomm LIKE sy-ucomm.
+
+  PERFORM mark_selected_f16 CHANGING object_tab-selected
+                                     object_tab-pm_selected.
+
+  CASE p_ucomm.
+*   show confirmation
+    WHEN 'RMEL'.
+      IF p_canct  = 'X' OR
+         p_chant  = 'X' OR
+         p_labcon = 'X' OR  "insert MOD-002
+         p_rebo   = 'X'.    "insert MOD-002
+        PERFORM confirmation_l USING object_tab-rueck
+                                     object_tab-rmzhl
+                                     object_tab-aufnr
+                                     'DISP'.
+      ELSE.
+        PERFORM confirmation_m USING object_tab-mblnr
+                                     object_tab-mjahr
+                                     object_tab-zeile
+                                     object_tab-aufnr
+                                     'DISP'.
+      ENDIF.
+
+*   cancel confirmation
+    WHEN 'STOR'.
+      IF p_canct = 'X' OR
+         p_chant = 'X'.
+        PERFORM confirmation_l USING object_tab-rueck
+                                     object_tab-rmzhl
+                                     object_tab-aufnr
+                                     'CANC'.
+      ELSE.
+        PERFORM confirmation_m USING object_tab-mblnr
+                                     object_tab-mjahr
+                                     object_tab-zeile
+                                     object_tab-aufnr
+                                     'CANC'.
+      ENDIF.
+*.... add underline to activity log
+      gv_msg = text-t05.
+      PERFORM add_message_to_tab.
+
+*   change acc.indicator (= cancel + create new confirmation)
+    WHEN 'CHAN'.
+      IF p_canct = 'X' OR
+         p_chant = 'X'.
+        PERFORM confirmation_l USING object_tab-rueck
+                                     object_tab-rmzhl
+                                     object_tab-aufnr
+                                     'CHAN'.
+      ELSE.
+        PERFORM confirmation_m USING object_tab-mblnr
+                                     object_tab-mjahr
+                                     object_tab-zeile
+                                     object_tab-aufnr
+                                     'CHAN'.
+      ENDIF.
+*.... add underline to activity log
+      gv_msg = text-t05.
+      PERFORM add_message_to_tab.
+
+*   reverse material confirmation
+    WHEN 'RVSE'.
+      PERFORM confirmation_m USING object_tab-mblnr
+                                   object_tab-mjahr
+                                   object_tab-zeile
+                                   object_tab-aufnr
+                                   'RVSE'.
+*.... add underline to activity log
+      gv_msg = text-t05.
+      PERFORM add_message_to_tab.
+
+* Begin of insert MOD-001
+    WHEN 'REBO'.
+      IF p_rebo = 'X'.
+        PERFORM confirmation_r USING object_tab-rueck
+                                     object_tab-rmzhl
+                                     object_tab-aufnr
+                                     'CHAN'.
+      ENDIF.
+* End of insert MOD-001
+
+* Begin of insert MOD-002
+    WHEN 'UPDA'.
+      PERFORM update_labour_confirmations USING object_tab-rueck
+                                                object_tab-rmzhl
+                                                object_tab-aufnr
+                                                'CHAN'.
+* Begin of insert MOD-002
+
+*   show order
+    WHEN 'AUFK'.
+      PERFORM order_l USING object_tab-aufnr.
+
+*   show longtext
+    WHEN 'LGTX'.
+      PERFORM longtext_l.
+  ENDCASE.
+
+ENDFORM.                    "fcodes_with_mark_l
+
+*&---------------------------------------------------------------------*
+*&      Form  CONFIRMATION_L
+*&---------------------------------------------------------------------*
+*       display confirmation
+*----------------------------------------------------------------------*
+*      -->P_OBJECT_TAB-RUECK                                           *
+*----------------------------------------------------------------------*
+FORM confirmation_l USING    p_rueck     TYPE co_rueck
+                             p_rmzhl     TYPE co_rmzhl
+                             p_aufnr     TYPE co_aufnr
+                             p_transflag TYPE c.
+
+  DATA: rueck      LIKE coruf-rueck,
+        aufnr      LIKE coruf-aufnr,
+        vornr      LIKE coruf-vornr,
+        rmzhl      LIKE coruf-rmzhl,
+        kapar      LIKE coruf-kapar,
+        tplnr      LIKE coruf-tplnr,
+        equnr      LIKE coruf-equnr,
+        rueck_ini  LIKE coruf-rueck,
+        aufnr_ini  LIKE coruf-aufnr,
+        vornr_ini  LIKE coruf-vornr,
+        rmzhl_ini  LIKE coruf-rmzhl,
+        kapar_ini  LIKE coruf-kapar,
+        tplnr_ini  LIKE coruf-tplnr,
+        equnr_ini  LIKE coruf-equnr,
+        l_tcode    LIKE sy-tcode,
+        l_retc     LIKE sy-subrc.
+
+  DATA: lv_lock            LIKE bapi_coru_param-locked,
+        lv_conf            TYPE confco,
+        lv_exit(1)         TYPE c,
+        lv_bemot           TYPE bemot,
+        lv_bemot_o         TYPE bemot,
+        lv_auart           TYPE auart,
+        ld_aufpl           TYPE co_aufpl,
+        ld_azlpl           TYPE cim_count,
+        lv_act_work        TYPE ismnw_2,
+        lv_conftext        LIKE bapi_alm_confirmation-conf_text,
+        lv_conf_no         TYPE confco-conf_no,
+        lv_conf_cnt        TYPE confco-conf_cnt,
+        ls_auart_bemot     TYPE yam_auart_bemot,
+        lv_bapiret2        TYPE bapiret2,
+        lt_return          TYPE TABLE OF bapiret2,
+        ls_return          TYPE bapiret2.
+
+  CONSTANTS: lc_x(1)       TYPE c          VALUE 'X'.
+
+  GET PARAMETER ID 'RCK' FIELD rueck.
+  GET PARAMETER ID 'ANR' FIELD aufnr.
+  GET PARAMETER ID 'VGN' FIELD vornr.
+  GET PARAMETER ID 'RZL' FIELD rmzhl.
+  GET PARAMETER ID 'CAA' FIELD kapar.
+  GET PARAMETER ID 'IFL' FIELD tplnr.
+  GET PARAMETER ID 'EQN' FIELD equnr.
+
+  SET PARAMETER ID 'ANR' FIELD aufnr_ini.
+  SET PARAMETER ID 'VGN' FIELD vornr_ini.
+  SET PARAMETER ID 'RZL' FIELD rmzhl_ini.
+  SET PARAMETER ID 'CAA' FIELD kapar_ini.
+  SET PARAMETER ID 'IFL' FIELD tplnr_ini.
+  SET PARAMETER ID 'EQN' FIELD equnr_ini.
+  SET PARAMETER ID 'RCK' FIELD p_rueck.
+  SET PARAMETER ID 'RZL' FIELD p_rmzhl.
+
+*--- set TCODE
+  CASE p_transflag.
+    WHEN 'DISP'.
+      l_tcode = 'IW43'.
+    WHEN 'CANC'.
+      l_tcode = 'IW45'.
+    WHEN 'CHAN'.
+      l_tcode = 'IW45'.
+  ENDCASE.
+
+*--- Authority Check for T-code
+  PERFORM auth_check_tcode_f16 USING    l_tcode
+                               CHANGING l_retc.
+
+*--- call transaction/BAPI
+  IF l_retc IS INITIAL AND NOT l_tcode IS INITIAL.
+    IF l_tcode = 'IW43'.
+      CALL TRANSACTION l_tcode AND SKIP FIRST SCREEN.
+      IMPORT return_code FROM MEMORY ID 'IW41'.
+      FREE MEMORY ID 'IW41'.
+    ELSE.
+      CLEAR lv_exit.
+      lv_conftext = p_cctext.
+
+      IF p_transflag = 'CHAN'.
+        IF p_bemott = object_tab-bemot.
+*........ Confirmation &1 &2 &3 has not been cancelled: &4
+*........ No difference in accounting indicator
+          MESSAGE i304 WITH p_aufnr p_rueck p_rmzhl INTO gv_msg.
+          PERFORM add_message_to_tab.
+          CONCATENATE '   --> ' text-t02 INTO gv_msg.
+          PERFORM add_message_to_tab.
+          lv_exit = lc_x.
+        ENDIF.
+
+        CHECK lv_exit <> lc_x.
+*...... Check if the acc.ind. may be changed
+        SELECT SINGLE bemot auart
+               INTO (lv_bemot_o, lv_auart)
+               FROM aufk
+               WHERE aufnr = p_aufnr.
+
+        SELECT SINGLE yam_bemot_to
+               INTO lv_bemot
+               FROM yam_accind_nochg
+               WHERE yam_bemot_from = lv_bemot_o
+                 AND yam_bemot_to   = p_bemott.
+
+        IF sy-subrc EQ 0.
+*........ Confirmation &1 &2 &3 has not been cancelled: &4
+*........ Accounting indicator may not be changed into: &1
+          MESSAGE i304 WITH p_aufnr p_rueck p_rmzhl INTO gv_msg.
+          PERFORM add_message_to_tab.
+          CONCATENATE '   --> ' text-t07 p_bemott INTO gv_msg.
+          PERFORM add_message_to_tab.
+          lv_exit = lc_x.
+        ENDIF.
+
+        CHECK lv_exit <> lc_x.
+*...... Check accounting indicator is valid for order type
+        SELECT SINGLE * INTO ls_auart_bemot
+               FROM yam_auart_bemot
+               WHERE auart = lv_auart
+                 AND bemot = p_bemott.
+
+        IF sy-subrc NE 0.
+*........ Confirmation &1 &2 &3 has not been cancelled: &4
+*........ Accounting indicator &1 not allowed for order type &2
+          MESSAGE i304 WITH p_aufnr p_rueck p_rmzhl INTO gv_msg.
+          PERFORM add_message_to_tab.
+          CONCATENATE '   --> ' text-t08 p_bemott
+                  text-t09 lv_auart INTO gv_msg SEPARATED BY space.
+          PERFORM add_message_to_tab.
+          lv_exit = lc_x.
+        ENDIF.
+
+        lv_conftext = text-t03.
+      ENDIF.
+
+      CHECK lv_exit <> lc_x.
+      CLEAR lv_bapiret2.
+      CLEAR lv_lock.
+* Cancel the time confirmation on the first order
+      CALL FUNCTION 'BAPI_ALM_CONF_CANCEL'
+            EXPORTING
+              confirmation              = p_rueck
+              confirmationcounter       = p_rmzhl
+              postgdate                 = sy-datum
+              conftext                  = lv_conftext
+            IMPORTING
+              return                    = lv_bapiret2
+              locked                    = lv_lock
+*              CREATED_CONF_NO           =
+*              CREATED_CONF_COUNT        =
+                    .
+
+      IF NOT lv_lock IS INITIAL.
+*...... Confirmation &1 &2 &3 has not been cancelled: lock conflict
+        MESSAGE i304 WITH p_aufnr p_rueck p_rmzhl INTO gv_msg.
+        PERFORM add_message_to_tab.
+        CONCATENATE '   --> ' text-t06 INTO gv_msg.
+        PERFORM add_message_to_tab.
+        EXIT.
+      ENDIF.
+
+      IF NOT lv_bapiret2 IS INITIAL.
+*...... Confirmation &1 &2 &3 has not been cancelled: &4
+        MESSAGE i304 WITH p_aufnr p_rueck p_rmzhl INTO gv_msg.
+        PERFORM add_message_to_tab.
+        CONCATENATE '   --> ' lv_bapiret2-message INTO gv_msg.
+        PERFORM add_message_to_tab.
+      ELSE.
+* -     COMMIT THE BAPI WHICH WILL FINALLY CANCEL THE CONFIRMATION
+        CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+          EXPORTING
+            wait = 'X'.
+
+        IF sy-subrc EQ 0.
+*........ Confirmation &1 &2 &3 has been cancelled
+          MESSAGE s303 WITH p_aufnr p_rueck p_rmzhl INTO gv_msg.
+          PERFORM add_message_to_tab.
+        ENDIF.
+
+*...... Check if confirmation has to be created with new acc.indicator
+        IF p_transflag = 'CHAN'.
+          REFRESH lt_return.
+
+          PERFORM fill_conf_to_create USING object_tab-rueck
+                                            object_tab-rmzhl
+                                            object_tab-uvorn
+                                            object_tab-iarbpl
+                                   CHANGING lv_conf
+                                            lv_act_work.
+
+          IF lv_conf IS INITIAL.
+*.......... Conf. has not been created for &1 with acc.ind &2: &3
+            MESSAGE i306 WITH p_aufnr p_bemott INTO gv_msg.
+            PERFORM add_message_to_tab.
+            CONCATENATE '   --> ' text-t04 INTO gv_msg.
+            PERFORM add_message_to_tab.
+            EXIT.
+          ENDIF.
+
+*........ Create new confirmation with new acc. indicator
+          CALL FUNCTION 'ALM_ME_TIME_CONF_CREATE_2'
+            EXPORTING
+*              POST_WRONG_ENTRIES         =
+              confirmation_item          = lv_conf
+              act_work                   = lv_act_work
+            IMPORTING
+              confirmation_number        = lv_conf_no
+              confirmation_counter       = lv_conf_cnt
+            TABLES
+              return                     = lt_return.
+
+          IF NOT lt_return[] IS INITIAL.
+            LOOP AT lt_return INTO ls_return.
+*............ Conf. has not been created for &1 with acc.ind &2: &3
+              MESSAGE i306 WITH p_aufnr p_bemott INTO gv_msg.
+              PERFORM add_message_to_tab.
+              CONCATENATE '   --> ' ls_return-message INTO gv_msg.
+              PERFORM add_message_to_tab.
+              EXIT.
+            ENDLOOP.
+          ELSE.
+            COMMIT WORK AND WAIT.
+
+            IF sy-subrc EQ 0.
+*............ Conf. &1 &2 has been created for &3 with acc.ind &4
+              MESSAGE s305 WITH lv_conf_no lv_conf_cnt
+                         p_aufnr p_bemott INTO gv_msg.
+              PERFORM add_message_to_tab.
+
+            ENDIF.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+  SET PARAMETER ID 'RCK' FIELD rueck.
+  SET PARAMETER ID 'ANR' FIELD aufnr.
+  SET PARAMETER ID 'VGN' FIELD vornr.
+  SET PARAMETER ID 'RZL' FIELD rmzhl.
+  SET PARAMETER ID 'CAA' FIELD kapar.
+  SET PARAMETER ID 'IFL' FIELD tplnr.
+  SET PARAMETER ID 'EQN' FIELD equnr.
+
+ENDFORM.                               " DISP_CONFIRMATION
+
+* Begin of insert MOD-001
+*&---------------------------------------------------------------------*
+*&      Form  CONFIRMATION_R
+*&---------------------------------------------------------------------*
+*       Rebook confirmation
+*----------------------------------------------------------------------*
+*      -->P_OBJECT_TAB-RUECK                                           *
+*----------------------------------------------------------------------*
+FORM confirmation_r USING    p_rueck     TYPE co_rueck
+                             p_rmzhl     TYPE co_rmzhl
+                             p_aufnr     TYPE co_aufnr
+                             p_transflag TYPE c.
+
+  DATA: rueck LIKE coruf-rueck,
+        aufnr LIKE coruf-aufnr,
+        vornr LIKE coruf-vornr,
+        rmzhl LIKE coruf-rmzhl,
+        kapar LIKE coruf-kapar,
+        tplnr LIKE coruf-tplnr,
+        equnr LIKE coruf-equnr,
+        rueck_ini LIKE coruf-rueck,
+        aufnr_ini LIKE coruf-aufnr,
+        vornr_ini LIKE coruf-vornr,
+        rmzhl_ini LIKE coruf-rmzhl,
+        kapar_ini LIKE coruf-kapar,
+        tplnr_ini LIKE coruf-tplnr,
+        equnr_ini LIKE coruf-equnr,
+        l_tcode   LIKE sy-tcode,
+        l_retc    LIKE sy-subrc.
+
+  DATA: lv_lock            LIKE bapi_coru_param-locked,
+        lv_conf            TYPE confco,
+        lv_exit(1)         TYPE c,
+        lv_bemot           TYPE bemot,
+        lv_bemot_o         TYPE bemot,
+        lv_bemot_n         TYPE bemot,
+        lv_auart           TYPE auart,
+        lv_auart_o         TYPE auart,
+        ld_aufpl           TYPE co_aufpl,
+        ld_azlpl           TYPE cim_count,
+        lv_act_work        TYPE ismnw_2,
+        lv_conftext        LIKE bapi_alm_confirmation-conf_text,
+        lv_conf_no         TYPE confco-conf_no,
+        lv_conf_cnt        TYPE confco-conf_cnt,
+        ls_auart_bemot     TYPE yam_auart_bemot,
+        lv_bapiret2        TYPE bapiret2,
+        lt_return          TYPE TABLE OF bapiret2,
+        ls_return          TYPE bapiret2.
+
+  CONSTANTS: lc_x(1)       TYPE c          VALUE 'X'.
+
+  GET PARAMETER ID 'RCK' FIELD rueck.
+  GET PARAMETER ID 'ANR' FIELD aufnr.
+  GET PARAMETER ID 'VGN' FIELD vornr.
+  GET PARAMETER ID 'RZL' FIELD rmzhl.
+  GET PARAMETER ID 'CAA' FIELD kapar.
+  GET PARAMETER ID 'IFL' FIELD tplnr.
+  GET PARAMETER ID 'EQN' FIELD equnr.
+
+  SET PARAMETER ID 'ANR' FIELD aufnr_ini.
+  SET PARAMETER ID 'VGN' FIELD vornr_ini.
+  SET PARAMETER ID 'RZL' FIELD rmzhl_ini.
+  SET PARAMETER ID 'CAA' FIELD kapar_ini.
+  SET PARAMETER ID 'IFL' FIELD tplnr_ini.
+  SET PARAMETER ID 'EQN' FIELD equnr_ini.
+  SET PARAMETER ID 'RCK' FIELD p_rueck.
+  SET PARAMETER ID 'RZL' FIELD p_rmzhl.
+
+*--- set TCODE
+  CASE p_transflag.
+    WHEN 'DISP'.
+      l_tcode = 'IW43'.
+    WHEN 'CANC'.
+      l_tcode = 'IW45'.
+    WHEN 'CHAN'.
+      l_tcode = 'IW45'.
+  ENDCASE.
+
+*--- Authority Check for T-code
+  PERFORM auth_check_tcode_f16 USING    l_tcode
+                               CHANGING l_retc.
+
+*--- call transaction/BAPI
+  IF l_retc IS INITIAL AND NOT l_tcode IS INITIAL.
+    IF l_tcode = 'IW43'.
+      CALL TRANSACTION l_tcode AND SKIP FIRST SCREEN.
+      IMPORT return_code FROM MEMORY ID 'IW41'.
+      FREE MEMORY ID 'IW41'.
+    ELSE.
+      CLEAR lv_exit.
+      lv_conftext = p_cctext.
+
+      IF p_transflag = 'CHAN'.
+*Begin of insert MOD-002
+        READ TABLE it_err_oper WITH KEY aufnr = object_tab-aufnr
+                                        vornr = object_tab-vornr.
+        IF sy-subrc EQ 0.
+*........ Confirmation &1 &2 &3 has not been cancelled: &4
+*........ Operation has not been created in second order
+          MESSAGE i304 WITH p_aufnr p_rueck p_rmzhl INTO gv_msg.
+          PERFORM add_message_to_tab.
+          CONCATENATE '   --> '
+                      'Operation'
+                      object_tab-vornr
+                      'has not been created in Second Order'
+                      p_auf_to
+                      INTO gv_msg
+                      SEPARATED BY space.
+          PERFORM add_message_to_tab.
+          lv_exit = lc_x.
+        ENDIF.
+*End of insert MOD-002
+
+        CHECK lv_exit <> lc_x.
+
+        CLEAR lv_bemot_n.
+*...... Retrieve accounting indicator at header of second order
+        SELECT SINGLE bemot
+               INTO (lv_bemot_n)
+               FROM aufk
+               WHERE aufnr = p_auf_to.
+
+*...... Check accounting indicator is valid for order type of new order
+*        SELECT SINGLE * INTO ls_auart_bemot
+*           FROM yam_auart_bemot
+*           WHERE auart EQ lv_auart_o
+*             AND bemot EQ lv_bemot_o.
+*
+*        IF sy-subrc NE 0.
+**........ Confirmation &1 &2 &3 has not been cancelled: &4
+**........ Accounting indicator &1 not allowed for order type &2
+*          MESSAGE i304 WITH p_aufnr p_rueck p_rmzhl INTO gv_msg.
+*          PERFORM add_message_to_tab.
+*          concatenate '   --> ' text-t08 p_bemott
+*                  text-t09 lv_auart into gv_msg separated by space.
+*          PERFORM add_message_to_tab.
+*          lv_exit = lc_x.
+*        ENDIF.
+        lv_conftext = text-t13.
+      ENDIF.
+
+      CHECK lv_exit <> lc_x.
+      CLEAR lv_bapiret2.
+      CLEAR lv_lock.
+* Cancel the time confirmation on the first order
+      CALL FUNCTION 'BAPI_ALM_CONF_CANCEL'
+            EXPORTING
+              confirmation              = p_rueck
+              confirmationcounter       = p_rmzhl
+              postgdate                 = sy-datum
+              conftext                  = lv_conftext
+            IMPORTING
+              return                    = lv_bapiret2
+              locked                    = lv_lock
+*              CREATED_CONF_NO           =
+*              CREATED_CONF_COUNT        =
+                    .
+
+      IF NOT lv_lock IS INITIAL.
+*...... Confirmation &1 &2 &3 has not been cancelled: lock conflict
+        MESSAGE i304 WITH p_aufnr p_rueck p_rmzhl INTO gv_msg.
+        PERFORM add_message_to_tab.
+        CONCATENATE '   --> ' text-t06 INTO gv_msg.
+        PERFORM add_message_to_tab.
+        EXIT.
+      ENDIF.
+
+      IF NOT lv_bapiret2 IS INITIAL.
+*...... Confirmation &1 &2 &3 has not been cancelled: &4
+        MESSAGE i304 WITH p_aufnr p_rueck p_rmzhl INTO gv_msg.
+        PERFORM add_message_to_tab.
+        CONCATENATE '   --> ' lv_bapiret2-message INTO gv_msg.
+        PERFORM add_message_to_tab.
+      ELSE.
+* -     COMMIT THE BAPI WHICH WILL FINALLY CANCEL THE CONFIRMATION
+        CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+          EXPORTING
+            wait = 'X'.
+
+        IF sy-subrc EQ 0.
+*........ Confirmation &1 &2 &3 has been cancelled
+          MESSAGE s303 WITH p_aufnr p_rueck p_rmzhl INTO gv_msg.
+          PERFORM add_message_to_tab.
+        ENDIF.
+
+*...... Check if confirmation has to be created with new acc.indicator
+        IF p_transflag = 'CHAN'.
+          REFRESH lt_return.
+
+          PERFORM fill_conf_to_rebook USING object_tab-rueck
+                                            object_tab-rmzhl
+                                            object_tab-uvorn
+                                            object_tab-iarbpl
+                                            lv_bemot_n
+                                   CHANGING lv_conf
+                                            lv_act_work.
+
+          IF lv_conf IS INITIAL.
+*.......... Conf. has not been created for &1 with acc.ind &2: &3
+            MESSAGE i306 WITH p_auf_to lv_bemot_n INTO gv_msg.
+            PERFORM add_message_to_tab.
+            CONCATENATE '   --> ' text-t04 INTO gv_msg.
+            PERFORM add_message_to_tab.
+            EXIT.
+          ENDIF.
+
+*........ Create new confirmation with new acc. indicator
+          CALL FUNCTION 'ALM_ME_TIME_CONF_CREATE_2'
+            EXPORTING
+*              POST_WRONG_ENTRIES         =
+              confirmation_item          = lv_conf
+              act_work                   = lv_act_work
+            IMPORTING
+              confirmation_number        = lv_conf_no
+              confirmation_counter       = lv_conf_cnt
+            TABLES
+              return                     = lt_return.
+
+          IF NOT lt_return[] IS INITIAL.
+            LOOP AT lt_return INTO ls_return.
+*............ Conf. has not been created for &1 with acc.ind &2: &3
+              MESSAGE i306 WITH p_auf_to lv_bemot_n INTO gv_msg.
+              PERFORM add_message_to_tab.
+              CONCATENATE '   --> ' ls_return-message INTO gv_msg.
+              PERFORM add_message_to_tab.
+              EXIT.
+            ENDLOOP.
+          ELSE.
+            COMMIT WORK AND WAIT.
+
+            IF sy-subrc EQ 0.
+*............ Conf. &1 &2 has been created for &3 with acc.ind &4
+              MESSAGE s305 WITH lv_conf_no lv_conf_cnt
+                                p_auf_to lv_bemot_n
+                           INTO gv_msg.
+              PERFORM add_message_to_tab.
+
+            ENDIF.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+  SET PARAMETER ID 'RCK' FIELD rueck.
+  SET PARAMETER ID 'ANR' FIELD aufnr.
+  SET PARAMETER ID 'VGN' FIELD vornr.
+  SET PARAMETER ID 'RZL' FIELD rmzhl.
+  SET PARAMETER ID 'CAA' FIELD kapar.
+  SET PARAMETER ID 'IFL' FIELD tplnr.
+  SET PARAMETER ID 'EQN' FIELD equnr.
+
+ENDFORM.                               " DISP_CONFIRMATION
+* End of insert MOD-001
+
+*&---------------------------------------------------------------------*
+*&      Form  ORDER_L
+*&---------------------------------------------------------------------*
+*       display order
+*----------------------------------------------------------------------*
+*      -->P_OBJECT_TAB-AUFNR                                           *
+*----------------------------------------------------------------------*
+FORM order_l USING    p_aufnr TYPE aufnr.
+
+  DATA: aufnr LIKE afru-aufnr.
+
+  GET PARAMETER ID 'ANR' FIELD aufnr.
+  SET PARAMETER ID 'ANR' FIELD p_aufnr.
+  CALL TRANSACTION 'IW33' AND SKIP FIRST SCREEN.
+  IMPORT return_code FROM MEMORY ID 'PMWOC'.
+  FREE MEMORY ID  'PMWOC'.
+  SET PARAMETER ID 'ANR' FIELD aufnr.
+
+ENDFORM.                               " ORDER_L
+
+*&---------------------------------------------------------------------*
+*&      Form  FUNCT_LOCATION_L
+*&---------------------------------------------------------------------*
+*       display functional location
+*----------------------------------------------------------------------*
+FORM func_location_l.
+
+  DATA: subrc LIKE sy-subrc.
+  DATA: tcode LIKE sy-tcode.
+  RANGES tplnr FOR object_tab-tplnr_int.
+
+  tcode = 'IH06'.
+
+  PERFORM auth_check_tcode_f16 USING    tcode
+                               CHANGING subrc.
+
+  IF subrc IS INITIAL.
+    LOOP AT object_tab WHERE selected = yes OR selected = g_x.
+      PERFORM mark_selected_f16 CHANGING object_tab-selected
+                                         object_tab-pm_selected.
+      CHECK NOT object_tab-tplnr_int IS INITIAL.
+      CLEAR tplnr.
+      tplnr-option = 'EQ'.
+      tplnr-sign = 'I'.
+      tplnr-low = object_tab-tplnr_int.
+      COLLECT tplnr.
+    ENDLOOP.
+    IF tplnr IS INITIAL.
+      IF object_tab-pm_selected <> space.
+        MESSAGE i077.
+      ELSE.
+        MESSAGE i011.
+      ENDIF.
+    ELSE.
+      SUBMIT riiflo20 WITH tplnr IN tplnr
+                      WITH dy_tcode = tcode
+                      AND RETURN.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                               " FUNC_LOCATION_L
+
+*&---------------------------------------------------------------------*
+*&      Form  EQUI_L  I
+*&---------------------------------------------------------------------*
+*       display equi
+*----------------------------------------------------------------------*
+FORM equi_l.
+
+  DATA: subrc LIKE sy-subrc.
+  DATA: tcode LIKE sy-tcode.
+  RANGES equnr FOR object_tab-equnr.
+
+  tcode = 'IH08'.
+
+  PERFORM auth_check_tcode_f16 USING    tcode
+                               CHANGING subrc.
+  IF subrc IS INITIAL.
+    LOOP AT object_tab WHERE selected = yes OR selected = g_x.
+      PERFORM mark_selected_f16 CHANGING object_tab-selected
+                                         object_tab-pm_selected.
+      CHECK NOT object_tab-equnr IS INITIAL.
+      CLEAR equnr.
+      equnr-sign = 'I'.
+      equnr-option = 'EQ'.
+      equnr-low = object_tab-equnr.
+      COLLECT equnr.
+    ENDLOOP.
+    IF equnr IS INITIAL.
+      IF object_tab-pm_selected <> space.
+        MESSAGE i079.
+      ELSE.
+        MESSAGE i011.
+      ENDIF.
+    ELSE.
+      SUBMIT riequi20 WITH equnr IN equnr
+                      WITH dy_tcode = tcode
+                      AND RETURN.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                               " EQUI_L
+
+*&---------------------------------------------------------------------*
+*&      Form  LONGTEXT_L
+*&---------------------------------------------------------------------*
+*       show longtext
+*----------------------------------------------------------------------*
+FORM longtext_l.
+
+  DATA: txt_name(30).
+  DATA: string1(30).
+  DATA: string2(30).
+  DATA: string3(30).
+  DATA: h_result LIKE itcer.
+  DATA: h_txtsp  LIKE afru-txtsp.
+
+  WRITE object_tab-mandt TO string1.
+  WRITE object_tab-rueck TO string2.
+  WRITE object_tab-rmzhl TO string3.
+
+  CONDENSE string1.
+  CONDENSE string2.
+  CONDENSE string3.
+
+  CONCATENATE string1 string2 string3 INTO txt_name.
+
+*--- select language of compf.confirmation
+  SELECT SINGLE txtsp INTO h_txtsp
+         FROM afru
+         WHERE rueck = object_tab-rueck
+           AND rmzhl = object_tab-rmzhl.
+
+  IF h_txtsp IS INITIAL.
+    MESSAGE s243(bs).
+    EXIT.
+  ENDIF.
+
+  CALL FUNCTION 'LANGTEXT_ONLY'
+    EXPORTING
+      object    = 'AUFK'
+      object_nr = txt_name
+      spras     = h_txtsp
+      txtid     = 'RMEL'
+      x_xaktyp  = 'A'
+    IMPORTING
+      RESULT    = h_result
+    EXCEPTIONS
+      OTHERS    = 0.
+
+*--- Longtext left with pf15 -> end of loop-session (popup)
+  IF h_result-userexit = 'E'.
+    return_code = 8.
+  ENDIF.
+
+ENDFORM.                               " LONGTEXT_L
+
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_FIELDCAT_VARIANT_L
+*&---------------------------------------------------------------------*
+*       set disp. fields if no list variant exists
+*----------------------------------------------------------------------*
+FORM check_fieldcat_variant_l.
+
+  DATA fieldcat_wa TYPE slis_fieldcat_alv.
+  DATA index       LIKE sy-tabix.
+
+  index = 1.
+
+  DESCRIBE TABLE g_selfields_tab LINES sy-tabix.
+  IF sy-tabix IS INITIAL.
+    LOOP AT g_fieldcat_tab INTO fieldcat_wa.
+      CASE fieldcat_wa-fieldname.
+        WHEN 'PM_SELECTED'.
+          fieldcat_wa-no_out  = space.
+          fieldcat_wa-col_pos = 1.
+        WHEN 'RUECK'.
+          fieldcat_wa-no_out  = space.
+          fieldcat_wa-col_pos = 2.
+        WHEN 'RMZHL'.
+          fieldcat_wa-no_out  = space.
+          fieldcat_wa-col_pos = 3.
+        WHEN 'ERSDA'.
+          fieldcat_wa-no_out  = space.
+          fieldcat_wa-col_pos = 4.
+        WHEN 'ERNAM'.
+          fieldcat_wa-no_out  = space.
+          fieldcat_wa-col_pos = 5.
+        WHEN 'AUFNR'.
+          fieldcat_wa-no_out = space.
+          fieldcat_wa-col_pos = 6.
+        WHEN OTHERS.
+          fieldcat_wa-no_out = g_x.
+      ENDCASE.
+      MODIFY g_fieldcat_tab FROM fieldcat_wa.
+    ENDLOOP.
+  ENDIF.
+
+  PERFORM create_g_selfields_tab_f14.
+
+ENDFORM.                               " CHECK_FIELDCAT_VARIANT_L
+
+*&---------------------------------------------------------------------*
+*&      Form  REFRESH_L
+*&---------------------------------------------------------------------*
+*       refresh fieldcatalog g_fidcat_tab
+*----------------------------------------------------------------------*
+FORM refresh_l.
+
+  DATA ucomm LIKE sy-ucomm.
+
+  PERFORM get_fieldcat_actual_f14 USING ucomm.
+
+ENDFORM.                               " REFRESH_L
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_ACTTYPE_AFRU_L
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM get_acttype_afru_l.
+
+  SELECT SINGLE * FROM t370a
+         WHERE tcode = g_tcode.
+  IF sy-subrc <> 0.
+    SELECT SINGLE * FROM t370a
+           WHERE tcode = 'IW47'.
+    IF sy-subrc <> 0.
+      RAISE iw29_not_in_t370a.
+    ENDIF.
+  ENDIF.
+  g_aktyp = t370a-aktyp.
+
+ENDFORM.                               " GET_ACTTYPE_AFRU_L
+
+*-------------------------- E N D -------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  MARK_SELECTED_L
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_P_SELFIELD_TABINDEX  text
+*----------------------------------------------------------------------*
+FORM mark_selected_l USING p_index LIKE sy-tabix.
+
+  CHECK NOT p_index IS INITIAL.
+
+  READ TABLE object_tab INDEX p_index.
+  IF sy-subrc IS INITIAL.
+    object_tab-selected    = space.
+    object_tab-pm_selected = sym_check_mark.
+    MODIFY object_tab INDEX p_index.
+  ENDIF.
+
+ENDFORM.                               " MARK_SELECTED_L
+
+*&---------------------------------------------------------------------*
+*&      Form  PRESELECT_CRHD
+*&---------------------------------------------------------------------*
+FORM preselect_crhd USING   it_crid TYPE crid_tab.
+
+  SELECT * INTO TABLE gt_crhd
+           FROM crhd
+           FOR ALL ENTRIES IN it_crid
+           WHERE objty = it_crid-objty
+             AND objid = it_crid-objid.
+
+  SORT gt_crhd BY objid.
+
+ENDFORM.                               " PRESELECT_CRHD
+
+*&---------------------------------------------------------------------*
+*&      Form  PRESELECT_AFWI
+*&---------------------------------------------------------------------*
+FORM preselect_afwi TABLES i_conf STRUCTURE afru.
+
+  SELECT * INTO TABLE gt_afwi
+           FROM afwi
+           FOR ALL ENTRIES IN i_conf
+           WHERE rueck = i_conf-rueck
+           AND   rmzhl = i_conf-rmzhl.
+
+  SORT gt_afwi BY rueck rmzhl mblnr mjahr mblpo.
+
+ENDFORM.                               " PRESELECT_AFWI
+
+*&---------------------------------------------------------------------*
+*&      Form  add_message_to_tab
+*&---------------------------------------------------------------------*
+*       Add messages to log
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM add_message_to_tab .
+
+  i_logtab-msg = gv_msg.
+  APPEND i_logtab.
+  CLEAR i_logtab.
+
+ENDFORM.                    " add_message_to_tab
+
+*&---------------------------------------------------------------------*
+*&      Form  list_logtab
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM list_logtab .
+
+  LEAVE TO LIST-PROCESSING.
+
+  LOOP AT i_logtab.
+    WRITE: / i_logtab-msg.
+  ENDLOOP.
+
+  REFRESH i_logtab.
+  CLEAR i_logtab.
+
+  REFRESH gt_canctc.
+
+ENDFORM.                    " list_logtab
+
+*&---------------------------------------------------------------------*
+*&      Form  fill_conf_to_create
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM fill_conf_to_create USING p_objt-rueck
+                               p_objt-rmzhl
+                               p_objt-uvorn
+                               p_objt-iarbpl
+                      CHANGING p_conf  TYPE confco
+                               p_act_work.
+
+* Local variables
+  DATA: lv_afru TYPE afru.
+
+  CLEAR: p_conf.
+
+* Get all fields from confirmation table AFRU
+  SELECT SINGLE * INTO lv_afru
+         FROM afru
+         WHERE rueck = p_objt-rueck
+           AND rmzhl = p_objt-rmzhl.
+
+  CHECK sy-subrc = 0.
+
+  p_conf-order          = lv_afru-aufnr.
+  p_conf-activity       = lv_afru-vornr.
+*  p_conf-SUB_ACTIVITY   = p_objt-uvorn.
+*  p_conf-conf_no        = lv_afru-rueck.
+*  if not p_conf-cap_type is initial.
+*    p_conf-cap_type       = lv_afru-kapid.
+*  endif.
+*  p_conf-split          = lv_afru-split.
+*  p_conf-procss_deg     = lv_afru-abarb.
+  p_conf-work_cntr      = p_objt-iarbpl.
+*  p_conf-fin_conf       = lv_afru-aueru.
+  p_conf-fin_conf       = 'X'.
+*  p_conf-clear_res      = lv_afru-ausor.
+  p_conf-postg_date     = sy-datum.
+  p_conf-dev_reason     = lv_afru-grund.
+  p_conf-un_act_dur     = lv_afru-idaue.
+  p_conf-actual_dur     = lv_afru-idaur.
+  p_conf-end_date       = lv_afru-iedd.
+  p_conf-end_time       = lv_afru-iedz.
+  p_conf-start_date     = lv_afru-isdd.
+  p_conf-start_time     = lv_afru-isdz.
+  p_conf-un_work        = lv_afru-ismnu.
+
+  IF NOT lv_afru-ismnu IS INITIAL AND
+   lv_afru-ismne NE lv_afru-ismnu.
+    CALL FUNCTION 'UNIT_CONVERSION_SIMPLE'
+      EXPORTING
+        input    = lv_afru-ismnw
+        unit_in  = lv_afru-ismne
+        unit_out = lv_afru-ismnu
+      IMPORTING
+        output   = p_act_work.
+  ENDIF.
+
+* p_conf-act_work       = lv_afru-ismnw.
+  IF p_act_work IS INITIAL.
+    p_act_work            = lv_afru-ismnw.
+  ENDIF.
+  p_conf-act_type       = lv_afru-learr.
+*  p_conf-complete       = lv_afru-leknw.
+*  p_conf-wage_type      = lv_afru-loart.
+*  p_conf-conf_text      = lv_afru-ltxa1.
+*  p_conf-un_rem_dur     = lv_afru-odaue.
+*  p_conf-rem_dur        = lv_afru-odaur.
+*  p_conf-un_rem_wrk     = lv_afru-ofmne.
+*  p_conf-rem_work       = lv_afru-ofmnw.
+*  clear p_conf-rem_work.
+*  p_conf-fcstfindat     = lv_afru-pedd.
+  p_conf-fcstfintim     = lv_afru-pedz.
+*  p_conf-pers_no        = lv_afru-pernr.
+  p_conf-plant          = lv_afru-werks.
+*  p_conf-cats_doc_no    = lv_afru-catsbelnr.
+*  p_conf-price          = lv_afru-catsprice.
+*  p_conf-trans_curr     = lv_afru-catstcurr.
+*  p_conf-price_unit     = lv_afru-catspeinh.
+*  p_conf-fin_conf_r     =
+*  p_conf-create_dat     = sy-datum.
+*  p_conf-create_tim     = sy-uzeit.
+
+  IF p_chant = 'X'.
+    p_conf-calc_motive  = p_bemott.
+  ELSE.
+    p_conf-calc_motive  = lv_afru-bemot.
+  ENDIF.
+
+*  p_conf-co_area        = lv_afru-skokrs.
+*  p_conf-send_cctr      = lv_afru-skostl.
+*  p_conf-un_work_dia    =
+*  p_conf-conf_cnt       = lv_afru-rmzhl.
+  p_conf-zzernam        = sy-uname.
+  p_conf-zzorigf        = lv_afru-origf.
+
+ENDFORM.                    " fill_conf_to_create
+
+* Begin of insert MOD-001
+*&---------------------------------------------------------------------*
+*&      Form  fill_conf_to_rebook
+*&---------------------------------------------------------------------*
+FORM fill_conf_to_rebook USING p_objt-rueck
+                               p_objt-rmzhl
+                               p_objt-uvorn
+                               p_objt-iarbpl
+                               lv_bemot_n
+                      CHANGING p_conf TYPE confco
+                               p_act_work.
+
+* Local variables
+  DATA: lv_afru TYPE afru.
+
+  CLEAR: p_conf.
+
+* Get all fields from confirmation table AFRU
+  SELECT SINGLE * INTO lv_afru
+         FROM afru
+         WHERE rueck = p_objt-rueck
+           AND rmzhl = p_objt-rmzhl.
+
+  CHECK sy-subrc = 0.
+
+*Begin of insert MOD-004
+  CLEAR: wa_delnewvornrs.
+  READ TABLE i_delnewvornrs INTO wa_delnewvornrs
+                            WITH KEY delvornr = lv_afru-vornr.
+  IF sy-subrc EQ 0.
+    lv_afru-vornr = wa_delnewvornrs-newvornr.
+  ENDIF.
+*End of insert MOD-004
+
+  p_conf-order          = p_auf_to.
+  p_conf-activity       = lv_afru-vornr.
+*  p_conf-SUB_ACTIVITY   = p_objt-uvorn.
+*  p_conf-conf_no        = lv_afru-rueck.
+*  if not p_conf-cap_type is initial.
+*    p_conf-cap_type       = lv_afru-kapid.
+*  endif.
+*  p_conf-split          = lv_afru-split.
+*  p_conf-procss_deg     = lv_afru-abarb.
+  p_conf-work_cntr      = p_objt-iarbpl.
+*  p_conf-fin_conf       = lv_afru-aueru.
+  p_conf-fin_conf       = 'X'.
+*  p_conf-clear_res      = lv_afru-ausor.
+  p_conf-postg_date     = sy-datum.
+  p_conf-dev_reason     = lv_afru-grund.
+  p_conf-un_act_dur     = lv_afru-idaue.
+  p_conf-actual_dur     = lv_afru-idaur.
+  p_conf-end_date       = lv_afru-iedd.
+  p_conf-end_time       = lv_afru-iedz.
+  p_conf-start_date     = lv_afru-isdd.
+  p_conf-start_time     = lv_afru-isdz.
+  p_conf-un_work        = lv_afru-ismnu.
+
+  IF NOT lv_afru-ismnu IS INITIAL AND
+   lv_afru-ismne NE lv_afru-ismnu.
+    CALL FUNCTION 'UNIT_CONVERSION_SIMPLE'
+      EXPORTING
+        input    = lv_afru-ismnw
+        unit_in  = lv_afru-ismne
+        unit_out = lv_afru-ismnu
+      IMPORTING
+        output   = p_act_work.
+  ENDIF.
+
+* p_conf-act_work       = lv_afru-ismnw.
+  IF p_act_work IS INITIAL.
+    p_act_work            = lv_afru-ismnw.
+  ENDIF.
+  p_conf-act_type       = lv_afru-learr.
+*  p_conf-complete       = lv_afru-leknw.
+*  p_conf-wage_type      = lv_afru-loart.
+*  p_conf-conf_text      = lv_afru-ltxa1.
+*  p_conf-un_rem_dur     = lv_afru-odaue.
+*  p_conf-rem_dur        = lv_afru-odaur.
+*  p_conf-un_rem_wrk     = lv_afru-ofmne.
+*  p_conf-rem_work       = lv_afru-ofmnw.
+*  clear p_conf-rem_work.
+*  p_conf-fcstfindat     = lv_afru-pedd.
+  p_conf-fcstfintim     = lv_afru-pedz.
+*  p_conf-pers_no        = lv_afru-pernr.
+  p_conf-plant          = lv_afru-werks.
+*  p_conf-cats_doc_no    = lv_afru-catsbelnr.
+*  p_conf-price          = lv_afru-catsprice.
+*  p_conf-trans_curr     = lv_afru-catstcurr.
+*  p_conf-price_unit     = lv_afru-catspeinh.
+*  p_conf-fin_conf_r     =
+*  p_conf-create_dat     = sy-datum.
+*  p_conf-create_tim     = sy-uzeit.
+
+  p_conf-calc_motive  = lv_bemot_n.
+
+*  p_conf-co_area        = lv_afru-skokrs.
+*  p_conf-send_cctr      = lv_afru-skostl.
+*  p_conf-un_work_dia    =
+*  p_conf-conf_cnt       = lv_afru-rmzhl.
+  p_conf-zzernam        = sy-uname.
+  p_conf-zzorigf        = lv_afru-origf.
+
+ENDFORM.                    " fill_conf_to_create
+* End of insert MOD-001
+
+*&---------------------------------------------------------------------*
+*&      Form  prepare_errmessage
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM prepare_errmessage TABLES i_emseg  STRUCTURE emseg
+                         USING p_emkpf  TYPE emkpf
+                      CHANGING p_return TYPE bapiret2.
+
+  DATA: wa_emseg  TYPE emseg.
+
+  IF p_emkpf-subrc EQ 4 OR
+     p_emkpf-subrc EQ 5 OR
+     p_emkpf-subrc EQ 6 OR
+     p_emkpf-subrc EQ 7.
+    LOOP AT i_emseg INTO wa_emseg
+                    WHERE msgno NE space.
+      MESSAGE ID wa_emseg-msgid
+              TYPE wa_emseg-msgty
+              NUMBER wa_emseg-msgno
+              WITH wa_emseg-msgv1 wa_emseg-msgv2
+                   wa_emseg-msgv3 wa_emseg-msgv4.
+      p_return-type = wa_emseg-msgty.
+      p_return-id = wa_emseg-msgid.
+      p_return-number = wa_emseg-msgno.
+      p_return-message_v1 = wa_emseg-msgv1.
+      p_return-message_v2 = wa_emseg-msgv2.
+      EXIT.
+    ENDLOOP.
+  ELSE.
+    MESSAGE ID p_emkpf-msgid
+            TYPE 'E'
+            NUMBER p_emkpf-msgno
+            WITH p_emkpf-msgv1 p_emkpf-msgv2
+                 p_emkpf-msgv3 p_emkpf-msgv4.
+    p_return-type = 'E'.
+    p_return-id = p_emkpf-msgid.
+    p_return-number = p_emkpf-msgno.
+    p_return-message_v1 = p_emkpf-msgv1.
+    p_return-message_v2 = p_emkpf-msgv2.
+    EXIT.
+  ENDIF.
+
+ENDFORM.                    " prepare_errmessage
+
+*&---------------------------------------------------------------------*
+*&      Form  CONFIRMATION_M
+*&---------------------------------------------------------------------*
+*       display material confirmation
+*----------------------------------------------------------------------*
+*      -->P_OBJECT_TAB-MBLNR                                           *
+*----------------------------------------------------------------------*
+FORM confirmation_m USING    p_mblnr     TYPE mblnr
+                             p_mjahr     TYPE mjahr
+                             p_zeile     TYPE mblpo
+                             p_aufnr     TYPE co_aufnr
+                             p_transflag TYPE c.
+
+  DATA: aufnr     LIKE coruf-aufnr,
+        mblnr     LIKE aufm-mblnr,
+        mjahr     LIKE aufm-mjahr,
+        aufnr_ini LIKE coruf-aufnr,
+        l_tcode   LIKE sy-tcode,
+        lv_retcd  LIKE sy-subrc,
+        l_retc    LIKE sy-subrc.
+
+  DATA: lv_bemot           TYPE bemot,
+        lv_bemot_o         TYPE bemot,
+        lv_auart           TYPE auart,
+        ls_auart_bemot     TYPE yam_auart_bemot,
+        lv_bapiret2        TYPE bapiret2,
+        lt_return          TYPE TABLE OF bapiret2,
+        ls_return          TYPE bapiret2,
+        ls_imkpf           TYPE imkpf,
+        lv_exit(1)         TYPE c.
+
+  CONSTANTS: lc_tcode      TYPE sy-tcode   VALUE 'MB03',
+             lc_x(1)       TYPE c          VALUE 'X'.
+
+*  GET PARAMETER ID 'ANR' FIELD aufnr.
+*  GET PARAMETER ID 'MBN' FIELD mblnr.
+*  GET PARAMETER ID 'MJA' FIELD mjahr.
+
+* SET PARAMETER ID 'ANR' FIELD aufnr_ini.
+  SET PARAMETER ID 'MBN' FIELD p_mblnr.
+  SET PARAMETER ID 'MJA' FIELD p_mjahr.
+
+*--- set TCODE
+  CASE p_transflag.
+    WHEN 'DISP'.
+      l_tcode = 'MB03'.
+    WHEN 'CANC'.
+      l_tcode = 'MIGO'.
+    WHEN 'CHAN'.
+      l_tcode = 'MIGO'.
+    WHEN 'RVSE'.
+      l_tcode = 'MIGO'.
+  ENDCASE.
+
+*--- Authority Check for T-code
+  PERFORM auth_check_tcode_f16 USING    l_tcode
+                               CHANGING l_retc.
+
+*--- call transaction/BAPI
+  IF l_retc IS INITIAL AND NOT l_tcode IS INITIAL.
+    IF l_tcode = 'MB03'.
+      CALL TRANSACTION l_tcode AND SKIP FIRST SCREEN.
+      IMPORT return_code FROM MEMORY ID 'MB01'.
+      FREE MEMORY ID 'MB01'.
+    ELSE.
+      CLEAR lv_exit.
+
+      IF p_transflag = 'CHAN'.
+        IF p_bemotm = object_tab-yam_bemot_mat.
+*........ Confirmation &1 &2 &3 has not been cancelled:
+*........ No difference in accounting indicator
+          MESSAGE i304 WITH p_mblnr p_mjahr p_zeile INTO gv_msg.
+          PERFORM add_message_to_tab.
+          CONCATENATE '   --> ' text-t02 INTO gv_msg.
+          PERFORM add_message_to_tab.
+          lv_exit = lc_x.
+        ENDIF.
+
+        CHECK lv_exit <> lc_x.
+*...... Check if the acc.ind. may be changed
+        SELECT SINGLE bemot auart
+               INTO (lv_bemot_o, lv_auart)
+               FROM aufk
+               WHERE aufnr = p_aufnr.
+
+        SELECT SINGLE yam_bemot_to
+               INTO lv_bemot
+               FROM yam_accind_nochg
+               WHERE yam_bemot_from = lv_bemot_o
+                 AND yam_bemot_to   = p_bemotm.
+
+        IF sy-subrc EQ 0.
+*........ Confirmation &1 &2 &3 has not been cancelled:
+*........ Accounting indicator may not be changed into: &1
+          MESSAGE i304 WITH p_mblnr p_mjahr p_zeile INTO gv_msg.
+          PERFORM add_message_to_tab.
+          CONCATENATE '   --> ' text-t07 p_bemotm INTO gv_msg.
+          PERFORM add_message_to_tab.
+          lv_exit = lc_x.
+        ENDIF.
+
+        CHECK lv_exit <> lc_x.
+*...... Check accounting indicator is valid for order type
+        SELECT SINGLE * INTO ls_auart_bemot
+               FROM yam_auart_bemot
+               WHERE auart = lv_auart
+                 AND bemot = p_bemotm.
+
+        IF sy-subrc NE 0.
+*........ Confirmation &1 &2 has not been cancelled:
+*........ Accounting indicator &1 not allowed for order type &2
+          MESSAGE i304 WITH p_mblnr p_mjahr p_zeile INTO gv_msg.
+          PERFORM add_message_to_tab.
+          CONCATENATE '   --> ' text-t08 p_bemotm text-t09 lv_auart
+                      INTO gv_msg SEPARATED BY space.
+          PERFORM add_message_to_tab.
+          lv_exit = lc_x.
+        ENDIF.
+      ENDIF.
+
+      CHECK lv_exit <> lc_x.
+      CLEAR lv_retcd.
+
+      IF p_cancm = 'X'.                    "cancel
+*...... Check if MC is already cancelled
+        IF object_tab-bwart = '262' OR
+           object_tab-bwart = '962'.
+*........ Confirmation &1 &2 has already been cancelled: no action
+          MESSAGE i314 WITH p_mblnr p_mjahr p_zeile INTO gv_msg.
+          PERFORM add_message_to_tab.
+        ELSE.
+          IF object_tab-rueck IS INITIAL.
+            PERFORM create_goodsmvt USING object_tab-bwart
+                                          'CAN'
+                                          object_tab-yam_bemot_mat
+                                 CHANGING lv_retcd.
+            IF lv_retcd = 0.
+*............ Confirmation &1 &2 &3 has been cancelled
+              MESSAGE s303 WITH p_mblnr p_mjahr p_zeile INTO gv_msg.
+              PERFORM add_message_to_tab.
+            ELSE.
+*............ Confirmation &1 &2 &3 has not been cancelled:
+              MESSAGE i304 WITH p_mblnr p_mjahr p_zeile INTO gv_msg.
+              PERFORM add_message_to_tab.
+              CONCATENATE '   --> ' gt_return-message
+                          INTO gv_msg SEPARATED BY space.
+              PERFORM add_message_to_tab.
+            ENDIF.
+          ELSE.
+*.......... check if cancellation is already done for this TC
+            READ TABLE gt_canctc WITH KEY rueck = object_tab-rueck
+                                          rmzhl = object_tab-rmzhl.
+            IF sy-subrc NE 0.
+              PERFORM canc_recreate_tc CHANGING lv_retcd.
+              IF lv_retcd = 0.
+*.............. put entry in table as already cancelled TC
+                CLEAR gt_canctc.
+                MOVE object_tab-rueck TO gt_canctc-rueck.
+                MOVE object_tab-rmzhl TO gt_canctc-rmzhl.
+                APPEND gt_canctc.
+              ENDIF.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+      ELSEIF p_chanm = 'X'.                "change acc.ind.
+*...... Check if MC is already cancelled
+        IF object_tab-bwart = '262' OR
+           object_tab-bwart = '962'.
+          PERFORM create_goodsmvt USING object_tab-bwart
+                                        'CRE'
+                                        p_bemotm
+                               CHANGING lv_retcd.
+          IF lv_retcd = 0.
+*.......... Conf. &1 &2 has been created for &3 with acc.ind &4
+            MESSAGE s305 WITH g_headret-mat_doc g_headret-doc_year
+                              p_mblnr p_bemotm
+                         INTO gv_msg.
+            PERFORM add_message_to_tab.
+          ELSE.
+*.......... Conf. has not been created for &1 with acc.ind &2: &3
+            MESSAGE i306 WITH p_mblnr p_bemotm INTO gv_msg.
+            PERFORM add_message_to_tab.
+            CONCATENATE '   --> ' gt_return-message
+                        INTO gv_msg SEPARATED BY space.
+            PERFORM add_message_to_tab.
+          ENDIF.
+        ELSE.
+          IF object_tab-rueck IS INITIAL.
+            PERFORM create_goodsmvt USING object_tab-bwart
+                                          'CAN'
+                                          object_tab-yam_bemot_mat
+                                 CHANGING lv_retcd.
+            IF lv_retcd = 0.
+              PERFORM create_goodsmvt USING object_tab-bwart
+                                            'CRE'
+                                            p_bemotm
+                                   CHANGING lv_retcd.
+            ENDIF.
+            IF lv_retcd = 0.
+*............ Conf. &1 &2 has been created for &3 with acc.ind &4
+              MESSAGE s305 WITH g_headret-mat_doc g_headret-doc_year
+                                p_mblnr p_bemotm
+                           INTO gv_msg.
+              PERFORM add_message_to_tab.
+            ELSE.
+*............ Conf. has not been created for &1 with acc.ind &2: &3
+              MESSAGE i306 WITH p_mblnr p_bemotm INTO gv_msg.
+              PERFORM add_message_to_tab.
+              CONCATENATE '   --> ' gt_return-message
+                          INTO gv_msg SEPARATED BY space.
+              PERFORM add_message_to_tab.
+            ENDIF.
+          ELSE.
+            IF object_tab-stzhl IS INITIAL.
+*............ check if cancellation is already done for this TC
+              READ TABLE gt_canctc WITH KEY rueck = object_tab-rueck
+                                            rmzhl = object_tab-rmzhl.
+              IF sy-subrc NE 0.
+                PERFORM canc_recreate_tc CHANGING lv_retcd.
+                IF lv_retcd = 0.
+*................ put entry in table as already cancelled TC
+                  CLEAR gt_canctc.
+                  MOVE object_tab-rueck TO gt_canctc-rueck.
+                  MOVE object_tab-rmzhl TO gt_canctc-rmzhl.
+                  APPEND gt_canctc.
+                ENDIF.
+              ENDIF.
+            ELSE.
+*............ put only entry in table because TC was already cancelled
+              READ TABLE gt_canctc WITH KEY rueck = object_tab-rueck
+                                            rmzhl = object_tab-rmzhl.
+              IF sy-subrc NE 0.
+                CLEAR gt_canctc.
+                MOVE object_tab-rueck TO gt_canctc-rueck.
+                MOVE object_tab-rmzhl TO gt_canctc-rmzhl.
+                APPEND gt_canctc.
+              ENDIF.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+      ELSE.                             "reverse of mat.confirmation
+*...... Check if MC is not yet cancelled
+        IF object_tab-bwart = '261' OR
+           object_tab-bwart = '961'.
+*........ Confirmation &1 &2 &3 was not reversed: no action
+*........ Confirmation was not cancelled
+          MESSAGE i317 WITH p_mblnr p_mjahr p_zeile INTO gv_msg.
+          PERFORM add_message_to_tab.
+          CONCATENATE '   --> ' text-t11 INTO gv_msg.
+          PERFORM add_message_to_tab.
+        ELSE.
+          IF object_tab-rueck IS INITIAL.
+            PERFORM create_goodsmvt USING object_tab-bwart
+                                          'CRE'
+                                          object_tab-yam_bemot_mat
+                                 CHANGING lv_retcd.
+            IF lv_retcd = 0.
+*............ Confirmation &1 &2 &3 has been reversed
+              MESSAGE s318 WITH p_mblnr p_mjahr p_zeile INTO gv_msg.
+              PERFORM add_message_to_tab.
+            ELSE.
+*............ Confirmation &1 &2 &3 has not been reversed:
+              MESSAGE i319 WITH p_mblnr p_mjahr p_zeile INTO gv_msg.
+              PERFORM add_message_to_tab.
+              CONCATENATE '   --> ' gt_return-message
+                          INTO gv_msg SEPARATED BY space.
+              PERFORM add_message_to_tab.
+            ENDIF.
+          ELSE.
+            IF object_tab-stzhl IS INITIAL.
+*............ Confirmation &1 &2 &3 has not been reversed: no action
+*............ MC is linked to TC --> so, they were already cancelled too
+              MESSAGE i317 WITH p_mblnr p_mjahr p_zeile INTO gv_msg.
+              PERFORM add_message_to_tab.
+              CONCATENATE '   --> ' text-t12 INTO gv_msg.
+              PERFORM add_message_to_tab.
+            ELSE.
+              PERFORM create_goodsmvt USING object_tab-bwart
+                                            'CRE'
+                                            object_tab-yam_bemot_mat
+                                   CHANGING lv_retcd.
+              IF lv_retcd = 0.
+*.............. Confirmation &1 &2 &3 has been reversed
+                MESSAGE s318 WITH p_mblnr p_mjahr p_zeile INTO gv_msg.
+                PERFORM add_message_to_tab.
+              ELSE.
+*.............. Confirmation &1 &2 &3 has not been reversed:
+                MESSAGE i319 WITH p_mblnr p_mjahr p_zeile INTO gv_msg.
+                PERFORM add_message_to_tab.
+                CONCATENATE '   --> ' gt_return-message
+                            INTO gv_msg SEPARATED BY space.
+                PERFORM add_message_to_tab.
+              ENDIF.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+*  SET PARAMETER ID 'ANR' FIELD aufnr.
+*  SET PARAMETER ID 'MBN' FIELD mblnr.
+*  SET PARAMETER ID 'MJA' FIELD mjahr.
+
+ENDFORM.                     " confirmation_m
+
+*&---------------------------------------------------------------------*
+*&      Form  create_goodsmvt
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_LV_mvt    movement type
+*      -->P_LV_act    type of action
+*      -->P_LV_BEMOT  accounting indicator
+*      <--P_LV_RETCD  returncode
+*----------------------------------------------------------------------*
+FORM create_goodsmvt USING p_lv_mvt
+                           p_lv_act
+                           p_lv_bemot
+                     CHANGING p_lv_retcd.
+
+  IF p_lv_act = 'CAN'.
+    IF p_lv_mvt = '261'.
+      g_mvt = '262'.
+    ELSE.
+      g_mvt = '962'.
+    ENDIF.
+  ELSE.
+    CASE p_lv_mvt.
+      WHEN '261' OR '262'.
+        g_mvt = '261'.
+      WHEN '961' OR '962'.
+        g_mvt = '961'.
+    ENDCASE.
+  ENDIF.
+
+  PERFORM prep_goods_movement USING g_mvt
+                                    p_lv_bemot.
+
+  CLEAR: g_headret,
+         p_lv_retcd.
+
+  CLEAR gt_return[].
+  g_goodsmvt_code_tmp = '03'.
+
+  CALL FUNCTION 'BAPI_GOODSMVT_CREATE'
+    EXPORTING
+      goodsmvt_header  = g_header
+      goodsmvt_code    = g_goodsmvt_code_tmp
+    IMPORTING
+      goodsmvt_headret = g_headret
+    TABLES
+      goodsmvt_item    = gt_item
+      return           = gt_return.
+
+  IF g_headret IS INITIAL.
+    MOVE 4 TO p_lv_retcd.
+  ELSE.
+    CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+      EXPORTING
+        wait = 'X'.
+  ENDIF.
+
+ENDFORM.                    " create_goodsmvt
+
+*&---------------------------------------------------------------------*
+*&      Form  prep_goods_movement
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_G_MVT    movement type
+*      -->P_G_BEMOT  accounting indicator
+*----------------------------------------------------------------------*
+FORM prep_goods_movement  USING    p_g_mvt
+                                   p_g_bemot.
+
+  DATA: g_conf_qty LIKE aufm-erfmg,
+        g_meins   TYPE meins,
+        g_qty(13) TYPE c.
+
+  g_header-pstng_date = sy-datum.
+  g_header-doc_date   = sy-datum.
+
+  REFRESH gt_item.
+
+  CLEAR gt_item.
+  gt_item-material  = object_tab-matnr.
+  gt_item-plant     = object_tab-werks.
+  gt_item-stge_loc  = object_tab-lgort.
+  gt_item-move_type = p_g_mvt.
+
+  WRITE object_tab-erfmg TO g_qty UNIT object_tab-erfme.
+  gt_item-entry_qnt = g_qty.
+
+  SELECT SINGLE meins INTO g_meins
+         FROM mara
+         WHERE matnr = object_tab-matnr.
+
+  IF sy-subrc = 0.
+    SELECT SINGLE isocode INTO gt_item-entry_uom_iso
+           FROM t006
+           WHERE msehi = g_meins.
+  ENDIF.
+
+  gt_item-orderid = object_tab-aufnr.
+  gt_item-calc_motive = p_g_bemot.
+
+  APPEND gt_item.
+
+ENDFORM.                    " prep_goods_movement
+
+*&---------------------------------------------------------------------*
+*&      Form  canc_recreate_tc
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_LV_RETCD  text
+*----------------------------------------------------------------------*
+FORM canc_recreate_tc  CHANGING p_lv_retcd.
+
+  DATA: lv_lock            LIKE bapi_coru_param-locked,
+        lv_conf            TYPE confco,
+        lv_act_work        TYPE ismnw_2,
+        lv_conftext        LIKE bapi_alm_confirmation-conf_text,
+        lv_conf_no         TYPE confco-conf_no,
+        lv_conf_cnt        TYPE confco-conf_cnt,
+        lv_bapiret2        TYPE bapiret2,
+        lt_return          TYPE TABLE OF bapiret2,
+        ls_return          TYPE bapiret2.
+
+  CLEAR lv_bapiret2.
+  CLEAR lv_lock.
+
+  lv_conftext = text-t10.
+
+  CALL FUNCTION 'BAPI_ALM_CONF_CANCEL'
+    EXPORTING
+      confirmation              = object_tab-rueck
+      confirmationcounter       = object_tab-rmzhl
+      postgdate                 = sy-datum
+      conftext                  = lv_conftext
+    IMPORTING
+      return                    = lv_bapiret2
+      locked                    = lv_lock
+*      CREATED_CONF_NO           =
+*      CREATED_CONF_COUNT        =
+            .
+
+  IF NOT lv_lock IS INITIAL.
+*.. Confirmation &1 &2 &3 has not been cancelled: lock conflict
+*    MESSAGE i304 WITH object_tab-aufnr object_tab-rueck
+*                      object_tab-rmzhl INTO gv_msg.
+*    PERFORM add_message_to_tab.
+*    concatenate '   --> ' text-t06 into gv_msg.
+*    PERFORM add_message_to_tab.
+    p_lv_retcd = 4.
+    RETURN.
+  ENDIF.
+
+  IF NOT lv_bapiret2 IS INITIAL.
+*.. Confirmation &1 &2 &3 has not been cancelled: &4
+*    MESSAGE i304 WITH object_tab-aufnr object_tab-rueck
+*                      object_tab-rmzhl INTO gv_msg.
+*    PERFORM add_message_to_tab.
+*    concatenate '   --> ' lv_bapiret2-message into gv_msg.
+*    PERFORM add_message_to_tab.
+    p_lv_retcd = 4.
+    RETURN.
+  ELSE.
+*   COMMIT THE BAPI WHICH WILL FINALLY CANCEL THE CONFIRMATION
+    CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+      EXPORTING
+        wait = 'X'.
+
+    IF sy-subrc EQ 0.
+*.... Confirmation &1 &2 &3 has been cancelled
+*      MESSAGE s303 WITH object_tab-aufnr object_tab-rueck
+*                      object_tab-rmzhl INTO gv_msg.
+*      PERFORM add_message_to_tab.
+    ENDIF.
+  ENDIF.
+
+  CHECK p_lv_retcd = 0.
+  REFRESH lt_return.
+
+  PERFORM fill_conf_to_create USING object_tab-rueck
+                                    object_tab-rmzhl
+                                    object_tab-uvorn
+                                    object_tab-iarbpl
+                           CHANGING lv_conf
+                                    lv_act_work.
+
+  IF lv_conf IS INITIAL.
+*.. Conf. has not been created for &1: &3
+*    MESSAGE i306 WITH p_aufnr INTO gv_msg.
+*    PERFORM add_message_to_tab.
+*    concatenate '   --> ' text-t04 into gv_msg.
+*    PERFORM add_message_to_tab.
+    p_lv_retcd = 4.
+    RETURN.
+  ENDIF.
+
+* Create new confirmation with new acc. indicator
+  CALL FUNCTION 'ALM_ME_TIME_CONF_CREATE_2'
+    EXPORTING
+*      POST_WRONG_ENTRIES         =
+      confirmation_item          = lv_conf
+      act_work                   = lv_act_work
+    IMPORTING
+      confirmation_number        = lv_conf_no
+      confirmation_counter       = lv_conf_cnt
+    TABLES
+      return                     = lt_return.
+
+  IF NOT lt_return[] IS INITIAL.
+    LOOP AT lt_return INTO ls_return.
+*..... Conf. has not been created for &1 with acc.ind &2: &3
+*      MESSAGE i306 WITH p_aufnr p_bemott INTO gv_msg.
+*      PERFORM add_message_to_tab.
+*      concatenate '   --> ' ls_return-message into gv_msg.
+*      PERFORM add_message_to_tab.
+      p_lv_retcd = 4.
+      EXIT.
+    ENDLOOP.
+  ELSE.
+    COMMIT WORK AND WAIT.
+
+*** IF sy-subrc EQ 0.
+*............ Conf. &1 &2 has been created for &3 with acc.ind &4
+*      MESSAGE s305 WITH lv_conf_no lv_conf_cnt
+*                 p_aufnr p_bemott INTO gv_msg.
+*      PERFORM add_message_to_tab.
+*.... wait x seconds before the new goods movement can be created
+***** wait up to gc_time seconds.
+*** ENDIF.
+  ENDIF.
+
+ENDFORM.                    " canc_recreate_tc
+
+*&---------------------------------------------------------------------*
+*&      Form  check_mat_locked
+*&---------------------------------------------------------------------*
+*       Check if material is still locked by the previous cancellation
+*       of the time confirmation (+ linked material confirmation)
+*----------------------------------------------------------------------*
+FORM check_mat_locked.
+
+  DATA: lv_stop(1) TYPE c.
+
+  CLEAR lv_stop.
+
+  WHILE lv_stop = ' '.
+    CALL FUNCTION 'ENQUEUE_EMMARCE'
+      EXPORTING
+        mode_marc      = 'E'
+        mandt          = sy-mandt
+        matnr          = object_tab2-matnr
+        werks          = object_tab2-werks
+      EXCEPTIONS
+        foreign_lock   = 1
+        system_failure = 2
+        OTHERS         = 3.
+
+    IF sy-subrc <> 0.
+      WAIT UP TO gc_time SECONDS.
+    ELSE.
+      lv_stop = 'X'.
+      CALL FUNCTION 'DEQUEUE_EMMARCE'
+        EXPORTING
+          mode_marc = 'E'
+          mandt     = sy-mandt
+          matnr     = object_tab2-matnr
+          werks     = object_tab2-werks.
+    ENDIF.
+  ENDWHILE.
+
+ENDFORM.                    "check_mat_locked
+
+* Begin of insert MOD-001
+*&---------------------------------------------------------------------*
+*&      Form  check_ord
+*&---------------------------------------------------------------------*
+FORM check_ord.
+
+  DATA: lv_count TYPE sy-tabix.
+
+  CLEAR lv_err_flag.
+  CLEAR lv_err_flag2.
+  CLEAR lv_err_tec_clos_fr.
+  CLEAR lv_err_tec_clos_to.
+  CLEAR lv_err_from_lock_flg.
+  CLEAR lv_err_to_lock_flg.
+  CLEAR lv_bukrs_from.
+  CLEAR lv_bukrs_to.
+  CLEAR lv_err_bukrs.
+
+* Check if company code of the orders is the same
+
+  SELECT SINGLE bukrs INTO lv_bukrs_from
+         FROM aufk
+         WHERE aufnr = aufnr_o.
+
+  SELECT SINGLE bukrs INTO lv_bukrs_to
+         FROM aufk
+         WHERE aufnr = p_auf_to.
+
+  IF lv_bukrs_from <> lv_bukrs_to.
+    lv_err_bukrs = 'X'.
+  ENDIF.
+
+* Check if the 'from' order is TECO or CLOSED
+
+  CONCATENATE 'OR' aufnr_o INTO gv_objnr.
+
+*.. Check S.O. TECO/CLSD status active
+  CALL FUNCTION 'STATUS_CHECK'
+    EXPORTING
+*      BYPASS_BUFFER           = ' '
+*      CLIENT                  = SY-MANDT
+      objnr                   = gv_objnr
+      status                  = 'I0045'
+    EXCEPTIONS
+      object_not_found        = 1
+      status_not_active       = 2
+      OTHERS                  = 3.
+
+  IF sy-subrc EQ 0.
+    lv_err_flag = 'X'.
+    lv_err_tec_clos_fr = 'X'.
+  ENDIF.
+
+  CALL FUNCTION 'STATUS_CHECK'
+    EXPORTING
+*      BYPASS_BUFFER           = ' '
+*      CLIENT                  = SY-MANDT
+      objnr                   = gv_objnr
+      status                  = 'I0046'
+    EXCEPTIONS
+      object_not_found        = 1
+      status_not_active       = 2
+      OTHERS                  = 3.
+
+  IF sy-subrc EQ 0.
+    lv_err_flag = 'X'.
+    lv_err_tec_clos_fr = 'X'.
+  ENDIF.
+
+* Check if the 'to' order is TECO or CLOSED
+  CLEAR gv_objnr.
+  CONCATENATE 'OR' p_auf_to INTO gv_objnr.
+
+* Check S.O. TECO/CLSD status active
+  CALL FUNCTION 'STATUS_CHECK'
+    EXPORTING
+*      BYPASS_BUFFER           = ' '
+*      CLIENT                  = SY-MANDT
+      objnr                   = gv_objnr
+      status                  = 'I0045'
+    EXCEPTIONS
+      object_not_found        = 1
+      status_not_active       = 2
+      OTHERS                  = 3.
+
+  IF sy-subrc EQ 0.
+    lv_err_flag = 'X'.
+    lv_err_tec_clos_to = 'X'.
+  ENDIF.
+
+  CALL FUNCTION 'STATUS_CHECK'
+    EXPORTING
+*      BYPASS_BUFFER           = ' '
+*      CLIENT                  = SY-MANDT
+      objnr                   = gv_objnr
+      status                  = 'I0046'
+    EXCEPTIONS
+      object_not_found        = 1
+      status_not_active       = 2
+      OTHERS                  = 3.
+
+  IF sy-subrc EQ 0.
+    lv_err_flag = 'X'.
+    lv_err_tec_clos_to = 'X'.
+  ENDIF.
+
+  CLEAR lv_count.
+
+* Check if the 'from' order is locked
+  CALL FUNCTION 'YSE_CHECK_LOCKS_SERV'
+    EXPORTING
+      aufnr     = aufnr_o
+    IMPORTING
+      number    = lv_count
+    TABLES
+      it_return = lt_return.
+
+  IF lv_count NE 0.
+    lv_err_flag2 = 'X'.
+    lv_err_from_lock_flg = 'X'.
+  ENDIF.
+
+  CLEAR lv_count.
+
+* Check if the 'to' order is locked
+  CALL FUNCTION 'YSE_CHECK_LOCKS_SERV'
+    EXPORTING
+      aufnr     = p_auf_to
+    IMPORTING
+      number    = lv_count
+    TABLES
+      it_return = lt_return.
+
+  IF lv_count NE 0.
+    lv_err_flag2 = 'X'.
+    lv_err_to_lock_flg = 'X'.
+  ENDIF.
+
+* create message Different company code
+  CONCATENATE aufnr_o '-' lv_bukrs_from ', '  p_auf_to '-' lv_bukrs_to
+              INTO lv_bukrs_text.
+  IF lv_err_bukrs = 'X'.
+    MESSAGE e001(00) WITH text-e05 lv_bukrs_text.
+  ELSE.
+* Create message locked and TECO/CLOSED
+    IF lv_err_flag = 'X' AND lv_err_flag2 = 'X'.
+      IF ( lv_err_tec_clos_fr = 'X' OR lv_err_from_lock_flg  = 'X' ) AND
+         ( lv_err_tec_clos_to = 'X' OR lv_err_to_lock_flg  = 'X' ).
+        MESSAGE e001(00) WITH text-e04 aufnr_o  ', '  p_auf_to.
+      ELSEIF ( lv_err_tec_clos_fr = 'X' OR lv_err_from_lock_flg  = 'X' ).
+        MESSAGE e001(00) WITH text-e04 aufnr_o.
+      ELSEIF ( lv_err_tec_clos_to = 'X' OR lv_err_to_lock_flg  = 'X' ).
+        MESSAGE e001(00) WITH text-e04 p_auf_to.
+      ENDIF.
+    ENDIF.
+
+* Create message TECO/CLOSED
+    IF lv_err_flag = 'X'.
+      IF lv_err_tec_clos_fr = 'X' AND lv_err_tec_clos_to = 'X' .
+        MESSAGE e001(00) WITH text-e02 aufnr_o  ', '  p_auf_to.
+      ELSEIF lv_err_tec_clos_fr = 'X'.
+        MESSAGE e001(00) WITH text-e02 aufnr_o.
+      ELSEIF lv_err_tec_clos_to = 'X'.
+        MESSAGE e001(00) WITH text-e02 p_auf_to.
+      ENDIF.
+    ENDIF.
+
+* Create message locked
+    IF lv_err_flag2 = 'X'.
+      IF lv_err_from_lock_flg = 'X' AND lv_err_to_lock_flg = 'X' .
+        MESSAGE e001(00) WITH text-e03 aufnr_o  ', '  p_auf_to.
+      ELSEIF lv_err_from_lock_flg  = 'X'.
+        MESSAGE e001(00) WITH text-e03 aufnr_o.
+      ELSEIF lv_err_to_lock_flg = 'X'.
+        MESSAGE e001(00) WITH text-e03 p_auf_to.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+ENDFORM.                    "check_ord
+* End of insert MOD-001
+
+*Begin of insert MOD-002
+*&---------------------------------------------------------------------*
+*&      Form  UPDATE_LABOUR_CONFIRMATIONS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM update_labour_confirmations  USING    p_rueck     TYPE co_rueck
+                                           p_rmzhl     TYPE co_rmzhl
+                                           p_aufnr     TYPE co_aufnr
+                                           p_transflag TYPE c.
+
+  DATA: rueck LIKE coruf-rueck,
+        aufnr LIKE coruf-aufnr,
+        vornr LIKE coruf-vornr,
+        rmzhl LIKE coruf-rmzhl,
+        kapar LIKE coruf-kapar,
+        tplnr LIKE coruf-tplnr,
+        equnr LIKE coruf-equnr,
+        rueck_ini LIKE coruf-rueck,
+        aufnr_ini LIKE coruf-aufnr,
+        vornr_ini LIKE coruf-vornr,
+        rmzhl_ini LIKE coruf-rmzhl,
+        kapar_ini LIKE coruf-kapar,
+        tplnr_ini LIKE coruf-tplnr,
+        equnr_ini LIKE coruf-equnr,
+        l_tcode   LIKE sy-tcode,
+        l_retc    LIKE sy-subrc.
+
+  DATA: lv_lock            LIKE bapi_coru_param-locked,
+        lv_conf            TYPE confco,
+        lv_exit(1)         TYPE c,
+        lv_bemot           TYPE bemot,
+        lv_bemot_o         TYPE bemot,
+        lv_auart           TYPE auart,
+        ld_aufpl           TYPE co_aufpl,
+        ld_azlpl           TYPE cim_count,
+        lv_act_work        TYPE ismnw_2,
+        lv_conftext        LIKE bapi_alm_confirmation-conf_text,
+        lv_conf_no         TYPE confco-conf_no,
+        lv_conf_cnt        TYPE confco-conf_cnt,
+        ls_auart_bemot     TYPE yam_auart_bemot,
+        lv_bapiret2        TYPE bapiret2,
+        lt_return          TYPE TABLE OF bapiret2,
+        ls_return          TYPE bapiret2.
+
+  CONSTANTS: lc_x(1)       TYPE c          VALUE 'X'.
+
+  GET PARAMETER ID 'RCK' FIELD rueck.
+  GET PARAMETER ID 'ANR' FIELD aufnr.
+  GET PARAMETER ID 'VGN' FIELD vornr.
+  GET PARAMETER ID 'RZL' FIELD rmzhl.
+  GET PARAMETER ID 'CAA' FIELD kapar.
+  GET PARAMETER ID 'IFL' FIELD tplnr.
+  GET PARAMETER ID 'EQN' FIELD equnr.
+
+  SET PARAMETER ID 'ANR' FIELD aufnr_ini.
+  SET PARAMETER ID 'VGN' FIELD vornr_ini.
+  SET PARAMETER ID 'RZL' FIELD rmzhl_ini.
+  SET PARAMETER ID 'CAA' FIELD kapar_ini.
+  SET PARAMETER ID 'IFL' FIELD tplnr_ini.
+  SET PARAMETER ID 'EQN' FIELD equnr_ini.
+  SET PARAMETER ID 'RCK' FIELD p_rueck.
+  SET PARAMETER ID 'RZL' FIELD p_rmzhl.
+
+*--- set TCODE
+  CASE p_transflag.
+    WHEN 'DISP'.
+      l_tcode = 'IW43'.
+    WHEN 'CANC'.
+      l_tcode = 'IW45'.
+    WHEN 'CHAN'.
+      l_tcode = 'IW45'.
+  ENDCASE.
+
+*--- Authority Check for T-code
+  PERFORM auth_check_tcode_f16 USING    l_tcode
+                               CHANGING l_retc.
+
+*--- call transaction/BAPI
+  IF l_retc IS INITIAL AND NOT l_tcode IS INITIAL.
+    IF l_tcode = 'IW43'.
+      CALL TRANSACTION l_tcode AND SKIP FIRST SCREEN.
+      IMPORT return_code FROM MEMORY ID 'IW41'.
+      FREE MEMORY ID 'IW41'.
+    ELSE.
+      CLEAR lv_exit.
+      IF p_arbpl IS INITIAL.
+        p_arbpl = object_tab-iarbpl.
+      ENDIF.
+      IF p_date IS INITIAL.
+*        p_date = object_tab-budat.    "comment MOD-003
+        p_date = object_tab-isdd.      "insert  MOD-003
+      ENDIF.
+
+*Begin of comment MOD-003
+*      IF object_tab-iarbpl NE p_arbpl AND object_tab-budat NE p_date.
+*        lv_conftext = 'Work Center and Posting date are changed'.
+*      ELSEIF object_tab-iarbpl NE p_arbpl.
+*        lv_conftext = 'Work Center has been changed'.
+*      ELSEIF object_tab-budat NE p_date.
+*        lv_conftext = 'Posting date has been changed'.
+*      ENDIF.
+*End of comment MOD-003
+
+*Begin of insert MOD-003
+      IF object_tab-iarbpl NE p_arbpl AND object_tab-isdd NE p_date.
+        lv_conftext = 'Work Center and Start date are changed'.
+      ELSEIF object_tab-iarbpl NE p_arbpl.
+        lv_conftext = 'Work Center has been changed'.
+      ELSEIF object_tab-isdd NE p_date.
+        lv_conftext = 'Start date has been changed'.
+      ENDIF.
+*End of comment MOD-003
+
+      IF p_transflag = 'CHAN'.
+*        IF object_tab-iarbpl EQ p_arbpl AND object_tab-budat EQ p_date.    "comment MOD-003
+        IF object_tab-iarbpl EQ p_arbpl AND object_tab-isdd EQ p_date.      "insert MOD-003
+*........ Confirmation &1 &2 &3 has not been cancelled: &4
+*........ No difference in Work Center and Start Date
+          MESSAGE i304 WITH p_aufnr p_rueck p_rmzhl INTO gv_msg.
+          PERFORM add_message_to_tab.
+          CONCATENATE '   --> ' text-t16 INTO gv_msg.
+          PERFORM add_message_to_tab.
+          lv_exit = lc_x.
+        ENDIF.
+      ENDIF.             "IF p_transflag = 'CHAN'.
+
+      CHECK lv_exit <> lc_x.
+      CLEAR lv_bapiret2.
+      CLEAR lv_lock.
+* Cancel the time confirmation on the first order
+      CALL FUNCTION 'BAPI_ALM_CONF_CANCEL'
+            EXPORTING
+              confirmation              = p_rueck
+              confirmationcounter       = p_rmzhl
+              postgdate                 = sy-datum
+              conftext                  = lv_conftext
+            IMPORTING
+              return                    = lv_bapiret2
+              locked                    = lv_lock
+*              CREATED_CONF_NO           =
+*              CREATED_CONF_COUNT        =
+                    .
+
+      IF NOT lv_lock IS INITIAL.
+*...... Confirmation &1 &2 &3 has not been cancelled: lock conflict
+        MESSAGE i304 WITH p_aufnr p_rueck p_rmzhl INTO gv_msg.
+        PERFORM add_message_to_tab.
+        CONCATENATE '   --> ' text-t06 INTO gv_msg.
+        PERFORM add_message_to_tab.
+        EXIT.
+      ENDIF.
+
+      IF NOT lv_bapiret2 IS INITIAL.
+*...... Confirmation &1 &2 &3 has not been cancelled: &4
+        MESSAGE i304 WITH p_aufnr p_rueck p_rmzhl INTO gv_msg.
+        PERFORM add_message_to_tab.
+        CONCATENATE '   --> ' lv_bapiret2-message INTO gv_msg.
+        PERFORM add_message_to_tab.
+      ELSE.
+* -     COMMIT THE BAPI WHICH WILL FINALLY CANCEL THE CONFIRMATION
+        CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+          EXPORTING
+            wait = 'X'.
+
+        IF sy-subrc EQ 0.
+*........ Confirmation &1 &2 &3 has been cancelled
+          MESSAGE s303 WITH p_aufnr p_rueck p_rmzhl INTO gv_msg.
+          PERFORM add_message_to_tab.
+        ENDIF.
+
+*...... Check if confirmation has to be created with new workcenter and/or new posting date
+        IF p_transflag = 'CHAN'.
+          REFRESH lt_return.
+
+          PERFORM fill_confdata_for_update USING object_tab-rueck
+                                                 object_tab-rmzhl
+                                                 object_tab-uvorn
+                                                 object_tab-iarbpl
+*                                                 object_tab-budat     "comment MOD-003
+                                                 object_tab-isdd       "insert  MOD-003
+                                        CHANGING lv_conf
+                                                 lv_act_work.
+
+          IF lv_conf IS INITIAL.
+*.......... Conf. has not been created for &1 with New Work Center/Start Date &2: &3
+            DATA: lv_errtext TYPE char75.
+*            IF object_tab-iarbpl NE p_arbpl AND object_tab-budat NE p_date.  "comment MOD-003
+            IF object_tab-iarbpl NE p_arbpl AND object_tab-isdd NE p_date.    "insert  MOD-003
+              CONCATENATE 'Work Center'
+                          p_arbpl
+                          'and'
+*                          'Posting Date'       "comment MOD-003
+                          'Start Date'          "insert  MOD-003
+                          p_date
+                          INTO lv_errtext
+                          SEPARATED BY space.
+              MESSAGE i325 WITH p_aufnr lv_errtext INTO gv_msg.
+            ELSEIF object_tab-iarbpl NE p_arbpl.
+              CONCATENATE 'Work Center'
+                          p_arbpl
+                          INTO lv_errtext
+                          SEPARATED BY space.
+              MESSAGE i325 WITH p_aufnr lv_errtext INTO gv_msg.
+*            ELSEIF object_tab-budat NE p_date.                     "comment MOD-003
+*              CONCATENATE 'Posting Date'
+            ELSEIF object_tab-isdd NE p_date.                       "insert  MOD-003
+              CONCATENATE 'Start Date'
+                          p_date
+                          INTO lv_errtext
+                          SEPARATED BY space.
+              MESSAGE i325 WITH p_aufnr lv_errtext INTO gv_msg.
+            ENDIF.
+            PERFORM add_message_to_tab.
+            CONCATENATE '   --> ' text-t04 INTO gv_msg.
+            PERFORM add_message_to_tab.
+            EXIT.
+          ENDIF.
+
+*........ Create new confirmation with new Work Center/Posting Date
+          CALL FUNCTION 'ALM_ME_TIME_CONF_CREATE_2'
+            EXPORTING
+*              POST_WRONG_ENTRIES         =
+              confirmation_item          = lv_conf
+              act_work                   = lv_act_work
+            IMPORTING
+              confirmation_number        = lv_conf_no
+              confirmation_counter       = lv_conf_cnt
+            TABLES
+              return                     = lt_return.
+
+          IF NOT lt_return[] IS INITIAL.
+            LOOP AT lt_return INTO ls_return.
+*.......... Conf. has not been created for &1 with New Work Center/Start Date &2: &3
+*              IF object_tab-iarbpl NE p_arbpl AND object_tab-budat NE p_date. "comment MOD-003
+              IF object_tab-iarbpl NE p_arbpl AND object_tab-isdd NE p_date.   "insert  MOD-003
+                CONCATENATE 'Work Center'
+                            p_arbpl
+                            'and'
+*                            'Posting Date' "comment MOD-003
+                            'Start Date'    "insert MOD-003
+                            p_date
+                            INTO lv_errtext
+                            SEPARATED BY space.
+                MESSAGE i325 WITH p_aufnr lv_errtext INTO gv_msg.
+              ELSEIF object_tab-iarbpl NE p_arbpl.
+                CONCATENATE 'Work Center'
+                            p_arbpl
+                            INTO lv_errtext
+                            SEPARATED BY space.
+                MESSAGE i325 WITH p_aufnr lv_errtext INTO gv_msg.
+*              ELSEIF object_tab-budat NE p_date.                 "comment MOD-003
+*                CONCATENATE 'Posting Date'
+              ELSEIF object_tab-isdd NE p_date.                   "insert MOD-003
+                CONCATENATE 'Start Date'
+                            p_date
+                            INTO lv_errtext
+                            SEPARATED BY space.
+                MESSAGE i325 WITH p_aufnr lv_errtext INTO gv_msg.
+              ENDIF.
+              PERFORM add_message_to_tab.
+              CONCATENATE '   --> ' ls_return-message INTO gv_msg.
+              PERFORM add_message_to_tab.
+              EXIT.
+            ENDLOOP.
+          ELSE.
+            COMMIT WORK AND WAIT.
+
+            IF sy-subrc EQ 0.
+*.......... Conf. has not been created for &1 with New Work Center/Start Date &2: &3
+*              IF object_tab-iarbpl NE p_arbpl AND object_tab-budat NE p_date.      "comment MOD-003
+              IF object_tab-iarbpl NE p_arbpl AND object_tab-isdd NE p_date.        "insert  MOD-003
+                CONCATENATE 'Work Center'
+                            p_arbpl
+                            'and'
+*                            'Posting Date'
+                            'Start Date'       "insert MOD-003
+                            p_date
+                            INTO lv_errtext
+                            SEPARATED BY space.
+                MESSAGE s324 WITH lv_conf_no
+                                  lv_conf_cnt
+                                  p_aufnr
+                                  lv_errtext
+                                  INTO gv_msg.
+              ELSEIF object_tab-iarbpl NE p_arbpl.
+                CONCATENATE 'Work Center'
+                            p_arbpl
+                            INTO lv_errtext
+                            SEPARATED BY space.
+                MESSAGE s324 WITH lv_conf_no
+                                  lv_conf_cnt
+                                  p_aufnr
+                                  lv_errtext
+                                  INTO gv_msg.
+*              ELSEIF object_tab-budat NE p_date.            "comment MOD-003
+*                CONCATENATE 'Posting Date'
+              ELSEIF object_tab-isdd NE p_date.              "insert  MOD-003
+                CONCATENATE 'Start Date'
+                            p_date
+                            INTO lv_errtext
+                            SEPARATED BY space.
+                MESSAGE s324 WITH lv_conf_no
+                                  lv_conf_cnt
+                                  p_aufnr
+                                  lv_errtext
+                                  INTO gv_msg.
+              ENDIF.
+              PERFORM add_message_to_tab.
+
+            ENDIF.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+  SET PARAMETER ID 'RCK' FIELD rueck.
+  SET PARAMETER ID 'ANR' FIELD aufnr.
+  SET PARAMETER ID 'VGN' FIELD vornr.
+  SET PARAMETER ID 'RZL' FIELD rmzhl.
+  SET PARAMETER ID 'CAA' FIELD kapar.
+  SET PARAMETER ID 'IFL' FIELD tplnr.
+  SET PARAMETER ID 'EQN' FIELD equnr.
+
+ENDFORM.                    " UPDATE_LABOUR_CONFIRMATIONS
+
+*&---------------------------------------------------------------------*
+*&      Form  FILL_CONFDATA_FOR_UPDATE
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM fill_confdata_for_update  USING p_objt-rueck
+                                     p_objt-rmzhl
+                                     p_objt-uvorn
+                                     p_objt-iarbpl
+*                                     p_objt-budat     "comment MOD-002
+                                     p_objt-isdd       "comment MOD-003
+                      CHANGING p_conf TYPE confco
+                               p_act_work.
+
+* Local variables
+  DATA: lv_afru TYPE afru.
+
+  CLEAR: p_conf.
+
+* Get all fields from confirmation table AFRU
+  SELECT SINGLE * INTO lv_afru
+         FROM afru
+         WHERE rueck = p_objt-rueck
+           AND rmzhl = p_objt-rmzhl.
+
+  CHECK sy-subrc = 0.
+
+  p_conf-order          = lv_afru-aufnr.
+  p_conf-activity       = lv_afru-vornr.
+  IF p_objt-iarbpl EQ p_arbpl.
+    p_conf-work_cntr      = p_objt-iarbpl.
+  ELSE.
+    p_conf-work_cntr      = p_arbpl.
+  ENDIF.
+  p_conf-fin_conf       = 'X'.
+*Begin of comments MOD-003
+*  IF p_objt-budat EQ p_date.
+*    p_conf-postg_date     = p_objt-budat.
+*  ELSE.
+*    p_conf-postg_date     = p_date.
+*  ENDIF.
+*End of comments MOD-003
+*Begin of insert MOD-003
+  IF p_objt-isdd EQ p_date.
+    p_conf-start_date     = p_objt-isdd.
+  ELSE.
+    p_conf-start_date     = p_date.
+  ENDIF.
+*End of insert MOD-003
+  p_conf-dev_reason     = lv_afru-grund.
+  p_conf-un_act_dur     = lv_afru-idaue.
+  p_conf-actual_dur     = lv_afru-idaur.
+  p_conf-end_date       = lv_afru-iedd.
+  p_conf-end_time       = lv_afru-iedz.
+*  p_conf-start_date     = lv_afru-isdd.   "comment MOD-003
+  p_conf-start_time     = lv_afru-isdz.
+  p_conf-un_work        = lv_afru-ismnu.
+  p_conf-postg_date     = sy-datum.        "insert MOD-003
+
+  IF NOT lv_afru-ismnu IS INITIAL AND
+   lv_afru-ismne NE lv_afru-ismnu.
+    CALL FUNCTION 'UNIT_CONVERSION_SIMPLE'
+      EXPORTING
+        input    = lv_afru-ismnw
+        unit_in  = lv_afru-ismne
+        unit_out = lv_afru-ismnu
+      IMPORTING
+        output   = p_act_work.
+  ENDIF.
+
+* p_conf-act_work       = lv_afru-ismnw.
+  IF p_act_work IS INITIAL.
+    p_act_work            = lv_afru-ismnw.
+  ENDIF.
+  p_conf-act_type       = lv_afru-learr.
+*  p_conf-complete       = lv_afru-leknw.
+*  p_conf-wage_type      = lv_afru-loart.
+*  p_conf-conf_text      = lv_afru-ltxa1.
+*  p_conf-un_rem_dur     = lv_afru-odaue.
+*  p_conf-rem_dur        = lv_afru-odaur.
+*  p_conf-un_rem_wrk     = lv_afru-ofmne.
+*  p_conf-rem_work       = lv_afru-ofmnw.
+*  clear p_conf-rem_work.
+*  p_conf-fcstfindat     = lv_afru-pedd.
+  p_conf-fcstfintim     = lv_afru-pedz.
+*  p_conf-pers_no        = lv_afru-pernr.
+  p_conf-plant          = lv_afru-werks.
+*  p_conf-cats_doc_no    = lv_afru-catsbelnr.
+*  p_conf-price          = lv_afru-catsprice.
+*  p_conf-trans_curr     = lv_afru-catstcurr.
+*  p_conf-price_unit     = lv_afru-catspeinh.
+*  p_conf-fin_conf_r     =
+*  p_conf-create_dat     = sy-datum.
+*  p_conf-create_tim     = sy-uzeit.
+
+  p_conf-calc_motive  = lv_afru-bemot.
+
+*  p_conf-co_area        = lv_afru-skokrs.
+*  p_conf-send_cctr      = lv_afru-skostl.
+*  p_conf-un_work_dia    =
+*  p_conf-conf_cnt       = lv_afru-rmzhl.
+  p_conf-zzernam        = sy-uname.
+  p_conf-zzorigf        = lv_afru-origf.
+
+ENDFORM.                    " FILL_CONFDATA_FOR_UPDATE
+
+*End of insert MOD-002
+*Text symbol text£º
+*001:Operation
+*002:Confirmation
+*004:Order status
+*005:In process
+*008:Completed
+*009:Select. profile
+*010:(where labour will be copied to.)
+*011:Order
+*700:**** LINES 701, 702, 703 are one sentence
+*701:Do you want to cancel processing
+*702:for all the objects selected that
+*703:have not yet been processed?
+*704:List editing canceled
+*705:No
+*706:Yes
+*ANZ:Number
+*B01:Order selection
+*B02:Processing options
+*E01:Please fill in the order to be booked to
+*E02:Order is in status TECO/CLOSED:
+*E03:Order is Locked:
+*E04:Order is TECO/CLOSED and Locked:
+*E05:The orders have different company code:
+*P05:Act. work (h)
+*PO1:High number, high act. work
+*PO2:Low number, high actual work
+*PO3:High number, low actual work
+*PO4:Low number, low actual work
+*SON:Others
+*T01:Action log
+*T02:No difference in accounting indicator, key value
+*T03:Wrong accounting indicator
+*T04:Confirmation data to be copied from does not exist !
+*T05:-------------------------------------------------------------------------------------------------------------------
+*T06:Lock conflict
+*T07:Accounting indicator may not be changed into :
+*T08:Accounting indicator
+*T09:not allowed for order type
+*T10:Cancel due to ZIW45
+*T11:Confirmation was not cancelled !!
+*T12:MC is linked to TC --> so, this was already cancelled too !!
+*T13:Rebook of order
+
+*T16:No difference in Work Center and Start Date
+*Selection text£º
+*AUFNR_O:D       .
+*P_ARBPL:        New Work Center
+*P_AUF_TO:        Order
+*P_BEMOTM:        Accounting Indicator
+*P_BEMOTT:        Accounting Indicator
+*P_CANCM:        Cancellations of material conf
+*P_CANCT:        Cancellations of time conf.
+*P_CCTEXT:        Reason for cancellation
+*P_CHANM:        Change acc.ind. on mat.conf.
+*P_CHANT:        Change acc.ind. on time conf.
+*P_DATE:        New Date
+*P_LABCON:        Update labour confirmations
+*P_REBO:        Rebook labour conf.
+
+*P_RVSEM:        Reverse of cancelled mat.conf.
+*List Title: Titlebar£º
+*:Action log

@@ -1,0 +1,426 @@
+*----------------------------------------------------------------------*
+*  INCLUDE SDRRR51NS  ---   Subroutines
+*  ************************************
+*
+* perform select_reference_lines.
+* perform select_revenue_lines.
+* perform show_fi_documents.
+* perform show_items.
+* perform show_items_multi.
+*
+*----------------------------------------------------------------------*
+
+*----------------------------------------------------------------------*
+*       Form  SELECT_REFERENCE_LINES
+*----------------------------------------------------------------------*
+*       Select reference lines from database
+*----------------------------------------------------------------------*
+*   --> PIT_CONTROL        Collect control lines
+*   <-> PIT_VBREVR         Reference lines
+*   <-> PIF_SUBRC_VBREVR   Error mark for table reference
+*----------------------------------------------------------------------*
+form select_reference_lines using pit_control type gvt_strucst_control
+                         changing pit_vbrevr  type gvt_strucst_vbrevr
+                                  pif_subrc_vbrevr.
+
+* Select all reference lines, which discribed the lines in PIT_CONTROL
+  check not pit_control is initial.
+  select * from vbrevr into table pit_vbrevr
+                          for all entries in pit_control
+                                  where vbeln = pit_control-vbeln and
+                                        posnr = pit_control-posnr
+                                  order by primary key.
+
+* Set error mark
+  pif_subrc_vbrevr = sy-subrc.
+
+endform.                               " SELECT_REFERENCE_LINES
+
+*----------------------------------------------------------------------*
+*       Form  SELECT_REVENUE_LINES
+*----------------------------------------------------------------------*
+*       Read revenue lines from database
+*----------------------------------------------------------------------*
+*   --> PIT_CONTROL         Collect control lines
+*   <-> PIT_VBREVE          Revenue lines
+*   <-> PIF_SUBRC_VBREVE    Error mark for table revenue lines
+*----------------------------------------------------------------------*
+form select_revenue_lines using pit_control type gvt_strucst_control
+                       changing pit_vbreve  type gvt_strucst_vbreve
+                                pif_subrc_vbreve.
+
+* Select all revenue lines, which discribed the lines in PIT_CONTROL
+  check not pit_control is initial.
+
+* Internal ranges
+  ranges: lvt_revpoblck for vbreve-revpoblck.      " Revenue post.block
+
+* Fill range of revenue posting block info
+  if prlkz eq gcf_rlkz_yes.
+    if pblkz eq gcf_blkz_no.
+      lvt_revpoblck-option = gcf_options_ne.
+      lvt_revpoblck-low    = gcf_blkz_yes.
+    endif.
+  else.
+    lvt_revpoblck-option = gcf_options_eq.
+    if pblkz eq gcf_blkz_yes.
+      lvt_revpoblck-low = gcf_blkz_yes.
+    else.
+      lvt_revpoblck-low = gcf_rlbl_ignore.
+    endif.
+  endif.
+
+  if not lvt_revpoblck is initial.
+    lvt_revpoblck-sign = gcf_sign_i.
+*   Append revenue posting block info
+    append lvt_revpoblck.
+  endif.
+
+  select * from vbreve into table pit_vbreve
+                          for all entries in pit_control
+                                  where vbeln      = pit_control-vbeln
+                                  and   posnr      = pit_control-posnr
+                                  and ( revpoblck in lvt_revpoblck or
+                                        revpoblck is null )
+                                  order by primary key.
+
+* Set error mark
+  pif_subrc_vbreve = sy-subrc.
+
+endform.                               " SELECT_REVENUE_LINES
+
+*----------------------------------------------------------------------*
+*       Form  show_fi_documents
+*----------------------------------------------------------------------*
+form show_fi_documents.
+
+  data: lvs_row      type lvc_s_row,
+        lvt_row      type lvc_t_row,
+        lvf_lines    type i,
+        lvs_header   like line of gvt_header,
+        lvs_item     like line of gvt_item,
+        lrt_belnr    type range of belnr_d,
+        lrs_belnr    like line of lrt_belnr,
+        lrt_gjahr    type range of gjahr,
+        lrs_gjahr    like line of lrt_gjahr,
+        lrt_bukrs    type range of bukrs,
+        lrs_bukrs    like line of lrt_bukrs,
+        lvt_bkpf     type standard table of bkpf,
+        lvs_bkpf     type bkpf.
+
+* distinguish between different posting logic
+  data: lvf_post_kz_old  type char1,
+        lvf_fidoc        type char1,
+        lvs_awref        type gvs_struc_selno,
+        lvf_awtyp        like bkpf-awtyp,
+        lrt_awkey        type range of awkey,
+        lrs_awkey        like line of lrt_awkey.
+
+* Internal tables
+  data: lvt_bkpf_fi type gvt_strucst_bkpf,
+        lvt_bseg_fi type gvt_strucst_bseg,
+        lvt_bseg    type gvt_strucst_bseg,
+        lvt_awref   type gvt_strucst_selno.
+
+* Field symbols
+  field-symbols:  <lvs_bseg>  type line of gvt_strucst_bseg.
+
+* First check the authority to call the transaction
+  authority-check object 'S_TCODE'
+           id 'TCD' field 'FB03'.
+  if sy-subrc ne 0.
+    message s172(00) with 'FB03'.
+    exit.
+  endif.
+
+  call method go_alv_grid_top->get_selected_rows
+    IMPORTING
+      et_index_rows = lvt_row.
+
+  describe table lvt_row lines lvf_lines.
+  if lvf_lines <> 1.
+    message s019.
+    exit.
+  endif.
+
+  read table lvt_row into lvs_row index 1.
+  read table gvt_header index lvs_row-index into lvs_header.
+
+  read table gvt_item with key
+                      vbeln = lvs_header-vbeln
+                      posnr = lvs_header-posnr
+                      sakdr = lvs_header-sakrr
+                      transporting no fields
+                      binary search.
+
+* Fill the AWKEY range table
+* 1.) with collective run number
+  loop at gvt_item into lvs_item from sy-tabix.
+    if lvs_item-vbeln  ne lvs_header-vbeln
+     or lvs_item-posnr ne lvs_header-posnr
+     or lvs_item-sakdr ne lvs_header-sakrr.
+      exit.
+    endif.
+    check not lvs_item-sammg is initial.
+
+*   distinguish between old and new posting logic
+    if not lvs_item-reffld is initial.
+      lvs_awref-docno      = lvs_item-sammg.
+      lvs_awref-no         = lvs_item-reffld.
+    else.
+      lvs_awref-docno      = lvs_item-sammg.
+      lvs_awref-no         = gcf_generic.
+      lvf_post_kz_old      = gcf_true.
+    endif.
+    collect lvs_awref into lvt_awref.
+  endloop.
+
+* with sales document number
+  lvs_awref-docno    = lvs_header-vbeln.
+  lvs_awref-no       = gcf_generic.
+  append  lvs_awref to lvt_awref.
+
+  loop at lvt_awref into lvs_awref.
+
+    do 2 times.
+*   Fill the AWTYP range table
+      case sy-index.
+        when 1.
+          if lvf_post_kz_old eq gcf_true.
+            lvf_awtyp    = gcf_vbak.
+          else.
+            continue.
+          endif.
+        when 2.
+          lvf_awtyp    = gcf_vbrr.
+      endcase.
+
+*   Get FI-documents
+      call function 'FI_DOCUMENT_READ'
+        EXPORTING
+          i_awtyp     = lvf_awtyp
+          i_awref     = lvs_awref-docno
+          i_aworg     = lvs_awref-no
+        TABLES
+          t_bkpf      = lvt_bkpf_fi
+          t_bseg      = lvt_bseg_fi
+        EXCEPTIONS
+          wrong_input = 1
+          not_found   = 2.
+
+      if sy-subrc eq 0.                " If sy-subrc ...
+*       Fill FI documents
+        append lines of lvt_bkpf_fi to lvt_bkpf.
+        append lines of lvt_bseg_fi to lvt_bseg.
+      endif.
+    enddo.
+  endloop.
+
+enhancement-point show_fi_documents_01 spots es_sdrrr51ns.
+
+  describe table lvt_bkpf lines lvf_lines.
+
+* Call the display transaction / report
+  if lvf_lines = 1.
+    read table lvt_bkpf into lvs_bkpf index 1.
+    authority-check object 'F_BKPF_BUK'
+             id 'BUKRS' field lvs_bkpf-bukrs
+             id 'ACTVT' field '03'.
+
+    if sy-subrc <> 0.
+      message s460(f5) with lvs_bkpf-bukrs.
+      exit.
+    endif.
+
+    set parameter id 'BUK' field lvs_bkpf-bukrs.
+    set parameter id 'GJR' field lvs_bkpf-gjahr.
+    set parameter id 'BLN' field lvs_bkpf-belnr.
+    call transaction 'FB03' and skip first screen.       "#EC CI_CALLTA
+  elseif lvf_lines > 1.
+
+*   All FI documents of one VBREVK belong to one bukrs
+    read table lvt_bkpf into lvs_bkpf index 1
+                        transporting bukrs.
+    authority-check object 'F_BKPF_BUK'
+             id 'BUKRS' field lvs_bkpf-bukrs
+             id 'ACTVT' field '03'.
+
+    if sy-subrc <> 0.
+      message s460(f5) with lvs_bkpf-bukrs.
+      exit.
+    endif.
+
+    if lvf_post_kz_old eq gcf_true.
+      sort lvt_bseg by bukrs belnr gjahr buzei.
+    endif.
+
+    loop at lvt_bkpf into lvs_bkpf.
+
+*     Check currency key
+      if lvs_header-waerk ne lvs_bkpf-waers.
+        continue.
+      endif.
+
+*     select the relevant FI documents for VBREVE entries without
+*     VBREVE-REFFLD
+      clear lvf_fidoc.
+      if lvf_post_kz_old eq gcf_true.
+        read table lvt_bseg with key bukrs = lvs_bkpf-bukrs
+                                     belnr = lvs_bkpf-belnr
+                                     gjahr = lvs_bkpf-gjahr
+                                     assigning <lvs_bseg>
+                                     binary search.
+        if sy-subrc is initial.
+          loop at lvt_bseg assigning <lvs_bseg> from sy-tabix.
+
+            if not ( <lvs_bseg>-bukrs eq lvs_bkpf-bukrs and
+                     <lvs_bseg>-belnr eq lvs_bkpf-belnr and
+                     <lvs_bseg>-gjahr eq lvs_bkpf-gjahr ).
+              exit.
+            endif.
+
+            if <lvs_bseg>-zuonr(10)   eq lvs_header-vbeln and
+               <lvs_bseg>-zuonr+10(6) eq lvs_header-posnr.
+              lvf_fidoc = gcf_true.
+              exit.
+            endif.
+          endloop.
+
+        endif.
+      else.
+        lvf_fidoc = gcf_true.
+      endif.
+
+      if lvf_fidoc eq gcf_true.
+
+        lrs_bukrs-sign   = gcf_sign_i.
+        lrs_bukrs-option = gcf_options_eq.
+        lrs_bukrs-low    = lvs_bkpf-bukrs.
+        collect lrs_bukrs into lrt_bukrs.
+
+        lrs_belnr-sign   = gcf_sign_i.
+        lrs_belnr-option = gcf_options_eq.
+        lrs_belnr-low    = lvs_bkpf-belnr.
+        collect lrs_belnr into lrt_belnr.
+
+        lrs_gjahr-sign   = gcf_sign_i.
+        lrs_gjahr-option = gcf_options_eq.
+        lrs_gjahr-low    = lvs_bkpf-gjahr.
+        collect lrs_gjahr into lrt_gjahr.
+
+        lrs_awkey-sign   = gcf_sign_i.
+        lrs_awkey-option = gcf_options_cp.
+        lrs_awkey-low    = lvs_bkpf-awkey.
+        collect lrs_awkey into lrt_awkey.
+
+      endif.
+    endloop.
+
+    submit rfbueb00 with br_bukrs in lrt_bukrs           "#EC CI_SUBMIT
+                    with br_belnr in lrt_belnr
+                    with br_gjahr in lrt_gjahr
+                    with br_awkey in lrt_awkey
+                    and return.
+  else.
+    message s062(vf).
+  endif.
+
+endform.                    " show_fi_document
+
+*----------------------------------------------------------------------*
+*       Form  show_items
+*----------------------------------------------------------------------*
+form show_items
+    using
+        pif_index  type lvc_index.
+
+  data: lvs_header like line of gvt_header,
+        lvs_item   like line of gvt_item,
+        lvs_stable type lvc_s_stbl.
+
+  read table gvt_header index pif_index into lvs_header.
+
+  clear gvt_item_lines.
+
+  read table gvt_item with key vbeln = lvs_header-vbeln
+                         posnr = lvs_header-posnr
+                         transporting no fields
+                         binary search.
+
+  loop at gvt_item into lvs_item from sy-tabix.
+    if lvs_item-vbeln ne lvs_header-vbeln
+     or lvs_item-posnr ne lvs_header-posnr.
+      exit.
+    endif.
+    append lvs_item to gvt_item_lines.
+  endloop.
+
+  lvs_stable-row = gcf_false.
+  lvs_stable-col = gcf_false.
+  call method go_alv_grid_buttom->refresh_table_display
+    EXPORTING
+      is_stable      = lvs_stable
+      i_soft_refresh = gcf_false
+    EXCEPTIONS
+      finished       = 1
+      others         = 2.
+
+  if sy-subrc <> 0.
+    message id sy-msgid type sy-msgty number sy-msgno
+               with sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  endif.
+endform.                    " show_items
+
+*----------------------------------------------------------------------*
+*       Form  show_items_multi
+*----------------------------------------------------------------------*
+form show_items_multi tables lvt_row.
+
+  data: lvs_header like line of gvt_header,
+        lvs_item   like line of gvt_item,
+        lvs_stable type lvc_s_stbl,
+        lvs_row    type lvc_s_row.
+
+
+  clear gvt_item_lines.
+
+  loop at lvt_row into lvs_row.
+
+    read table gvt_header index lvs_row-index into lvs_header.
+    check: sy-subrc is initial.
+
+    read table gvt_item with key vbeln = lvs_header-vbeln
+                                 posnr = lvs_header-posnr
+                                 transporting no fields
+                                 binary search.
+    check: sy-subrc is initial.
+
+    loop at gvt_item into lvs_item from sy-tabix.
+      if lvs_item-vbeln ne lvs_header-vbeln
+       or lvs_item-posnr ne lvs_header-posnr.
+        exit.
+      endif.
+      append lvs_item to gvt_item_lines.
+    endloop.
+
+  endloop.
+
+  sort gvt_item_lines stable.
+  delete adjacent duplicates from gvt_item_lines
+  comparing all fields.
+
+  lvs_stable-row = gcf_false.
+  lvs_stable-col = gcf_false.
+  call method go_alv_grid_buttom->refresh_table_display
+    EXPORTING
+      is_stable      = lvs_stable
+      i_soft_refresh = gcf_false
+    EXCEPTIONS
+      finished       = 1
+      others         = 2.
+
+  if sy-subrc <> 0.
+    message id sy-msgid type sy-msgty number sy-msgno
+               with sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  endif.
+endform.                    " show_items_multi

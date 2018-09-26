@@ -1,0 +1,486 @@
+REPORT yse_sf_caselabel LINE-COUNT 100 MESSAGE-ID vv.
+
+
+TABLES: vbco3, tvst, vbkd.
+
+INCLUDE palidata.
+INCLUDE rvadtabl.
+
+DATA: retcode LIKE sy-subrc,             "Returncode
+      xscreen(1) TYPE c,                 "Ausgabe Printer/Screen
+      ls_aufnr TYPE aufnr.
+
+DATA: it_serial TYPE TABLE OF yse_serial,
+      wa_ekko TYPE ekko.
+*&---------------------------------------------------------------------*
+*&      Form  ENTRY
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->RETURN_CODE  text
+*      -->US_SCREEN    text
+*----------------------------------------------------------------------*
+FORM entry USING return_code us_screen.
+
+  CLEAR retcode.
+  xscreen = us_screen.
+  PERFORM processing USING xscreen.
+  IF retcode NE 0.
+    return_code = 1.
+  ELSE.
+    return_code = 0.
+  ENDIF.
+
+ENDFORM.                    "ENTRY
+
+* Aufruf Unterprogramme
+FORM processing USING proc_screen.
+
+* Datenbeschaffung ¨¹ber Funktionsbaustein
+  PERFORM get_data.
+  CHECK retcode = 0.
+
+
+
+* F¨¹llen Sapscript-Formular mit Daten
+  PERFORM item_print.
+  CHECK retcode = 0.
+
+
+
+ENDFORM.                    "PROCESSING
+
+
+* Etikettierungsdaten beschaffen
+FORM get_data.
+
+  REFRESH: lvbplk, lvbpla.
+  CLEAR: lvbplk, lvbpla.
+
+
+* Beschaffung Daten f¨¹r Funktionsbausteinaufruf
+  vbco3-venum = nast-objky.                                 "00000.....
+  vbco3-spras = nast-spras.      "D
+  vbco3-kunde = nast-parnr.      "KUNDE
+  vbco3-parvw = nast-parvw.      "WE
+  vbco3-packd = 'X'.
+
+  CALL FUNCTION 'SD_PACKING_PRINT_VIEW_SINGLE'
+    EXPORTING
+      comwa                    = vbco3
+    IMPORTING
+      vbplk_wa                 = lvbplk
+      vbpla_wa                 = lvbpla
+      vbadr_tvst               = lvbadr                     "n_916660
+    TABLES
+      vbplp_tab                = lvbplp
+    EXCEPTIONS
+      shipping_unit_not_unique = 1
+      shipping_unit_not_found  = 2
+      OTHERS                   = 3.
+
+  IF sy-subrc NE 0.
+    retcode = 1.
+    PERFORM protocol_update.
+  ENDIF.
+
+* fill address key --> necessary for emails -                   n_916660
+  addr_key-addrnumber = lvbadr-adrnr.
+  addr_key-persnumber = lvbadr-adrnp.
+  addr_key-addr_type  = lvbadr-address_type.
+
+ENDFORM.                    "GET_DATA
+
+
+* #ffnen Formular
+FORM form_open USING us_screen us_country.
+
+  INCLUDE rvadopfo.
+
+ENDFORM.                    "FORM_OPEN
+
+* Ausgabe der Etikettierungsdaten
+FORM item_print.
+
+  DATA: lf_fm_name            TYPE rs38l_fnam.
+  DATA: ls_control_param      TYPE ssfctrlop.
+  DATA: ls_composer_param     TYPE ssfcompop.
+  DATA: ls_recipient          TYPE swotobjid.
+  DATA: ls_sender             TYPE swotobjid.
+  DATA: lf_formname           TYPE tdsfname.
+  DATA: ls_addr_key           LIKE addr_key.
+  DATA: ls_job_info           TYPE ssfcrescl.
+
+* Vorbereiten SAPscript-Daten
+  vbplk = lvbplk.                     "Versandelementkopfdaten
+  vbpla = lvbpla.                     "Versandadre#daten
+
+  PERFORM get_extra_data.
+
+  CLEAR retcode.
+*  nast_key = objky.
+
+
+  PERFORM set_print_param USING      ls_addr_key
+                          CHANGING ls_control_param
+                                   ls_composer_param
+                                   ls_recipient
+                                   ls_sender
+                                   retcode.
+
+
+
+
+*Get the Smart Form name.
+  IF NOT tnapr-sform IS INITIAL.
+    lf_formname = tnapr-sform.
+  ELSE.
+    MESSAGE e001(/smb40/ssfcomposer).
+  ENDIF.
+
+* Begin of Insert AIR21243 04/08/09 for some countries,we will pick another layout
+  DATA: l_sform TYPE tdsfname,
+        l_land1 TYPE land1_gp,
+        gv_bukrs TYPE bukrs.
+
+
+
+
+  CLEAR l_land1.
+  CLEAR gv_bukrs.
+
+  SELECT SINGLE bukrs INTO gv_bukrs
+    FROM tvko WHERE vkorg = vbplk-vkorg.
+
+  SELECT SINGLE land1 INTO l_land1 FROM  t001
+         WHERE  bukrs  = gv_bukrs.
+
+
+
+  CALL FUNCTION 'YSE_LAY_GET_FNAME'
+    EXPORTING
+      tnapr = tnapr
+      land1 = l_land1
+      vkorg = vbplk-vkorg
+    IMPORTING
+      sform = l_sform.
+
+  IF NOT l_sform IS INITIAL.
+    lf_formname = l_sform.
+  ELSE.
+    lf_formname = tnapr-sform.
+  ENDIF.
+
+* End of Insert AIR21243 04/08/09
+
+* determine smartform function module for invoice
+  CALL FUNCTION 'SSF_FUNCTION_MODULE_NAME'
+       EXPORTING  formname           = lf_formname
+*                 variant            = ' '
+*                 direct_call        = ' '
+       IMPORTING  fm_name            = lf_fm_name
+       EXCEPTIONS no_form            = 1
+                  no_function_module = 2
+                  OTHERS             = 3.
+  IF sy-subrc <> 0.
+*   error handling
+    retcode = sy-subrc.
+    IF sy-subrc = 1.
+      MESSAGE e001(/smb40/ssfcomposer).
+    ENDIF.
+    IF sy-subrc = 2.
+      MESSAGE e002(/smb40/ssfcomposer) WITH lf_fm_name .
+    ENDIF.
+    PERFORM protocol_update.
+  ENDIF.
+
+  CALL FUNCTION lf_fm_name
+    EXPORTING
+       archive_index              = toa_dara
+*   ARCHIVE_INDEX_TAB          =
+       archive_parameters         = arc_params
+       control_parameters         = ls_control_param
+*   MAIL_APPL_OBJ              =
+       mail_recipient             = ls_recipient
+       mail_sender                = ls_sender
+       output_options             = ls_composer_param
+       user_settings              = ' '
+       vbplk                      = vbplk  "vekp
+       vbpla                      = vbpla
+       is_nast                    = nast
+       w_vbkd                     = vbkd
+       aufnr                      = ls_aufnr
+       lt_ekko                    = wa_ekko
+ IMPORTING
+       job_output_info            = ls_job_info
+ TABLES
+       lvbplp                     = lvbplp
+       lt_serial                  = it_serial
+ EXCEPTIONS
+       formatting_error           = 1
+       internal_error             = 2
+       send_error                 = 3
+       user_canceled              = 4
+       OTHERS                     = 5
+            .
+  IF sy-subrc <> 0.
+    retcode = sy-subrc.
+    PERFORM protocol_update.
+* get SmartForm protocoll and store it in the NAST protocoll
+    PERFORM add_smfrm_prot.
+  ENDIF.
+
+ENDFORM.                    "ITEM_PRINT
+*---------------------------------------------------------------------*
+*       FORM PROTOCOL_UPDATE                                          *
+*---------------------------------------------------------------------*
+*       The messages are collected for the processing protocol.       *
+*---------------------------------------------------------------------*
+
+* Nachrichtenaufbereitung
+FORM protocol_update.
+
+  CHECK xscreen = ' '.                                      "n_881840
+
+  CALL FUNCTION 'NAST_PROTOCOL_UPDATE'
+    EXPORTING
+      msg_arbgb = sy-msgid
+      msg_nr    = sy-msgno
+      msg_ty    = sy-msgty
+      msg_v1    = sy-msgv1
+      msg_v2    = sy-msgv2
+      msg_v3    = sy-msgv3
+      msg_v4    = sy-msgv4
+    EXCEPTIONS
+      OTHERS    = 1.
+
+ENDFORM.                    "PROTOCOL_UPDATE
+*&---------------------------------------------------------------------*
+*&      Form  set_print_param
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_LS_ADDR_KEY  text
+*      <--P_LS_CONTROL_PARAM  text
+*      <--P_LS_COMPOSER_PARAM  text
+*      <--P_LS_RECIPIENT  text
+*      <--P_LS_SENDER  text
+*      <--P_RETCODE  text
+*----------------------------------------------------------------------*
+FORM set_print_param USING    is_addr_key LIKE addr_key
+                     CHANGING cs_control_param TYPE ssfctrlop
+                              cs_composer_param TYPE ssfcompop
+                              cs_recipient TYPE  swotobjid
+                              cs_sender TYPE  swotobjid
+                              cf_retcode TYPE sy-subrc.
+
+  DATA: ls_itcpo     TYPE itcpo.
+  DATA: lf_repid     TYPE sy-repid.
+  DATA: lf_device    TYPE tddevice.
+  DATA: ls_recipient TYPE swotobjid.
+  DATA: ls_sender    TYPE swotobjid.
+
+  lf_repid = sy-repid.
+  IF itcpo IS INITIAL.
+    CALL FUNCTION 'WFMC_PREPARE_SMART_FORM'
+      EXPORTING
+        pi_nast       = nast
+        pi_addr_key   = is_addr_key
+        pi_repid      = lf_repid
+      IMPORTING
+        pe_returncode = cf_retcode
+        pe_itcpo      = ls_itcpo
+        pe_device     = lf_device
+        pe_recipient  = cs_recipient
+        pe_sender     = cs_sender.
+
+    IF cf_retcode = 0.
+      MOVE-CORRESPONDING ls_itcpo TO cs_composer_param.
+*   CS_CONTROL_PARAM-NO_OPEN
+*   CS_CONTROL_PARAM-NO_CLOSE
+      cs_control_param-device      = lf_device.
+      cs_control_param-no_dialog   = 'X'.
+      cs_control_param-preview     = xscreen.
+      cs_control_param-getotf      = ls_itcpo-tdgetotf.
+      cs_control_param-langu       = nast-spras.
+*   CS_CONTROL_PARAM-REPLANGU1
+*   CS_CONTROL_PARAM-REPLANGU2
+*   CS_CONTROL_PARAM-REPLANGU3
+*   CS_CONTROL_PARAM-STARTPAGE
+    ENDIF.
+  ELSE.
+    MOVE-CORRESPONDING itcpo TO cs_composer_param.
+*   CS_CONTROL_PARAM-NO_OPEN
+*   CS_CONTROL_PARAM-NO_CLOSE
+    cs_control_param-device      = lf_device.
+    cs_control_param-no_dialog   = 'X'.
+    cs_control_param-preview     = xscreen.
+    cs_control_param-getotf      = itcpo-tdgetotf.
+    cs_control_param-langu       = nast-spras.
+*   CS_CONTROL_PARAM-REPLANGU1
+*   CS_CONTROL_PARAM-REPLANGU2
+*   CS_CONTROL_PARAM-REPLANGU3
+*   CS_CONTROL_PARAM-STARTPAGE
+
+  ENDIF.
+
+ENDFORM.                               " set_print_param
+*&---------------------------------------------------------------------*
+*&      Form  add_smfrm_prot
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM add_smfrm_prot.
+  DATA: lt_errortab             TYPE tsferror.
+  DATA: lf_msgnr                TYPE sy-msgno.
+  DATA:  l_s_log                TYPE bal_s_log,
+         p_loghandle            TYPE balloghndl,
+         l_s_msg                TYPE bal_s_msg.
+
+  FIELD-SYMBOLS: <fs_errortab>  TYPE LINE OF tsferror.
+
+* get smart form protocoll
+  CALL FUNCTION 'SSF_READ_ERRORS'
+    IMPORTING
+      errortab = lt_errortab.
+
+* add smartform protocoll to nast protocoll
+  LOOP AT lt_errortab ASSIGNING <fs_errortab>.
+    CLEAR lf_msgnr.
+    lf_msgnr = <fs_errortab>-errnumber.
+    CALL FUNCTION 'NAST_PROTOCOL_UPDATE'
+      EXPORTING
+        msg_arbgb = <fs_errortab>-msgid
+        msg_nr    = lf_msgnr
+        msg_ty    = <fs_errortab>-msgty
+        msg_v1    = <fs_errortab>-msgv1
+        msg_v2    = <fs_errortab>-msgv2
+        msg_v3    = <fs_errortab>-msgv3
+        msg_v4    = <fs_errortab>-msgv4
+      EXCEPTIONS
+        OTHERS    = 1.
+  ENDLOOP.
+* open the application log
+  l_s_log-extnumber    = sy-uname.
+
+  CALL FUNCTION 'BAL_LOG_CREATE'
+    EXPORTING
+      i_s_log      = l_s_log
+    IMPORTING
+      e_log_handle = p_loghandle
+    EXCEPTIONS
+      OTHERS       = 1.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+  LOOP AT lt_errortab ASSIGNING <fs_errortab>.
+    MOVE-CORRESPONDING <fs_errortab> TO l_s_msg.
+    CALL FUNCTION 'BAL_LOG_MSG_ADD'
+      EXPORTING
+        i_log_handle = p_loghandle
+        i_s_msg      = l_s_msg
+      EXCEPTIONS
+        OTHERS       = 1.
+    IF sy-subrc <> 0.
+      MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+              WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+    ENDIF.
+  ENDLOOP.
+
+  CALL FUNCTION 'BAL_DSP_LOG_DISPLAY'.
+*  IF sy-subrc <> 0.
+*    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+*            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+*  ENDIF.
+
+ENDFORM.                               " add_smfrm_prot
+*&---------------------------------------------------------------------*
+*&      Form  get_extra_data
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM get_extra_data.
+
+  DATA: sto_check TYPE flag.
+  DATA: it_vbfa TYPE STANDARD TABLE OF vbfa WITH HEADER LINE.
+  DATA: l_auart TYPE auart,
+        l_vbelv TYPE srrelroles-objkey.
+
+  DATA: BEGIN OF it_vbeln OCCURS 0,
+    aufnr TYPE aufnr.
+  DATA: END OF it_vbeln.
+
+
+  CLEAR vbkd.
+  SELECT SINGLE * FROM vbkd WHERE vbeln = lvbplp-vgbel.
+
+* Get the service order number:
+*  "select an earlier document for wich you find a notification.
+  CLEAR l_vbelv.
+  SELECT SINGLE vbelv INTO l_vbelv FROM vbfa
+                                   WHERE vbeln = vbplk-vpobjkey
+                                   AND vbtyp_v = 'C'.
+  CLEAR l_auart.
+  SELECT SINGLE auart INTO l_auart FROM vbak WHERE vbeln = l_vbelv.
+
+  CLEAR it_vbeln.
+  REFRESH it_vbeln.
+
+  CALL FUNCTION 'YSE_GET_EXISTING_SEO'
+    EXPORTING
+      objectkey_imp       = l_vbelv
+      auart_imp           = l_auart
+    TABLES
+      vbeln_exp           = it_vbeln
+* EXCEPTIONS
+*   NONSENSE            = 1
+*   OTHERS              = 2
+            .
+  IF sy-subrc <> 0.
+* MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*         WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+  ENDIF.
+
+
+  READ TABLE it_vbeln INDEX 1.
+  IF sy-subrc = 0.
+    ls_aufnr = it_vbeln-aufnr.
+  ENDIF.
+
+
+*select the serial numbers from the delivery:
+
+
+*   Select all serial numbers for all items
+  CLEAR it_serial[].
+  SELECT lips~vbeln           " delivery
+         lips~posnr           " position
+         ser01~obknr          " nr
+         objk~sernr           " serial number
+    INTO TABLE it_serial
+    FROM lips
+    JOIN ser01
+    ON   lips~vbeln EQ ser01~lief_nr
+    AND  lips~posnr EQ ser01~posnr
+    JOIN objk
+    ON   ser01~obknr EQ objk~obknr
+    WHERE lips~vbeln EQ vbplk-vpobjkey.
+
+
+*select ekko entries
+  DATA: l_ebeln TYPE ebeln.
+  CLEAR l_ebeln.
+  SELECT single vbeln INTO l_ebeln FROM vbfa WHERE vbelv = l_vbelv
+                                     AND vbtyp_n = 'V'.
+  clear wa_ekko.
+  select single * from ekko into wa_ekko where ebeln = l_ebeln.
+
+  ENDFORM.                    " get_extra_data

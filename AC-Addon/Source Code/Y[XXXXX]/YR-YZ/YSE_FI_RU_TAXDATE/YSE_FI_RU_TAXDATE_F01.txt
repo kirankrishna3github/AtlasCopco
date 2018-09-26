@@ -1,0 +1,960 @@
+*----------------------------------------------------------------------*
+***INCLUDE YSE_FI_RU_TAXDATE_F01.
+*----------------------------------------------------------------------*
+
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_GLACCOUNTS
+*&---------------------------------------------------------------------*
+FORM SELECT_GLACCOUNTS.
+
+* Get all accounts according to chart of accounts
+  select a~saknr b~altkt
+    FROM ska1 as a
+    INNER JOIN skb1 as b
+    ON b~saknr = a~saknr
+    INTO CORRESPONDING FIELDS OF TABLE gt_ska1
+    WHERE a~ktopl eq c_scoa
+      and a~saknr in s_saknr
+      and a~saknr le c_8999999
+      and b~bukrs eq p_bukrs.
+
+  if gt_ska1[] is INITIAL.
+    MESSAGE s001(00) with text-e02.
+    exit.
+  endif.
+
+  sort gt_ska1 by saknr.
+
+* Select descriptions of G/L accounts
+  SELECT saknr txt50
+    INTO CORRESPONDING FIELDS OF TABLE gt_skat
+    from skat WHERE spras eq sy-langu
+                AND ktopl eq c_scoa
+                AND saknr in s_saknr.
+
+* Select descriptions of alternative accounts
+  SELECT saknr txt50
+    APPENDING CORRESPONDING FIELDS OF TABLE gt_skat
+    from skat WHERE spras eq 'R'
+                AND ktopl eq c_zaru.
+
+  sort gt_skat by saknr.
+
+* Get G/L Actual Line Items: Opening balance (OB)
+  IF s_budat-high is initial.
+    gv_budat_high = s_budat-low.
+  ELSE.
+    gv_budat_high = s_budat-high.
+  ENDIF.
+  gv_year = gv_budat_high(4).
+
+  select * into table gt_faglflexa
+    from faglflexa
+    for ALL ENTRIES IN gt_ska1
+    where rbukrs  = p_bukrs
+      AND ryear  <= gv_year
+      AND rldnr   = p_rldnr
+      AND racct   = gt_ska1-saknr
+      AND budat  <= gv_budat_high.
+
+  if gt_faglflexa[] is INITIAL.
+    MESSAGE s001(00) with text-e03.
+    exit.
+  endif.
+
+  SORT gt_faglflexa by ryear docnr rldnr rbukrs docln.
+
+* Get header reference key 1, ...
+  SELECT bukrs belnr gjahr xref1_hd xblnr bktxt
+         blart bldat budat
+    INTO CORRESPONDING FIELDS OF TABLE gt_bkpf
+    FROM bkpf
+    FOR ALL ENTRIES IN gt_faglflexa
+    WHERE bukrs = gt_faglflexa-rbukrs
+      AND belnr = gt_faglflexa-docnr
+      AND gjahr = gt_faglflexa-ryear.
+
+  SORT gt_bkpf by bukrs belnr gjahr.
+
+  PERFORM select_differences.
+
+  LOOP at gt_faglflexa.
+*.. check on valid taxdate
+    read table gt_bkpf with key bukrs = gt_faglflexa-rbukrs
+                                belnr = gt_faglflexa-docnr
+                                gjahr = gt_faglflexa-ryear
+                    BINARY SEARCH.
+
+    if sy-subrc = 0.
+      if gt_faglflexa-budat <= gv_stida.
+        if gt_bkpf-xref1_hd+0(6) cn '0123456789'.
+          clear gt_bkpf-xref1_hd+0(6).        " invalid date
+        endif.
+
+        gv_i = gt_bkpf-xref1_hd+0(6).
+        if gv_i = 0.
+*                  " invalid date
+        else.
+          if gt_bkpf-xref1_hd+0(6) > gv_stida+2(6).
+            if gt_bkpf-xref1_hd+0(6) >= s_budat-low+2(6) and
+               gt_bkpf-xref1_hd+0(6) <= s_budat-high+2(6).
+              gt_faglflexa-flag = 'X'.
+              modify gt_faglflexa.
+              continue.
+            else.
+              gt_faglflexa-flag = 'D'.
+              modify gt_faglflexa.
+              continue.
+            endif.
+          endif.
+        endif.
+      endif.
+
+      if gt_faglflexa-budat in s_budat.
+        if gt_bkpf-xref1_hd = space.
+          gt_faglflexa-flag = 'D'.
+          modify gt_faglflexa.
+          continue.
+        endif.
+
+        if gt_bkpf-xref1_hd+0(6) cn '0123456789'.
+          gt_faglflexa-flag = 'D'.
+          modify gt_faglflexa.
+          continue.                   " invalid date
+        endif.
+
+        gv_i = gt_bkpf-xref1_hd+0(6).
+        if gv_i = 0.                  " invalid date
+          gt_faglflexa-flag = 'D'.
+          modify gt_faglflexa.
+          continue.
+        else.
+          if gt_bkpf-xref1_hd+0(6) >= s_budat-low+2(6).
+            gt_faglflexa-flag = 'D'.
+            modify gt_faglflexa.
+            continue.
+          endif.
+        endif.
+      endif.
+
+      if gt_faglflexa-racct >= c_3000000.
+*...... For PL: exclude postingdate before beginning of from-posting date year
+        if gt_faglflexa-budat < gv_begyear.
+          gt_faglflexa-flag = 'D'.
+          modify gt_faglflexa.
+          continue.
+        endif.
+
+*...... For PL: exclude taxdate before beginning of from-posting date year
+        if gt_bkpf-xref1_hd+0(6) < gv_begyear+2(6).
+          gt_faglflexa-flag = 'D'.
+          modify gt_faglflexa.
+          continue.
+        endif.
+      endif.
+    ENDIF.
+  ENDLOOP.
+
+* Add flagged items from OB to differences
+  LOOP AT gt_faglflexa where flag = 'X'.
+    MOVE-CORRESPONDING gt_faglflexa to gt_faglflexa_diff_acc.
+    COLLECT gt_faglflexa_diff_acc.
+    CLEAR gt_faglflexa_diff_acc.
+  ENDLOOP.
+
+* Prepare output structures
+  if p_gtot = 'X'.
+*.. Be aware to leave OB's with zero values
+    LOOP AT gt_faglflexa WHERE flag = ' '.
+      MOVE gt_faglflexa-racct to gt_taxdate-hkont.
+      MOVE gt_faglflexa-hsl   to gt_taxdate-ydmbtr_ob.
+      COLLECT GT_TAXDATE.
+      CLEAR GT_TAXDATE.
+    ENDLOOP.
+
+    LOOP AT gt_faglflexa WHERE flag <> ' '.
+      MOVE gt_faglflexa-racct to gt_taxdate-hkont.
+      MOVE 0                  to gt_taxdate-ydmbtr_ob.
+      COLLECT GT_TAXDATE.
+      CLEAR GT_TAXDATE.
+    ENDLOOP.
+
+    LOOP AT GT_TAXDATE.
+      READ TABLE gt_faglflexa_diff_acc WITH KEY racct = GT_TAXDATE-hkont
+                        BINARY SEARCH.
+      if sy-subrc = 0.
+        MOVE gt_faglflexa_diff_acc-hsl to gt_taxdate-ydmbtr_diff.
+      endif.
+
+      READ TABLE gt_skat WITH KEY saknr = GT_TAXDATE-hkont
+                           BINARY SEARCH.
+      if sy-subrc = 0.
+        move gt_skat-txt50 to gt_taxdate-txt50.
+      endif.
+
+      READ TABLE gt_ska1 WITH KEY saknr = GT_TAXDATE-hkont
+                         BINARY SEARCH.
+      if sy-subrc = 0.
+        MOVE gt_ska1-altkt to gt_taxdate-altkt.
+        READ TABLE gt_skat WITH KEY saknr = gt_ska1-altkt
+                            BINARY SEARCH.
+        if sy-subrc = 0.
+          move gt_skat-txt50 to gt_taxdate-ytxt50_alt.
+        endif.
+      ENDIF.
+
+      GT_TAXDATE-ydmbtr_cb = GT_TAXDATE-ydmbtr_ob + GT_TAXDATE-ydmbtr_diff.
+      modify GT_TAXDATE.
+    ENDLOOP.
+
+    SORT GT_TAXDATE BY hkont.
+  endif.
+
+  if not gt_faglflexa_diff[] is initial.
+    if p_gtot = ' '.
+*.... Secondary Index for G/L Accounts
+      SELECT bukrs hkont belnr gjahr buzei
+             zuonr mwskz sgtxt xref1 xref2 xref3
+             INTO CORRESPONDING FIELDS OF TABLE gt_bseg
+             FROM bseg
+             FOR ALL ENTRIES IN gt_faglflexa_diff
+             WHERE bukrs  = gt_faglflexa_diff-rbukrs
+               AND belnr  = gt_faglflexa_diff-belnr
+               AND gjahr  = gt_faglflexa_diff-gjahr
+               AND buzei  = gt_faglflexa_diff-buzei.
+
+      SORT gt_bseg by bukrs belnr gjahr buzei.
+    endif.
+
+    LOOP at gt_faglflexa_diff.
+      if p_gdt = 'X'.
+        CONCATENATE '20' gt_faglflexa_diff-xref1_hd INTO gv_xref1_hd.
+        if not gv_xref1_hd in s_gtxdat.
+          delete gt_faglflexa_diff.
+          continue.
+        endif.
+      endif.
+
+      READ TABLE gt_skat WITH KEY saknr = gt_faglflexa_diff-racct
+                           BINARY SEARCH.
+      if sy-subrc = 0.
+        move gt_skat-txt50 to gt_taxdate_det-txt50.
+      endif.
+
+      READ TABLE gt_ska1 WITH KEY saknr = gt_faglflexa_diff-racct
+                         BINARY SEARCH.
+      if sy-subrc = 0.
+        MOVE gt_ska1-altkt to gt_taxdate_det-altkt.
+        READ TABLE gt_skat WITH KEY saknr = gt_ska1-altkt
+                            BINARY SEARCH.
+        if sy-subrc = 0.
+          move gt_skat-txt50 to gt_taxdate_det-ytxt50_alt.
+        endif.
+      ENDIF.
+
+      MOVE-CORRESPONDING gt_faglflexa_diff to gt_taxdate_det.
+      MOVE gt_faglflexa_diff-racct to gt_taxdate_det-hkont.
+      MOVE gt_faglflexa_diff-hsl   to gt_taxdate_det-dmbtr.
+      MOVE 'RUB'                   to gt_taxdate_det-hwaer.
+      MOVE gt_faglflexa_diff-rbusa to gt_taxdate_det-gsber.
+
+      READ TABLE gt_bseg WITH KEY bukrs = gt_faglflexa_diff-rbukrs
+                                  belnr = gt_faglflexa_diff-docnr
+                                  gjahr = gt_faglflexa_diff-ryear
+                                  buzei = gt_faglflexa_diff-buzei
+                           BINARY SEARCH.
+      if sy-subrc = 0.
+        MOVE-CORRESPONDING gt_bseg to gt_taxdate_det.
+      endif.
+      APPEND GT_TAXDATE_DET.
+      CLEAR GT_TAXDATE_DET.
+    ENDLOOP.
+    SORT GT_TAXDATE_DET BY hkont gjahr belnr buzei.
+  endif.
+
+ENDFORM.                    " SELECT_GLACCOUNTS
+
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_AUTHORIZATION
+*&---------------------------------------------------------------------*
+FORM CHECK_AUTHORIZATION .
+
+  AUTHORITY-CHECK OBJECT 'YAM_BUKRS'
+           ID 'BUKRS' FIELD p_bukrs.
+
+  IF sy-subrc NE 0.
+*.. No authorization for company code
+    MESSAGE E001(00) WITH text-e01 p_bukrs.
+  ENDIF.
+
+ENDFORM.                    " CHECK_AUTHORIZATION
+
+*&---------------------------------------------------------------------*
+*&      Form  output_list
+*&---------------------------------------------------------------------*
+FORM output_list tables r_tab.
+
+  DATA: ls_events TYPE slis_alv_event,
+        lt_events TYPE slis_t_event,
+        lv_struct(30).
+
+* Create the fieldcatalog e.g. which fields to display
+  if p_gtot = 'X' and x_gsel = 'X'..
+    lv_struct = 'YSE_TAXDATE_OUTPUT'.
+  else.
+    lv_struct = 'YSE_TAXDATE_OUTPUT_DET'.
+  endif.
+
+  PERFORM CREATE_FIELDCAT using lv_struct.
+
+  REFRESH lt_events.
+  ls_events-name = 'PF_STATUS_SET'.
+  ls_events-form = 'PF_STATUS_SET'.
+  APPEND ls_events TO lt_events.
+  ls_events-name = 'TOP_OF_PAGE'.
+  ls_events-form = 'TOP_OF_PAGE'.
+  APPEND ls_events TO lt_events.
+
+* Call ALV grid output
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+    EXPORTING
+      i_callback_program = sy-cprog
+      i_structure_name   = lv_struct
+*      i_grid_settings    = gs_grid
+      is_layout          = gs_layout
+      i_save             = 'A'
+      it_fieldcat        = gt_fieldcat
+      it_events          = lt_events
+    TABLES
+      t_outtab           = r_tab
+    EXCEPTIONS
+      program_error      = 1
+      OTHERS             = 2.
+
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+endform.                    "output_list
+
+*&---------------------------------------------------------------------*
+*&      Form  create_fieldcat
+*&---------------------------------------------------------------------*
+FORM create_fieldcat using r_struct.
+
+* Prepare field catalog
+  CALL FUNCTION 'REUSE_ALV_FIELDCATALOG_MERGE'
+    EXPORTING
+      i_structure_name       = r_struct
+      i_client_never_display = 'X'
+    CHANGING
+      ct_fieldcat            = gt_fieldcat
+    EXCEPTIONS
+      inconsistent_interface = 1
+      program_error          = 2
+      OTHERS                 = 3.
+
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+endform.                    "create_fieldcat
+
+*&---------------------------------------------------------------------*
+*&      Form  PF_STATUS_SET
+*&---------------------------------------------------------------------*
+*       text: PF-status callback routine for ALV
+*----------------------------------------------------------------------*
+FORM pf_status_set using rt_extab TYPE slis_t_extab.
+
+  SET PF-STATUS '100'.
+
+ENDFORM.                    " PF_STATUS_SET
+
+*&---------------------------------------------------------------------*
+*&      Form  top_of_page
+*&---------------------------------------------------------------------*
+*       Top of page callback routine for ALV
+*----------------------------------------------------------------------*
+FORM top_of_page.
+
+* Local variables
+  DATA: lt_comment      TYPE slis_t_listheader,
+        ls_comment      TYPE slis_listheader,
+        lv_saknr_low    TYPE saknr,
+        lv_saknr_high   TYPE saknr,
+        lv_dat_low(10)  TYPE c,
+        lv_dat_high(10) TYPE c,
+        lv_kunnr_low    TYPE kunnr,
+        lv_kunnr_high   TYPE kunnr,
+        lv_lifnr_low    TYPE lifnr,
+        lv_lifnr_high   TYPE lifnr.
+
+* Header
+  if x_gsel = 'X' or x_gsel2 = 'X'.
+    if p_gtot = 'X'.
+      ls_comment-typ  = 'H'.
+      ls_comment-info = text-h00.
+      APPEND ls_comment TO lt_comment.
+      CLEAR ls_comment.
+    else.
+      ls_comment-typ  = 'H'.
+      ls_comment-info = text-h10.
+      APPEND ls_comment TO lt_comment.
+      CLEAR ls_comment.
+    endif.
+  ELSEIF x_csel = 'X'.
+    ls_comment-typ  = 'H'.
+    ls_comment-info = text-h11.
+    APPEND ls_comment TO lt_comment.
+    CLEAR ls_comment.
+  ELSEIF x_vsel = 'X'.
+    ls_comment-typ  = 'H'.
+    ls_comment-info = text-h12.
+    APPEND ls_comment TO lt_comment.
+    CLEAR ls_comment.
+  ENDIF.
+
+* Selection
+  ls_comment-typ  = 'S'.
+  ls_comment-key  = text-h01.
+  ls_comment-info = p_rldnr.
+  APPEND ls_comment TO lt_comment.
+  CLEAR ls_comment.
+
+  ls_comment-typ  = 'S'.
+  ls_comment-key  = text-h02.
+  write s_budat-low  to lv_dat_low DD/MM/YYYY.
+  write s_budat-high to lv_dat_high DD/MM/YYYY.
+  CONCATENATE lv_dat_low lv_dat_high INTO ls_comment-info SEPARATED BY '-'.
+  APPEND ls_comment TO lt_comment.
+  CLEAR ls_comment.
+
+  ls_comment-typ  = 'S'.
+  if x_gsel = 'X' or x_gsel2 = 'X'.
+    ls_comment-key  = text-h03.
+    if s_saknr-high is initial.
+      write s_saknr-low to ls_comment-info no-zero.
+    else.
+      write s_saknr-low  to lv_saknr_low no-zero.
+      write s_saknr-high to lv_saknr_high no-zero.
+      CONCATENATE lv_saknr_low lv_saknr_high INTO ls_comment-info SEPARATED BY '-'.
+    endif.
+    APPEND ls_comment TO lt_comment.
+    CLEAR ls_comment.
+  elseif x_csel = 'X'.
+    ls_comment-key  = text-h05.
+    if s_kunnr-high is initial.
+      write s_kunnr-low to ls_comment-info no-zero.
+    else.
+      write s_kunnr-low  to lv_kunnr_low no-zero.
+      write s_kunnr-high to lv_kunnr_high no-zero.
+      CONCATENATE lv_kunnr_low lv_kunnr_high INTO ls_comment-info SEPARATED BY '-'.
+    endif.
+    APPEND ls_comment TO lt_comment.
+    CLEAR ls_comment.
+  elseif x_vsel = 'X'.
+    ls_comment-key  = text-h06.
+    if s_lifnr-high is initial.
+      write s_lifnr-low to ls_comment-info no-zero.
+    else.
+      write s_lifnr-low  to lv_lifnr_low no-zero.
+      write s_lifnr-high to lv_lifnr_high no-zero.
+      CONCATENATE lv_lifnr_low lv_lifnr_high INTO ls_comment-info SEPARATED BY '-'.
+    endif.
+    APPEND ls_comment TO lt_comment.
+    CLEAR ls_comment.
+  endif.
+
+  IF p_gdt = 'X' and x_gsel2 = 'X'.
+    ls_comment-typ  = 'S'.
+    ls_comment-key  = text-h04.
+    write s_gtxdat-low  to lv_dat_low DD/MM/YYYY.
+    write s_gtxdat-high to lv_dat_high DD/MM/YYYY.
+    CONCATENATE lv_dat_low lv_dat_high INTO ls_comment-info SEPARATED BY '-'.
+    APPEND ls_comment TO lt_comment.
+    CLEAR ls_comment.
+  ENDIF.
+
+  IF p_cdt = 'X' and x_csel = 'X'.
+    ls_comment-typ  = 'S'.
+    ls_comment-key  = text-h04.
+    write s_ctxdat-low  to lv_dat_low DD/MM/YYYY.
+    write s_ctxdat-high to lv_dat_high DD/MM/YYYY.
+    CONCATENATE lv_dat_low lv_dat_high INTO ls_comment-info SEPARATED BY '-'.
+    APPEND ls_comment TO lt_comment.
+    CLEAR ls_comment.
+  ENDIF.
+
+  IF p_vdt = 'X' and x_vsel = 'X'..
+    ls_comment-typ  = 'S'.
+    ls_comment-key  = text-h04.
+    write s_vtxdat-low  to lv_dat_low DD/MM/YYYY.
+    write s_vtxdat-high to lv_dat_high DD/MM/YYYY.
+    CONCATENATE lv_dat_low lv_dat_high INTO ls_comment-info SEPARATED BY '-'.
+    APPEND ls_comment TO lt_comment.
+    CLEAR ls_comment.
+  ENDIF.
+
+  CALL FUNCTION 'REUSE_ALV_COMMENTARY_WRITE'
+    EXPORTING
+      it_list_commentary       = lt_comment
+*      I_LOGO                   =
+*      I_END_OF_LIST_GRID       =
+            .
+
+ENDFORM.                    " top_of_page
+
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_CUSTOMERS
+*&---------------------------------------------------------------------*
+*       Select customers
+*----------------------------------------------------------------------*
+FORM SELECT_CUSTOMERS .
+
+* Select customers
+  SELECT kunnr name1
+    INTO CORRESPONDING FIELDS OF TABLE it_customers
+    FROM kna1
+    WHERE kunnr IN s_kunnr.
+
+  IF it_customers[] is initial.
+    MESSAGE s001(00) with text-e04.
+    exit.
+  ENDIF.
+
+* Secondary Index for Customer Accounts
+  SELECT bukrs gjahr kunnr belnr zuonr hkont
+         buzei mwskz sgtxt xref1 xref2 xref3
+         INTO CORRESPONDING FIELDS OF TABLE it_bsid
+         FROM bsid
+         FOR ALL ENTRIES IN it_customers
+         WHERE bukrs  = p_bukrs
+           AND kunnr  = it_customers-kunnr
+           AND budat in s_budat.
+
+* Cleared items
+  SELECT bukrs gjahr kunnr belnr zuonr hkont
+         buzei mwskz sgtxt xref1 xref2 xref3
+         APPENDING CORRESPONDING FIELDS OF TABLE it_bsid
+         FROM bsad
+         FOR ALL ENTRIES IN it_customers
+         WHERE bukrs  = p_bukrs
+           AND kunnr  = it_customers-kunnr
+           AND budat in s_budat.
+
+  if it_bsid[] is INITIAL.
+    MESSAGE s001(00) with text-e06.
+    exit.
+  endif.
+
+  SORT it_bsid by bukrs gjahr belnr buzei.
+
+* Get header reference key 1, ...
+  if not it_bsid[] is initial.
+    SELECT bukrs belnr gjahr xref1_hd xblnr bktxt
+           blart bldat budat
+      INTO CORRESPONDING FIELDS OF TABLE gt_bkpf
+      FROM bkpf
+      FOR ALL ENTRIES IN it_bsid
+      WHERE bukrs = it_bsid-bukrs
+        AND belnr = it_bsid-belnr
+        AND gjahr = it_bsid-gjahr.
+  endif.
+
+  SORT gt_bkpf by bukrs belnr gjahr.
+
+  SELECT * from faglflexa
+    INTO corresponding fields of table gt_faglflexa_diff
+    for all entries in it_bsid
+              where ryear  = it_bsid-gjahr
+                and rldnr  = p_rldnr
+                and rbukrs = it_bsid-bukrs
+                and belnr  = it_bsid-belnr
+                and buzei  = it_bsid-buzei.
+
+  sort gt_faglflexa_diff by ryear docnr rldnr rbukrs docln.
+
+  LOOP at gt_faglflexa_diff.
+    read table gt_bkpf with key bukrs = gt_faglflexa_diff-rbukrs
+                                belnr = gt_faglflexa_diff-docnr
+                                gjahr = gt_faglflexa_diff-ryear
+                    BINARY SEARCH.
+
+    if sy-subrc = 0.
+      gt_faglflexa_diff-xref1_hd = gt_bkpf-xref1_hd.
+      gt_faglflexa_diff-xblnr    = gt_bkpf-xblnr.
+      gt_faglflexa_diff-bktxt    = gt_bkpf-bktxt.
+      gt_faglflexa_diff-blart    = gt_bkpf-blart.
+      gt_faglflexa_diff-bldat    = gt_bkpf-bldat.
+      gt_faglflexa_diff-budat    = gt_bkpf-budat.
+    endif.
+
+    if p_cdt = 'X'.
+      CONCATENATE '20' gt_faglflexa_diff-xref1_hd INTO gv_xref1_hd.
+      if not gv_xref1_hd in s_ctxdat.
+        delete gt_faglflexa_diff.
+        continue.
+      endif.
+    endif.
+
+    MOVE-CORRESPONDING gt_faglflexa_diff to gt_taxdate_det.
+    MOVE gt_faglflexa_diff-hsl           to gt_taxdate_det-dmbtr.
+    MOVE 'RUB'                           to gt_taxdate_det-hwaer.
+    MOVE gt_faglflexa_diff-rbusa         to gt_taxdate_det-gsber.
+
+    READ TABLE it_bsid WITH KEY bukrs = gt_faglflexa_diff-rbukrs
+                                belnr = gt_faglflexa_diff-docnr
+                                gjahr = gt_faglflexa_diff-ryear
+                                buzei = gt_faglflexa_diff-buzei
+                         BINARY SEARCH.
+    if sy-subrc = 0.
+      MOVE-CORRESPONDING it_bsid to gt_taxdate_det.
+      MOVE it_bsid-kunnr         to gt_taxdate_det-hkont.
+    endif.
+    APPEND GT_TAXDATE_DET.
+    CLEAR GT_TAXDATE_DET.
+  ENDLOOP.
+  SORT GT_TAXDATE_DET BY hkont gjahr belnr buzei.
+
+ENDFORM.                    " SELECT_CUSTOMERS
+
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_VENDORS
+*&---------------------------------------------------------------------*
+*       Select vendors
+*----------------------------------------------------------------------*
+FORM SELECT_VENDORS .
+
+* Select vendors
+  SELECT lifnr name1
+    INTO CORRESPONDING FIELDS OF TABLE it_vendors
+    FROM lfa1
+    WHERE lifnr IN s_lifnr.
+
+  IF it_vendors[] is initial.
+    MESSAGE s001(00) with text-e05.
+    exit.
+  ENDIF.
+
+* Secondary Index for Vendor Accounts
+  SELECT bukrs gjahr lifnr belnr zuonr hkont
+         buzei mwskz sgtxt xref1 xref2 xref3
+         INTO CORRESPONDING FIELDS OF TABLE it_bsik
+         FROM bsik
+         FOR ALL ENTRIES IN it_vendors
+         WHERE bukrs  = p_bukrs
+           AND lifnr  = it_vendors-lifnr
+           AND budat in s_budat.
+
+* Cleared items
+  SELECT bukrs gjahr lifnr belnr zuonr hkont
+         buzei mwskz sgtxt xref1 xref2 xref3
+         APPENDING CORRESPONDING FIELDS OF TABLE it_bsik
+         FROM bsak
+         FOR ALL ENTRIES IN it_vendors
+         WHERE bukrs  = p_bukrs
+           AND lifnr  = it_vendors-lifnr
+           AND budat in s_budat.
+
+  if it_bsik[] is INITIAL.
+    MESSAGE s001(00) with text-e07.
+    exit.
+  endif.
+
+  SORT it_bsik by bukrs gjahr belnr buzei.
+
+* Get header reference key 1, ...
+  if not it_bsik[] is initial.
+    SELECT bukrs belnr gjahr xref1_hd xblnr bktxt
+           blart bldat budat
+      INTO CORRESPONDING FIELDS OF TABLE gt_bkpf
+      FROM bkpf
+      FOR ALL ENTRIES IN it_bsik
+      WHERE bukrs = it_bsik-bukrs
+        AND belnr = it_bsik-belnr
+        AND gjahr = it_bsik-gjahr.
+  endif.
+
+  SORT gt_bkpf by bukrs belnr gjahr.
+
+  SELECT * from faglflexa
+    INTO corresponding fields of table gt_faglflexa_diff
+    for all entries in it_bsik
+              where ryear  = it_bsik-gjahr
+                and rldnr  = p_rldnr
+                and rbukrs = it_bsik-bukrs
+                and belnr  = it_bsik-belnr
+                and buzei  = it_bsik-buzei.
+
+  sort gt_faglflexa_diff by ryear docnr rldnr rbukrs docln.
+
+  LOOP at gt_faglflexa_diff.
+    read table gt_bkpf with key bukrs = gt_faglflexa_diff-rbukrs
+                                belnr = gt_faglflexa_diff-docnr
+                                gjahr = gt_faglflexa_diff-ryear
+                    BINARY SEARCH.
+
+    if sy-subrc = 0.
+      gt_faglflexa_diff-xref1_hd = gt_bkpf-xref1_hd.
+      gt_faglflexa_diff-xblnr    = gt_bkpf-xblnr.
+      gt_faglflexa_diff-bktxt    = gt_bkpf-bktxt.
+      gt_faglflexa_diff-blart    = gt_bkpf-blart.
+      gt_faglflexa_diff-bldat    = gt_bkpf-bldat.
+      gt_faglflexa_diff-budat    = gt_bkpf-budat.
+    endif.
+
+    if p_vdt = 'X'.
+      CONCATENATE '20' gt_faglflexa_diff-xref1_hd INTO gv_xref1_hd.
+      if not gv_xref1_hd in s_vtxdat.
+        delete gt_faglflexa_diff.
+        continue.
+      endif.
+    endif.
+
+    MOVE-CORRESPONDING gt_faglflexa_diff to gt_taxdate_det.
+    MOVE gt_faglflexa_diff-hsl           to gt_taxdate_det-dmbtr.
+    MOVE 'RUB'                           to gt_taxdate_det-hwaer.
+    MOVE gt_faglflexa_diff-rbusa         to gt_taxdate_det-gsber.
+
+    READ TABLE it_bsik WITH KEY bukrs = gt_faglflexa_diff-rbukrs
+                                belnr = gt_faglflexa_diff-docnr
+                                gjahr = gt_faglflexa_diff-ryear
+                                buzei = gt_faglflexa_diff-buzei
+                         BINARY SEARCH.
+    if sy-subrc = 0.
+      MOVE-CORRESPONDING it_bsik to gt_taxdate_det.
+      MOVE it_bsik-lifnr         to gt_taxdate_det-hkont.
+    endif.
+    APPEND GT_TAXDATE_DET.
+    CLEAR GT_TAXDATE_DET.
+  ENDLOOP.
+  SORT GT_TAXDATE_DET BY hkont gjahr belnr buzei.
+
+ENDFORM.                    " SELECT_VENDORS
+
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_DIFFERENCES
+*&---------------------------------------------------------------------*
+*       Select all items posted in posting date range
+*       - exclude items with taxdate outside this range
+*----------------------------------------------------------------------*
+FORM SELECT_DIFFERENCES .
+
+* Get G/L Actual Line Items: Differences (Diff)
+  select * into table gt_faglflexa_diff
+    from faglflexa
+    for ALL ENTRIES IN gt_ska1
+    where rbukrs  = p_bukrs
+      AND ryear  <= gv_year
+      AND rldnr   = p_rldnr
+      AND racct   = gt_ska1-saknr
+      AND budat  in s_budat.
+
+  if not gt_faglflexa_diff[] is INITIAL.
+*    SORT gt_faglflexa_diff by rldnr rbukrs racct.
+
+    LOOP at gt_faglflexa_diff.
+      read table gt_bkpf with key bukrs = gt_faglflexa_diff-rbukrs
+                                  belnr = gt_faglflexa_diff-docnr
+                                  gjahr = gt_faglflexa_diff-ryear
+                      BINARY SEARCH.
+
+      if sy-subrc = 0.
+        gt_faglflexa_diff-xref1_hd = gt_bkpf-xref1_hd.
+        gt_faglflexa_diff-xblnr    = gt_bkpf-xblnr.
+        gt_faglflexa_diff-bktxt    = gt_bkpf-bktxt.
+        gt_faglflexa_diff-blart    = gt_bkpf-blart.
+        gt_faglflexa_diff-bldat    = gt_bkpf-bldat.
+        gt_faglflexa_diff-budat    = gt_bkpf-budat.
+        modify gt_faglflexa_diff.
+
+*...... check on valid taxdate
+        if gt_bkpf-xref1_hd = space.
+          continue.
+        endif.
+
+        if gt_bkpf-xref1_hd+0(6) cn '0123456789'.
+          continue.                   " invalid date
+        endif.
+
+        gv_i = gt_bkpf-xref1_hd+0(6).
+        if gv_i = 0.                  " invalid date
+          continue.
+        else.
+          if gt_bkpf-xref1_hd+0(6) < s_budat-low+2(6).
+            delete gt_faglflexa_diff.
+            continue.
+          endif.
+          IF s_budat-high is INITIAL.
+            if gt_bkpf-xref1_hd+0(6) > s_budat-low+2(6).
+              delete gt_faglflexa_diff.
+              continue.
+            endif.
+          ELSE.
+            if gt_bkpf-xref1_hd+0(6) > s_budat-high+2(6).
+              delete gt_faglflexa_diff.
+              continue.
+            endif.
+          ENDIF.
+        endif.
+      endif.
+    ENDLOOP.
+
+    if p_gtot = 'X'.
+      LOOP at gt_faglflexa_diff.
+        MOVE-CORRESPONDING gt_faglflexa_diff to gt_faglflexa_diff_acc.
+        COLLECT gt_faglflexa_diff_acc.
+        CLEAR gt_faglflexa_diff_acc.
+      ENDLOOP.
+    endif.
+  endif.
+
+ENDFORM.                    " SELECT_DIFFERENCES
+
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_GLACCOUNTS2
+*&---------------------------------------------------------------------*
+*       Select G/L accounts
+*----------------------------------------------------------------------*
+FORM SELECT_GLACCOUNTS2 .
+
+* Get all accounts according to chart of accounts
+  select a~saknr b~altkt
+    FROM ska1 as a
+    INNER JOIN skb1 as b
+    ON b~saknr = a~saknr
+    INTO CORRESPONDING FIELDS OF TABLE gt_ska1
+    WHERE a~ktopl eq c_scoa
+      and a~saknr in s_saknr2
+      and a~saknr le c_8999999
+      and b~bukrs eq p_bukrs.
+
+  if gt_ska1[] is INITIAL.
+    MESSAGE s001(00) with text-e02.
+    exit.
+  endif.
+
+  sort gt_ska1 by saknr.
+
+* Select descriptions of G/L accounts
+  SELECT saknr txt50
+    INTO CORRESPONDING FIELDS OF TABLE gt_skat
+    from skat WHERE spras eq sy-langu
+                AND ktopl eq c_scoa
+                AND saknr in s_saknr.
+
+* Select descriptions of alternative accounts
+  SELECT saknr txt50
+    APPENDING CORRESPONDING FIELDS OF TABLE gt_skat
+    from skat WHERE spras eq 'R'
+                AND ktopl eq c_zaru.
+
+  sort gt_skat by saknr.
+
+* Get G/L Actual Line Items: Opening balance
+  select * into table gt_faglflexa
+    from faglflexa
+    for ALL ENTRIES IN gt_ska1
+    where rbukrs  = p_bukrs
+      AND rldnr   = p_rldnr
+      AND racct   = gt_ska1-saknr
+      AND budat  in s_budat.
+
+  if gt_faglflexa[] is INITIAL.
+    MESSAGE s001(00) with text-e03.
+    exit.
+  endif.
+
+  SORT gt_faglflexa by ryear docnr rldnr rbukrs docln.
+
+* Get header reference key 1, ...
+  SELECT bukrs belnr gjahr xref1_hd xblnr bktxt
+         blart bldat budat
+      INTO CORRESPONDING FIELDS OF TABLE gt_bkpf
+      FROM bkpf
+      FOR ALL ENTRIES IN gt_faglflexa
+      WHERE bukrs = gt_faglflexa-rbukrs
+        AND belnr = gt_faglflexa-docnr
+        AND gjahr = gt_faglflexa-ryear.
+
+  SORT gt_bkpf by bukrs belnr gjahr.
+
+  LOOP at gt_faglflexa.
+    read table gt_bkpf with key bukrs = gt_faglflexa-rbukrs
+                                belnr = gt_faglflexa-docnr
+                                gjahr = gt_faglflexa-ryear
+                    BINARY SEARCH.
+
+    if sy-subrc = 0.
+      gt_faglflexa-xref1_hd = gt_bkpf-xref1_hd.
+      gt_faglflexa-xblnr    = gt_bkpf-xblnr.
+      gt_faglflexa-bktxt    = gt_bkpf-bktxt.
+      gt_faglflexa-blart    = gt_bkpf-blart.
+      gt_faglflexa-bldat    = gt_bkpf-bldat.
+      gt_faglflexa-budat    = gt_bkpf-budat.
+      modify gt_faglflexa.
+    ENDIF.
+  ENDLOOP.
+
+* Secondary Index for G/L Accounts
+  SELECT bukrs hkont belnr gjahr buzei
+         zuonr mwskz sgtxt xref1 xref2 xref3
+         INTO CORRESPONDING FIELDS OF TABLE gt_bseg
+         FROM bseg
+         FOR ALL ENTRIES IN gt_faglflexa
+         WHERE bukrs  = gt_faglflexa-rbukrs
+           AND belnr  = gt_faglflexa-belnr
+           AND gjahr  = gt_faglflexa-gjahr
+           AND buzei  = gt_faglflexa-buzei.
+
+  SORT gt_bseg by bukrs belnr gjahr buzei.
+
+  LOOP at gt_faglflexa.
+    if p_gdt = 'X'.
+      CONCATENATE '20' gt_faglflexa-xref1_hd INTO gv_xref1_hd.
+      if not gv_xref1_hd in s_gtxdat.
+        delete gt_faglflexa.
+        continue.
+      endif.
+    endif.
+
+    READ TABLE gt_skat WITH KEY saknr = gt_faglflexa-racct
+                         BINARY SEARCH.
+    if sy-subrc = 0.
+      move gt_skat-txt50 to gt_taxdate_det-txt50.
+    endif.
+
+    READ TABLE gt_ska1 WITH KEY saknr = gt_faglflexa-racct
+                       BINARY SEARCH.
+    if sy-subrc = 0.
+      MOVE gt_ska1-altkt to gt_taxdate_det-altkt.
+      READ TABLE gt_skat WITH KEY saknr = gt_ska1-altkt
+                          BINARY SEARCH.
+      if sy-subrc = 0.
+        move gt_skat-txt50 to gt_taxdate_det-ytxt50_alt.
+      endif.
+    ENDIF.
+
+    MOVE-CORRESPONDING gt_faglflexa to gt_taxdate_det.
+    MOVE gt_faglflexa-racct to gt_taxdate_det-hkont.
+    MOVE gt_faglflexa-hsl   to gt_taxdate_det-dmbtr.
+    MOVE 'RUB'                   to gt_taxdate_det-hwaer.
+    MOVE gt_faglflexa-rbusa to gt_taxdate_det-gsber.
+
+    READ TABLE gt_bseg WITH KEY bukrs = gt_faglflexa-rbukrs
+                                belnr = gt_faglflexa-docnr
+                                gjahr = gt_faglflexa-ryear
+                                buzei = gt_faglflexa-buzei
+                         BINARY SEARCH.
+    if sy-subrc = 0.
+      MOVE-CORRESPONDING gt_bseg to gt_taxdate_det.
+    endif.
+    APPEND GT_TAXDATE_DET.
+    CLEAR GT_TAXDATE_DET.
+  ENDLOOP.
+  SORT GT_TAXDATE_DET BY hkont gjahr belnr buzei.
+
+ENDFORM.                    " SELECT_GLACCOUNTS2

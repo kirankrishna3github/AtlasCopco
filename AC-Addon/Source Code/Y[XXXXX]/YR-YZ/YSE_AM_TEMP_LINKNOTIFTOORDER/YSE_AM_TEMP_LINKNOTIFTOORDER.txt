@@ -1,0 +1,278 @@
+*&---------------------------------------------------------------------*
+*& Report  YSE_AM_TEMP_LINKNOTIFTOORDER                                *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+*& Code is a changed copy of method YseAmLinkNotifToOrder in workflow
+*& object YBUS2088 (transaction SWO1)
+*& Created during China cutover, more details with Simon De Greef
+*&---------------------------------------------------------------------*
+
+REPORT  YSE_AM_TEMP_LINKNOTIFTOORDER                          .
+
+DEFINE BDC_DYNPRO.
+  CLEAR BDCDATA.
+   BDCDATA-PROGRAM  = &1.
+   BDCDATA-DYNPRO   = &2.
+   BDCDATA-DYNBEGIN = 'X'.
+   APPEND BDCDATA.
+END-OF-DEFINITION.
+DEFINE BDC_FIELD.
+  IF &2 <> NODATA_CHARACTER.
+    CLEAR BDCDATA.
+    BDCDATA-FNAM = &1.
+    BDCDATA-FVAL = &2.
+    APPEND BDCDATA.
+  ENDIF.
+END-OF-DEFINITION.
+
+* First check if service order is still locked due to previous create
+DATA:
+  LT_ENQ TYPE STANDARD TABLE OF SEQG3,
+  LV_GNAME TYPE EQEGRANAME VALUE 'AUFK',
+  LV_GARG TYPE EQEGRAARG,
+  LV_COUNT TYPE SYTABIX,
+  NODATA_CHARACTER VALUE '/',
+  BDC_OPTIONS TYPE CTU_PARAMS,
+  IT_MESSTAB TYPE TABLE OF BDCMSGCOLL,
+  BDCDATA LIKE BDCDATA OCCURS 0 WITH HEADER LINE,
+  WA_CI_AUFK TYPE YAM_CI_AUFK,
+  WA_VBKD TYPE VBKD,
+  WA_VBAK TYPE VBAK,
+  WA_CAUFV TYPE CAUFV,
+  WA_TRC TYPE YAM_TRC,
+  WA_APC TYPE YAM_APC,
+  WA_PSF TYPE YAM_PSF,
+  WA_CON TYPE YAM_CON,
+  lt_vbap type standard table of vbap,
+  LS_VBAP TYPE vbap,
+  lv_serv_prod type i,
+  lv_vgbel type vgbel,
+  lv_vgpos type vgpos,
+  lv_pstyv type pstyv,
+  BEGIN OF IT_QMEL OCCURS 0,
+    QMNUM LIKE QMEL-QMNUM,
+    VBELN LIKE QMEL-VBELN,
+    POSNR LIKE VBEP-POSNR,
+    ETENR LIKE VBEP-ETENR,
+    AUFNR LIKE VBEP-AUFNR,
+  END OF IT_QMEL.
+CONSTANTS:
+  CT_ZZPSF_DEFAULT TYPE ZZPSF VALUE '1'.
+ranges:
+  lr_pstyv for vbap-pstyv.
+
+* ********************************************************************
+* SELECTION SCREEN
+* ********************************************************************
+SELECT-OPTIONS:
+  SO_QMNUM FOR IT_QMEL-QMNUM.
+
+* ********************************************************************
+START-OF-SELECTION.
+* ********************************************************************
+* Get related service order number for the notification
+  SELECT      QMNUM QMEL~VBELN POSNR ETENR VBEP~AUFNR
+         INTO TABLE IT_QMEL
+         FROM QMEL
+         JOIN VBEP
+           ON QMEL~VBELN EQ VBEP~VBELN
+        WHERE QMNUM IN SO_QMNUM.
+
+  LOOP AT IT_QMEL.
+
+*   use service order number for further processing
+    CHECK: IT_QMEL-AUFNR NE SPACE.
+
+*   CONCATENATE SY-MANDT OBJECT-KEY-NUMBER INTO LV_GARG.
+    CONCATENATE SY-MANDT IT_QMEL-AUFNR INTO LV_GARG. "  -> can't be correct, since QMNUM is picked up later in the method...
+
+*   Fill the range with all serv prod item cat's
+    lr_pstyv-sign = 'I'.
+    lr_pstyv-option = 'EQ'.
+    lr_pstyv-low = 'ZI00'.
+    append lr_pstyv.
+    lr_pstyv-low = 'ZI01'.
+    append lr_pstyv.
+    lr_pstyv-low = 'ZI02'.
+    append lr_pstyv.
+    lr_pstyv-low = 'ZAGE'.
+    append lr_pstyv.
+    lr_pstyv-low = 'ZO05'.
+    append lr_pstyv.
+    lr_pstyv-low = 'ZO06'.
+    append lr_pstyv.
+    lr_pstyv-low = 'ZO07'.
+    append lr_pstyv.
+    lr_pstyv-low = 'ZO08'.
+    append lr_pstyv.
+
+   CLEAR: WA_CAUFV, WA_VBAK, WA_VBKD.
+   SELECT SINGLE * FROM CAUFV INTO WA_CAUFV
+                  WHERE AUFNR EQ IT_QMEL-AUFNR.
+   IF NOT WA_CAUFV-KDAUF IS INITIAL.
+     SELECT SINGLE *
+              FROM VBKD
+              INTO WA_VBKD
+             WHERE VBELN EQ WA_CAUFV-KDAUF.
+     SELECT SINGLE *
+              FROM VBAK
+              INTO WA_VBAK
+             WHERE VBELN EQ WA_CAUFV-KDAUF.
+
+*  -Insert Raskin Kevin--------------------------------------------------*
+*  If a sales document contains more then 1 service products
+*  no link should be created between the notification and the first SEO
+*  When there is a link, only this SEO can be monitored in the doc flow
+*  if no link exists,all seo for the sales doc can be monitored
+*  ----------------------------------------------------------------------*
+*  *First select all sales doc line items
+    select * from vbap into table lt_vbap where vbeln eq WA_CAUFV-kdauf.
+*  -Next check if more then one service product items in sales doc
+*  -If this is the case then ni linking is to be done
+     loop at lt_vbap into ls_vbap where pstyv in lr_pstyv.
+     add 1 to lv_serv_prod.
+     endloop.
+     if lv_serv_prod = 1.
+*  -If only one serv prod, we still need to check if it isn't a S&Q flow
+       select single vgbel vgpos from vbap into (lv_vgbel, lv_vgpos)
+           where vbeln = wa_caufv-kdauf
+             and posnr   = wa_caufv-kdpos.
+        select single pstyv from vbap into lv_pstyv where vbeln = lv_vgbel
+                                     and posnr = lv_vgpos.
+        if lv_pstyv = 'ZI00'.
+           lv_serv_prod = 99.
+        endif.
+     endif.
+    ENDIF.
+*  Map the 4 necessary fields in the enhancement tab of IW32 screen (scree
+*  -----------------------------------------------------------------
+*  1 ZZCON "AM: Consignee code"            |uses a mapping table
+*                                           (YSE_MAP_ZZCON)
+*  2 ZZAPC "AM: Airpower Priority Code"    |1 to 1 (no mapping table) from
+*                                           VBAK-VSBED
+*  3 ZZPSF "AM: Partial Shipment Flag"     |Always default value '1'
+*  4 ZZTRC "AM: Transport Code"            |uses a mapping table
+*                                           (YSE_MAP_ZZTRC)
+*  -----------------------------------------------------------------------
+*  1
+*  Check the check table
+    SELECT SINGLE * FROM YAM_CON INTO WA_CON
+                   WHERE BUKRS EQ WA_CAUFV-BUKRS AND
+                    ZZCON EQ WA_VBKD-SDABW.
+    IF SY-SUBRC EQ 0.
+    SELECT SINGLE ZZNEW FROM YSE_MAP_ZZCON INTO WA_CI_AUFK-ZZCON
+                         WHERE ZZOLD EQ WA_VBKD-SDABW.
+    ENDIF.
+*  2
+*  Check the check table
+    SELECT SINGLE * FROM YAM_APC INTO WA_APC
+                   WHERE BUKRS EQ WA_CAUFV-BUKRS AND
+                          ZZAPC EQ WA_VBAK-VSBED.
+    IF SY-SUBRC EQ 0.
+      WA_CI_AUFK-ZZAPC = WA_VBAK-VSBED.
+    ENDIF.
+*  3
+*  Flag complete delivery
+    IF WA_VBAK-AUTLF EQ 'X'.
+      WA_CI_AUFK-ZZPSF = CT_ZZPSF_DEFAULT.   "default = 1
+    ELSE.
+      SELECT SINGLE ZZNEW FROM YSE_MAP_ZZPSF INTO WA_CI_AUFK-ZZPSF
+                         WHERE ZZOLD EQ WA_VBAK-KVGR4.
+      IF SY-SUBRC EQ 0.
+*  Now do the check
+        SELECT SINGLE * FROM YAM_PSF INTO WA_PSF
+                        WHERE BUKRS EQ WA_CAUFV-BUKRS AND
+                              ZZPSF EQ WA_CI_AUFK-ZZPSF.
+        IF SY-SUBRC NE 0.
+*  if the default fields is not in the check table
+          CLEAR WA_CI_AUFK-ZZPSF.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+*  4
+*  Check that the field is in the check table, otherwise not possible to
+*  enter it in order
+*  SELECT SINGLE * FROM YAM_TRC INTO WA_TRC
+*                    WHERE BUKRS EQ WA_CAUFV-BUKRS AND
+*                          ZZTRC EQ WA_VBKD-SDABW.
+*  IF SY-SUBRC EQ 0.
+    SELECT SINGLE ZZNEW FROM YSE_MAP_ZZTRC INTO WA_CI_AUFK-ZZTRC
+                       WHERE ZZOLD EQ WA_VBKD-SDABW.
+*  ENDIF.
+*  end of insert by CGEE 16.03.2007 (fill extra 4 fields default "D256")
+*  endif.
+
+    FREE BDCDATA.
+
+*    ----------------------------------------------
+    BDC_DYNPRO     'SAPLCOIH' '0101'.
+    BDC_FIELD      'BDC_OKCODE' '/00'.
+    BDC_FIELD       'CAUFVD-AUFNR' IT_QMEL-AUFNR.
+*    ----------------------------------------------
+*    -If more then one service products or S&Q flow no linking
+    if lv_serv_prod = 1.
+
+    BDC_DYNPRO   'SAPLCOIH' '3000'.
+    BDC_FIELD       'BDC_OKCODE' '=IOLU'.
+*
+*    *----------------------------------------------
+    BDC_DYNPRO   'SAPLCOIH' '3000'.
+    BDC_FIELD       'BDC_OKCODE' '=IHAD'.
+    BDC_FIELD       'RIWOL0-SELEC(01)' 'X'.
+    BDC_FIELD       'RIWOL-IHNUM(01)' IT_QMEL-QMNUM.
+*    *----------------------------------------------
+    endif.
+*    begin of insert by CGEE 16.03.2007 (fill extra 4 fields default "D256")
+    BDC_DYNPRO      'SAPLCOIH' '3000'.
+    BDC_FIELD       'BDC_OKCODE' '=+CUK'.
+
+    BDC_DYNPRO      'SAPLCOIH' '3000'.
+    BDC_FIELD       'BDC_OKCODE' '/00'.
+    BDC_FIELD       'YAM_CI_AUFK-ZZCON' WA_CI_AUFK-ZZCON.
+    BDC_FIELD       'YAM_CI_AUFK-ZZAPC' WA_CI_AUFK-ZZAPC.
+    BDC_FIELD       'YAM_CI_AUFK-ZZPSF' WA_CI_AUFK-ZZPSF.
+    BDC_FIELD       'YAM_CI_AUFK-ZZTRC' WA_CI_AUFK-ZZTRC.
+*    end of insert by CGEE 16.03.2007 (fill extra 4 fields default "D256")
+*    endif.
+*    *----------------------------------------------
+    BDC_DYNPRO   'SAPLCOIH' '3000'.
+    BDC_FIELD       'BDC_OKCODE' '=BU'.
+*
+    BDC_OPTIONS-DISMODE = 'N'.
+    DO 20 TIMES.
+
+
+      CALL FUNCTION 'ENQUEUE_READ'
+        EXPORTING
+          GCLIENT = SY-MANDT
+          GNAME   = LV_GNAME
+          GARG    = LV_GARG
+        IMPORTING
+          NUMBER  = LV_COUNT
+        TABLES
+          ENQ     = LT_ENQ.
+
+      IF LV_COUNT = 0.
+        EXIT.
+      ELSE.
+        WAIT UP TO 4 SECONDS.
+      ENDIF.
+
+    ENDDO.
+
+*    Call change sales order transaction
+    CALL TRANSACTION 'IW32' USING BDCDATA
+                            OPTIONS FROM BDC_OPTIONS
+                            MESSAGES INTO IT_MESSTAB.
+
+    CALL FUNCTION 'YSE_WRKFL_ERRORS'
+      EXPORTING
+        DOC_TYPE   = 'SO'
+        AUFNR      = IT_QMEL-AUFNR
+        METHOD     = 'YSEAMLINKNOTIFTOORDER'
+      TABLES
+        IT_MESSTAB = IT_MESSTAB.
+  ENDLOOP.
+
+*Selection text£º
+*SO_QMNUM:D       Notification

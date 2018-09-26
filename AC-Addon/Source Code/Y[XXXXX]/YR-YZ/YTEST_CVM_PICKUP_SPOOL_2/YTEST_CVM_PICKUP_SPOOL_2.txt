@@ -1,0 +1,543 @@
+*&---------------------------------------------------------------------*
+*& Report  YTEST_CVM_PICKUP_SPOOL
+*&
+*&---------------------------------------------------------------------*
+*&
+*&
+*&---------------------------------------------------------------------*
+
+REPORT  ytest_cvm_pickup_spool_2 MESSAGE-ID so.
+
+*DATA: report_list like abaplist occurs 0 with header line,
+*      report_html like w3html occurs 0 with header line,
+*      objtxt like solisti1 occurs 0 with header line.
+SELECTION-SCREEN BEGIN OF BLOCK mode WITH FRAME TITLE text-001.
+PARAMETERS: submit RADIOBUTTON GROUP mode DEFAULT 'X'.
+PARAMETERS: write  RADIOBUTTON GROUP mode .
+PARAMETERS: spool  RADIOBUTTON GROUP mode.
+SELECTION-SCREEN END OF BLOCK mode.
+
+SELECTION-SCREEN BEGIN OF BLOCK type WITH FRAME TITLE text-002.
+PARAMETERS: int  TYPE c AS CHECKBOX DEFAULT 'X',
+            fax  TYPE c AS CHECKBOX,
+            rml  TYPE c AS CHECKBOX,
+            user TYPE c AS CHECKBOX.
+SELECTION-SCREEN END OF BLOCK type.
+
+* global data
+DATA g_list_content TYPE solix_tab.
+DATA g_text_content TYPE soli_tab.
+DATA: i_params TYPE STANDARD TABLE OF rsparams WITH HEADER LINE.
+DATA: params LIKE pri_params.
+
+
+*---- start-of-selection -----------------------------------------------
+START-OF-SELECTION.
+
+  PERFORM create_text_content CHANGING g_text_content.
+  PERFORM create_list_content CHANGING g_list_content.
+  PERFORM send USING g_text_content
+                     g_list_content.
+
+
+
+
+
+
+
+*~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~*
+* Form routines                                                        *
+*~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~*
+
+*&---------------------------------------------------------------------*
+*&      Form  create_list_content
+*&---------------------------------------------------------------------*
+*
+*----------------------------------------------------------------------*
+FORM create_list_content CHANGING list_content TYPE solix_tab.
+
+* 1st possibility - use "submit <report> exporting list to memory"
+* this is the recommended way
+  IF submit = 'X'.
+    PERFORM use_submit CHANGING list_content.
+  ENDIF.
+
+* 2nd possibility - create a new list within this report.
+  IF write = 'X'.
+    PERFORM write_a_list CHANGING list_content.
+  ENDIF.
+
+* 3rd possibility - get list from spool
+  IF spool = 'X'.
+    PERFORM get_list_from_spool CHANGING list_content.
+  ENDIF.
+
+ENDFORM.                                         "create_list_content
+*&---------------------------------------------------------------------*
+*&      Form  create_text_content
+*&---------------------------------------------------------------------*
+*
+*----------------------------------------------------------------------*
+FORM create_text_content CHANGING text_content TYPE soli_tab.
+
+  APPEND 'This is the first line'  TO text_content.         "#EC NOTEXT
+  APPEND 'This is the second line' TO text_content.         "#EC NOTEXT
+* convert the content from RAW to TXT
+  CALL FUNCTION 'SO_RAW_TO_RTF'
+    TABLES
+      objcont_old = text_content
+      objcont_new = text_content
+    EXCEPTIONS
+      OTHERS      = 0.
+
+ENDFORM.                                         "create_text_content
+*&---------------------------------------------------------------------*
+*&      Form  SEND
+*&---------------------------------------------------------------------*
+*       Create the list-document and send it via FAX, Mail and RML
+*----------------------------------------------------------------------*
+FORM send USING text_content TYPE soli_tab
+                list_content TYPE solix_tab.
+
+* structures and internal tables for the send data
+  DATA document_data    TYPE sodocchgi1.
+  DATA packing_list     TYPE TABLE OF sopcklsti1.
+  DATA receivers        TYPE TABLE OF somlreci1.
+  DATA contents_txt     TYPE soli_tab.
+  DATA contents_hex     TYPE solix_tab.
+
+  DATA packlist_wa      TYPE sopcklsti1.
+  DATA receiver_wa      TYPE somlreci1.
+  DATA packlist_counter TYPE i.
+  DATA sent_to_all      TYPE sonv-flag.
+
+*~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~*
+* main document
+*~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~*
+* document data contains information for the whole message
+  document_data-obj_descr = 'ABAPlist'.
+
+* some text for the main document
+  APPEND 'Hi,' TO contents_txt.
+  APPEND 'attached you will find the list.' TO contents_txt.
+
+  packlist_counter = 1.
+  PERFORM create_packlist_entry USING contents_txt
+                                      'RAW'
+                             CHANGING packlist_wa
+                                      packlist_counter.
+  APPEND packlist_wa TO packing_list.
+
+*~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+* add a text attachment of type TXT
+*~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  PERFORM create_packlist_entry USING text_content
+                                      'TXT'
+                             CHANGING packlist_wa
+                                      packlist_counter.
+  APPEND packlist_wa TO packing_list.
+  APPEND LINES OF text_content TO contents_txt.
+
+*~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+* add the list attachment of type ALI
+*~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  packlist_counter = 1.        "because we will fill the hex table now
+  PERFORM create_packlist_entry USING list_content
+                                      'ALI'
+                             CHANGING packlist_wa
+                                      packlist_counter.
+  APPEND packlist_wa TO packing_list.
+  APPEND LINES OF list_content TO contents_hex.
+
+*~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+* fill recipients tables
+*~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+*  if fax = 'X'.
+*    perform create_fax_recipient changing receiver_wa.
+*    append receiver_wa to receivers.
+*  endif.
+*  if int = 'X'.
+*    perform create_int_recipient changing receiver_wa.
+*    append receiver_wa to receivers.
+*  endif.
+*  if rml = 'X'.
+*    perform create_rml_recipient changing receiver_wa.
+*    append receiver_wa to receivers.
+*  endif.
+  IF user = 'X'.
+    receiver_wa-receiver = sy-uname.
+    receiver_wa-rec_type = 'B'.
+    APPEND receiver_wa TO receivers.
+  ENDIF.
+
+*~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+* Send the document by calling the API1
+* as of 6.10 either the flag 'commit_work' has to be set
+* or a commit work statement has to be set somewhere after the call
+* Sending won't work without this!
+*~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  CALL FUNCTION 'SO_DOCUMENT_SEND_API1'
+    EXPORTING
+      document_data              = document_data
+      put_in_outbox              = 'X'
+      commit_work                = 'X'
+    IMPORTING
+      sent_to_all                = sent_to_all
+    TABLES
+      packing_list               = packing_list
+      contents_txt               = contents_txt
+      contents_hex               = contents_hex
+      receivers                  = receivers
+    EXCEPTIONS
+      too_many_receivers         = 1
+      document_not_sent          = 2
+      document_type_not_exist    = 3
+      operation_no_authorization = 4
+      parameter_error            = 5
+      x_error                    = 6
+      enqueue_error              = 7
+      OTHERS                     = 8.
+  CASE sy-subrc.
+    WHEN 0.
+      IF sent_to_all IS INITIAL.
+        READ TABLE receivers INDEX 1 INTO receiver_wa.
+        MESSAGE i865 WITH receiver_wa-retrn_code.
+      ELSE.
+        MESSAGE s022.
+      ENDIF.
+    WHEN 2.
+      MESSAGE i023 WITH document_data-obj_descr.
+    WHEN 4.
+      MESSAGE i015.
+    WHEN OTHERS.
+      MESSAGE i619.
+  ENDCASE.
+
+ENDFORM.                               " SEND
+*&---------------------------------------------------------------------*
+*&      Form  USE_SUBMIT
+*&---------------------------------------------------------------------*
+*   Use "submit <report> exporting list to memory"
+*----------------------------------------------------------------------*
+FORM use_submit CHANGING contents_hex TYPE solix_tab.
+
+  DATA listobject TYPE TABLE OF abaplist.
+
+* get the list object by calling the list in another report
+* F1 on submit gives more information
+*  submit balvsd03 exporting list to memory and return.
+
+  SUBMIT ytest_cvm_background_print
+  WITH SELECTION-TABLE i_params
+    TO SAP-SPOOL WITHOUT SPOOL DYNPRO
+    SPOOL PARAMETERS params.
+*  EXPORTING LIST TO MEMORY   AND RETURN.
+
+
+* import the list from memory and store it in table listobject
+  CALL FUNCTION 'LIST_FROM_MEMORY'
+    TABLES
+      listobject = listobject
+    EXCEPTIONS
+      not_found  = 1
+      OTHERS     = 2.
+  IF sy-subrc <> 0.
+    MESSAGE e105 WITH 'LIST_FROM_MEMORY'.
+  ENDIF.
+
+* free memory
+  CALL FUNCTION 'LIST_FREE_MEMORY'
+    TABLES
+      listobject = listobject
+    EXCEPTIONS
+      OTHERS     = 1.
+  IF sy-subrc <> 0.
+    MESSAGE e105 WITH 'LIST_FREE_MEMORY'.
+  ENDIF.
+
+* it's always necessary to compress the table.
+* SAPconnect will decompress it
+  CALL FUNCTION 'TABLE_COMPRESS'                            "#EC *
+    TABLES
+      in             = listobject
+      out            = contents_hex
+    EXCEPTIONS
+      compress_error = 1
+      OTHERS         = 2.
+  IF sy-subrc <> 0.
+    MESSAGE e105 WITH 'TABLE_COMPRESS'.
+  ENDIF.
+
+ENDFORM.                               " USE_SUBMIT
+*&---------------------------------------------------------------------*
+*&      Form  WRITE_A_LIST
+*&---------------------------------------------------------------------*
+*       Create a new list within this report.
+*----------------------------------------------------------------------*
+FORM write_a_list CHANGING contents_hex TYPE solix_tab.
+
+  DATA listobject TYPE TABLE OF abaplist.
+
+  PERFORM write_list.
+
+* Save the list and store table listobject
+  CALL FUNCTION 'SAVE_LIST'
+    EXPORTING
+      list_index         = sy-lsind
+    TABLES
+      listobject         = listobject
+    EXCEPTIONS
+      list_index_invalid = 1.
+  IF sy-subrc = 1.
+    MESSAGE e105 WITH 'SAVE_LIST'.
+  ENDIF.
+
+* It's always necessary to compress the table
+* SAPconnect will decompress it
+  CALL FUNCTION 'TABLE_COMPRESS'                            "#EC *
+    TABLES
+      in             = listobject
+      out            = contents_hex
+    EXCEPTIONS
+      compress_error = 1
+      OTHERS         = 2.
+  IF sy-subrc <> 0.
+    MESSAGE e105 WITH 'TABLE_COMPRESS'.
+  ENDIF.
+
+ENDFORM.                               " WRITE_A_LIST
+*&---------------------------------------------------------------------*
+*&      Form  GET_LIST_FROM_SPOOL
+*&---------------------------------------------------------------------*
+*       Get list from spool
+*----------------------------------------------------------------------*
+FORM get_list_from_spool CHANGING contents_hex TYPE solix_tab.
+
+  DATA spool_number     TYPE rspoid.
+  DATA contents_bin     TYPE soli_tab.
+  DATA print_parameters TYPE pri_params.
+  DATA valid            TYPE c.
+
+* write a list into spool
+  CALL FUNCTION 'GET_PRINT_PARAMETERS'
+    EXPORTING
+      destination            = 'LOCL'
+      immediately            = ' '
+      release                = ' '
+      new_list_id            = 'X'
+      no_dialog              = 'X'
+      line_count             = 65
+      line_size              = 82
+    IMPORTING
+      out_parameters         = print_parameters
+      valid                  = valid
+    EXCEPTIONS
+      archive_info_not_found = 1
+      invalid_print_params   = 2
+      invalid_archive_params = 3
+      OTHERS                 = 4.
+  IF sy-subrc <> 0.
+    MESSAGE e105 WITH 'GET_PRINT_PARAMETERS'.
+  ELSEIF valid IS INITIAL.
+    RETURN.
+  ENDIF.
+  NEW-PAGE PRINT ON PARAMETERS print_parameters NO DIALOG.
+
+
+  SUBMIT ytest_cvm_background_print
+   WITH SELECTION-TABLE i_params
+  TO SAP-SPOOL WITHOUT SPOOL DYNPRO
+  SPOOL PARAMETERS print_parameters
+  AND RETURN.
+
+
+
+*  perform write_list.
+  NEW-PAGE PRINT OFF.
+
+  spool_number = sy-spono.
+
+* you can also send OTF documents from spool with this function
+* module. The importing parameter real_type gives you the doc type
+* that you have to give to the send interface. The parameter is not
+* used here
+  CALL FUNCTION 'RSPO_RETURN_SPOOLJOB'
+    EXPORTING
+      rqident              = spool_number
+    TABLES
+      buffer               = contents_bin
+    EXCEPTIONS
+      no_such_job          = 1
+      job_contains_no_data = 2
+      selection_empty      = 3
+      no_permission        = 4
+      can_not_access       = 5
+      read_error           = 6
+      type_no_match        = 7
+      OTHERS               = 8.
+
+  IF sy-subrc <> 0.
+    MESSAGE e105 WITH 'RSPO_RETURN_SPOOLJOB'.
+  ENDIF.
+
+* convert to hex table
+  CALL FUNCTION 'SO_SOLITAB_TO_SOLIXTAB'
+    EXPORTING
+      ip_solitab  = contents_bin
+    IMPORTING
+      ep_solixtab = contents_hex.
+
+ENDFORM.                               " GET_LIST_FROM_SPOOL
+*&---------------------------------------------------------------------*
+*&      Form  WRITE_LIST
+*&---------------------------------------------------------------------*
+*       Write a list of SAPconnect conversion rules
+*----------------------------------------------------------------------*
+FORM write_list.
+
+  DATA lt_scarr TYPE TABLE OF scarr.
+  DATA carr TYPE scarr.
+
+  SELECT * FROM scarr INTO TABLE lt_scarr.
+
+  FORMAT COLOR = 1.
+  ULINE AT /1(46).
+  WRITE: / sy-vline,
+         'CARRID',   10 sy-vline,
+         'CARRNAME', 35 sy-vline,
+         'CURRCODE', 46 sy-vline.
+  FORMAT COLOR = 2.
+  ULINE AT /1(46).
+  LOOP AT lt_scarr INTO carr.
+    WRITE: / sy-vline,
+           carr-carrid,   10 sy-vline,
+           carr-carrname, 35 sy-vline,
+           carr-currcode, 46 sy-vline.
+  ENDLOOP.
+
+  ULINE AT /1(46).
+  NEW-LINE.
+
+ENDFORM.                               " WRITE_LIST
+*&---------------------------------------------------------------------*
+*&      Form  create_packlist_entry
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM create_packlist_entry  USING  contents TYPE STANDARD TABLE
+                                   format TYPE so_obj_tp
+                         CHANGING  packlist_wa TYPE sopcklsti1
+                                   packlist_counter TYPE i.
+
+  DATA tab_lines TYPE i.
+  CLEAR packlist_wa.
+
+* get the table length of the attachment
+  DESCRIBE TABLE contents LINES tab_lines.
+
+* set binary flag for binary content to mark that this packlist entry
+* is meant for table contents_hex and not for contents_bin
+  IF format = 'ALI'.
+    packlist_wa-transf_bin = 'X'.
+  ENDIF.
+
+* attachment's description and format
+  CONCATENATE format text-003 INTO
+     packlist_wa-obj_descr SEPARATED BY space.
+  packlist_wa-doc_type   = format.
+
+* describe start and length in contents_txt or contents_hex
+* which table is meant is decided by the transf_bin flag set above
+  packlist_wa-body_start = packlist_counter.
+  packlist_wa-body_num   = tab_lines.
+
+* increase counter to have the starting line for the next attachment
+  packlist_counter = packlist_counter + tab_lines.
+
+ENDFORM.                    " create_packlist_entry
+*&---------------------------------------------------------------------*
+*&      Form  create_int_recipient
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM create_int_recipient CHANGING receiver TYPE somlreci1.
+
+  FIELD-SYMBOLS <receiver> TYPE c.
+  DATA recipient_int TYPE sadrud.
+
+  CLEAR receiver.
+
+* fill address type specific recipient structure
+  recipient_int-address = 'john.doe@company.com'.
+
+* cast structure to generic receiver field
+  ASSIGN recipient_int TO <receiver> CASTING.
+  receiver-receiver = <receiver>.
+* set address type for INT
+  receiver-rec_type = 'U'.
+
+ENDFORM.                    "create_int_recipient
+*&---------------------------------------------------------------------*
+*&      Form  create_fax_recipient
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM create_fax_recipient CHANGING receiver TYPE somlreci1.
+
+  FIELD-SYMBOLS <receiver> TYPE c.
+  DATA recipient_fax TYPE sadrfd.
+  DATA name TYPE soud3.
+
+  CLEAR receiver.
+
+  name-sapnam = sy-uname.
+  CALL FUNCTION 'SO_NAME_CONVERT'
+    EXPORTING
+      name_in  = name
+    IMPORTING
+      name_out = name
+    EXCEPTIONS
+      OTHERS   = 1.
+  IF sy-subrc <> 0.
+    name-adrname = sy-uname.
+  ENDIF.
+
+* fill address type specific recipient structure
+  recipient_fax-rec_fax    = '9999'.
+  recipient_fax-rec_state  = 'DE'.
+  recipient_fax-rec_title  = 'Mr.'.
+  recipient_fax-rec_name1  = 'John Doe'.                    "#EC NOTEXT
+  recipient_fax-send_nam   = name-adrname.
+  recipient_fax-send_cover = 'X'.
+
+* cast structure to generic receiver field
+  ASSIGN recipient_fax TO <receiver> CASTING.
+  receiver-receiver = <receiver>.
+* set address type for FAX
+  receiver-rec_type = 'F'.
+
+ENDFORM.                    "create_fax_recipient
+*&---------------------------------------------------------------------*
+*&      Form  create_rml_recipient
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM create_rml_recipient CHANGING receiver TYPE somlreci1.
+
+  FIELD-SYMBOLS <receiver> TYPE c.
+  DATA recipient_rml TYPE sadr7d.
+
+  CLEAR receiver.
+
+* fill address type specific recipient structure
+  recipient_rml-sdest = sy-sysid.
+  recipient_rml-umand = sy-mandt.
+  recipient_rml-uname = sy-uname.
+
+* cast structure to generic receiver field
+  ASSIGN recipient_rml TO <receiver> CASTING.
+  receiver-receiver = <receiver>.
+* set address type for RML
+  receiver-rec_type = 'R'.
+
+ENDFORM.                    "create_rml_recipient

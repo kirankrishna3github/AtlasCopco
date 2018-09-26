@@ -1,0 +1,455 @@
+*&---------------------------------------------------------------------*
+*& Report  ZCWU_DOI_3
+*&
+*&---------------------------------------------------------------------*
+*&
+*&
+*&---------------------------------------------------------------------*
+
+REPORT  ZCWU_DOI_3.
+************************************************************************
+**  声明数据库表 Declaration of database                              **
+************************************************************************
+TABLES:mara.     "物料主数据
+************************************************************************
+**  定义结构类型 Define the structure's type                          **
+************************************************************************
+*     结果内表结构
+TYPES:BEGIN OF typ_result,
+        matnr TYPE matnr,      "物料编号
+        werks TYPE werks_d,    "工厂
+        lgort TYPE lgort_d,    "库存地点
+        charg TYPE charg_d,    "批次
+        box   TYPE c,
+      END OF typ_result.
+************************************************************************
+**  定义变量与内表 Define the variants and Internal tables            **
+************************************************************************
+DATA:gt_result TYPE TABLE OF typ_result WITH HEADER LINE.     "结果内表
+*@---------------------------------------------------------------------*
+*调用相关对象使用的变量
+TYPE-POOLS:vrm, sbdst, soi.
+*     定位EXCEL的单元格，
+TYPES:BEGIN OF typ_excel,
+        row   TYPE kcd_ex_row_n,
+        col   TYPE kcd_ex_col_n,
+        value TYPE char50,
+      END OF typ_excel.
+DATA:gt_tabcontent TYPE TABLE OF typ_excel.
+DATA:wa_tabcontent TYPE typ_excel.
+TYPES: typ_url LIKE bapiuri-uri.
+TYPES: BEGIN OF typ_docu_descr,
+          document_name(40),
+          document_id(64),
+       END OF typ_docu_descr.
+TYPES:BEGIN OF typ_area_excel,
+        areano(2) TYPE n,
+        tabcontent LIKE gt_tabcontent,
+      END OF typ_area_excel.
+* SAP Desktop Office Integration Interfaces
+DATA: cl_container   TYPE REF TO cl_gui_container,
+      cl_splitter    TYPE REF TO cl_gui_splitter_container,
+      cl_control     TYPE REF TO i_oi_container_control,
+      cl_docu_proxy  TYPE REF TO i_oi_document_proxy,
+      cl_spreadsheet TYPE REF TO i_oi_spreadsheet,
+      cl_error       TYPE REF TO i_oi_error,
+      cl_errors      TYPE REF TO i_oi_error OCCURS 0 WITH HEADER LINE.
+* spreadsheet interface structures for Excel data input
+DATA:wa_cellitem    TYPE soi_generic_item,
+     wa_rangeitem   TYPE soi_range_item,
+     gt_ranges      TYPE soi_range_list,
+     gt_excel_input TYPE soi_generic_table,
+     wa_excel_input TYPE soi_generic_item,
+     g_initialized  type c,
+     g_retcode      TYPE soi_ret_string,
+     gt_excel_format TYPE soi_format_table,
+     wa_format      LIKE LINE OF gt_excel_format.
+DATA:gt_itab     TYPE TABLE OF alsmex_tabline WITH HEADER LINE,
+     gt_imt_tab  TYPE TABLE OF typ_area_excel,
+     wa_imt_tab  LIKE LINE OF gt_imt_tab,
+     g_macro     TYPE text100,
+     g_sheet(10) TYPE c,
+     g_cell_fit  TYPE c.
+DATA:cl_bds_instance   TYPE REF TO cl_bds_document_set,
+     gt_doc_signature  TYPE sbdst_signature,
+     wa_doc_signature  LIKE LINE OF gt_doc_signature,
+     gt_doc_components TYPE sbdst_components,
+     gt_doc_uris       TYPE sbdst_uri,
+     wa_doc_uris       LIKE LINE OF gt_doc_uris.
+DATA:g_app      TYPE vrm_id,
+     gt_applist TYPE vrm_values,
+     g_excel    TYPE text80 VALUE 'Excel.Sheet',       "EXCEL的表单
+     g_docu_type TYPE text80,
+     g_url(256)  TYPE c,
+     g_has_activex TYPE c,
+     g_col TYPE i,         "字段所在的列数
+     g_row TYPE i.         "字段所在的行数
+*以下三个值为Tcode:OAOR里面新建模板文件的参数
+DATA: g_classname  TYPE sbdst_classname VALUE 'HRFPM_EXCEL_STANDARD',
+      g_classtype  TYPE sbdst_classtype VALUE 'OT',
+      g_object_key TYPE sbdst_object_key VALUE 'TEMP'.
+************************************************************************
+**  宏定义 Define the macro                                           **
+************************************************************************
+DEFINE m_value.
+  clear &1.
+  &1-key = &2.
+  &1-text = &3.
+  append &1.
+END-OF-DEFINITION.
+* 将数据对应到EXCEL的单元格,并添加到内表中
+DEFINE m_excel_cell.
+  clear wa_tabcontent.
+  g_col = g_col + 1.
+  wa_tabcontent-row  = g_row.
+  wa_tabcontent-col  = g_col.
+  wa_tabcontent-value = &1.
+  shift wa_tabcontent-value left deleting leading space.
+  append wa_tabcontent to gt_tabcontent.
+END-OF-DEFINITION.
+************************************************************************
+**  选择屏幕 Customize the selection-screen                           **
+************************************************************************
+SELECTION-SCREEN BEGIN OF BLOCK xavery WITH FRAME TITLE text-001.
+SELECT-OPTIONS:s_matnr FOR mara-matnr MEMORY ID mat.   "物料编号
+SELECTION-SCREEN END OF BLOCK xavery.
+************************************************************************
+**  执行程序事件 Executing the program's events                       **
+************************************************************************
+INITIALIZATION.
+START-OF-SELECTION.
+  PERFORM sub_query_mara.
+END-OF-SELECTION.
+  PERFORM sub_process_excel.
+  CALL SCREEN 0100.
+*&---------------------------------------------------------------------*
+*&      Form  sub_query_mara
+*&---------------------------------------------------------------------*
+*       从物料主数据表MARA中取数
+*----------------------------------------------------------------------*
+FORM sub_query_mara .
+* 取物料主数据
+  SELECT matnr
+      FROM mara
+      INTO CORRESPONDING FIELDS OF TABLE gt_result
+      WHERE matnr IN s_matnr.
+ENDFORM.                    " sub_query_mara
+************************************************************************
+** Dialog Modules PBO and PAI
+************************************************************************
+MODULE status_0100 OUTPUT.
+  DATA: wa_tab TYPE typ_area_excel.
+  DATA: its_tab TYPE TABLE OF typ_excel.
+  SET PF-STATUS 'XAVERY_HSUEH'.
+  SET TITLEBAR 'TIT_100' WITH '活动界面示例'.
+  PERFORM sub_create_basic_object.
+  LOOP AT gt_imt_tab INTO wa_tab.
+    REFRESH gt_itab.
+    gt_itab[] = wa_tab-tabcontent[].
+    PERFORM sub_set_cell.
+  ENDLOOP.
+  IF g_cell_fit = 'X'.
+    CALL METHOD cl_spreadsheet->fit_widest
+      EXPORTING
+        name     = space
+        no_flush = 'X'.
+  ENDIF.
+* 修改WORK SHEET 的名字
+  CALL METHOD cl_spreadsheet->set_sheet_name
+    EXPORTING
+      newname = '物料主数据清单'
+      oldname = 'Selection-Screen'
+    IMPORTING
+      error   = cl_errors.
+* 宏执行
+  IF NOT g_macro IS INITIAL.
+*    CALL METHOD DOCUMENT->EXECUTE_MACRO
+*      EXPORTING
+*        g_macro = g_macro
+**      SCRIPT_NAME  = 'Open_text'
+**      NO_FLUSH     = ' '
+*      IMPORTING
+*        cl_error        = cl_errorS.
+**    CALL METHOD C_OI_ERRORS=>SHOW_MESSAGE
+**      EXPORTING
+**        TYPE = 'E'.
+*    APPEND cl_errorS.
+  ENDIF.
+ENDMODULE.                    "status_0100 OUTPUT
+*&---------------------------------------------------------------------*
+*& Dialog Modules PAI
+*&---------------------------------------------------------------------*
+MODULE user_command_0100 INPUT.
+  LEAVE TO SCREEN 0.
+ENDMODULE.                    "USER_COMMAND_0100 INPUT
+*&---------------------------------------------------------------------*
+*&      Form  SUB_CREATE_BASIC_OBJECT
+*&---------------------------------------------------------------------*
+*       创建相关的对象
+*----------------------------------------------------------------------*
+FORM sub_create_basic_object .
+  CHECK g_initialized IS INITIAL.
+  CALL FUNCTION 'GUI_HAS_ACTIVEX'
+    IMPORTING
+      return = g_has_activex.
+  IF g_has_activex IS INITIAL.
+    MESSAGE e007(demoofficeintegratio).
+  ENDIF.
+* first get the SAP DOI i_oi_container_control interface
+  CALL METHOD
+    c_oi_container_control_creator=>get_container_control
+    IMPORTING
+      control = cl_control
+      error   = cl_error.
+* check no errors occured
+  CALL METHOD cl_error->raise_message
+    EXPORTING
+      type = 'E'.
+* 创建CONTIANER
+  CREATE OBJECT cl_splitter
+    EXPORTING
+      parent  = cl_gui_container=>screen0
+      rows    = 1
+      columns = 1.
+  CALL METHOD cl_splitter->set_border
+    EXPORTING
+      border = cl_gui_cfw=>false.
+  cl_container  = cl_splitter->get_container( row = 1 column = 1 ).
+* initialize the SAP DOI Container, tell it to run in the container
+* specified above and tell it to run Excel in-place
+  CALL METHOD cl_control->init_control
+    EXPORTING
+      r3_application_name      = 'RBasis'                   "#EC NOTEXT
+      inplace_enabled          = 'X'
+      inplace_scroll_documents = 'X'
+      parent                   = cl_container
+      register_on_close_event  = 'X'
+      register_on_custom_event = 'X'
+      no_flush                 = 'X'
+    IMPORTING
+      error                    = cl_errors.
+* save error object in collection
+  APPEND cl_errors.
+  CALL METHOD cl_gui_cfw=>dispatch.
+  wa_doc_signature-prop_name = 'DESCRIPTION'.
+  g_app = 'excel'.                                       "
+  IF g_app = 'excel'.
+    g_docu_type = g_excel.
+    wa_doc_signature-prop_value = 'PP_REPORT'.
+  ELSE.
+  ENDIF.
+  APPEND wa_doc_signature TO gt_doc_signature.
+  CREATE OBJECT cl_bds_instance.
+  CALL METHOD cl_bds_instance->get_info
+    EXPORTING
+      classname       = g_classname
+      classtype       = g_classtype
+      object_key      = g_object_key
+    CHANGING
+      components      = gt_doc_components
+      signature       = gt_doc_signature
+    EXCEPTIONS
+      nothing_found   = 1
+      error_kpro      = 2
+      internal_error  = 3
+      parameter_error = 4
+      not_authorized  = 5
+      not_allowed     = 6.
+  CALL METHOD cl_bds_instance->get_with_url
+    EXPORTING
+      classname  = g_classname
+      classtype  = g_classtype
+      object_key = g_object_key
+    CHANGING
+      uris       = gt_doc_uris
+      signature  = gt_doc_signature.
+  FREE cl_bds_instance.
+* ask the SAP DOI container for a i_oi_document_proxy for Excel
+  CALL METHOD cl_control->get_document_proxy
+    EXPORTING
+      document_type      = 'Excel.Sheet'
+      no_flush           = 'X'
+*      REGISTER_CONTAINER = 'X'
+    IMPORTING
+      document_proxy     = cl_docu_proxy
+      error              = cl_errors.
+  APPEND cl_errors.
+* open a document saved in business document service.
+*  READ TABLE doc_uris INTO wa_doc_uris INDEX 1.
+  LOOP AT gt_doc_uris INTO wa_doc_uris. " WHERE uri CP '*ZSDR17.xls*'.
+    g_url = wa_doc_uris-uri.
+  ENDLOOP.
+  CALL METHOD cl_docu_proxy->open_document
+    EXPORTING
+      open_inplace = 'X'
+*      NO_FLUSH     = 'X'
+      document_url = g_url
+    IMPORTING
+      error        = cl_errors.
+*      STARTUP_MACRO = g_macro.
+  DATA: has TYPE i.
+  CALL METHOD cl_docu_proxy->has_spreadsheet_interface
+    EXPORTING
+      no_flush     = 'X'
+    IMPORTING
+      is_available = has
+      error        = cl_errors.
+  APPEND cl_errors.
+  CALL METHOD cl_docu_proxy->get_spreadsheet_interface
+    EXPORTING
+      no_flush        = 'X'
+    IMPORTING
+      sheet_interface = cl_spreadsheet
+      error           = cl_errors.
+  APPEND cl_errors.
+* Activate  sheet 1
+*  g_sheet = '物料'.
+  DATA: g_def_active_sheetname(50) VALUE 'Program history'.
+  CALL METHOD cl_spreadsheet->select_sheet
+    EXPORTING
+      name  = g_def_active_sheetname
+    IMPORTING
+      error = cl_errors.
+  APPEND cl_errors.
+*  LOOP AT cl_errorS.
+*    CALL METHOD cl_errorS->RAISE_MESSAGE
+*      EXPORTING
+*        TYPE = 'E'.
+*  ENDLOOP.
+  FREE cl_errors.
+  g_initialized = 'X'.
+ENDFORM.                    " FRM_CREATE_BASIC_OBJECT
+*&---------------------------------------------------------------------*
+*&      Form  SUB_SET_CELL
+*&---------------------------------------------------------------------*
+*       根据数据设置 EXCEL 表的属性
+*----------------------------------------------------------------------*
+FORM sub_set_cell .
+  DATA:  i_top TYPE i, i_left TYPE i,
+             i_rows TYPE i, i_cols TYPE i,
+             t_row TYPE i, t_col TYPE i,
+             s_row TYPE i, s_col TYPE i.
+  SORT gt_itab BY row col.
+  READ TABLE gt_itab INDEX 1.
+  IF sy-subrc = 0.
+    MOVE gt_itab-row TO  i_top.
+    MOVE gt_itab-col  TO  i_left.
+  ENDIF.
+  SORT gt_itab BY row DESCENDING col DESCENDING.
+  READ TABLE gt_itab INDEX 1.
+  IF sy-subrc = 0.
+    i_rows = gt_itab-row - i_top + 1.
+    i_cols =  gt_itab-col  - i_left + 1.
+  ENDIF.
+  SORT gt_itab BY row col.
+  CALL METHOD cl_spreadsheet->insert_range_dim
+    EXPORTING
+      name     = 'cell'
+      no_flush = 'X'
+      top      = i_top
+      left     = i_left
+      rows     = i_rows
+      columns  = i_cols
+    IMPORTING
+      error    = cl_errors.
+  APPEND cl_errors.
+  REFRESH gt_ranges.
+  wa_rangeitem-name = 'cell'.
+  wa_rangeitem-columns = i_cols.
+  wa_rangeitem-rows = i_rows.
+  wa_rangeitem-code = 4.
+  APPEND wa_rangeitem TO gt_ranges.
+  PERFORM sub_fill_blank USING i_top i_left i_rows i_cols .
+  REFRESH gt_excel_input.
+  REFRESH gt_excel_format.
+  LOOP AT gt_itab.
+    wa_excel_input-column = gt_itab-col - i_left + 1.
+    wa_excel_input-row = gt_itab-row - i_top + 1.
+    MOVE gt_itab-value TO wa_excel_input-value.
+*    CONDENSE  wa_excel_input-value  NO-GAPS.
+    APPEND wa_excel_input TO gt_excel_input.
+  ENDLOOP.
+* set data
+  CALL METHOD cl_spreadsheet->set_ranges_data
+    EXPORTING
+      ranges   = gt_ranges
+      contents = gt_excel_input
+*      UPDATING = '1'
+      no_flush = 'X'
+    IMPORTING
+      error    = cl_errors.
+  APPEND cl_errors.
+*  设置 FRAME.
+  IF wa_tab-areano NE 1.
+    CALL METHOD cl_spreadsheet->set_frame
+      EXPORTING
+        rangename = 'cell'
+        typ       = '127'
+        color     = '1'
+        no_flush  = 'X'
+      IMPORTING
+        error     = cl_errors.
+  ENDIF.
+ENDFORM.                    " SUB_SET_CELL
+*&---------------------------------------------------------------------*
+*&      Form  SUB_FILL_BLANK
+*&---------------------------------------------------------------------*
+*       将数据填充到 EXCEL 表中
+*----------------------------------------------------------------------*
+FORM sub_fill_blank  USING  i_top  TYPE i
+                            i_left TYPE i
+                            i_rows TYPE i
+                            i_cols TYPE i .
+  DATA: inx_col(4) TYPE n,
+        inx_row(4) TYPE n.
+  DATA: BEGIN OF it_row OCCURS 0,
+         row(4) TYPE n,
+        END OF it_row.
+  MOVE i_top TO inx_row.
+  DO i_rows TIMES.
+    MOVE i_left TO inx_col.
+    DO i_cols TIMES.
+      READ TABLE gt_itab WITH KEY row = inx_row
+                               col = inx_col.
+      IF sy-subrc <> 0.
+        MOVE inx_row TO gt_itab-row.
+        MOVE inx_col TO gt_itab-col.
+        MOVE ''      TO gt_itab-value.
+        APPEND gt_itab.
+      ENDIF.
+      ADD 1 TO inx_col.
+    ENDDO.
+    ADD 1 TO inx_row.
+  ENDDO.
+  SORT gt_itab BY row col.
+ENDFORM.                    " SUB_FILL_BLANK
+*&---------------------------------------------------------------------*
+*&      Form  sub_process_excel
+*&---------------------------------------------------------------------*
+*       处理结果内表
+*----------------------------------------------------------------------*
+FORM sub_process_excel .
+  g_row = 3.
+  CLEAR g_col.
+* 将数据添充到EXCEL内表中
+  REFRESH gt_tabcontent.
+  LOOP AT gt_result.
+    g_col = 1.
+    m_excel_cell   gt_result-matnr.
+    m_excel_cell   gt_result-werks.
+    m_excel_cell   gt_result-lgort.
+    m_excel_cell   gt_result-charg.
+    g_row = g_row + 1.
+  ENDLOOP.
+*  wa_imt_tab-areano = 2.
+*  wa_imt_tab-tabcontent = gt_tabcontent.
+*  APPEND wa_imt_tab TO gt_imt_tab.
+  g_col = 1.
+  m_excel_cell   '执行日期'.
+  m_excel_cell   sy-datum.
+  m_excel_cell   '登录用户'.
+  m_excel_cell   sy-uname.
+  wa_imt_tab-areano = 1.
+  wa_imt_tab-tabcontent = gt_tabcontent.
+  APPEND wa_imt_tab TO gt_imt_tab.
+ENDFORM.                    " sub_process_excel

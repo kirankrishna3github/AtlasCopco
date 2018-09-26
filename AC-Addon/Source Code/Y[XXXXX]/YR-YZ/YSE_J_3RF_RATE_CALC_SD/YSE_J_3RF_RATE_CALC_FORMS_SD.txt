@@ -1,0 +1,1230 @@
+*&---------------------------------------------------------------------*
+*&  Include           YSE_J_3RF_RATE_CALC_FORMS_SD
+*&---------------------------------------------------------------------*
+
+DATA:
+  BEGIN OF it_j_3rf_invoice OCCURS 0,
+        " customer or vendor
+        lifnr     TYPE bseg-lifnr,
+        kunnr     TYPE bseg-kunnr,
+        " invoice properties
+        rate_inv  TYPE j_3rfin_rate_clc-rate_inv," invoice rate
+        rate_clr  TYPE j_3rfin_rate_clc-rate_clr," clearing rate
+        belnr_inv TYPE bkpf-belnr,               " invoice doc num
+        awkey_inv TYPE bkpf-awkey,               " ref. to SD document
+        wrbtr_inv TYPE bseg-wrbtr,               " invoice amount
+        waers_inv TYPE bkpf-waers,               " invoice currency
+        gjahr_inv TYPE bkpf-gjahr,               " invoice fiscal year
+        bukrs_inv TYPE bkpf-bukrs,               " invoice company code
+        clr_auto  TYPE j_3rfin_rate_clc-clr_auto," auto clearing
+        clr_blart TYPE j_3rfin_rate_clc-clr_blart,
+        clr_rstgr TYPE j_3rfin_rate_clc-clr_rstgr,
+        clr_part  TYPE j_3rfin_rate_clc-clr_part,
+  END OF it_j_3rf_invoice,
+
+  it_j_3rf_downpay TYPE STANDARD TABLE OF J_3RF_RATE_CALC_ALV WITH HEADER LINE.
+
+DATA:
+*     calculation results
+  g_dp_count    TYPE i,          " number of selected down payments
+  g_dp_amount   TYPE bseg-wrbtr, " down payments amount (including partial payment) in FC
+  g_dp_partial  TYPE bseg-wrbtr, " amount of partial payment in FC
+  g_dp_rate     TYPE kursf,      " invoice rate
+  g_cl_rate     TYPE kursf       " clearance rate
+  .
+CONSTANTS:
+  c_round_mul   TYPE p DECIMALS 5 VALUE 1000000.
+
+* increase local currency accuracy
+TYPES:     t_curr(8)  TYPE p DECIMALS 5. " currency amount
+CONSTANTS: c_curr_mul TYPE p DECIMALS 5 VALUE 100.
+
+*&---------------------------------------------------------------------*
+*&      Form  get_down_payments
+*&---------------------------------------------------------------------*
+* returns list of open down payments for selected vendor or/and customer
+*----------------------------------------------------------------------*
+FORM get_down_payments
+  TABLES  p_belnr
+          p_budat
+          p_bldat
+          p_umskz
+  USING   p_bukrs  TYPE bukrs
+          p_lifnr  TYPE lifnr
+          p_kunnr  TYPE kunnr
+          p_zuonr  LIKE bseg-zuonr
+          p_gsber  TYPE gsber
+          p_waers  TYPE bkpf-waers
+          p_waers_pay TYPE J_3RFCLC_WAERS_PAY
+          p_blart  type bkpf-blart
+          p_xref2  type bseg-xref2
+  .
+  RANGES: ra_zuonr FOR bseg-zuonr,
+          ra_gsber FOR bseg-gsber,
+          ra_belnr FOR bseg-belnr
+          .
+  DATA:   wa_bsik  TYPE bsik,
+          wa_bsid  TYPE bsid,
+          wa_t001  TYPE t001,
+          it_inv   TYPE STANDARD TABLE OF j_3rfin_rate_clc WITH HEADER LINE,
+          it_dp    TYPE STANDARD TABLE OF j_3rfpm_rate_clc WITH HEADER LINE,
+          it_bkpf  TYPE STANDARD TABLE OF bkpf             WITH HEADER LINE,
+          l_locked TYPE c,
+          l_found  TYPE c,
+          i        TYPE i,
+          FFACT    TYPE TCURR-FFACT,
+          LFACT    TYPE TCURR-TFACT,
+          l_curr   TYPE t_curr.
+
+  FIELD-SYMBOLS: <fs> LIKE LINE OF it_j_3rf_downpay.
+
+  REFRESH: it_j_3rf_invoice, it_j_3rf_downpay.
+
+* at least one parameter should be selected
+  CHECK ( ( NOT p_lifnr IS INITIAL ) OR
+          ( NOT p_kunnr IS INITIAL ) ).
+
+* get company info
+  SELECT SINGLE * FROM t001 INTO wa_t001 WHERE bukrs = p_bukrs.
+
+* init filter criterias
+  IF NOT p_zuonr IS INITIAL.
+    CLEAR ra_zuonr.
+    ra_zuonr-sign   = 'I'.
+    ra_zuonr-option = 'EQ'.
+    ra_zuonr-low    = p_zuonr.
+    APPEND ra_zuonr.
+  ENDIF.
+  IF NOT p_gsber IS INITIAL.
+    CLEAR ra_gsber.
+    ra_gsber-sign   = 'I'.
+    ra_gsber-option = 'EQ'.
+    ra_gsber-low    = p_gsber.
+    APPEND ra_gsber.
+  ENDIF.
+
+* check for open downpayments
+  IF NOT p_lifnr IS INITIAL.
+
+    SELECT * FROM j_3rfin_rate_clc
+      INTO TABLE it_inv
+      WHERE lifnr = p_lifnr.  "#EC CI_SGLSELECT
+
+    SELECT * FROM j_3rfpm_rate_clc
+      INTO TABLE it_dp
+      WHERE lifnr = p_lifnr.  "#EC CI_SGLSELECT
+
+  ENDIF.
+
+  IF NOT p_kunnr IS INITIAL.
+
+    SELECT * FROM j_3rfin_rate_clc
+      APPENDING TABLE it_inv
+      WHERE kunnr = p_kunnr.  "#EC CI_NOFIRST
+
+    SELECT * FROM j_3rfpm_rate_clc
+      APPENDING TABLE it_dp
+      WHERE kunnr = p_kunnr.  "#EC CI_NOFIRST
+
+  ENDIF.
+
+  CLEAR l_locked.
+*  IF LINES( it_inv ) > 0 AND LINES( it_dp ) > 0.
+*    l_locked = 'X'.
+*  ENDIF.
+
+* load open down payments for vendor
+  IF l_locked = 'X' AND NOT p_lifnr IS INITIAL.
+    " validate that vendor has documents
+    READ TABLE it_dp WITH KEY lifnr = p_lifnr.
+    IF sy-subrc IS INITIAL.
+      SELECT * FROM bsik
+        INTO wa_bsik
+        FOR ALL ENTRIES IN it_dp
+        WHERE
+          bukrs = p_bukrs         AND
+          lifnr = p_lifnr         AND
+          belnr = it_dp-belnr_pay AND
+          buzei = it_dp-buzei_pay AND
+          umsks = 'A'             AND     " Down Payments
+          bstat <> 'S'            AND     " ignore "Noted items"
+          shkzg = gc_shkzg_s.             " debit
+
+        PERFORM add_bsik USING wa_bsik wa_t001-waers.
+
+      ENDSELECT.
+    ENDIF.
+  ENDIF.
+
+* load open down payments for customer
+  IF l_locked = 'X' AND NOT p_kunnr IS INITIAL.
+    " validate that customer has documents
+    READ TABLE it_dp WITH KEY kunnr = p_kunnr.
+    IF sy-subrc IS INITIAL.
+      SELECT * FROM bsid
+        INTO wa_bsid
+        FOR ALL ENTRIES IN it_dp
+        WHERE
+          bukrs = p_bukrs         AND
+          kunnr = p_kunnr         AND
+          belnr = it_dp-belnr_pay AND
+          buzei = it_dp-buzei_pay AND
+          umsks = 'A'             AND     " Down Payments
+          bstat <> 'S'            AND     " ignore "Noted items"
+          shkzg = gc_shkzg_h.             " credit
+
+        PERFORM add_bsid USING wa_bsid wa_t001-waers.
+
+      ENDSELECT.
+    ENDIF.
+  ENDIF.
+
+*  if l_locked = 'X' and no down payment found, then the
+*  j_3rfpm_rate_clc table is corrupted - down payments were cleared
+*  by different way. clear the table
+  IF l_locked = 'X' AND LINES( it_j_3rf_downpay ) EQ 0.
+    CLEAR l_locked.
+    REFRESH: it_inv, it_dp.
+    PERFORM db_clear_down_payments USING p_lifnr p_kunnr.
+  ENDIF.
+
+* select down payments for vendors
+  IF l_locked IS INITIAL AND NOT p_lifnr IS INITIAL.
+    SELECT * FROM bsik
+      INTO wa_bsik
+      WHERE
+        bukrs = p_bukrs   AND
+        lifnr = p_lifnr   AND
+        umskz IN p_umskz  AND
+        zuonr IN ra_zuonr AND
+        gsber IN ra_gsber AND
+        belnr IN p_belnr  AND
+        budat IN p_budat  AND
+        bldat IN p_bldat  AND
+        umsks = 'A'       AND     " Down Payments
+        bstat <> 'S'      AND     " ignore "Noted items"
+        shkzg = gc_shkzg_s.       " debit
+
+      PERFORM add_bsik USING wa_bsik wa_t001-waers.
+
+    ENDSELECT.
+  ENDIF.
+
+* select down payments for customers
+  IF l_locked IS INITIAL AND NOT p_kunnr IS INITIAL.
+    SELECT * FROM bsid
+      INTO wa_bsid
+      WHERE
+        bukrs = p_bukrs   AND
+        kunnr = p_kunnr   AND
+        umskz IN p_umskz  AND
+        zuonr IN ra_zuonr AND
+        gsber IN ra_gsber AND
+        belnr IN p_belnr  AND
+        budat IN p_budat  AND
+        bldat IN p_bldat  AND
+        blart = p_blart   and
+        xref2 = p_xref2   and
+        umsks = 'A'       AND     " Down Payments
+        bstat <> 'S'      AND     " ignore "Noted items"
+        shkzg = gc_shkzg_h.       " credit
+
+      PERFORM add_bsid USING wa_bsid wa_t001-waers.
+
+    ENDSELECT.
+  ENDIF.
+
+* load documents header
+  DESCRIBE TABLE it_j_3rf_downpay LINES i.
+  IF i > 0.
+    SELECT * FROM bkpf
+      INTO TABLE it_bkpf
+      FOR ALL ENTRIES IN it_j_3rf_downpay
+      WHERE  bukrs = p_bukrs   AND
+             belnr = it_j_3rf_downpay-belnr  AND
+             gjahr = it_j_3rf_downpay-gjahr.
+    LOOP AT it_j_3rf_downpay ASSIGNING <fs>.
+      READ TABLE it_bkpf
+        WITH KEY bukrs = p_bukrs
+                 belnr = <fs>-belnr
+                 gjahr = <fs>-gjahr
+        BINARY SEARCH.
+      IF sy-subrc IS INITIAL.
+        MOVE-CORRESPONDING it_bkpf TO <fs>.
+      ENDIF.
+    ENDLOOP.
+    FREE it_bkpf.
+  ENDIF.
+
+* check currency
+  IF NOT p_waers_pay IS INITIAL AND l_locked IS INITIAL.
+    DELETE it_j_3rf_downpay
+      WHERE waers_pay <> p_waers_pay.
+  ENDIF.
+
+* ??? delete assigned documents ???
+*  DELETE it_j_3rf_downpay
+*    WHERE rebzg <> '' AND rebzj <> '' AND rebzz <> ''.
+
+* N1310626 - correct partially cleared payments
+  PERFORM correct_payments USING p_lifnr p_kunnr.
+
+* if p_waers is empty then only FC allowed
+  IF p_waers IS INITIAL.
+    IF l_locked IS INITIAL.
+      DELETE it_j_3rf_downpay
+        WHERE waers_pay = wa_t001-waers.
+    ENDIF.
+  ELSE.
+    " calculate convertional rate using selected currency
+    LOOP AT it_j_3rf_downpay ASSIGNING <fs> WHERE waers_pay <> p_waers.
+
+      CALL FUNCTION 'CONVERT_TO_FOREIGN_CURRENCY'
+        EXPORTING
+          date             = <fs>-bldat
+          foreign_currency = p_waers
+          local_amount     = <fs>-dmbtr
+          local_currency   = wa_t001-waers
+        IMPORTING
+          foreign_amount   = <fs>-wrbtr_inv
+        EXCEPTIONS
+          OTHERS           = 6.
+
+      IF sy-subrc <> 0.
+        MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+                   WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+      ENDIF.
+
+      CALL FUNCTION 'READ_EXCHANGE_RATE'
+        EXPORTING
+          date                    = <fs>-bldat
+          foreign_currency        = p_waers
+          local_currency          = wa_t001-waers
+       IMPORTING
+         EXCHANGE_RATE           = <fs>-rate_pay
+         FOREIGN_FACTOR          = FFACT
+         LOCAL_FACTOR            = LFACT
+       EXCEPTIONS
+         NO_RATE_FOUND           = 1
+         NO_FACTORS_FOUND        = 2
+         NO_SPREAD_FOUND         = 3
+         DERIVED_2_TIMES         = 4
+         OVERFLOW                = 5
+         ZERO_RATE               = 6
+         OTHERS                  = 7.
+      IF sy-subrc <> 0.
+        MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+           WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+      ENDIF.
+
+      <fs>-waers_inv = p_waers. " override currency
+      IF sy-subrc NE 0.
+*     IF FFACT <> 1 OR LFACT <> 1.
+        IF <fs>-wrbtr_inv > 0.
+          "<fs>-rate_pay = <fs>-dmbtr / <fs>-wrbtr_inv.
+          l_curr = <fs>-dmbtr.
+          PERFORM calc_conv_rate
+             USING    l_curr
+                      <fs>-wrbtr_inv
+                      p_waers
+             CHANGING <fs>-rate_pay.
+        ENDIF.
+      ENDIF.
+
+    ENDLOOP.
+
+  ENDIF.
+
+* check items from J_3RFPM_RATE_CLC table
+  LOOP AT it_inv.
+
+    IF it_inv-lifnr IS INITIAL AND it_inv-kunnr IS INITIAL.
+      CONTINUE.
+    ENDIF.
+
+    CLEAR l_found.
+    LOOP AT it_dp WHERE lifnr = it_inv-lifnr AND kunnr = it_inv-kunnr.
+
+      READ TABLE it_j_3rf_downpay
+        WITH KEY bukrs = it_dp-bukrs
+                 gjahr = it_dp-gjahr
+                 belnr = it_dp-belnr_pay
+                 buzei = it_dp-buzei_pay
+                 lifnr = it_dp-lifnr
+                 kunnr = it_dp-kunnr.
+      IF sy-subrc EQ 0.
+        i = sy-tabix.
+        it_j_3rf_downpay-chk_sel   = 'X'.
+        it_j_3rf_downpay-chk_part  = it_dp-chk_part.
+        MODIFY it_j_3rf_downpay INDEX i.
+        l_found = 'X'.
+      ENDIF.
+    ENDLOOP.
+
+*   append invoice
+    IF l_found EQ 'X'.
+      CLEAR it_j_3rf_invoice.
+      MOVE-CORRESPONDING it_inv TO it_j_3rf_invoice.        "#EC ENHOK
+      APPEND it_j_3rf_invoice.
+    ENDIF.
+
+  ENDLOOP.
+
+ENDFORM.                    "get_down_payments
+
+*&---------------------------------------------------------------------*
+*&      Form  add_bsik
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->PA_BSIK    text
+*      -->PA_WAERS   text
+*----------------------------------------------------------------------*
+FORM add_bsik
+  USING pa_bsik  TYPE bsik
+        pa_waers TYPE bkpf-waers.
+
+  CLEAR it_j_3rf_downpay.
+  MOVE-CORRESPONDING pa_bsik TO it_j_3rf_downpay.           "#EC ENHOK
+  it_j_3rf_downpay-dmbtr = pa_bsik-dmbtr.
+  it_j_3rf_downpay-lifnr = pa_bsik-lifnr.
+  it_j_3rf_downpay-hwaer = pa_waers.
+  it_j_3rf_downpay-koart = 'K'.
+
+  it_j_3rf_downpay-wrbtr_pay = pa_bsik-wrbtr.
+  it_j_3rf_downpay-waers_pay = pa_bsik-waers.
+  it_j_3rf_downpay-wrbtr_inv = pa_bsik-wrbtr.
+  it_j_3rf_downpay-waers_inv = pa_bsik-waers.
+
+  " calculate rate
+  IF it_j_3rf_downpay-wrbtr_inv > 0.
+    DATA: l_curr TYPE t_curr.
+    l_curr = it_j_3rf_downpay-dmbtr.
+    PERFORM calc_conv_rate
+      USING    l_curr
+               it_j_3rf_downpay-wrbtr_inv
+               it_j_3rf_downpay-waers_pay
+      CHANGING it_j_3rf_downpay-rate_pay.
+  ENDIF.
+
+  APPEND it_j_3rf_downpay.
+ENDFORM.                    "add_bsik
+
+*&---------------------------------------------------------------------*
+*&      Form  add_bsid
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->PA_BSID    text
+*      -->PA_WAERS   text
+*----------------------------------------------------------------------*
+FORM add_bsid
+  USING pa_bsid  TYPE bsid
+        pa_waers TYPE bkpf-waers.
+
+  CLEAR it_j_3rf_downpay.
+  MOVE-CORRESPONDING pa_bsid TO it_j_3rf_downpay.           "#EC ENHOK
+  it_j_3rf_downpay-dmbtr = pa_bsid-dmbtr.
+  it_j_3rf_downpay-kunnr = pa_bsid-kunnr.
+  it_j_3rf_downpay-hwaer = pa_waers.
+  it_j_3rf_downpay-koart = 'D'.
+
+  it_j_3rf_downpay-wrbtr_pay = pa_bsid-wrbtr.
+  it_j_3rf_downpay-waers_pay = pa_bsid-waers.
+  it_j_3rf_downpay-wrbtr_inv = pa_bsid-wrbtr.
+  it_j_3rf_downpay-waers_inv = pa_bsid-waers.
+
+  " calculate rate
+  IF it_j_3rf_downpay-wrbtr_inv > 0.
+    DATA: l_curr TYPE t_curr.
+    l_curr = it_j_3rf_downpay-dmbtr.
+    PERFORM calc_conv_rate
+      USING    l_curr
+               it_j_3rf_downpay-wrbtr_inv
+               it_j_3rf_downpay-waers_pay
+      CHANGING it_j_3rf_downpay-rate_pay.
+  ENDIF.
+
+  APPEND it_j_3rf_downpay.
+ENDFORM.                    "add_bsid
+
+*&---------------------------------------------------------------------*
+*&      Form  calculate_down_payments
+*&---------------------------------------------------------------------*
+FORM calc_down_payments
+  USING invoice_amount   " invoice amount in foreign currency
+        invoice_date     " date of invoice to calculate conversional rate
+        invoice_rate.    " echange rate when date is not defined
+
+  DATA: i  TYPE i,
+        v  TYPE bseg-wrbtr,
+        r       TYPE t_curr, " amount in LC
+        rr      TYPE t_curr, " amount in LC
+        l_budat TYPE bkpf-budat,
+        l_dmbtr TYPE bseg-dmbtr,
+        l_wrbtr TYPE bseg-wrbtr,
+        l_waers TYPE bkpf-waers
+        .
+
+  FIELD-SYMBOLS: <fs> LIKE LINE OF it_j_3rf_downpay.
+
+* select items
+  CLEAR: g_dp_amount, g_dp_count, g_dp_partial, g_dp_rate, g_cl_rate, i, r.
+
+  LOOP AT it_j_3rf_downpay ASSIGNING <fs> WHERE chk_sel = 'X'.
+    g_dp_count  = g_dp_count  + 1.
+
+*   check: only one partial payment allowed
+    IF <fs>-chk_part EQ 'X' AND NOT i IS INITIAL.
+      CLEAR <fs>-chk_part.
+    ENDIF.
+
+    IF <fs>-chk_part NE 'X'.
+      g_dp_amount = g_dp_amount + <fs>-wrbtr_inv.
+      r           = r           + <fs>-dmbtr.
+    ELSE.
+      i = sy-tabix.
+    ENDIF.
+  ENDLOOP.
+
+*  append partial
+  IF NOT i IS INITIAL AND g_dp_amount < invoice_amount.
+    READ TABLE it_j_3rf_downpay ASSIGNING <fs> INDEX i.
+
+    v = g_dp_amount + <fs>-wrbtr_inv.
+    IF v > invoice_amount.
+      g_dp_partial = invoice_amount - g_dp_amount.
+    ELSE.
+      g_dp_partial = <fs>-wrbtr_inv.
+    ENDIF.
+    g_dp_amount = g_dp_amount + g_dp_partial.
+    IF <fs>-wrbtr_inv > 0.
+      r = r + <fs>-dmbtr * ( g_dp_partial / <fs>-wrbtr_inv ).
+    ENDIF.
+  ENDIF.
+
+  v = g_dp_amount.
+
+* calculate clearance amount
+  IF v <= invoice_amount AND v > 0.
+    "g_cl_rate = ( c_round_mul * r / v ) / c_round_mul.
+    perform calc_conv_rate
+       using    r
+                v
+                p_waers
+       changing g_cl_rate.
+  ENDIF.
+
+* rest of invoice - by invoice date
+  CLEAR: l_dmbtr, l_wrbtr.
+  IF g_dp_amount < invoice_amount.
+*   get local currency of the company
+    SELECT SINGLE waers FROM t001 INTO l_waers WHERE bukrs = p_bukrs.
+
+    l_wrbtr = invoice_amount - g_dp_amount. " rest of amount in FC
+    rr      = l_wrbtr.
+    l_budat = invoice_date.
+    IF l_budat IS INITIAL.
+      l_budat = rateequation-conv_date.
+      IF l_budat IS INITIAL.
+        l_budat = sy-datum.
+      ENDIF.
+    ENDIF.
+
+*   if invoice currency doesn't match to lc then convert to lc
+    IF p_waers NE l_waers.
+      IF NOT invoice_rate IS INITIAL.
+        rr = l_wrbtr * rateequation-lref. " absolute amount
+        IF invoice_rate > 0.
+          rr = rr * invoice_rate.
+        ELSE.
+          rr = rr / abs( invoice_rate ).
+        ENDIF.
+        rr = rr / rateequation-ffactp * rateequation-tfactp.
+        rr = rr / rateequation-fref.
+      ELSE.
+        l_wrbtr = l_wrbtr * c_curr_mul. " increase accuracy
+        CALL FUNCTION 'CONVERT_TO_LOCAL_CURRENCY'
+          EXPORTING
+            date             = l_budat
+            foreign_amount   = l_wrbtr
+            foreign_currency = p_waers
+            local_currency   = l_waers
+          IMPORTING
+            local_amount     = l_dmbtr
+          EXCEPTIONS
+            OTHERS           = 6.
+        IF sy-subrc <> 0.
+          MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+             WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+        ENDIF.
+        rr      = l_dmbtr / c_curr_mul.
+        l_wrbtr = l_wrbtr / c_curr_mul.
+      ENDIF.
+    ENDIF.
+
+    r = r + rr.
+    v = v + l_wrbtr.
+  ENDIF.
+
+* calculate invoice rate
+  IF v EQ invoice_amount AND v > 0.
+    "g_dp_rate = ( c_round_mul * r / v ) / c_round_mul.
+    perform calc_conv_rate
+       using    r
+                v
+                p_waers
+       changing g_dp_rate.
+  ENDIF.
+
+ENDFORM.                    "calculate_down_payments
+
+*&---------------------------------------------------------------------*
+*&      Form  db_clear_down_payments
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->PA_LIFNR   text
+*      -->PA_KUNNR   text
+*----------------------------------------------------------------------*
+FORM db_clear_down_payments
+  USING pa_lifnr  TYPE lifnr
+        pa_kunnr  TYPE kunnr.
+
+  IF NOT pa_lifnr IS INITIAL.
+    DELETE FROM j_3rfin_rate_clc WHERE lifnr = pa_lifnr.
+    DELETE FROM j_3rfpm_rate_clc WHERE lifnr = pa_lifnr.
+  ENDIF.
+
+  IF NOT pa_kunnr IS INITIAL.
+    DELETE FROM j_3rfin_rate_clc WHERE KUNNR = pa_kunnr."#EC CI_NOFIRST
+    DELETE FROM j_3rfpm_rate_clc WHERE KUNNR = pa_kunnr."#EC CI_NOFIRST
+  ENDIF.
+ENDFORM.                    "db_clear_down_payments
+
+*&---------------------------------------------------------------------*
+*&      Form  down_payments_locked
+*&---------------------------------------------------------------------*
+*       If customer or vendor is locked then returns:
+*          p_locked = 'X'
+*          p_amount = invoice amount in FC
+*          p_waers  = invoice currency
+*          p_user   = user, who created list
+*       If customer is unlocked then returns:
+*          p_locked = ' '
+*          p_amount = unchanged
+*          p_waers  = unchanged
+*----------------------------------------------------------------------*
+*      -->P_BUKRS    text
+*      -->P_LIFNR    text
+*      -->P_KUNNR    text
+*      -->P_LOCKED   text
+*----------------------------------------------------------------------*
+FORM down_payments_locked
+  USING
+    pa_lifnr  TYPE lifnr
+    pa_kunnr  TYPE kunnr
+  CHANGING
+    pa_locked TYPE c
+    pa_amount TYPE bseg-wrbtr " invoice amount
+    pa_waers  TYPE bkpf-waers " invoice currency
+    pa_user   TYPE sy-uname   " user created list
+  .
+  DATA:   l_amount TYPE j_3rfin_rate_clc-wrbtr_inv,
+          l_waers  TYPE j_3rfin_rate_clc-waers_inv,
+          l_user   TYPE sy-uname,
+          l_gjahr  TYPE j_3rfpm_rate_clc-gjahr,
+          f_inv    TYPE c,
+          f_dp     TYPE c.
+
+  CLEAR: pa_locked, f_inv, f_dp, pa_user.
+
+  SELECT SINGLE
+       wrbtr_inv waers_inv usnam
+    FROM j_3rfin_rate_clc
+    INTO (l_amount, l_waers, l_user)
+    WHERE lifnr = pa_lifnr AND
+          kunnr = pa_kunnr.
+
+  IF sy-subrc EQ 0.
+    f_inv = 'X'.
+  ENDIF.
+
+  SELECT SINGLE gjahr
+    FROM j_3rfpm_rate_clc
+    INTO l_gjahr
+    WHERE lifnr = pa_lifnr AND
+          kunnr = pa_kunnr.                             "#EC CI_GENBUFF
+
+  IF sy-subrc EQ 0.
+    f_dp = 'X'.
+  ENDIF.
+
+* check constraints
+  IF f_inv NE f_dp.
+    " table reference corrupted
+    PERFORM db_clear_down_payments
+      USING pa_lifnr
+            pa_kunnr.
+    CLEAR: f_inv, f_dp.
+  ENDIF.
+
+  IF f_inv = 'X'.
+    pa_locked = 'X'.
+*    pa_amount = l_amount.
+*    pa_waers  = l_waers.
+*    pa_user   = l_user.
+  ENDIF.
+
+ENDFORM.                    "down_payments_locked
+
+
+*&---------------------------------------------------------------------*
+*&      Form  read_invoice
+*&---------------------------------------------------------------------*
+*  read invoice amount, currency and date for selected vendor/customer
+*----------------------------------------------------------------------*
+*      -->PA_BUKRS   text
+*      -->PA_BELNR   text
+*      -->PA_GJAHR   text
+*      -->PA_KUNNR   text
+*      -->PA_LIFNR   text
+*      -->PA_AMOUNT  text
+*      -->PA_WAERS   text
+*      <--pa_subrc = 0 - OK
+*                  = 1 - not found
+*                  = 2 - not invoice
+*----------------------------------------------------------------------*
+FORM read_invoice
+  USING    pa_bukrs  TYPE bkpf-bukrs
+           pa_belnr  TYPE bkpf-belnr
+           pa_gjahr  TYPE bkpf-gjahr
+           pa_kunnr  TYPE bseg-kunnr
+           pa_lifnr  TYPE bseg-lifnr
+  CHANGING pa_amount TYPE bseg-wrbtr
+           pa_waers  TYPE bkpf-waers
+           pa_budat  TYPE bkpf-budat
+           pa_rate   TYPE bkpf-kursf
+           pa_subrc  TYPE sy-subrc.
+
+  DATA: it_bseg   TYPE TABLE OF bseg,
+        l_kunnr   TYPE kunnr,
+        l_lifnr   TYPE lifnr,
+        l_payment TYPE c.
+  FIELD-SYMBOLS: <fs> TYPE bseg.
+
+  CLEAR: pa_amount, pa_subrc.
+
+* read invoice currency
+  SELECT SINGLE waers budat kursf FROM bkpf
+    INTO (pa_waers, pa_budat, pa_rate)
+    WHERE bukrs = pa_bukrs AND
+          belnr = pa_belnr AND
+          gjahr = pa_gjahr.
+  IF NOT sy-subrc IS INITIAL.
+*   invoice not found
+    CLEAR: pa_waers, pa_budat, pa_rate.
+    pa_subrc = 1.
+    EXIT.
+  ENDIF.
+
+  SELECT * FROM bseg
+    INTO TABLE it_bseg
+    WHERE bukrs = pa_bukrs AND
+          belnr = pa_belnr AND
+          gjahr = pa_gjahr.
+
+*  calculate invoice amount in invoice currency
+  CLEAR: l_kunnr, l_lifnr, l_payment.
+  LOOP AT it_bseg ASSIGNING <fs>.
+    IF <fs>-koart = gc_koart_d AND NOT <fs>-kunnr IS INITIAL.
+      l_kunnr  = <fs>-kunnr.
+      pa_amount = pa_amount + <fs>-wrbtr.
+    ELSEIF <fs>-koart = gc_koart_k AND NOT <fs>-lifnr IS INITIAL.
+      l_lifnr  = <fs>-lifnr.
+      pa_amount = pa_amount + <fs>-wrbtr.
+    ENDIF.
+    IF <fs>-umskz = 'A' OR <fs>-xzahl = 'X'.
+      l_payment = 'X'.
+    ENDIF.
+  ENDLOOP.
+
+  IF pa_kunnr NE l_kunnr OR pa_lifnr NE l_lifnr.
+    CLEAR: pa_waers, pa_budat, pa_rate.
+    pa_subrc = 2.
+    EXIT.
+  ENDIF.
+
+  IF l_payment EQ 'X'.
+    CLEAR: pa_waers, pa_budat, pa_rate.
+    pa_subrc = 2.
+    EXIT.
+  ENDIF.
+
+* if no positions found then show an error
+  IF pa_amount IS INITIAL.
+    CLEAR: pa_waers, pa_budat, pa_rate.
+    pa_subrc = 2.
+    EXIT.
+  ENDIF.
+
+ENDFORM.                    "read_invoice
+
+*&---------------------------------------------------------------------*
+*&      Form  check_invoice
+*&---------------------------------------------------------------------*
+*  Check: if there are selected down payments, then
+*  amount of invoice should match to saved to the database
+*----------------------------------------------------------------------*
+*      -->PA_BUKRS   text
+*      -->PA_LIFNR   text
+*      -->PA_KUNNR   text
+*      -->PA_AMOUNT  text
+*      -->PA_WAERS   text
+*      -->PA_VALID   text
+*----------------------------------------------------------------------*
+FORM check_invoice
+  USING pa_bukrs  TYPE bkpf-bukrs
+        pa_lifnr  TYPE bseg-lifnr
+        pa_kunnr  TYPE bseg-kunnr
+        pa_amount TYPE bseg-wrbtr
+        pa_waers  TYPE bkpf-waers
+  CHANGING
+        pa_valid  TYPE c
+        pa_uname  TYPE sy-uname.
+
+  DATA: l_amount TYPE bseg-wrbtr,
+        l_waers  TYPE bkpf-waers.
+
+  pa_valid = 'X'.
+
+  SELECT SINGLE
+       wrbtr_inv waers_inv usnam
+    FROM j_3rfin_rate_clc
+    INTO (l_amount, l_waers, pa_uname)
+    WHERE lifnr = pa_lifnr AND
+          kunnr = pa_kunnr.
+  IF sy-subrc EQ 0.
+*   compare currency and amount
+    IF pa_waers NE l_waers OR pa_amount NE l_amount.
+      CLEAR pa_valid.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    "check_invoice
+
+*&---------------------------------------------------------------------*
+*&      Form  correct_payments          Note 1310626
+*&---------------------------------------------------------------------*
+*  Subtract cleared amounts from payments.
+*  Routine corrects DMBTR and WRBTR amounts of down payment.
+*----------------------------------------------------------------------*
+FORM correct_payments
+  USING p_lifnr  TYPE lifnr
+        p_kunnr  TYPE kunnr.
+
+  TYPES: BEGIN OF s_part_pay,
+           BUKRS TYPE bseg-BUKRS,
+           BELNR TYPE bseg-BELNR,
+           GJAHR TYPE bseg-GJAHR,
+           BUZEI TYPE bseg-BUZEI,
+           REBZG TYPE bseg-REBZG,
+           REBZJ TYPE bseg-REBZJ,
+           REBZZ TYPE bseg-REBZZ,
+           DMBTR TYPE bseg-DMBTR,
+           WRBTR TYPE bseg-WRBTR,
+           WAERS TYPE bkpf-WAERS,
+         END OF s_part_pay.
+  TYPES: t_part_pay TYPE STANDARD TABLE OF s_part_pay.
+
+  DATA: it_bse_clr  TYPE STANDARD TABLE OF BSE_CLR,
+        it_bkpf_clr TYPE STANDARD TABLE OF BKPF,
+        i_index     TYPE sy-tabix,
+        l_clr_dmbtr TYPE BSE_CLR-DMBTR,
+        l_clr_wrbtr TYPE BSE_CLR-WRBTR,
+        l_rate(16)  TYPE p,
+        l_fc        TYPE c,
+        wa_bse_clr  TYPE BSE_CLR,
+        it_part_pay TYPE t_part_pay.
+  FIELD-SYMBOLS: <fs_bkpf_clr> TYPE BKPF,
+                 <fs_bse_clr>  TYPE BSE_CLR,
+                 <dp>          TYPE J_3RF_RATE_CALC_ALV,
+                 <fs_part_pay> TYPE s_part_pay.
+
+  CHECK NOT it_j_3rf_downpay[] IS INITIAL.
+
+* select cleared items
+  SELECT * FROM BSE_CLR
+    INTO TABLE it_bse_clr
+    FOR ALL ENTRIES IN it_j_3rf_downpay
+    WHERE BUKRS = it_j_3rf_downpay-BUKRS AND
+          BELNR = it_j_3rf_downpay-BELNR AND
+          GJAHR = it_j_3rf_downpay-GJAHR AND
+          BUZEI = it_j_3rf_downpay-BUZEI.
+
+* N1349663: search for partial transfers
+  IF NOT p_lifnr IS INITIAL.
+    SELECT * FROM BSIK
+      INTO CORRESPONDING FIELDS OF TABLE it_part_pay
+      FOR ALL ENTRIES IN it_j_3rf_downpay
+      WHERE BUKRS = it_j_3rf_downpay-BUKRS AND
+            REBZG = it_j_3rf_downpay-BELNR AND
+            REBZJ = it_j_3rf_downpay-GJAHR AND
+            REBZZ = it_j_3rf_downpay-BUZEI AND
+            UMSKS = 'A'                    AND
+            REBZT = 'A'.
+  ENDIF.
+
+  IF NOT p_kunnr IS INITIAL.
+    SELECT * FROM BSID
+      INTO CORRESPONDING FIELDS OF TABLE it_part_pay
+      FOR ALL ENTRIES IN it_j_3rf_downpay
+      WHERE BUKRS = it_j_3rf_downpay-BUKRS AND
+            REBZG = it_j_3rf_downpay-BELNR AND
+            REBZJ = it_j_3rf_downpay-GJAHR AND
+            REBZZ = it_j_3rf_downpay-BUZEI AND
+            UMSKS = 'A'                    AND
+            REBZT = 'A'.
+  ENDIF.
+
+  IF NOT it_part_pay IS INITIAL.
+
+    " sort for fast search
+    SORT it_bse_clr BY BUKRS BELNR GJAHR BUZEI BELNR_CLR GJAHR_CLR.
+
+    " remove cleared items
+    LOOP AT it_part_pay ASSIGNING <fs_part_pay>.
+
+      READ TABLE it_bse_clr
+        TRANSPORTING NO FIELDS
+        BINARY SEARCH
+        WITH KEY BUKRS     = <fs_part_pay>-BUKRS
+                 BELNR     = <fs_part_pay>-REBZG
+                 GJAHR     = <fs_part_pay>-REBZJ
+                 BUZEI     = <fs_part_pay>-REBZZ
+                 BELNR_CLR = <fs_part_pay>-BELNR
+                 GJAHR_CLR = <fs_part_pay>-GJAHR.
+      IF sy-subrc IS INITIAL.
+        CLEAR <fs_part_pay>-BUKRS.
+      ENDIF.
+
+    ENDLOOP.
+
+    " append paid items to it_bse_clr
+    CLEAR wa_bse_clr.
+    LOOP AT it_part_pay ASSIGNING <fs_part_pay>.
+      " check for amounts
+      CHECK NOT <fs_part_pay>-BUKRS IS INITIAL.
+      CHECK NOT <fs_part_pay>-DMBTR IS INITIAL AND
+            NOT <fs_part_pay>-WRBTR IS INITIAL.
+
+      wa_bse_clr-BUKRS_CLR = <fs_part_pay>-BUKRS.
+      wa_bse_clr-BELNR_CLR = <fs_part_pay>-BELNR.
+      wa_bse_clr-GJAHR_CLR = <fs_part_pay>-GJAHR.
+      wa_bse_clr-BUKRS     = <fs_part_pay>-BUKRS.
+      wa_bse_clr-BELNR     = <fs_part_pay>-REBZG.
+      wa_bse_clr-GJAHR     = <fs_part_pay>-REBZJ.
+      wa_bse_clr-BUZEI     = <fs_part_pay>-REBZZ.
+      wa_bse_clr-DIFHW     = 1. " we need difference
+      wa_bse_clr-DIFFW     = 1.
+      wa_bse_clr-DMBTR     = <fs_part_pay>-DMBTR + wa_bse_clr-DIFHW.
+      wa_bse_clr-WRBTR     = <fs_part_pay>-WRBTR + wa_bse_clr-DIFFW.
+      wa_bse_clr-WAERS     = <fs_part_pay>-WAERS.
+
+      APPEND wa_bse_clr TO it_bse_clr.
+    ENDLOOP.
+  ENDIF.
+* end of N1349663
+
+  CHECK NOT it_bse_clr IS INITIAL.
+
+* select headers
+  SELECT * FROM BKPF
+    INTO TABLE it_bkpf_clr
+    FOR ALL ENTRIES IN it_bse_clr
+    WHERE BUKRS = it_bse_clr-BUKRS_CLR AND
+          BELNR = it_bse_clr-BELNR_CLR AND
+          GJAHR = it_bse_clr-GJAHR_CLR.
+  CHECK NOT it_bkpf_clr IS INITIAL.
+
+* remove reversed documents
+  LOOP AT it_bkpf_clr ASSIGNING <fs_bkpf_clr>
+    WHERE ( BSTAT = 'B' ) OR
+          ( NOT STBLG IS INITIAL AND
+            NOT STJAH IS INITIAL ).
+
+    DELETE it_bse_clr
+      WHERE BUKRS_CLR = <fs_bkpf_clr>-BUKRS AND
+            BELNR_CLR = <fs_bkpf_clr>-BELNR AND
+            GJAHR_CLR = <fs_bkpf_clr>-GJAHR.
+
+  ENDLOOP.
+  CHECK NOT it_bse_clr IS INITIAL.
+
+* sort clearing documents by down payments
+  SORT it_bse_clr  BY BUKRS BELNR GJAHR BELNR_CLR.
+
+* correct down payments
+  LOOP AT it_j_3rf_downpay ASSIGNING <dp>.
+    CHECK NOT <dp>-DMBTR     IS INITIAL AND
+          NOT <dp>-WRBTR_PAY IS INITIAL.
+    " set position
+    READ TABLE it_bse_clr
+      TRANSPORTING NO FIELDS
+      BINARY SEARCH
+      WITH KEY BUKRS = <dp>-BUKRS
+               BELNR = <dp>-BELNR
+               GJAHR = <dp>-GJAHR.
+    CHECK sy-subrc IS INITIAL.
+    i_index = sy-tabix.
+
+    " down payment rate
+    "l_rate = <dp>-DMBTR * c_round_mul / <dp>-WRBTR_PAY.
+    l_rate = <dp>-rate_pay * c_round_mul.
+    CHECK NOT l_rate IS INITIAL.
+
+    CLEAR l_fc.
+
+    " loop at all clearing documents
+    LOOP AT it_bse_clr ASSIGNING <fs_bse_clr> FROM i_index.
+      IF <fs_bse_clr>-BUKRS NE <dp>-BUKRS OR
+         <fs_bse_clr>-BELNR NE <dp>-BELNR OR
+         <fs_bse_clr>-GJAHR NE <dp>-GJAHR.
+        EXIT.
+      ENDIF.
+
+      " if payment fully cleared then ignore
+      CHECK NOT <fs_bse_clr>-DIFHW IS INITIAL AND
+            NOT <fs_bse_clr>-DIFFW IS INITIAL.
+
+      " get cleared amount
+      l_clr_dmbtr = abs( <fs_bse_clr>-DMBTR ) - abs( <fs_bse_clr>-DIFHW ).
+      l_clr_wrbtr = abs( <fs_bse_clr>-WRBTR ) - abs( <fs_bse_clr>-DIFFW ).
+
+      " if cleared currency doesn't match down payment then calc correction
+      IF <dp>-waers_pay NE <fs_bse_clr>-waers.
+        l_clr_wrbtr = l_clr_dmbtr * c_round_mul / l_rate.
+        l_fc        = 'X'.
+      ENDIF.
+
+      " correct payment
+      <dp>-DMBTR     = <dp>-DMBTR     - l_clr_dmbtr.
+      <dp>-WRBTR_PAY = <dp>-WRBTR_PAY - l_clr_wrbtr.
+      <dp>-WRBTR_INV = <dp>-WRBTR_PAY.
+
+    ENDLOOP.
+
+    " if down payment is fully cleared then delete payment from result
+    IF <dp>-DMBTR     IS INITIAL OR
+       <dp>-WRBTR_PAY IS INITIAL.
+      CLEAR <dp>-bukrs.
+    ELSEIF l_fc = 'X'.
+      " Foreign currency has priority on local currency
+      <dp>-DMBTR = <dp>-WRBTR_PAY * l_rate / c_round_mul.
+    ENDIF.
+
+  ENDLOOP.
+
+  DELETE it_j_3rf_downpay WHERE bukrs IS INITIAL.
+
+  REFRESH: it_bkpf_clr, it_bkpf_clr.  " free memory
+
+ENDFORM.                    "correct_payments
+
+*&---------------------------------------------------------------------*
+*&      Form  get_conv_factor
+*&---------------------------------------------------------------------*
+*       Returns conversion factor for ALV status display
+*----------------------------------------------------------------------*
+*      --> s - result
+*----------------------------------------------------------------------*
+FORM get_conv_factor CHANGING s TYPE string.
+
+  DATA: ffact(20) TYPE c,
+        tfact(20) TYPE c.
+
+  CLEAR s.
+  CHECK rateequation-kurstyp NE space AND
+        rateequation-fcurrp  NE space AND
+        rateequation-tcurrp  NE space AND
+        rateequation-fcurrm  NE space AND
+        rateequation-tcurrm  NE space.
+
+  IF NOT rateequation-ffactp IS INITIAL AND
+     NOT rateequation-tfactp IS INITIAL AND
+     ( rateequation-ffactp NE '1' OR
+       rateequation-tfactp NE '1' ).
+
+    WRITE rateequation-ffactp TO ffact LEFT-JUSTIFIED.
+    WRITE rateequation-tfactp TO tfact LEFT-JUSTIFIED.
+
+    CONCATENATE '('
+                ffact  rateequation-fcurrp
+                '->'
+                tfact  rateequation-tcurrp
+                ')'
+                INTO s
+                SEPARATED BY space.
+  ENDIF.
+
+  IF NOT rateequation-ffactm IS INITIAL AND
+     NOT rateequation-tfactm IS INITIAL AND
+     ( rateequation-ffactm NE '1' OR
+       rateequation-tfactm NE '1' ).
+
+    WRITE rateequation-ffactm TO ffact LEFT-JUSTIFIED.
+    WRITE rateequation-tfactm TO tfact LEFT-JUSTIFIED.
+
+    CONCATENATE '('
+                ffact  rateequation-fcurrm
+                '->'
+                tfact  rateequation-tcurrm
+                ')'
+                INTO s.
+  ENDIF.
+
+ENDFORM.                    "get_conv_factor
+
+*&---------------------------------------------------------------------*
+*&      Form  calc_conv_rate
+*&---------------------------------------------------------------------*
+*       calculates exchange rate with translation ratio
+*----------------------------------------------------------------------*
+*     <-- pa_dmbtr
+*     <-- pa_wrbtr
+*     <-- pa_waers
+*     --> pa_rate
+*----------------------------------------------------------------------*
+FORM calc_conv_rate
+   USING    pa_dmbtr TYPE t_curr
+            pa_wrbtr TYPE bseg-wrbtr
+            pa_waers TYPE bkpf-waers
+   CHANGING pa_rate  TYPE kursf.
+
+  DATA: p(16) TYPE p DECIMALS 5.
+  pa_rate = 1.
+  CHECK NOT pa_wrbtr IS INITIAL AND
+        NOT pa_waers IS INITIAL.
+
+  p = c_round_mul * pa_dmbtr * rateequation-fref /
+      ( pa_wrbtr * rateequation-lref ).
+  IF pa_waers            EQ p_waers AND
+     rateequation-fcurrp EQ p_waers.
+
+    IF rateequation-ffactp < 1.
+      rateequation-ffactp = 1.
+    ENDIF.
+    IF rateequation-tfactp < 1.
+      rateequation-tfactp = 1.
+    ENDIF.
+
+    IF rateequation-ffactp > 1 OR rateequation-tfactp > 1.
+      p = p * rateequation-ffactp / rateequation-tfactp.
+    ENDIF.
+  ENDIF.
+  p       = p / c_round_mul.
+  pa_rate = p.
+
+ENDFORM.                    "calc_conv_rate
+
+*&---------------------------------------------------------------------*
+*&      Form  init_currency
+*&---------------------------------------------------------------------*
+*       init currency rates and factors
+*----------------------------------------------------------------------*
+*     <-- p_kurstyp - kurs type
+*     <-- p_date    - translation date
+*     <-- f_waers   - foreign currency
+*     <-- l_waers   - local currency
+*     <-- p_rate    - rate
+*----------------------------------------------------------------------*
+FORM init_currency USING p_kurstyp TYPE tcurv-kurst
+                         p_date    TYPE bkpf-budat
+                         f_waers   TYPE tcurc-waers
+                         l_waers   TYPE tcurc-waers
+                         p_rate    TYPE kursf.
+
+  DATA: l_date TYPE bkpf-budat.
+  l_date = rateequation-conv_date.
+  CLEAR rateequation.
+
+  rateequation-fcurrp    = f_waers.
+  rateequation-tcurrp    = l_waers.
+  rateequation-fcurrm    = f_waers.
+  rateequation-tcurrm    = l_waers.
+  rateequation-kurstyp   = p_kurstyp.
+  rateequation-conv_date = l_date.
+  if not p_date is initial.
+    rateequation-conv_date = p_date.
+  endif.
+  if rateequation-conv_date is initial.
+    rateequation-conv_date = sy-datum.
+  endif.
+
+*  get factors
+  CALL FUNCTION 'KURS_IN_PREISNOTATION'
+       EXPORTING
+            date             = rateequation-conv_date
+            type_of_rate     = rateequation-kurstyp
+            foreign_currency = rateequation-fcurrp
+            local_currency   = rateequation-tcurrp
+            rate             = 0
+       IMPORTING
+            foreign_factor   = rateequation-ffactp
+            local_factor     = rateequation-tfactp
+       EXCEPTIONS
+            error_message    = 1.
+  IF sy-subrc = 1.
+    MESSAGE ID sy-msgid TYPE 'S' NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+  CALL FUNCTION 'KURS_IN_MENGENNOTATION'
+       EXPORTING
+            date             = rateequation-conv_date
+            type_of_rate     = rateequation-kurstyp
+            foreign_currency = rateequation-fcurrm
+            local_currency   = rateequation-tcurrm
+            rate             = 0
+       IMPORTING
+            foreign_factor   = rateequation-ffactm
+            local_factor     = rateequation-tfactm
+       EXCEPTIONS
+            error_message    = 1.
+  IF sy-subrc = 1.
+    MESSAGE ID sy-msgid TYPE 'S' NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+  IF p_rate > 0.
+    rateequation-kursp = p_rate.
+  ELSEIF p_rate < 0.
+    rateequation-kursm = - p_rate.
+  ENDIF.
+
+* multiplier
+  SELECT SINGLE currdec FROM TCURX
+    INTO (rateequation-fcurrdec)
+    WHERE CURRKEY = f_waers.
+  IF sy-subrc NE 0.
+    rateequation-fcurrdec = 2.
+  ENDIF.
+
+  SELECT SINGLE currdec FROM TCURX
+    INTO (rateequation-lcurrdec)
+    WHERE CURRKEY = l_waers.
+  IF sy-subrc NE 0.
+    rateequation-lcurrdec = 2.
+  ENDIF.
+
+  rateequation-fref = 1.
+  rateequation-lref = 1.
+
+  DO rateequation-fcurrdec TIMES.
+    rateequation-fref = rateequation-fref * 10.
+  ENDDO.
+  DO rateequation-lcurrdec TIMES.
+    rateequation-lref = rateequation-lref * 10.
+  ENDDO.
+
+ENDFORM.                    "init_currency

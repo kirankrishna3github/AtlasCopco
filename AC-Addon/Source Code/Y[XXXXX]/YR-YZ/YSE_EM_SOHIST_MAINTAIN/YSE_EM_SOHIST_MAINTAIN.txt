@@ -1,0 +1,1002 @@
+************************************************************************
+* Program ID           : YSE_EM_SOHIST_MAINTAIN                        *
+* Program Title        : EM: Maintain Sales History                    *
+* Author               : Inge Bruyndonckx                              *
+* Date                 : 14.11.2006                                    *
+* Change Request Number: 141106-SE-OTH-D168-Exception Management       *
+* Description          :                                               *
+*----------------------------------------------------------------------*
+*                                                                      *
+************************************************************************
+
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME     |CORRECTION NUMBER| CHANGE REFERENCE # *
+*----------------------------------------------------------------------*
+* MOD-001 |12.03.2009|J. Smets  |CD1K946949       |Exclude deleted res.*
+* MOD-002 |25.03.2011|Lakshmi R |CD1K962549       |CR1310              *
+* MOD-003 |11.07.2011|L. Mertens|CD1K966430       |CR1310              *
+* MOD-004 |08.06.2015|CSC Chris |CD1K985802       |CR3632              *
+************************************************************************
+
+REPORT  yse_em_sohist_maintain NO STANDARD PAGE HEADING LINE-SIZE 132.
+
+
+*----------------------------------------------------------------------*
+* Data declarations                                                    *
+*----------------------------------------------------------------------*
+INCLUDE yse_em_sohist_maintain_top.
+
+
+*----------------------------------------------------------------------*
+* Selection screen                                                     *
+*----------------------------------------------------------------------*
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE text-s01.
+SELECT-OPTIONS: s_auart FOR vbak-auart.
+SELECT-OPTIONS: s_auart1 FOR vbak-auart.     "insert MOD-002
+SELECT-OPTIONS: s_auart2 FOR aufk-auart.
+SELECT-OPTIONS: s_vkorg FOR vbak-vkorg.
+SELECT-OPTIONS: s_vtweg FOR vbak-vtweg.
+SELECT-OPTIONS: s_bzirk FOR vbkd-bzirk.
+SELECT-OPTIONS: s_pgc   FOR v_pgc NO INTERVALS.
+SELECT-OPTIONS: s_matnr FOR vbap-matnr.
+SELECT-OPTIONS: s_kunnr FOR vbak-kunnr.
+SELECT-OPTIONS: s_werks FOR vbap-werks OBLIGATORY.
+SELECT-OPTIONS: s_augru FOR vbak-augru.
+PARAMETERS:     cb_mam  AS  CHECKBOX.      "insert MOD-002
+* parameters: p_datum like sy-datum default sy-datum NO-DISPLAY.
+PARAMETERS: p_months TYPE num2 DEFAULT 12 NO-DISPLAY.
+SELECTION-SCREEN END OF BLOCK b1.
+
+SELECTION-SCREEN BEGIN OF BLOCK b2 WITH FRAME TITLE text-s02.
+PARAMETERS: rb_all   RADIOBUTTON GROUP sel DEFAULT 'X'.
+PARAMETERS: rb_sales RADIOBUTTON GROUP sel.
+SELECTION-SCREEN END OF BLOCK b2.
+
+SELECTION-SCREEN BEGIN OF BLOCK b3 WITH FRAME TITLE text-s03.
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(28) text-s04.
+SELECTION-SCREEN POSITION 32.
+PARAMETERS: cb_test  AS CHECKBOX.
+SELECTION-SCREEN END OF LINE.
+SELECTION-SCREEN END OF BLOCK b3.
+
+INITIALIZATION.
+* Not all options for S_PGC possible
+  ls_optl-name       = 'S_PGC'.
+  ls_optl-options-eq = 'X'.
+* ls_optl-options-bt = 'X'.
+  APPEND ls_optl TO lt_rest-opt_list_tab.
+  ls_sass-kind    = 'S'.
+  ls_sass-sg_main = 'I'.
+  ls_sass-sg_addy = space.
+  ls_sass-op_main = 'S_PGC'.
+  ls_sass-name    = 'S_PGC'.
+  APPEND ls_sass TO lt_rest-ass_tab.
+
+
+  CALL FUNCTION 'SELECT_OPTIONS_RESTRICT'
+    EXPORTING
+      restriction = lt_rest.
+  IF sy-subrc <> 0.
+*   message id sy-msgid type sy-msgty number sy-msgno
+*           with sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+*at selection-screen.
+* if sy-mandt eq '160'.
+*   message e000(yse_sales_log) with 'Program not active in client 160'.
+* endif.
+
+
+
+************************************************************************
+* START MAIN PROGRAM                                                   *
+************************************************************************
+START-OF-SELECTION.
+
+  PERFORM initialize_data.
+
+  PERFORM select_data.
+
+  PERFORM process_data.
+
+  PERFORM update_data.
+
+
+
+************************************************************************
+* SUBROUTINES  LEVEL 01                                                *
+************************************************************************
+
+*----------------------------------------------------------------------*
+*   Form  INITIALIZE_DATA                                              *
+*----------------------------------------------------------------------*
+*   .....                                                              *
+*----------------------------------------------------------------------*
+FORM initialize_data.
+
+  CLEAR: start_period, end_period, start_date, end_date.
+  CLEAR: v_n2, v_pgc.
+
+  CLEAR: i_vbak, i_vbap, i_vbep, i_sohist, i_t179, i_mara.
+  REFRESH: i_vbak, i_vbap, i_vbep, i_sohist, i_t179, i_mara.
+
+  CLEAR: " r_vbeln,
+         r_prodh.
+  REFRESH: " r_vbeln,
+           r_prodh.
+
+  PERFORM get_dates.
+
+*-- make a range for PGC
+*-- select all level 2 product hierarchies & fill PRODH range
+  DESCRIBE TABLE s_pgc LINES sy-tfill.
+  IF sy-tfill NE 0.
+    SELECT * FROM t179 INTO TABLE i_t179
+                       WHERE stufe EQ '2'.
+    LOOP AT i_t179.
+      IF i_t179-prodh+4(4) IN s_pgc.
+        r_prodh-sign   = 'I'.
+        r_prodh-option = 'EQ'.
+        r_prodh-low    = i_t179-prodh.
+        APPEND r_prodh.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+
+
+*-- select all orders in the relevant period
+  SELECT vbeln FROM vbep INTO TABLE i_docs
+                         WHERE etenr EQ 1
+                           AND edatu GE start_date
+                           AND edatu LE end_date.
+  SORT i_docs BY vbeln.
+  DELETE ADJACENT DUPLICATES FROM i_docs.
+* TVO: The use of "IN R_VBELN" when selection from VBAK, caused an SQL dump in case of
+* too many entries. The Dump suggested to use a "FOR ALL ENTRIES" instead
+*  loop at i_docs.
+*    r_vbeln-sign   = 'I'.
+*    r_vbeln-option = 'EQ'.
+*    r_vbeln-low    = i_docs-vbeln.
+*    append r_vbeln.
+*  endloop.
+
+*-- select all superseded materials
+  SELECT matnr werks nfmat FROM marc
+         INTO CORRESPONDING FIELDS OF TABLE i_matseq
+         WHERE                                         "( matnr in s_matnr or nfmat in s_matnr )
+           "and
+           mmsta EQ 'A1'
+           AND werks IN s_werks.      "Added by K Raskin for performance reasons
+
+**-- add all superseded materials to the selection
+*  r_matnr[]  = s_matnr[].
+*  loop at i_matseq.
+*    r_matnr-sign   = 'I'.
+*    r_matnr-option = 'EQ'.
+*    if i_matseq-matnr in s_matnr. " and i_matseq-matnr <> ' '.    "Changed by K Raskin
+*      r_matnr-low = i_matseq-nfmat.
+**      append r_matnr.                  "Added by K Raskin
+*    elseif i_matseq-nfmat in s_matnr. " and i_matseq-nfmat <> ' '.
+*      r_matnr-low = i_matseq-matnr.                                     "Changed by K Raskin
+**      append r_matnr.                  "Added by K Raskin
+*    endif.
+*    append r_matnr.    "Removed by K Raskin
+*  endloop.
+*  sort r_matnr by low.
+*  delete adjacent duplicates from r_matnr comparing low.
+
+*Begin of insert MOD-002
+  CLEAR: v_enddate,
+         v_startdate,
+         v_mondiff.
+  REFRESH: i_orddetr.
+  v_enddate = sy-datum.
+  v_enddate+6(2) = 01.
+  v_enddate = v_enddate - 1.
+
+  v_mondiff = '-11'.
+
+  CALL FUNCTION 'MONTH_PLUS_DETERMINE'
+    EXPORTING
+      months  = v_mondiff
+      olddate = v_enddate
+    IMPORTING
+      newdate = v_startdate.
+
+  v_startdate+6(2) = 01.
+*End   of insert MOD-002
+ENDFORM.                    " INITIALIZE_DATA
+
+
+*----------------------------------------------------------------------*
+*   Form  SELECT_DATA                                                  *
+*----------------------------------------------------------------------*
+*   .....                                                              *
+*----------------------------------------------------------------------*
+FORM select_data.
+
+* describe table r_vbeln lines sy-tfill.
+  DESCRIBE TABLE i_docs LINES sy-tfill.
+  IF sy-tfill NE 0.
+
+*-- delete all lines for chosen plants from YSE_EM_SOHIST
+    IF cb_test IS INITIAL.
+      DELETE FROM yse_em_sohist WHERE werks IN s_werks.
+    ENDIF.
+
+**-- select all relevant sales orders and order lines
+    SELECT vbeln auart vkorg vtweg kunnr FROM vbak
+                                         INTO TABLE i_vbak
+                                          FOR ALL ENTRIES IN i_docs
+*                                        where vbeln in r_vbeln
+                                         WHERE vbeln EQ i_docs-vbeln
+                                           AND auart IN s_auart
+                                           AND vkorg IN s_vkorg
+                                           AND vtweg IN s_vtweg
+                                           AND kunnr IN s_kunnr
+                                           AND augru IN s_augru.
+
+    DESCRIBE TABLE i_vbak LINES sy-tfill.
+    IF sy-tfill NE 0.
+      SORT i_vbak.
+
+      SELECT a~vbeln a~posnr a~matnr a~werks a~abgru
+             FROM vbap AS a INNER JOIN mara AS b
+               ON a~matnr = b~matnr
+             INTO TABLE i_vbap
+             FOR ALL ENTRIES IN i_vbak
+             WHERE a~vbeln EQ i_vbak-vbeln
+              AND a~matnr IN s_matnr
+*               and a~matnr in r_matnr
+               AND a~werks IN s_werks
+               AND b~prdha IN r_prodh.
+
+      DESCRIBE TABLE i_vbap LINES sy-tfill.
+      IF sy-tfill NE 0.
+        SORT i_vbap.
+        SELECT vbeln posnr etenr edatu wmeng FROM vbep
+                                             INTO TABLE i_vbep
+                                             FOR ALL ENTRIES IN i_vbap
+                                             WHERE vbeln EQ i_vbap-vbeln
+                                               AND posnr EQ i_vbap-posnr
+                                               AND etenr EQ 1
+                                               AND edatu GE start_date
+*                                              and edatu lt end_date.
+                                               AND edatu LE end_date.
+
+        DESCRIBE TABLE i_vbep LINES sy-tfill.
+        IF sy-tfill EQ 0.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+*Begin of insert MOD-002
+    IF NOT s_auart1 IS INITIAL.
+      IF NOT i_vbep[] IS INITIAL.
+        REFRESH: i_vbfa_det.
+        SELECT vbelv
+               posnv
+               vbeln
+               posnn
+        FROM   vbfa
+        INTO   TABLE i_vbfa_det
+        FOR    ALL ENTRIES IN i_vbep
+        WHERE  vbelv EQ i_vbep-vbeln
+        AND    posnv EQ i_vbep-posnr
+        AND    vbtyp_n EQ c_vbtypn.
+      ENDIF.
+
+      IF NOT i_vbfa_det IS INITIAL.
+        REFRESH: i_vbap_det.
+        SELECT vbak~auart
+               vbap~vbeln
+               vbap~posnr
+               vbap~kwmeng
+        INTO   CORRESPONDING FIELDS OF TABLE i_vbap_det
+        FROM   vbak INNER JOIN vbap
+        ON     vbak~vbeln EQ vbap~vbeln
+        FOR    ALL entries IN i_vbfa_det
+        WHERE  vbap~vbeln EQ i_vbfa_det-vbeln
+        AND    vbap~posnr EQ i_vbfa_det-posnn
+        AND    vbak~auart IN s_auart1.
+      ENDIF.
+    ENDIF.
+*End  of insert MOD-002
+
+*-- select all relevant reservations
+    IF NOT rb_all IS INITIAL.
+
+* begin of insert MOD-004
+      IF 'CN61' IN s_werks AND 'ZP01' IN s_auart2 AND s_auart2 IS NOT INITIAL.
+        SELECT a~matnr a~werks a~bdter a~bdmng a~aufnr
+               a~objnr
+               FROM resb AS a INNER JOIN aufk AS b
+                 ON a~aufnr = b~aufnr
+               INTO CORRESPONDING FIELDS OF TABLE i_resb
+               WHERE a~matnr IN s_matnr
+                 AND a~werks = 'CN61'
+*                 AND a~lgort = '1000'
+*                 AND a~xloek EQ space
+                 AND a~bdter BETWEEN start_date AND end_date
+                 AND a~postp EQ 'L'
+                 AND a~aufnr LIKE '000001%'
+                 AND a~bdmng NE 0      " Order Qty
+                 AND b~auart = 'ZP01'. " Order Type
+
+        CLEAR: i_resb_wo,i_resb_wo[].
+
+        LOOP AT i_resb.
+*         Check deletion status of component
+          CONCATENATE 'OR' i_resb-aufnr INTO v_objnr.
+          CALL FUNCTION 'STATUS_CHECK'
+            EXPORTING
+              objnr             = v_objnr
+              status            = 'I0076'
+            EXCEPTIONS
+              object_not_found  = 1
+              status_not_active = 2
+              OTHERS            = 3.
+          IF sy-subrc = 0.
+            DELETE i_resb.
+            CONTINUE.
+          ELSE.
+            APPEND i_resb TO i_resb_wo.
+          ENDIF.
+        ENDLOOP.
+
+        CLEAR: i_resb,i_resb[].
+
+        LOOP AT s_auart2 WHERE low = 'ZP01'.
+          DELETE s_auart2.
+        ENDLOOP.
+      ENDIF.
+* end of insert MOD-004
+
+
+      SELECT a~matnr a~werks a~bdter a~bdmng a~aufnr
+             a~objnr                                        "MOD-001
+             FROM resb AS a INNER JOIN mara AS b
+               ON a~matnr = b~matnr
+             INTO CORRESPONDING FIELDS OF TABLE i_resb
+             WHERE a~matnr IN s_matnr
+               AND a~werks IN s_werks
+*              and a~xloek eq space  " Put in comment on request of GBT
+               AND a~bdter BETWEEN start_date AND end_date
+               AND a~postp EQ 'L'
+               AND a~bwart EQ '261'
+               AND b~prdha IN r_prodh.
+
+      READ TABLE i_resb INDEX 1.
+      IF sy-subrc EQ 0.
+*-- find sales organisation for the service orders
+        SELECT a~aufnr a~kdauf a~kdpos b~vkorg b~vtweg
+               INTO CORRESPONDING FIELDS OF TABLE i_aufk
+               FROM aufk AS a INNER JOIN pmsdo AS b
+                 ON a~objnr = b~objnr
+               FOR ALL ENTRIES IN i_resb
+               WHERE a~aufnr EQ i_resb-aufnr
+                 AND a~auart IN s_auart2
+                 AND b~vkorg IN s_vkorg
+                 AND b~vtweg IN s_vtweg.
+
+        SORT i_aufk BY aufnr.
+        DELETE ADJACENT DUPLICATES FROM i_aufk COMPARING aufnr.
+
+*-- Find notification type of the preceding notif
+        SELECT      qmnum qmart aufnr
+               INTO TABLE i_qmel
+               FROM qmel
+                FOR ALL ENTRIES IN i_resb
+              WHERE aufnr EQ i_resb-aufnr.
+
+        SORT i_qmel BY aufnr.
+        DELETE ADJACENT DUPLICATES FROM i_qmel COMPARING aufnr.
+
+* DELETE ALL NON RELEVANT RESERVATIONS
+*
+        LOOP AT i_resb.
+
+*** MOD-001 * begin ***
+*         Check deletion status of component
+          CALL FUNCTION 'STATUS_CHECK'
+            EXPORTING
+              objnr             = i_resb-objnr
+              status            = 'I0013'
+            EXCEPTIONS
+              object_not_found  = 1
+              status_not_active = 2
+              OTHERS            = 3.
+          IF sy-subrc = 0.
+            DELETE i_resb.
+            CONTINUE.
+          ENDIF.
+*** MOD-001 * end ***
+
+*         Check if corresponding SEO was found with additional selection criteria
+          READ TABLE i_aufk WITH KEY aufnr = i_resb-aufnr BINARY SEARCH.
+          IF sy-subrc NE 0.
+            DELETE i_resb.
+            CONTINUE.
+          ENDIF.
+
+*         Check if preceding Notification is of type X6 (then exclude confirmation)
+          READ TABLE i_qmel WITH KEY aufnr = i_resb-aufnr BINARY SEARCH.
+          IF sy-subrc EQ 0.
+            IF i_qmel-qmart = 'X6'.
+              DELETE i_resb.
+              CONTINUE.
+            ENDIF.
+          ENDIF.
+
+        ENDLOOP.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+*Begin of insert MOD-002
+*For all orders of RESB table,get quantities of movement types 261 and 262
+  REFRESH:i_resbmseg,
+          i_resbmseg_tmp.
+  IF NOT i_resb[] IS INITIAL.
+    SELECT mblnr
+           bwart
+           matnr
+           menge
+           aufnr
+* begin of insert MOD-003
+           mjahr
+           zeile
+* end of insert MOD-003
+    FROM   mseg
+    INTO   CORRESPONDING FIELDS OF TABLE i_resbmseg_tmp
+    FOR    ALL ENTRIES IN i_resb
+    WHERE  matnr EQ i_resb-matnr
+    AND    aufnr EQ i_resb-aufnr
+    AND    ( bwart EQ '261' OR bwart EQ '262' ).
+  ENDIF.
+  SORT i_resbmseg_tmp[] BY aufnr bwart.
+  LOOP AT i_resbmseg_tmp INTO wa_resbmsegtmp.
+    MOVE-CORRESPONDING wa_resbmsegtmp TO wa_resbmseg.
+    COLLECT wa_resbmseg INTO i_resbmseg.
+    CLEAR: wa_resbmseg,
+           wa_resbmsegtmp.
+  ENDLOOP.
+
+*Get Movement types related to the MAM from MSEG and MKPF table
+  IF cb_mam EQ 'X'.
+    REFRESH: i_mseg,
+             i_maufk,
+             i_mvbkd,
+             i_pmsdo.
+    SELECT mkpf~mblnr
+           mkpf~mjahr
+           mkpf~budat
+           mseg~matnr
+           mseg~bwart
+           mseg~werks
+           mseg~menge
+           mseg~aufnr
+    FROM   mkpf INNER JOIN mseg
+    ON     mkpf~mblnr EQ mseg~mblnr
+    AND    mkpf~mjahr EQ mseg~mjahr
+    INTO   CORRESPONDING FIELDS OF TABLE i_mseg
+    WHERE  mkpf~budat BETWEEN v_startdate AND v_enddate
+    AND    mseg~matnr IN s_matnr
+    AND    mseg~werks IN s_werks
+    AND    ( mseg~bwart EQ '961' OR mseg~bwart EQ '962' ).
+
+    IF NOT i_mseg IS INITIAL.
+      SELECT aufnr
+             kdauf
+             kdpos
+             objnr
+      FROM   aufk
+      INTO   CORRESPONDING FIELDS OF TABLE i_maufk
+      FOR    ALL ENTRIES IN i_mseg
+      WHERE  aufnr EQ i_mseg-aufnr
+      AND    auart IN s_auart2.
+    ENDIF.
+
+    IF NOT i_maufk IS INITIAL.
+      SELECT objnr
+             vkorg
+             vtweg
+      FROM   pmsdo
+      INTO   CORRESPONDING FIELDS OF TABLE i_pmsdo
+      FOR    ALL ENTRIES IN i_maufk
+      WHERE  objnr EQ i_maufk-objnr
+      AND    vkorg IN s_vkorg
+      AND    vtweg IN s_vtweg.
+    ENDIF.
+
+    IF NOT i_maufk IS INITIAL.
+      SELECT vbeln
+             posnr
+             bzirk
+      FROM   vbkd
+      INTO   CORRESPONDING FIELDS OF TABLE i_mvbkd
+      FOR    ALL ENTRIES IN i_maufk
+      WHERE  vbeln EQ i_maufk-kdauf
+      AND    posnr EQ i_maufk-kdpos.
+    ENDIF.
+  ENDIF.
+*End   of insert MOD-002
+ENDFORM.                    " SELECT_DATA
+
+
+*----------------------------------------------------------------------*
+*   Form  PROCESS_DATA                                                 *
+*----------------------------------------------------------------------*
+*   .....                                                              *
+*----------------------------------------------------------------------*
+FORM process_data.
+
+  SORT i_matseq BY matnr werks.
+
+  LOOP AT i_vbep.
+    CLEAR: i_sohist.
+    CLEAR i_vbap.
+    READ TABLE i_vbap WITH KEY vbeln = i_vbep-vbeln
+                               posnr = i_vbep-posnr
+                               BINARY SEARCH.
+
+    CLEAR i_vbak.
+    READ TABLE i_vbak WITH KEY vbeln = i_vbep-vbeln
+                               BINARY SEARCH.
+
+    MOVE-CORRESPONDING i_vbak TO i_sohist.
+    MOVE-CORRESPONDING i_vbap TO i_sohist.
+    i_sohist-period = i_vbep-edatu(6).
+
+*-- get sales district
+    SELECT SINGLE * FROM vbkd
+                    WHERE vbeln EQ i_vbep-vbeln
+                      AND posnr EQ i_vbep-posnr.
+    IF sy-subrc EQ 0.
+      i_sohist-bzirk = vbkd-bzirk.
+    ELSE.
+      SELECT SINGLE * FROM vbkd
+                      WHERE vbeln EQ i_vbep-vbeln
+                        AND posnr EQ '000000'.
+      IF sy-subrc EQ 0.
+        i_sohist-bzirk = vbkd-bzirk.
+      ENDIF.
+    ENDIF.
+    IF NOT i_sohist-bzirk IN s_bzirk.
+      CONTINUE.
+    ENDIF.
+*Begin of insert MOD-002
+    CLEAR: wa_vbfa_det.
+    READ TABLE i_vbfa_det INTO wa_vbfa_det WITH KEY vbelv = i_vbep-vbeln
+                                                    posnv = i_vbep-posnr.
+    IF sy-subrc EQ 0.
+      READ TABLE i_vbap_det INTO wa_vbap_det WITH KEY vbeln = wa_vbfa_det-vbeln
+                                                      posnr = wa_vbfa_det-posnn.
+      IF sy-subrc EQ 0.
+        i_vbep-wmeng = i_vbep-wmeng - wa_vbap_det-kwmeng.
+      ENDIF.
+    ENDIF.
+*End   of insert MOD-002
+
+*-- get delivered quantity
+*-- if no reason for rejection => del. quant is the ordered quantity
+    IF i_vbap-abgru IS INITIAL.
+      i_sohist-zmeng = i_vbep-wmeng.
+    ELSE.
+*-- get delivered quantity from delivery
+      SELECT SUM( lfimg ) INTO i_sohist-zmeng
+                          FROM lips
+                          WHERE vgbel EQ i_vbap-vbeln
+                            AND vgpos EQ i_vbap-posnr.  "#EC CI_NOFIELD
+    ENDIF.
+    IF NOT i_sohist-zmeng IS INITIAL.
+      i_sohist-zline = 1.
+      COLLECT i_sohist.
+    ENDIF.
+  ENDLOOP.
+
+  SORT i_sohist.
+
+*Begin of insert MOD-002
+*Check quantities of the first line in RESB,if total quantity is bigger,
+*also consider the second line of RESB and so on.
+*if not, second line should not be considered.
+
+  SORT i_resb BY aufnr
+                 matnr
+                 bdmng DESCENDING.
+
+* begin of change MOD-003
+*  DELETE ADJACENT DUPLICATES FROM i_resb COMPARING aufnr
+*                                                   matnr
+*                                                   bdmng.
+**End of insert MOD-002
+**-- add reservation quantities
+*  IF NOT rb_all IS INITIAL.
+**-- first add sales organisation info to i_resb
+*    LOOP AT i_resb.
+*      READ TABLE i_aufk WITH KEY aufnr = i_resb-aufnr BINARY SEARCH.
+**-- get sales district
+*      SELECT SINGLE * FROM vbkd
+*                      WHERE vbeln EQ i_aufk-kdauf
+*                        AND posnr EQ i_aufk-kdpos.
+*      IF sy-subrc EQ 0.
+*        i_resb-bzirk = vbkd-bzirk.
+*      ELSE.
+*        SELECT SINGLE * FROM vbkd
+*                        WHERE vbeln EQ i_aufk-kdauf
+*                          AND posnr EQ '000000'.
+*        IF sy-subrc EQ 0.
+*          i_resb-bzirk = vbkd-bzirk.
+*        ENDIF.
+*      ENDIF.
+*
+*      IF NOT i_resb-bzirk IN s_bzirk.
+*        CONTINUE.
+*      ENDIF.
+*
+*      i_resb-period = i_resb-bdter(6).
+*      i_resb-vkorg  = i_aufk-vkorg.
+*      i_resb-vtweg  = i_aufk-vtweg.
+**Begin of comment MOD-002
+**      IF NOT i_resb-bdmng IS INITIAL.
+**
+**        MOVE-CORRESPONDING i_resb TO i_sohist.
+**        i_sohist-zline = 1.
+**        i_sohist-zmeng = i_resb-bdmng.
+**        COLLECT i_sohist.
+**      ENDIF.
+**End of comment MOD-002
+*
+**Begin of insert MOD-002
+*      CLEAR: wa_resbmseg_262,
+*             wa_resbmseg_261.
+*      READ TABLE i_resbmseg INTO wa_resbmseg_262 WITH KEY aufnr = i_resb-aufnr
+*                                                          matnr = i_resb-matnr
+*                                                          bwart = '262'.
+*      IF sy-subrc EQ 0.
+*        READ TABLE i_resbmseg INTO wa_resbmseg_261 WITH KEY aufnr = i_resb-aufnr
+*                                                            matnr = i_resb-matnr
+*                                                            bwart = '261'.
+*        IF sy-subrc EQ 0.
+*          CLEAR: v_qty.
+*          v_qty = wa_resbmseg_261-menge - wa_resbmseg_262-menge.
+*          IF NOT v_qty IS INITIAL.
+*            MOVE-CORRESPONDING i_resb TO i_sohist.
+*            i_sohist-zline = 1.
+*            i_sohist-zmeng = v_qty.
+*            COLLECT i_sohist.
+*          ENDIF.
+*        ELSE.
+*          IF NOT i_resb-bdmng IS INITIAL.
+*            MOVE-CORRESPONDING i_resb TO i_sohist.
+*            i_sohist-zline = 1.
+*            i_sohist-zmeng = i_resb-bdmng.
+*            COLLECT i_sohist.
+*          ENDIF.
+*        ENDIF.
+*      ELSE.
+*        IF NOT i_resb-bdmng IS INITIAL.
+*          MOVE-CORRESPONDING i_resb TO i_sohist.
+*          i_sohist-zline = 1.
+*          i_sohist-zmeng = i_resb-bdmng.
+*          COLLECT i_sohist.
+*        ENDIF.
+*      ENDIF.
+**End   of insert MOD-002
+*
+**      MODIFY i_resb.
+*    ENDLOOP.
+*
+*  ENDIF.
+
+
+* add reservation quantities
+  IF NOT rb_all IS INITIAL.
+
+* begin of insert MOD-004
+* Add work order data into historical table
+    i_resb_wo2[] = i_resb_wo[].
+    DELETE ADJACENT DUPLICATES FROM i_resb_wo2 COMPARING aufnr
+                                                         matnr.
+
+    LOOP AT i_resb_wo2.
+
+      i_resb_wo2-period = i_resb_wo2-bdter(6).
+      i_resb_wo2-vkorg  = 'CN06'.
+      i_resb_wo2-vtweg  = '01'.
+
+      CLEAR: v_qty.
+      LOOP AT i_resb_wo WHERE matnr = i_resb_wo2-matnr
+                          AND aufnr = i_resb_wo2-aufnr.
+        v_qty = v_qty + i_resb_wo-bdmng.
+      ENDLOOP.
+
+      IF v_qty > 0.
+        gv_zline = 1.
+
+        REFRESH i_resb3.
+        LOOP AT i_resb_wo INTO wa_resb
+          WHERE aufnr = i_resb_wo2-aufnr
+            AND matnr = i_resb_wo2-matnr.
+          APPEND wa_resb TO i_resb3.
+        ENDLOOP.
+
+        i_qty = v_qty.
+        LOOP AT i_resb3.
+          i_qty = i_qty - i_resb3-bdmng.
+          IF i_qty > 0.
+            gv_zline = gv_zline + 1.
+          ENDIF.
+        ENDLOOP.
+
+        MOVE-CORRESPONDING i_resb_wo2 TO i_sohist.
+
+        i_sohist-bzirk = 'CN8888'.
+        i_sohist-zline = gv_zline.
+        i_sohist-zmeng = v_qty.
+        COLLECT i_sohist.
+      ENDIF.
+    ENDLOOP.
+* end of insert MOD-004
+
+    i_resb2[] = i_resb[].
+    DELETE ADJACENT DUPLICATES FROM i_resb2 COMPARING aufnr
+                                                      matnr.
+
+*-- first add sales organisation info to i_resb
+    LOOP AT i_resb2.
+      READ TABLE i_aufk WITH KEY aufnr = i_resb2-aufnr BINARY SEARCH.
+*---- get sales district
+      SELECT SINGLE * FROM vbkd
+                      WHERE vbeln EQ i_aufk-kdauf
+                        AND posnr EQ i_aufk-kdpos.
+      IF sy-subrc EQ 0.
+        i_resb2-bzirk = vbkd-bzirk.
+      ELSE.
+        SELECT SINGLE * FROM vbkd
+                        WHERE vbeln EQ i_aufk-kdauf
+                          AND posnr EQ '000000'.
+        IF sy-subrc EQ 0.
+          i_resb2-bzirk = vbkd-bzirk.
+        ENDIF.
+      ENDIF.
+
+      IF NOT i_resb2-bzirk IN s_bzirk.
+        CONTINUE.
+      ENDIF.
+
+      i_resb2-period = i_resb2-bdter(6).
+      i_resb2-vkorg  = i_aufk-vkorg.
+      i_resb2-vtweg  = i_aufk-vtweg.
+
+      CLEAR: wa_resbmseg_262,
+             wa_resbmseg_261,
+             v_qty.
+      READ TABLE i_resbmseg INTO wa_resbmseg_262 WITH KEY aufnr = i_resb2-aufnr
+                                                          matnr = i_resb2-matnr
+                                                          bwart = '262'.
+      IF sy-subrc = 0.
+        READ TABLE i_resbmseg INTO wa_resbmseg_261 WITH KEY aufnr = i_resb2-aufnr
+                                                            matnr = i_resb2-matnr
+                                                            bwart = '261'.
+        v_qty = wa_resbmseg_261-menge - wa_resbmseg_262-menge.
+      ELSE.
+        LOOP AT i_resb WHERE matnr = i_resb2-matnr
+                         AND aufnr = i_resb2-aufnr.
+          v_qty = v_qty + i_resb-bdmng.
+        ENDLOOP.
+      ENDIF.
+
+      IF v_qty > 0.
+        gv_zline = 1.
+
+        REFRESH i_resb3.
+        LOOP AT i_resb INTO wa_resb
+          WHERE aufnr = i_resb2-aufnr
+            AND matnr = i_resb2-matnr.
+          APPEND wa_resb TO i_resb3.
+        ENDLOOP.
+
+        i_qty = v_qty.
+        LOOP AT i_resb3.
+          i_qty = i_qty - i_resb3-bdmng.
+          IF i_qty > 0.
+            gv_zline = gv_zline + 1.
+          ENDIF.
+        ENDLOOP.
+
+        MOVE-CORRESPONDING i_resb2 TO i_sohist.
+        i_sohist-zline = gv_zline.
+        i_sohist-zmeng = v_qty.
+        COLLECT i_sohist.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+* end of change MOD-003
+
+  SORT i_sohist.
+*Begin of insert MOD-002
+  IF cb_mam EQ 'X'.
+    IF NOT i_mseg IS INITIAL.
+      CLEAR: wa_mseg.
+      LOOP AT i_mseg INTO wa_mseg.
+        CLEAR:i_sohist.
+        IF NOT wa_mseg-menge IS INITIAL.
+          MOVE wa_mseg-matnr TO i_sohist-matnr.    "Material number
+          MOVE wa_mseg-werks TO i_sohist-werks.    "Plant
+          MOVE wa_mseg-budat(6) TO i_sohist-period. "Period
+          CLEAR: wa_maufk.
+          READ TABLE i_maufk INTO wa_maufk WITH KEY aufnr = wa_mseg-aufnr.
+          IF sy-subrc EQ 0.
+            CLEAR: wa_mvbkd.
+            READ TABLE i_mvbkd INTO wa_mvbkd WITH KEY vbeln = wa_maufk-kdauf
+                                                      posnr = wa_maufk-kdpos.
+            IF sy-subrc EQ 0.
+              MOVE wa_mvbkd-bzirk TO i_sohist-bzirk.
+            ENDIF.
+*Get Distribution channel and Sales org
+            CLEAR: wa_pmsdo.
+            READ TABLE i_pmsdo INTO wa_pmsdo WITH KEY objnr = wa_maufk-objnr.
+            IF sy-subrc EQ 0.
+              MOVE wa_pmsdo-vkorg TO i_sohist-vkorg.
+              MOVE wa_pmsdo-vtweg TO i_sohist-vtweg.
+            ENDIF.
+          ENDIF.
+          IF wa_mseg-bwart EQ '961'.
+            i_sohist-zline = 1.
+            i_sohist-zmeng = wa_mseg-menge.
+          ENDIF.
+          IF wa_mseg-bwart EQ '962'.
+            i_sohist-zline = 0 - 1.
+            i_sohist-zmeng = 0 - wa_mseg-menge.
+          ENDIF.
+        ENDIF.
+        CLEAR: wa_mseg.
+        COLLECT i_sohist.
+      ENDLOOP.
+    ENDIF.
+  ENDIF.
+
+  SORT i_sohist.
+*End   of insert MOD-002
+*-- check if materials are superseded or not
+  i_sohist_tmp[] = i_sohist[].
+  CLEAR i_sohist.
+  REFRESH: i_sohist.
+
+  LOOP AT i_sohist_tmp.
+    wa_tabix = sy-tabix.
+    wa_nfmat = i_sohist_tmp-matnr.
+    DO.
+      IF NOT wa_nfmat IS INITIAL.
+        wa_matnr = wa_nfmat.
+        READ TABLE i_matseq WITH KEY matnr = wa_nfmat
+                                     werks = i_sohist_tmp-werks.
+        IF sy-subrc EQ 0.
+          wa_nfmat = i_matseq-nfmat.
+        ELSE.
+          CLEAR wa_nfmat.
+        ENDIF.
+      ELSE.
+        EXIT.
+      ENDIF.
+    ENDDO.
+    IF wa_matnr NE i_sohist_tmp-matnr.
+      i_sohist_tmp-matnr = wa_matnr.
+*     modify i_sohist. " index wa_tabix.
+    ENDIF.
+    i_sohist = i_sohist_tmp.
+    COLLECT i_sohist.
+*   endif.
+  ENDLOOP.
+  SORT i_sohist.
+
+ENDFORM.                    " PROCESS_DATA
+
+
+*----------------------------------------------------------------------*
+*   Form  UPDATE_DATA                                                  *
+*----------------------------------------------------------------------*
+*   .....                                                              *
+*----------------------------------------------------------------------*
+FORM update_data.
+
+  SORT i_sohist.
+
+  IF cb_test IS INITIAL.
+*-- update table YSE_EM_SOHIST
+    MODIFY yse_em_sohist FROM TABLE i_sohist.
+    COMMIT WORK.
+    DESCRIBE TABLE i_sohist LINES sy-tfill.
+    WRITE:/ sy-tfill,
+            'lines updated in Sales History Table'(t01).
+    ULINE.
+  ELSE.
+    LOOP AT i_sohist.
+      WRITE: / i_sohist-period,
+               i_sohist-matnr,
+               i_sohist-vkorg,
+               i_sohist-vtweg,
+               i_sohist-bzirk,
+               i_sohist-werks,
+               i_sohist-zmeng,
+               i_sohist-zline.
+    ENDLOOP.
+    DESCRIBE TABLE i_sohist LINES sy-tfill.
+    SKIP 2.
+    WRITE:/ sy-tfill,
+            'lines could be updated in Sales History Table'(t02).
+    ULINE.
+  ENDIF.
+
+ENDFORM.                    " UPDATE_DATA
+
+
+
+************************************************************************
+* SUBROUTINES  LEVEL 02                                                *
+************************************************************************
+
+*----------------------------------------------------------------------*
+*   Form  GET_DATES                                                    *
+*----------------------------------------------------------------------*
+*   .....                                                              *
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM get_dates.
+
+*-- End date = last day of previous month
+*  end_date      = p_datum.
+  end_date      = sy-datum.
+  end_date+6(2) = 01.
+  end_date      = end_date - 1.
+
+  end_period    = end_date(6).
+
+*-- Start date = end date - (N) months
+*-- Take first day of the month
+*-- Negative to subtract from old date, positive to add
+  v_n2 = - ( p_months - 1 ).
+
+  CALL FUNCTION 'MONTH_PLUS_DETERMINE'
+    EXPORTING
+      months  = v_n2
+      olddate = end_date
+    IMPORTING
+      newdate = start_date.
+  start_date+6(2) = 01.
+
+  start_period = start_date(6).
+
+ENDFORM.                    " GET_DATES
+
+*Text symbol text£º
+*S01:Selection parameters
+*S02:Selection range
+*S03:Selection execution mode
+*S04:Test run (display on screen)
+*T01:lines updated in Sales History Table
+
+*T02:lines could be updated in Sales History Table
+*Selection text£º
+*CB_MAM:        Include MAM movements
+*CB_TEST:        Test run (display on screen)
+*RB_ALL:        Sales and service orders
+*RB_SALES:        Only sales orders
+*S_AUART:D       .
+*S_AUART1:        Sales Order types to detract
+*S_AUART2:        Service order type
+*S_AUGRU:D       .
+*S_BZIRK:D       .
+*S_KUNNR:D       .
+*S_MATNR:D       .
+*S_PGC:        PGC Code
+*S_VKORG:D       .
+*S_VTWEG:D       .
+*S_WERKS:D       .

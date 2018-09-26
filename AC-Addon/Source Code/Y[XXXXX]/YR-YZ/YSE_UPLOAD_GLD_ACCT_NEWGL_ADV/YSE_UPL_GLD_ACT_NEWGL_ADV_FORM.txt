@@ -1,0 +1,699 @@
+*&---------------------------------------------------------------------*
+*&  Include           YSE_UPLOAD_GLD_ACCT_FORMS                        *
+*&---------------------------------------------------------------------*
+
+*&---------------------------------------------------------------------*
+*&      Form  READ_FILE
+*&---------------------------------------------------------------------*
+FORM READ_FILE.
+
+  DATA : W_FILENAME TYPE STRING.
+
+
+  SELECT SINGLE * FROM USR01 WHERE BNAME = SY-UNAME.
+
+  W_FILENAME = P_FNAME.
+
+  CALL FUNCTION 'GUI_UPLOAD'
+    EXPORTING
+      FILENAME                = W_FILENAME
+      FILETYPE                = 'ASC'
+      HAS_FIELD_SEPARATOR     = 'X'
+    TABLES
+      DATA_TAB                = I_DATA
+    EXCEPTIONS
+      FILE_OPEN_ERROR         = 1
+      FILE_READ_ERROR         = 2
+      NO_BATCH                = 3
+      GUI_REFUSE_FILETRANSFER = 4
+      INVALID_TYPE            = 5
+      NO_AUTHORITY            = 6
+      UNKNOWN_ERROR           = 7
+      BAD_DATA_FORMAT         = 8
+      HEADER_NOT_ALLOWED      = 9
+      SEPARATOR_NOT_ALLOWED   = 10
+      HEADER_TOO_LONG         = 11
+      UNKNOWN_DP_ERROR        = 12
+      ACCESS_DENIED           = 13
+      DP_OUT_OF_MEMORY        = 14
+      DISK_FULL               = 15
+      DP_TIMEOUT              = 16
+      OTHERS                  = 17.
+  IF SY-SUBRC <> 0.
+    MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+          WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+  ENDIF.
+
+* Delete first row from file if user indicated that a header line is
+* included
+  IF P_HEADER = 'X'.
+    DELETE I_DATA INDEX 1.
+  ENDIF.
+
+* Convert data if required
+  IF P_POINT = 'X' AND USR01-DCPFM <> 'X'.
+    PERFORM CONVERT_INTO_COMMA.
+  ELSEIF P_COMMA = 'X' AND USR01-DCPFM = 'X'.
+    PERFORM CONVERT_INTO_POINT.
+  ENDIF.
+
+  PERFORM CHANGE_DATE.
+
+ENDFORM.                    " READ_FILE
+
+*&---------------------------------------------------------------------*
+*&      Form  CREATE_BATCH_INPUT
+*&---------------------------------------------------------------------*
+FORM CREATE_BATCH_INPUT .
+
+* Data
+  DATA:
+    LV_CALLMODE  TYPE C VALUE 'B',
+    LV_CNT     TYPE I.
+
+* Read parameter "ID: Calculate tax" into W_XTX
+  GET PARAMETER ID 'XTX' FIELD W_XTX.
+
+* Copy the data lines to a table with fewer fields to allow grouping
+  I_HEADER[] = I_DATA[].
+  SORT I_HEADER.
+  DELETE ADJACENT DUPLICATES FROM I_HEADER.
+  DESCRIBE TABLE I_HEADER LINES LV_CNT.
+* Set call mode depending on number of document headers
+  IF LV_CNT GT 20.
+    LV_CALLMODE = 'B'.  " create batch
+    MESSAGE ID 'YSE_FICO' TYPE 'I' NUMBER 13.
+  ELSE.
+    LV_CALLMODE = 'C'.  " direct input
+  ENDIF.
+
+* Initialize the header, item and session template working area's
+  PERFORM INIT.
+
+* Fill session header from template and update with current data
+  PERFORM SET_SESSION_WA.
+
+* Open file in which BDC input will be written
+  W_FILE = 'BATCH_INPUT.TXT'.
+  OPEN DATASET W_FILE FOR OUTPUT IN TEXT MODE ENCODING DEFAULT.
+
+* Write session header into file
+  TRANSFER BGR00 TO W_FILE.
+
+* Proccess the data
+  LOOP AT I_HEADER.
+
+    PERFORM PROCESS_HEADER.
+
+  ENDLOOP.
+
+* Close file in which BDC input is written
+  CLOSE DATASET W_FILE.
+
+* Take timestamp 1
+  W_CRETIME1 = SY-UZEIT.
+
+* Have standard report creating the batch session
+  SUBMIT RFBIBL00
+    WITH CALLMODE = LV_CALLMODE
+    WITH DS_NAME  = W_FILE
+*   WITH XLOG     = 'X'
+    WITH XINF     = 'X'
+    WITH PA_XPROT = 'X'
+  AND RETURN.
+
+* Take timestamp 2
+  W_CRETIME2 = SY-UZEIT.
+
+* Don't reprocess failed entries when batch session was created
+  CHECK LV_CALLMODE = 'C'.
+
+* Find most recently created batch time
+  SELECT SINGLE MAX( CRETIME ) INTO W_MAX
+           FROM APQI
+          WHERE CREDATE EQ SY-DATUM
+            AND CREATOR EQ SY-UNAME
+            AND GROUPID EQ P_SESS.
+
+* Read QID using the most recent batch time
+  SELECT SINGLE QID INTO W_QID
+           FROM APQI
+          WHERE CREDATE EQ SY-DATUM
+            AND CREATOR EQ SY-UNAME
+            AND GROUPID EQ P_SESS
+            AND CRETIME EQ W_MAX
+            AND CRETIME BETWEEN W_CRETIME1 AND W_CRETIME2.
+
+* Following part is for covering the failed entries???
+
+* If batch QID found
+  IF SY-SUBRC = 0.
+
+*   Get batch data definition
+    SELECT * INTO TABLE IT_APQD
+      FROM APQD
+      WHERE QID = W_QID.
+    SORT IT_APQD BY QID TRANS BLOCK SEGMT.
+
+    LV_MODE = 'N'.
+
+*   Loop over the batch entries
+    LOOP AT IT_APQD.
+      IF IT_APQD-VARDATA+0(1) = 'S'.
+        W_TCODE = IT_APQD-VARDATA+2(5).
+      ENDIF.
+
+      IF IT_APQD-VARDATA+0(1) = 'M'.
+        W_SCREEN = IT_APQD-VARDATA+22(20).
+        W_DYNPRO = IT_APQD-VARDATA+62(4).
+        PERFORM BDC_DYNPRO USING W_SCREEN W_DYNPRO.
+
+        W_STRING = IT_APQD-VARDATA+68.
+        W_SPLITER = IT_APQD-VARDATA+67(1).
+        DO.
+          FIND W_SPLITER IN W_STRING MATCH OFFSET W_OFF.
+          IF SY-SUBRC <> 0.
+            EXIT.
+          ENDIF.
+          IF W_OFF <> 0.
+            W_VAR1 = W_STRING+0(W_OFF).
+          ELSE.
+            CLEAR W_VAR1.
+          ENDIF.
+          W_STRING = W_STRING+W_OFF.
+          W_STRING = W_STRING+1.
+          FIND W_SPLITER IN W_STRING MATCH OFFSET W_OFF.
+          IF SY-SUBRC <> 0.
+            W_VAR2 = W_STRING.
+          ELSE.
+            IF W_OFF <> 0.
+              W_VAR2 = W_STRING+0(W_OFF).
+            ELSE.
+              CLEAR W_VAR2.
+            ENDIF.
+            W_STRING = W_STRING+W_OFF.
+            W_STRING = W_STRING+1.
+            IF W_VAR1 = 'BKPF-BKTXT'.
+              W_BKTXT = W_VAR2.
+            ENDIF.
+            IF W_VAR1 = 'BKPF-XBLNR'.
+              W_XBLNR = W_VAR2.
+            ENDIF.
+          ENDIF.
+          PERFORM BDC_FIELD USING W_VAR1 W_VAR2.
+        ENDDO.
+      ENDIF.
+
+      AT END OF TRANS.
+
+        CALL TRANSACTION W_TCODE  USING BDCDATA  MODE LV_MODE
+                           MESSAGES INTO MESSTAB.
+*If something went wrong sy-subrc will be different from zero!!
+        IF SY-SUBRC NE 0.
+*        READ TABLE MESSTAB WITH KEY MSGTYP = 'E'.
+*        IF SY-SUBRC = 0.
+          W_NLINE_E = W_NLINE_E + 1.
+*        ENDIF.
+
+*Try to get the error message, if not found, try to get the 'S' message
+          LOOP AT MESSTAB WHERE MSGTYP = 'E'.
+            CLEAR I_ERRORS.
+            MOVE W_BKTXT TO I_ERRORS-BKTXT.
+            MOVE W_XBLNR TO I_ERRORS-XBLNR.
+            CLEAR IT_ASSIGN.
+            READ TABLE IT_ASSIGN WITH KEY BKTXT = W_BKTXT
+                                          XBLNR = W_XBLNR.
+            IF SY-SUBRC = 0.
+              MOVE IT_ASSIGN-ZUONR TO I_ERRORS-ZUONR.
+            ENDIF.
+            MESSAGE ID MESSTAB-MSGID
+                  TYPE MESSTAB-MSGTYP
+                NUMBER MESSTAB-MSGNR
+                WITH   MESSTAB-MSGV1
+                       MESSTAB-MSGV2
+                       MESSTAB-MSGV3
+                       MESSTAB-MSGV4
+                  INTO I_ERRORS-MESSAGE.
+            APPEND I_ERRORS.
+          ENDLOOP.
+          IF SY-SUBRC NE 0.
+*The error was not found, so then try the first 'S' message
+            LOOP AT MESSTAB WHERE MSGTYP = 'S' OR
+                                  MSGTYP = 'A'.
+              CLEAR I_ERRORS.
+              MOVE W_BKTXT TO I_ERRORS-BKTXT.
+              MOVE W_XBLNR TO I_ERRORS-XBLNR.
+              CLEAR IT_ASSIGN.
+              READ TABLE IT_ASSIGN WITH KEY BKTXT = W_BKTXT
+                                            XBLNR = W_XBLNR.
+              IF SY-SUBRC = 0.
+                MOVE IT_ASSIGN-ZUONR TO I_ERRORS-ZUONR.
+              ENDIF.
+              MESSAGE ID MESSTAB-MSGID
+                    TYPE MESSTAB-MSGTYP
+                  NUMBER MESSTAB-MSGNR
+                  WITH   MESSTAB-MSGV1
+                         MESSTAB-MSGV2
+                         MESSTAB-MSGV3
+                         MESSTAB-MSGV4
+                    INTO I_ERRORS-MESSAGE.
+              APPEND I_ERRORS.
+            ENDLOOP.
+
+          ENDIF.
+        ENDIF.
+        CLEAR BDCDATA. REFRESH BDCDATA.
+        CLEAR MESSTAB. REFRESH MESSTAB.
+
+      ENDAT.
+    ENDLOOP.
+  ENDIF.
+
+  DESCRIBE TABLE I_HEADER LINES W_NLINE_T.
+
+  WRITE :/ W_NLINE_E , TEXT-007 , W_NLINE_T, TEXT-008.
+
+  ULINE.
+
+  LOOP AT I_ERRORS.
+    WRITE : /.
+    WRITE : I_ERRORS-BKTXT , I_ERRORS-XBLNR,
+            I_ERRORS-ZUONR , I_ERRORS-MESSAGE.
+  ENDLOOP.
+
+
+ENDFORM.                    " CREATE_BATCH_INPUT
+
+*&---------------------------------------------------------------------*
+*&      Form  CONVERT_INTO_COMMA
+*&---------------------------------------------------------------------*
+FORM CONVERT_INTO_COMMA.
+
+  LOOP AT I_DATA.
+    REPLACE ALL OCCURRENCES OF '.' IN I_DATA-WRBTR WITH '/'.
+    REPLACE ALL OCCURRENCES OF ',' IN I_DATA-WRBTR WITH '.'.
+    REPLACE ALL OCCURRENCES OF '/' IN I_DATA-WRBTR WITH ','.
+    REPLACE ALL OCCURRENCES OF '.' IN I_DATA-DMBTR WITH '/'.
+    REPLACE ALL OCCURRENCES OF ',' IN I_DATA-DMBTR WITH '.'.
+    REPLACE ALL OCCURRENCES OF '/' IN I_DATA-DMBTR WITH ','.
+    REPLACE ALL OCCURRENCES OF '.' IN I_DATA-MENGE WITH '/'.
+    REPLACE ALL OCCURRENCES OF ',' IN I_DATA-MENGE WITH '.'.
+    REPLACE ALL OCCURRENCES OF '/' IN I_DATA-MENGE WITH ','.
+    MODIFY I_DATA INDEX SY-TABIX.
+  ENDLOOP.
+
+ENDFORM.                    " CONVERT_INTO_COMMA
+*&---------------------------------------------------------------------*
+*&      FORM  CONVERT_INTO_POINT
+*&---------------------------------------------------------------------*
+FORM CONVERT_INTO_POINT.
+
+  LOOP AT I_DATA.
+    REPLACE ALL OCCURRENCES OF ',' IN I_DATA-WRBTR WITH '/'.
+    REPLACE ALL OCCURRENCES OF '.' IN I_DATA-WRBTR WITH ','.
+    REPLACE ALL OCCURRENCES OF '/' IN I_DATA-WRBTR WITH '.'.
+    REPLACE ALL OCCURRENCES OF ',' IN I_DATA-DMBTR WITH '/'.
+    REPLACE ALL OCCURRENCES OF '.' IN I_DATA-DMBTR WITH ','.
+    REPLACE ALL OCCURRENCES OF '/' IN I_DATA-DMBTR WITH '.'.
+    REPLACE ALL OCCURRENCES OF ',' IN I_DATA-MENGE WITH '/'.
+    REPLACE ALL OCCURRENCES OF '.' IN I_DATA-MENGE WITH ','.
+    REPLACE ALL OCCURRENCES OF '/' IN I_DATA-MENGE WITH '.'.
+    MODIFY I_DATA INDEX SY-TABIX.
+  ENDLOOP.
+
+ENDFORM.                    " CONVERT_INTO_POINT
+
+*&---------------------------------------------------------------------*
+*&      Form  CHANGE_DATE
+*&---------------------------------------------------------------------*
+FORM CHANGE_DATE.
+
+  DATA : WL_DATE(8) TYPE C.
+
+  LOOP AT I_DATA.
+
+    CASE USR01-DATFM.
+      WHEN '1'.
+
+        WL_DATE = I_DATA-BLDAT.
+        I_DATA-BLDAT+0(2) = WL_DATE+6(2).
+        I_DATA-BLDAT+2(2) = WL_DATE+4(2).
+        I_DATA-BLDAT+4(4) = WL_DATE+0(4).
+
+        WL_DATE = I_DATA-BUDAT.
+        I_DATA-BUDAT+0(2) = WL_DATE+6(2).
+        I_DATA-BUDAT+2(2) = WL_DATE+4(2).
+        I_DATA-BUDAT+4(4) = WL_DATE+0(4).
+
+        WL_DATE = I_DATA-STODT.
+        I_DATA-STODT+0(2) = WL_DATE+6(2).
+        I_DATA-STODT+2(2) = WL_DATE+4(2).
+        I_DATA-STODT+4(4) = WL_DATE+0(4).
+
+        WL_DATE = I_DATA-ZFBDT.
+        I_DATA-ZFBDT+0(2) = WL_DATE+6(2).
+        I_DATA-ZFBDT+2(2) = WL_DATE+4(2).
+        I_DATA-ZFBDT+4(4) = WL_DATE+0(4).
+
+      WHEN '2' OR '3'.
+        WL_DATE = I_DATA-BLDAT.
+        I_DATA-BLDAT+0(2) = WL_DATE+4(2).
+        I_DATA-BLDAT+2(2) = WL_DATE+6(2).
+        I_DATA-BLDAT+4(4) = WL_DATE+0(4).
+
+        WL_DATE = I_DATA-BUDAT.
+        I_DATA-BUDAT+0(2) = WL_DATE+4(2).
+        I_DATA-BUDAT+2(2) = WL_DATE+6(2).
+        I_DATA-BUDAT+4(4) = WL_DATE+0(4).
+
+        WL_DATE = I_DATA-STODT.
+        I_DATA-STODT+0(2) = WL_DATE+4(2).
+        I_DATA-STODT+2(2) = WL_DATE+6(2).
+        I_DATA-STODT+4(4) = WL_DATE+0(4).
+
+        WL_DATE = I_DATA-ZFBDT.
+        I_DATA-ZFBDT+0(2) = WL_DATE+4(2).
+        I_DATA-ZFBDT+2(2) = WL_DATE+6(2).
+        I_DATA-ZFBDT+4(4) = WL_DATE+0(4).
+
+    ENDCASE.
+    MODIFY I_DATA TRANSPORTING BLDAT BUDAT STODT ZFBDT.
+  ENDLOOP.
+
+ENDFORM.                    " CHANGE_DATE
+
+*&---------------------------------------------------------------------*
+*&      Form  init
+*&---------------------------------------------------------------------*
+FORM INIT.
+
+  DATA: IDETAILS   TYPE ABAP_COMPDESCR_TAB,
+        XDETAILS   TYPE ABAP_COMPDESCR,
+        STRUCTREF  TYPE REF TO CL_ABAP_STRUCTDESCR.
+
+  FIELD-SYMBOLS: <FS_FIELD> TYPE ANY.
+
+*Session header
+  CLEAR IDETAILS[].
+  STRUCTREF ?= CL_ABAP_TYPEDESCR=>DESCRIBE_BY_NAME( 'BGR00' ).
+  IDETAILS[] = STRUCTREF->COMPONENTS[].
+  LOOP AT IDETAILS INTO XDETAILS.
+    ASSIGN COMPONENT XDETAILS-NAME OF STRUCTURE INIT_BGR00 TO <FS_FIELD>.
+    <FS_FIELD> = '/'.
+  ENDLOOP.
+*Document header
+  CLEAR IDETAILS[].
+  STRUCTREF ?= CL_ABAP_TYPEDESCR=>DESCRIBE_BY_NAME( 'BBKPF' ).
+  IDETAILS[] = STRUCTREF->COMPONENTS[].
+  LOOP AT IDETAILS INTO XDETAILS.
+    ASSIGN COMPONENT XDETAILS-NAME OF STRUCTURE INIT_BBKPF TO <FS_FIELD>.
+    <FS_FIELD> = '/'.
+  ENDLOOP.
+* Document item
+  CLEAR IDETAILS[].
+  STRUCTREF ?= CL_ABAP_TYPEDESCR=>DESCRIBE_BY_NAME( 'BBSEG' ).
+  IDETAILS[] = STRUCTREF->COMPONENTS[].
+  LOOP AT IDETAILS INTO XDETAILS.
+    IF XDETAILS-NAME = 'MEINS'.
+      ASSIGN COMPONENT XDETAILS-NAME OF STRUCTURE INIT_BBSEG TO <FS_FIELD> CASTING TYPE C.
+    ELSE.
+      ASSIGN COMPONENT XDETAILS-NAME OF STRUCTURE INIT_BBSEG TO <FS_FIELD>.
+    ENDIF.
+    <FS_FIELD> = '/'.
+  ENDLOOP.
+
+ENDFORM.                    "INIT
+
+*&---------------------------------------------------------------------*
+*&      Form  BDC_DYNPRO
+*&---------------------------------------------------------------------*
+*       Start new screen
+*----------------------------------------------------------------------*
+FORM BDC_DYNPRO USING PROGRAM DYNPRO.
+  CLEAR BDCDATA.
+  BDCDATA-PROGRAM  = PROGRAM.
+  BDCDATA-DYNPRO   = DYNPRO.
+  BDCDATA-DYNBEGIN = 'X'.
+  APPEND BDCDATA.
+ENDFORM.                    "bdc_dynpro
+*&---------------------------------------------------------------------*
+*&      Form  BDC_FIELD
+*&---------------------------------------------------------------------*
+*       Insert field
+*----------------------------------------------------------------------*
+FORM BDC_FIELD USING FNAM FVAL.
+  IF FVAL <> '/'.
+    CLEAR BDCDATA.
+    BDCDATA-FNAM = FNAM.
+    BDCDATA-FVAL = FVAL.
+    APPEND BDCDATA.
+  ENDIF.
+ENDFORM.                    "BDC_FIELD
+
+*&---------------------------------------------------------------------*
+*&      Form  PROCESS_HEADER
+*&---------------------------------------------------------------------*
+FORM PROCESS_HEADER .
+
+* Fill header wa with initial data
+  BBKPF = INIT_BBKPF.
+* Update specifics in the header
+  BBKPF-STYPE = '1'.
+  IF I_HEADER-STGRD IS INITIAL.
+    BBKPF-TCODE = 'FB01'.
+  ELSE.
+    BBKPF-TCODE = 'FBS1'.
+  ENDIF.
+  IF NOT I_HEADER-BLDAT IS INITIAL.
+    BBKPF-BLDAT = I_HEADER-BLDAT.
+  ENDIF.
+  IF NOT I_HEADER-BLART IS INITIAL.
+    BBKPF-BLART = I_HEADER-BLART.
+  ENDIF.
+  IF NOT I_HEADER-BUKRS IS INITIAL.
+    BBKPF-BUKRS = I_HEADER-BUKRS.
+  ENDIF.
+  IF NOT I_HEADER-BUDAT IS INITIAL.
+    BBKPF-BUDAT = I_HEADER-BUDAT.
+    BBKPF-MONAT = I_HEADER-BUDAT+2(2).
+  ENDIF.
+  IF NOT I_HEADER-WAERS IS INITIAL.
+    BBKPF-WAERS = I_HEADER-WAERS.
+  ENDIF.
+  IF NOT I_HEADER-XBLNR IS INITIAL.
+    BBKPF-XBLNR = I_HEADER-XBLNR.
+  ENDIF.
+  IF NOT I_HEADER-BKTXT IS INITIAL.
+    BBKPF-BKTXT = I_HEADER-BKTXT.
+  ENDIF.
+  IF BBKPF-BLART = 'KR' OR BBKPF-BLART = 'KG'
+                        OR BBKPF-BLART = 'DR'
+                        OR BBKPF-BLART = 'DG'
+                        OR BBKPF-BLART = 'ZA'. " Inserted on request of M. Schaerlaeken
+    BBKPF-XMWST = 'X'.
+  ENDIF.
+  IF NOT I_HEADER-STODT IS INITIAL.
+    BBKPF-STODT = I_HEADER-STODT.
+  ENDIF.
+  IF NOT I_HEADER-STGRD IS INITIAL.
+    BBKPF-STGRD = I_HEADER-STGRD.
+  ENDIF.
+  if not i_HEADER-LDGRP is initial.
+    bbkpf-ldgrp = I_HEADER-ldgrp.
+  endif.
+
+* Write header to file (input for BDC)
+  TRANSFER BBKPF TO W_FILE.
+
+* Start processing the items
+  LOOP AT I_DATA
+    WHERE BLDAT = I_HEADER-BLDAT
+      AND BLART = I_HEADER-BLART
+      AND BUKRS = I_HEADER-BUKRS
+      AND BUDAT = I_HEADER-BUDAT
+      AND WAERS = I_HEADER-WAERS
+      AND XBLNR = I_HEADER-XBLNR
+      AND BKTXT = I_HEADER-BKTXT
+      AND STGRD = I_HEADER-STGRD
+      AND STODT = I_HEADER-STODT
+      and ldgrp = I_HEADER-LDGRP.
+
+*   Fill item wa with initial data
+    BBSEG = INIT_BBSEG.
+*   Update specifics in the item
+    BBSEG-TBNAM = 'BBSEG'.
+    BBSEG-STYPE = '2'.
+    BBSEG-TBNAM = 'BBSEG'.
+    IF NOT I_DATA-NEWBS IS INITIAL.
+      BBSEG-NEWBS = I_DATA-NEWBS.
+    ENDIF.
+    IF NOT I_DATA-NEWKO IS INITIAL.
+      BBSEG-NEWKO = I_DATA-NEWKO.
+    ENDIF.
+    IF NOT I_DATA-NEWBW IS INITIAL.
+      BBSEG-NEWBW = I_DATA-NEWBW.
+    ENDIF.
+    IF NOT I_DATA-WRBTR IS INITIAL.
+      BBSEG-WRBTR = I_DATA-WRBTR.
+    ENDIF.
+    IF NOT I_DATA-DMBTR IS INITIAL.
+      BBSEG-DMBTR = I_DATA-DMBTR.
+    ENDIF.
+    IF NOT I_DATA-MWSKZ IS INITIAL.
+      BBSEG-MWSKZ = I_DATA-MWSKZ.
+    ENDIF.
+    IF NOT I_DATA-MENGE IS INITIAL.
+      BBSEG-MENGE = I_DATA-MENGE.
+    ENDIF.
+    IF NOT I_DATA-ZUONR IS INITIAL.
+      BBSEG-ZUONR = I_DATA-ZUONR.
+      IT_ASSIGN-XBLNR = I_DATA-XBLNR.
+      IT_ASSIGN-BKTXT = I_DATA-BKTXT.
+      IT_ASSIGN-ZUONR = I_DATA-ZUONR.
+      APPEND IT_ASSIGN.
+    ENDIF.
+    IF NOT I_DATA-SGTXT IS INITIAL.
+      BBSEG-SGTXT = I_DATA-SGTXT.
+    ENDIF.
+    IF NOT I_DATA-KKBER IS INITIAL.
+      BBSEG-KKBER = I_DATA-KKBER.
+    ENDIF.
+    IF NOT I_DATA-KOSTL IS INITIAL.
+      BBSEG-KOSTL = I_DATA-KOSTL.
+    ENDIF.
+    IF NOT I_DATA-PRCTR IS INITIAL.
+      BBSEG-PRCTR = I_DATA-PRCTR.
+    ENDIF.
+    IF NOT I_DATA-ZTERM IS INITIAL.
+      BBSEG-ZTERM = I_DATA-ZTERM.
+    ENDIF.
+    IF NOT I_DATA-ZFBDT IS INITIAL.
+      BBSEG-ZFBDT = I_DATA-ZFBDT.
+    ENDIF.
+    IF NOT I_DATA-ZLSPR IS INITIAL.
+      BBSEG-ZLSPR = I_DATA-ZLSPR.
+    ENDIF.
+    IF NOT I_DATA-PERNR IS INITIAL.
+      BBSEG-PERNR = I_DATA-PERNR.
+    ENDIF.
+    IF NOT I_DATA-C_KNDNR IS INITIAL.
+      BBSEG-RKE_KNDNR = I_DATA-C_KNDNR.
+      BBSEG-RKE_BUKRS = I_DATA-BUKRS.
+    ENDIF.
+    IF NOT I_DATA-C_ARTNR IS INITIAL.
+      BBSEG-RKE_ARTNR = I_DATA-C_ARTNR.
+      BBSEG-RKE_BUKRS = I_DATA-BUKRS.
+    ENDIF.
+    IF NOT I_DATA-C_PRCTR IS INITIAL.
+      BBSEG-RKE_PRCTR = I_DATA-C_PRCTR.
+      BBSEG-RKE_BUKRS = I_DATA-BUKRS.
+    ENDIF.
+    IF NOT I_DATA-C_WW006 IS INITIAL.
+      BBSEG-RKE_WW006 = I_DATA-C_WW006.
+      BBSEG-RKE_BUKRS = I_DATA-BUKRS.
+    ENDIF.
+    IF NOT I_DATA-C_WW007 IS INITIAL.
+      BBSEG-RKE_WW007 = I_DATA-C_WW007.
+      BBSEG-RKE_BUKRS = I_DATA-BUKRS.
+    ENDIF.
+
+    IF NOT I_DATA-C_WW008 IS INITIAL.
+      BBSEG-RKE_WW008 = I_DATA-C_WW008.
+    ENDIF.
+
+    IF NOT I_DATA-C_EQUNR IS INITIAL.
+      BBSEG-RKE_EQUNR = I_DATA-C_EQUNR.
+      BBSEG-RKE_BUKRS = I_DATA-BUKRS.
+    ENDIF.
+
+    IF NOT I_DATA-C_WW002 IS INITIAL.
+      BBSEG-RKE_WW002 = I_DATA-C_WW002.
+    ENDIF.
+
+    IF NOT I_DATA-C_SPART IS INITIAL.
+      BBSEG-RKE_SPART = I_DATA-C_SPART.
+    ENDIF.
+
+    IF NOT I_DATA-C_VTWEG IS INITIAL.
+      BBSEG-RKE_VTWEG = I_DATA-C_VTWEG.
+    ENDIF.
+    IF NOT I_DATA-C_WW009 IS INITIAL.
+      BBSEG-RKE_WW009 = I_DATA-C_WW009.
+    ENDIF.
+    IF NOT I_DATA-C_KTGRD IS INITIAL.
+      BBSEG-RKE_KTGRD = I_DATA-C_KTGRD.
+    ENDIF.
+
+*   Special GL indicator
+    IF NOT I_DATA-C_NEWUM IS INITIAL.
+      BBSEG-NEWUM = I_DATA-C_NEWUM.
+    ENDIF.
+*   Sales order number
+    IF NOT I_DATA-C_VBEL2 IS INITIAL.
+      BBSEG-VBEL2 = I_DATA-C_VBEL2.
+    ENDIF.
+*   Sales order item number
+    IF NOT I_DATA-C_POSN2 IS INITIAL.
+      BBSEG-POSN2 = I_DATA-C_POSN2.
+    ENDIF.
+
+*   Accounting indicator
+    IF NOT I_DATA-C_WW003 IS INITIAL.
+      BBSEG-RKE_WW003 = I_DATA-C_WW003.
+    ENDIF.
+
+*   Material
+    IF NOT I_DATA-C_MATNR IS INITIAL.
+      BBSEG-MATNR = I_DATA-C_MATNR.
+    ENDIF.
+
+*   Plant
+    IF NOT I_DATA-C_WERKS IS INITIAL.
+      BBSEG-WERKS = I_DATA-C_WERKS.
+    ENDIF.
+
+
+*   Sales order
+    IF NOT I_DATA-C_KAUFN IS INITIAL.
+      BBSEG-RKE_KAUFN = I_DATA-C_KAUFN.
+    ENDIF.
+
+*   Sales order
+    IF NOT I_DATA-C_KDPOS IS INITIAL.
+      BBSEG-RKE_KDPOS = I_DATA-C_KDPOS.
+    ENDIF.
+
+* segment
+    if not i_data-segment is INITIAL.
+      bbseg-segment = i_data-segment.
+    endif.
+
+* begin of insertion MOD-001
+* functional area
+    if not i_data-fkber_long is initial.
+      bbseg-fkber_long = i_data-fkber_long.
+    endif.
+* end of insertion MOD-001
+
+*   Write item to file (input for BDC)
+    TRANSFER BBSEG TO W_FILE.
+
+  ENDLOOP.
+
+ENDFORM.                    " PROCESS_HEADER
+
+*&---------------------------------------------------------------------*
+*&      Form  SET_SESSION_WA
+*&---------------------------------------------------------------------*
+FORM SET_SESSION_WA .
+
+  BGR00 = INIT_BGR00.
+  BGR00-STYPE = '0'.
+  BGR00-MANDT = SY-MANDT.
+  BGR00-START = ''.
+  BGR00-XKEEP = 'X'.
+  BGR00-NODATA = '/'.
+  BGR00-USNAM = SY-UNAME.
+  BGR00-GROUP = P_SESS.
+
+ENDFORM.                    " SET_SESSION_WA

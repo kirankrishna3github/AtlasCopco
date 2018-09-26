@@ -1,0 +1,1035 @@
+*----------------------------------------------------------------------*
+* PROGRAM ID           : YSE_CLEAR_CONTRACT_LINES                      *
+* PROGRAM TITLE        : FICO: Accruals for foreign Currency Contracts *
+*                        will not zero out in local currency           *
+* AUTHOR               : Geert Rutten                                  *
+* DATE                 : 14/06/2011                                    *
+* DEVELOPMENT ID       :                                               *
+*                                                                      *
+* CHANGE REQUEST NUMBER: CD1K965624                                    *
+*                                                                      *
+* Program Description:  Program to clear contract lines                *
+*                                                                      *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME     |CORRECTION NUMBER| CHANGE REFERENCE # *
+*----------------------------------------------------------------------*
+
+REPORT  yse_clear_contract_lines.
+
+TYPE-POOLS : tpit.
+
+TYPES: BEGIN OF ty_bsis,
+         bukrs TYPE bsis-bukrs,
+         hkont TYPE bsis-hkont,
+         zuonr TYPE bsis-zuonr,
+         shkzg TYPE bsis-shkzg,
+         segm  TYPE bsis-segment,
+         dmbtr TYPE dmbtrv,
+         wrbtr TYPE dmbtrv,
+       END OF ty_bsis.
+
+DATA : gt_bsis TYPE TABLE OF bsis WITH HEADER LINE,
+       gt_bsis_all TYPE TABLE OF bsis WITH HEADER LINE,
+       gs_bsis TYPE bsis,
+       gt_bseg TYPE TABLE OF bseg,
+       gt_bsis_sel TYPE TABLE OF ty_bsis WITH HEADER LINE,
+       gt_bsis_sum_all TYPE TABLE OF ty_bsis WITH HEADER LINE,
+       gt_bsis_sum TYPE TABLE OF ty_bsis WITH HEADER LINE,
+       gs_bsis_sel TYPE ty_bsis,
+       gs_bseg TYPE bseg,
+       gv_zuonr TYPE bseg-zuonr,
+       gt_belnr TYPE TABLE OF belnr_d WITH HEADER LINE.
+
+DATA: i_bdcdata LIKE bdcdata OCCURS 0 WITH HEADER LINE,
+      struct_bdcdata TYPE bdcdata.
+
+DATA: seltab     TYPE TABLE OF rsparams,
+      seltab_wa  LIKE LINE OF seltab.
+
+DATA: g_curr_dynpro      LIKE ibipbdcd-dynpro,   " current dynpro
+      g_curr_program     LIKE syst-repid,        " current program name
+      g_curr_okcode(5).                          " last issued okcode
+
+DATA: gt_error    LIKE bdcmsgcoll  OCCURS 0  WITH HEADER LINE.
+
+DATA: gv_mode    TYPE c             VALUE 'N'.
+
+CONSTANTS:
+c_2295901 TYPE string VALUE '0002295901',
+c_2295902 TYPE string VALUE '0002295902',
+c_1780002 TYPE string VALUE '0001780002',
+c_2997901 TYPE string VALUE '0002997901',
+
+c_7960902 TYPE string VALUE '0007960902',
+c_3960902 TYPE string VALUE '0003960902',
+c_zs TYPE string VALUE 'ZS',
+c_assignment TYPE string VALUE '10'.
+*
+*****************************
+* SELECTION SCREEN
+****************************
+
+
+SELECTION-SCREEN BEGIN OF BLOCK 1 WITH FRAME TITLE text-001.
+
+PARAMETERS: p_bukrs LIKE bsis-bukrs OBLIGATORY.   " Company code
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 01(50) text-003.  " GL Accounts
+SELECTION-SCREEN END OF LINE.
+PARAMETERS: p_keydat LIKE bsis-budat DEFAULT sy-datum.
+
+SELECTION-SCREEN END OF BLOCK 1.
+
+* Select open RV documents and update ZUONR(assignment)
+PERFORM selection_open_rv.
+
+
+
+* Process 1780002
+PERFORM prepare_list_1780002.
+
+
+
+
+* Process 2997901
+PERFORM prepare_list_2997901.
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  selection_open_rv
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM selection_open_rv.
+
+
+
+
+  SELECT * FROM  bsis INTO TABLE gt_bsis
+           WHERE bukrs = p_bukrs
+           AND   blart = 'RV'
+           AND   budat <= p_keydat
+           AND   hkont IN (c_2997901, c_1780002).
+
+  SELECT * FROM  bsas APPENDING TABLE gt_bsis
+             WHERE bukrs = p_bukrs
+             AND blart = 'RV'
+             AND   augdt > p_keydat
+             AND   budat <= p_keydat
+             AND   hkont IN (c_2997901, c_1780002).
+
+  LOOP AT gt_bsis INTO gs_bsis.
+
+
+    SELECT * FROM bseg  INTO TABLE gt_bseg
+      WHERE bukrs = gs_bsis-bukrs  AND
+            belnr = gs_bsis-belnr  AND
+            gjahr = gs_bsis-gjahr  AND
+            buzei = gs_bsis-buzei  AND
+            hkont IN (c_2997901, c_1780002).
+
+    LOOP AT gt_bseg INTO gs_bseg.
+      CLEAR gv_zuonr.
+     IF gs_bseg-vbel2 IS NOT INITIAL.
+* Convert to Internal Number
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+        EXPORTING
+          input  = gs_bseg-vbel2
+        IMPORTING
+          output = gs_bseg-vbel2.
+
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+        EXPORTING
+          input  = gs_bseg-posn2
+        IMPORTING
+          output = gs_bseg-posn2.
+      CONCATENATE gs_bseg-vbel2 gs_bseg-posn2 INTO gv_zuonr.
+
+      PERFORM update_zuonr USING gv_zuonr gs_bseg.
+     ENDIF.
+
+    ENDLOOP.
+
+
+
+  ENDLOOP.
+
+ENDFORM.                    "Selection_open_RV
+
+
+*&---------------------------------------------------------------------*
+*&      Form  UPDATE_ZUONR
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->GV_ZUONR   text
+*      -->GS_BSEG    text
+*----------------------------------------------------------------------*
+FORM update_zuonr USING gv_zuonr TYPE bseg-zuonr
+                        gs_bseg TYPE bseg.
+
+  DATA : w_bseg TYPE bseg,
+  w_message TYPE t100-text.
+
+  DATA : it_errtab TYPE tpit_t_errdoc WITH HEADER LINE,
+  it_fldtab TYPE tpit_t_fname WITH HEADER LINE,
+  it_buztab TYPE tpit_t_buztab WITH HEADER LINE.
+
+* Field name to be changed
+  it_fldtab-fname = 'ZUONR'.
+  APPEND it_fldtab.
+  CLEAR it_fldtab.
+
+* Field value
+  w_bseg-zuonr = gv_zuonr.
+
+
+  SELECT SINGLE
+  bukrs
+  belnr
+  gjahr
+  buzei
+  koart
+  umskz
+  bschl
+  mwart
+  mwskz
+  FROM bseg
+  INTO CORRESPONDING FIELDS OF it_buztab
+  WHERE belnr = gs_bseg-belnr AND
+  bukrs = gs_bseg-bukrs AND
+  gjahr = gs_bseg-gjahr AND
+  buzei = gs_bseg-buzei.
+  IF sy-subrc = 0.
+    APPEND it_buztab.
+    CLEAR it_buztab.
+  ENDIF.
+
+  CALL FUNCTION 'FI_ITEMS_MASS_CHANGE'
+    EXPORTING
+      s_bseg     = w_bseg
+    IMPORTING
+      errtab     = it_errtab[]
+    TABLES
+      it_buztab  = it_buztab
+      it_fldtab  = it_fldtab
+    EXCEPTIONS
+      bdc_errors = 1
+      OTHERS     = 2.
+
+
+ENDFORM.                    "UPDATE_ZUONR
+
+
+*&---------------------------------------------------------------------*
+*&      Form  select_open_items
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM select_open_items.
+
+
+
+ENDFORM.                    "select_open_items
+*&---------------------------------------------------------------------*
+*&      Form  prepare_list
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM prepare_list_1780002.
+
+  DATA: lv_first TYPE c,
+        lv_index TYPE sy-tabix,
+        lv_test TYPE c.
+
+  CLEAR gt_bsis_all[].
+  CLEAR gt_bsis_sel[].
+  CLEAR gt_bsis_sum[].
+
+  SELECT * FROM  bsis INTO TABLE gt_bsis_all
+           WHERE bukrs = p_bukrs
+           AND   budat <= p_keydat
+           AND   hkont IN (c_1780002).
+
+  SELECT * FROM  bsas APPENDING TABLE gt_bsis_all
+             WHERE bukrs = p_bukrs
+             AND   augdt > p_keydat
+             AND   budat <= p_keydat
+             AND   hkont IN (c_1780002).
+
+
+  IF gt_bsis_all[] IS NOT INITIAL.
+
+
+    LOOP AT gt_bsis_all.
+      MOVE-CORRESPONDING gt_bsis_all TO gt_bsis_sum_all.
+      APPEND gt_bsis_sum_all.
+    ENDLOOP.
+
+*    LOOP AT gt_bsis_sel INTO gs_bsis_sel.
+*      COLLECT gs_bsis_sel INTO gt_bsis_sum_all.
+*    ENDLOOP.
+
+    SORT gt_bsis_sum_all BY hkont zuonr.
+
+    LOOP AT gt_bsis_sum_all.
+
+      READ TABLE gt_bsis_sum
+        WITH KEY zuonr = gt_bsis_sum_all-zuonr.
+      lv_index = sy-tabix.
+      IF sy-subrc <> 0.
+        MOVE-CORRESPONDING gt_bsis_sum_all TO gt_bsis_sum.
+        CLEAR: gt_bsis_sum-dmbtr, gt_bsis_sum-wrbtr.
+        IF gt_bsis_sum_all-shkzg = 'S'.
+          gt_bsis_sum-dmbtr = gt_bsis_sum-dmbtr + gt_bsis_sum_all-dmbtr.
+          gt_bsis_sum-wrbtr = gt_bsis_sum-wrbtr + gt_bsis_sum_all-wrbtr.
+        ELSEIF gt_bsis_sum_all-shkzg = 'H'.
+          gt_bsis_sum-dmbtr = gt_bsis_sum-dmbtr - gt_bsis_sum_all-dmbtr.
+          gt_bsis_sum-wrbtr = gt_bsis_sum-wrbtr - gt_bsis_sum_all-wrbtr.
+        ENDIF.
+        APPEND gt_bsis_sum.
+      ELSE.
+        lv_index = sy-tabix.
+        IF gt_bsis_sum_all-shkzg = 'S'.
+          gt_bsis_sum-dmbtr = gt_bsis_sum-dmbtr + gt_bsis_sum_all-dmbtr.
+          gt_bsis_sum-wrbtr = gt_bsis_sum-wrbtr + gt_bsis_sum_all-wrbtr.
+        ELSEIF gt_bsis_sum_all-shkzg = 'H'.
+          gt_bsis_sum-dmbtr = gt_bsis_sum-dmbtr - gt_bsis_sum_all-dmbtr.
+          gt_bsis_sum-wrbtr = gt_bsis_sum-wrbtr - gt_bsis_sum_all-wrbtr.
+        ENDIF.
+        MODIFY gt_bsis_sum INDEX lv_index TRANSPORTING dmbtr wrbtr.
+      ENDIF.
+    ENDLOOP.
+
+    SORT gt_bsis_sum BY hkont zuonr.
+    SORT gt_bsis_all BY hkont zuonr budat DESCENDING.
+    LOOP AT gt_bsis_sum.
+      lv_index = sy-tabix.
+      CLEAR gt_belnr[].
+      lv_first = 'X'.
+      LOOP AT gt_bsis_all WHERE zuonr = gt_bsis_sum-zuonr.
+        IF lv_first = 'X'.
+          IF gt_bsis_all-segment IS NOT INITIAL.
+            gt_bsis_sum-segm = gt_bsis_all-segment.
+          ELSE.
+            SELECT SINGLE segment FROM faglflexa INTO gt_bsis_sum-segm
+              WHERE   ryear = gt_bsis_all-gjahr AND
+                      docnr = gt_bsis_all-belnr AND
+                      rldnr = '0L'.
+          ENDIF.
+          lv_first = ' '.
+        ENDIF.
+        APPEND gt_bsis_all-belnr TO gt_belnr.
+      ENDLOOP.
+      MODIFY gt_bsis_sum INDEX lv_index TRANSPORTING segm.
+
+      PERFORM process_list_1780002.
+    ENDLOOP.
+
+  ENDIF.
+
+ENDFORM.                    "PREPARE_LIST
+
+*&---------------------------------------------------------------------*
+*&      Form  process_list
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM process_list_1780002.
+
+  DATA: lv_flag TYPE c,
+        lv_saknr TYPE saknr,
+        lv_belnr TYPE belnr_d,
+        lv_test TYPE c.
+
+
+  IF gt_bsis_sum-hkont = c_1780002.
+
+
+      IF gt_bsis_sum-wrbtr = 0 AND gt_bsis_sum-dmbtr <> 0.
+        lv_flag = ' '.
+
+        PERFORM prepare_fi_posting_fs00 USING lv_flag gt_bsis_sum-bukrs gt_bsis_sum-hkont.
+        CALL TRANSACTION 'FS00' USING i_bdcdata
+            MODE gv_mode UPDATE 'S'.
+        lv_saknr = c_7960902.
+        PERFORM prepare_fi_posting_fs00 USING lv_flag gt_bsis_sum-bukrs lv_saknr.
+        CALL TRANSACTION 'FS00' USING i_bdcdata
+            MODE gv_mode UPDATE 'S'.
+        lv_saknr = c_3960902.
+        PERFORM prepare_fi_posting_fs00 USING lv_flag gt_bsis_sum-bukrs lv_saknr.
+        CALL TRANSACTION 'FS00' USING i_bdcdata
+            MODE gv_mode UPDATE 'S'.
+        PERFORM prepare_fi_posting_f-05.
+        CALL TRANSACTION 'F-05' USING i_bdcdata
+                 MODE gv_mode UPDATE 'S'
+                 MESSAGES INTO gt_error.
+        IF sy-subrc = 0.
+          CLEAR lv_belnr.
+          GET PARAMETER ID 'BLN' FIELD lv_belnr.
+          APPEND lv_belnr TO gt_belnr.
+          PERFORM execute_clearing_1780002.
+
+        ENDIF.
+
+        lv_flag = 'X'.
+        PERFORM prepare_fi_posting_fs00 USING lv_flag gt_bsis_sum-bukrs gt_bsis_sum-hkont.
+        CALL TRANSACTION 'FS00' USING i_bdcdata
+            MODE gv_mode UPDATE 'S'.
+        lv_saknr = c_7960902.
+        PERFORM prepare_fi_posting_fs00 USING lv_flag gt_bsis_sum-bukrs lv_saknr.
+        CALL TRANSACTION 'FS00' USING i_bdcdata
+            MODE gv_mode UPDATE 'S'.
+        lv_saknr = c_3960902.
+        PERFORM prepare_fi_posting_fs00 USING lv_flag gt_bsis_sum-bukrs lv_saknr.
+        CALL TRANSACTION 'FS00' USING i_bdcdata
+            MODE gv_mode UPDATE 'S'.
+      ELSEIF gt_bsis_sum-wrbtr = 0 AND gt_bsis_sum-dmbtr = 0.
+        PERFORM execute_clearing_1780002.
+      ENDIF.
+
+  ENDIF.
+
+
+
+ENDFORM.                    "process_list
+
+*&---------------------------------------------------------------------*
+*&      Form  prepare_list
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM prepare_list_2997901.
+
+  DATA: lv_first TYPE c,
+        lv_index TYPE sy-tabix.
+
+  CLEAR gt_bsis_all[].
+  CLEAR gt_bsis_sel[].
+  CLEAR gt_bsis_sum[].
+
+
+
+  SELECT * FROM  bsis INTO TABLE gt_bsis_all
+           WHERE bukrs = p_bukrs
+           AND   budat <= p_keydat
+           AND   hkont IN (c_2997901).
+
+  SELECT * FROM  bsas APPENDING TABLE gt_bsis_all
+             WHERE bukrs = p_bukrs
+             AND   augdt > p_keydat
+             AND   budat <= p_keydat
+             AND   hkont IN (c_2997901).
+
+
+  IF gt_bsis_all IS NOT INITIAL.
+
+    LOOP AT gt_bsis_all.
+      MOVE-CORRESPONDING gt_bsis_all TO gt_bsis_sum_all.
+      APPEND gt_bsis_sum_all.
+    ENDLOOP.
+
+*    LOOP AT gt_bsis_sel INTO gs_bsis_sel.
+*      COLLECT gs_bsis_sel INTO gt_bsis_sum_all.
+*    ENDLOOP.
+
+    SORT gt_bsis_sum_all BY hkont zuonr.
+    SORT gt_bsis_all BY hkont zuonr budat DESCENDING.
+
+    LOOP AT gt_bsis_sum_all.
+      READ TABLE gt_bsis_sum
+        WITH KEY zuonr = gt_bsis_sum_all-zuonr.
+      lv_index = sy-tabix.
+      IF sy-subrc <> 0.
+        MOVE-CORRESPONDING gt_bsis_sum_all TO gt_bsis_sum.
+        CLEAR: gt_bsis_sum-dmbtr, gt_bsis_sum-wrbtr.
+        IF gt_bsis_sum_all-shkzg = 'S'.
+          gt_bsis_sum-dmbtr = gt_bsis_sum-dmbtr + gt_bsis_sum_all-dmbtr.
+          gt_bsis_sum-wrbtr = gt_bsis_sum-wrbtr + gt_bsis_sum_all-wrbtr.
+        ELSEIF gt_bsis_sum_all-shkzg = 'H'.
+          gt_bsis_sum-dmbtr = gt_bsis_sum-dmbtr - gt_bsis_sum_all-dmbtr.
+          gt_bsis_sum-wrbtr = gt_bsis_sum-wrbtr - gt_bsis_sum_all-wrbtr.
+        ENDIF.
+        APPEND gt_bsis_sum.
+      ELSE.
+        lv_index = sy-tabix.
+        IF gt_bsis_sum_all-shkzg = 'S'.
+          gt_bsis_sum-dmbtr = gt_bsis_sum-dmbtr + gt_bsis_sum_all-dmbtr.
+          gt_bsis_sum-wrbtr = gt_bsis_sum-wrbtr + gt_bsis_sum_all-wrbtr.
+        ELSEIF gt_bsis_sum_all-shkzg = 'H'.
+          gt_bsis_sum-dmbtr = gt_bsis_sum-dmbtr - gt_bsis_sum_all-dmbtr.
+          gt_bsis_sum-wrbtr = gt_bsis_sum-wrbtr - gt_bsis_sum_all-wrbtr.
+        ENDIF.
+        MODIFY gt_bsis_sum INDEX lv_index TRANSPORTING dmbtr wrbtr.
+      ENDIF.
+    ENDLOOP.
+
+    SORT gt_bsis_sum BY hkont zuonr.
+
+
+    LOOP AT gt_bsis_sum.
+      lv_index = sy-tabix.
+      CLEAR gt_belnr[].
+      lv_first = 'X'.
+
+      LOOP AT gt_bsis_all WHERE zuonr = gt_bsis_sum-zuonr.
+
+        IF lv_first = 'X'.
+          IF gt_bsis_all-segment IS NOT INITIAL.
+            gt_bsis_sum-segm = gt_bsis_all-segment.
+          ELSE.
+            SELECT SINGLE segment FROM faglflexa INTO gt_bsis_sum-segm
+              WHERE   ryear = gt_bsis_all-gjahr AND
+                      docnr = gt_bsis_all-belnr AND
+                      rldnr = '0L'.
+          ENDIF.
+          lv_first = ' '.
+        ENDIF.
+        APPEND gt_bsis_all-belnr TO gt_belnr.
+      ENDLOOP.
+      MODIFY gt_bsis_sum INDEX lv_index TRANSPORTING segm.
+
+      PERFORM process_list_2997901.
+    ENDLOOP.
+  ENDIF.
+
+ENDFORM.                    "PREPARE_LIST
+
+*&---------------------------------------------------------------------*
+*&      Form  process_list
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM process_list_2997901.
+
+  DATA: lv_flag TYPE c,
+        lv_saknr TYPE saknr,
+        lv_belnr TYPE belnr_d.
+
+
+  IF gt_bsis_sum-hkont = c_2997901.
+
+      IF gt_bsis_sum-wrbtr = 0 AND gt_bsis_sum-dmbtr <> 0.
+        lv_flag = ' '.
+
+        PERFORM prepare_fi_posting_fs00 USING lv_flag gt_bsis_sum-bukrs gt_bsis_sum-hkont.
+        CALL TRANSACTION 'FS00' USING i_bdcdata
+            MODE gv_mode UPDATE 'S'.
+
+        lv_saknr = c_7960902.
+        PERFORM prepare_fi_posting_fs00 USING lv_flag gt_bsis_sum-bukrs lv_saknr.
+        CALL TRANSACTION 'FS00' USING i_bdcdata
+            MODE gv_mode UPDATE 'S'.
+
+
+        lv_saknr = c_3960902.
+        PERFORM prepare_fi_posting_fs00 USING lv_flag gt_bsis_sum-bukrs lv_saknr.
+        CALL TRANSACTION 'FS00' USING i_bdcdata
+            MODE gv_mode UPDATE 'S'.
+
+
+        PERFORM prepare_fi_posting_f-05.
+        CALL TRANSACTION 'F-05' USING i_bdcdata
+                 MODE gv_mode UPDATE 'S'
+                 MESSAGES INTO gt_error.
+        IF sy-subrc = 0.
+          CLEAR lv_belnr.
+          GET PARAMETER ID 'BLN' FIELD lv_belnr.
+          APPEND lv_belnr TO gt_belnr.
+          PERFORM execute_clearing_2997901.
+        ENDIF.
+
+        lv_flag = 'X'.
+        PERFORM prepare_fi_posting_fs00 USING lv_flag gt_bsis_sum-bukrs gt_bsis_sum-hkont.
+        CALL TRANSACTION 'FS00' USING i_bdcdata
+            MODE gv_mode UPDATE 'S'.
+
+        lv_saknr = c_7960902.
+        PERFORM prepare_fi_posting_fs00 USING lv_flag gt_bsis_sum-bukrs lv_saknr.
+        CALL TRANSACTION 'FS00' USING i_bdcdata
+            MODE gv_mode UPDATE 'S'.
+
+        lv_saknr = c_3960902.
+        PERFORM prepare_fi_posting_fs00 USING lv_flag gt_bsis_sum-bukrs lv_saknr.
+        CALL TRANSACTION 'FS00' USING i_bdcdata
+            MODE gv_mode UPDATE 'S'.
+
+      ELSEIF gt_bsis_sum-wrbtr = 0 AND gt_bsis_sum-dmbtr = 0.
+        PERFORM execute_clearing_2997901.
+      ENDIF.
+
+  ENDIF.
+
+
+ENDFORM.                    "process_list
+
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  prepare_fi_posting_fb01
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM prepare_fi_posting_f-05.
+
+  DATA:lv_date TYPE d,
+       lv_dmbtr TYPE char16,
+       lv_newbs(2) TYPE c,
+       lv_first TYPE c,
+       lv_waers TYPE waers,
+       lv_dmbtr_d TYPE wrbtr,
+       lv_pl_acc_2 TYPE hkont,
+       lv_pk_1 TYPE newbs,
+       lv_pk_2 TYPE newbs.
+* 1st posting
+  REFRESH: i_bdcdata,
+           gt_error.
+
+
+
+* Post document: Header Data
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    'SAPMF05A'  '0100'  'X'  ''   ''
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  CLEAR lv_date.
+  WRITE sy-datum TO lv_date.
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    ''  ''  ''  'BKPF-BLDAT' lv_date
+          CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    ''  ''  ''  'BKPF-BUDAT'  lv_date
+          CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    ''  ''  ''  'BKPF-BLART'  'SA'
+          CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    ''  ''  ''  'BKPF-BUKRS' gt_bsis_sum-bukrs
+          CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  CLEAR lv_waers.
+  SELECT SINGLE waers FROM t001 INTO lv_waers
+    WHERE bukrs = gt_bsis_sum-bukrs.
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    ''  ''  ''  'BKPF-WAERS'  lv_waers
+          CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    ''  ''  ''  'RF05A-NEWKO' gt_bsis_sum-hkont
+          CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+
+*  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+*       USING    ''  ''  ''  'BSEG-MWSKZ' c_zs
+*          CHANGING struct_bdcdata.
+*  APPEND struct_bdcdata  TO i_bdcdata.
+*  CLEAR  struct_bdcdata.
+
+  CLEAR lv_dmbtr_d.
+  lv_dmbtr_d = ABS( gt_bsis_sum-dmbtr ).
+  IF gt_bsis_sum-dmbtr > 0.
+    lv_pk_1 = '50'.
+    lv_pk_2 = '40'.
+    lv_pl_acc_2 = c_7960902.
+  ELSE.
+    lv_pk_1 = '40'.
+    lv_pk_2 = '50'.
+    lv_pl_acc_2 = c_3960902.
+  ENDIF.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    ''  ''  ''  'RF05A-NEWBS'  lv_pk_1
+          CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    ''  ''  ''  'BDC_OKCODE'  '/00'
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+* Screen 2
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    'SAPMF05A'  '0300' 'X'  ''   ''
+          CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+
+  WRITE lv_dmbtr_d TO lv_dmbtr.
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    ''  ''  ''  'BSEG-DMBTR'  lv_dmbtr
+          CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    ''  ''  ''  'RF05A-NEWBS'  lv_pk_2
+          CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    ''  ''  ''  'BDC_OKCODE'  '=ZK'
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    ''  ''  ''  'RF05A-NEWKO' lv_pl_acc_2
+          CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    ''  ''  ''  'BSEG-ZUONR' gt_bsis_sum-zuonr
+          CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    ''  ''  ''  'BSEG-MWSKZ' c_zs
+          CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+
+* Coding block
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    'SAPLKACB'  '0002'  'X'  ''   ''
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    ''  ''  ''  'COBL-SEGMENT'  gt_bsis_sum-segm
+          CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    ''  ''  ''  'BDC_OKCODE'  '=ENTE'
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+
+* Subscreen
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    'SAPMF05A'  '0330'  'X'  ''   ''
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    ''  ''  ''  'BDC_OKCODE'  '/00'
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+
+* Screen 3
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+        USING    'SAPMF05A'  '0300' 'X'  ''   ''
+        CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    ''  ''  ''  'BDC_OKCODE'  '=ZK'
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    ''  ''  ''  'BSEG-DMBTR'  lv_dmbtr
+          CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    ''  ''  ''  'BSEG-ZUONR' gt_bsis_sum-zuonr
+          CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+
+* Coding block
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    'SAPLKACB'  '0002'  'X'  ''   ''
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    ''  ''  ''  'COBL-SEGMENT'  gt_bsis_sum-segm
+          CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    ''  ''  ''  'BDC_OKCODE'  '=ENTE'
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+
+* SAVE
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    'SAPMF05A'  '0330'  'X'  ''   ''
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    ''  ''  ''  'BDC_OKCODE'  '=BU'
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+
+
+ENDFORM.                    " prepare_fi_posting
+
+
+*&---------------------------------------------------------------------*
+*&      Form  prepare_fi_posting_fs00
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->LV_FLAG    text
+*      -->LV_BUKRS   text
+*      -->LV_SAKNR   text
+*----------------------------------------------------------------------*
+FORM  prepare_fi_posting_fs00 USING lv_flag TYPE c lv_bukrs TYPE bukrs lv_saknr TYPE saknr.
+
+
+  PERFORM bdc_dynpro      USING 'SAPLGL_ACCOUNT_MASTER_MAINTAIN' '2001'.
+
+  PERFORM bdc_field       USING 'BDC_OKCODE'
+                               '=ACC_MOD'.
+
+  PERFORM bdc_field       USING 'GLACCOUNT_SCREEN_KEY-SAKNR' lv_saknr.
+
+  PERFORM bdc_field       USING 'GLACCOUNT_SCREEN_KEY-BUKRS' lv_bukrs.
+
+  PERFORM bdc_dynpro      USING 'SAPLGL_ACCOUNT_MASTER_MAINTAIN' '2001'.
+
+  PERFORM bdc_field       USING 'BDC_OKCODE'
+                                '=TAB03'.
+
+  PERFORM bdc_dynpro      USING 'SAPLGL_ACCOUNT_MASTER_MAINTAIN' '2001'.
+
+  PERFORM bdc_field       USING 'BDC_OKCODE'
+                                '=SAVE'.
+
+  PERFORM bdc_field       USING 'GLACCOUNT_SCREEN_CCODE-XINTB'
+                                lv_flag.
+
+
+ENDFORM.                    "prepare_fi_posting_fs00
+
+*&---------------------------------------------------------------------*
+*&      Form  EXECUTE_CLEARING
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM execute_clearing_1780002.
+  DATA: lv_waers TYPE waers.
+
+  REFRESH seltab.
+  LOOP AT gt_belnr.
+
+    MOVE: 'S_BELNR'    TO seltab_wa-selname,
+          'S'        TO seltab_wa-kind,      " SELECT-OPTION
+          'I'        TO seltab_wa-sign,
+          'EQ'       TO seltab_wa-option,
+    gt_belnr         TO seltab_wa-low.
+    APPEND seltab_wa TO seltab.
+
+  ENDLOOP.
+
+      MOVE: 'S_HKONT'    TO seltab_wa-selname,
+          'S'        TO seltab_wa-kind,      " SELECT-OPTION
+          'I'        TO seltab_wa-sign,
+          'EQ'       TO seltab_wa-option,
+    c_1780002        TO seltab_wa-low.
+    APPEND seltab_wa TO seltab.
+
+
+  SELECT SINGLE waers FROM t001 INTO lv_waers
+  WHERE bukrs = p_bukrs.
+
+  SUBMIT yse_sel_clearing
+   WITH  p_bukrs = p_bukrs
+   WITH  p_budat = sy-datum
+   WITH  p_waers = lv_waers
+   WITH  x_gsel = 'X'
+   WITH  p_scrfld = c_assignment
+   WITH SELECTION-TABLE seltab
+   AND RETURN.
+
+ENDFORM.                    "EXECUTE_CLEARING
+
+*&---------------------------------------------------------------------*
+*&      Form  EXECUTE_CLEARING
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM execute_clearing_2997901.
+  DATA: lv_waers TYPE waers.
+
+  LOOP AT gt_belnr.
+
+    MOVE: 'S_BELNR'    TO seltab_wa-selname,
+          'S'        TO seltab_wa-kind,      " SELECT-OPTION
+          'I'        TO seltab_wa-sign,
+          'EQ'       TO seltab_wa-option,
+    gt_belnr         TO seltab_wa-low.
+    APPEND seltab_wa TO seltab.
+
+  ENDLOOP.
+
+  MOVE: 'S_HKONT'    TO seltab_wa-selname,
+      'S'        TO seltab_wa-kind,      " SELECT-OPTION
+      'I'        TO seltab_wa-sign,
+      'EQ'       TO seltab_wa-option,
+c_2997901         TO seltab_wa-low.
+  APPEND seltab_wa TO seltab.
+
+  SELECT SINGLE waers FROM t001 INTO lv_waers
+  WHERE bukrs = p_bukrs.
+
+  SUBMIT yse_sel_clearing
+   WITH  p_bukrs = p_bukrs
+   WITH  p_budat = sy-datum
+   WITH  p_waers = lv_waers
+   WITH  x_gsel = 'X'
+   WITH  p_scrfld = c_assignment
+   WITH SELECTION-TABLE seltab
+   AND RETURN.
+
+ENDFORM.                    "EXECUTE_CLEARING
+
+*----------------------------------------------------------------------*
+*       FORM BDC_DYNPRO
+*----------------------------------------------------------------------*
+*       Add a dynpro to BDCDATA. INTERNAL Table with all dynpros.
+*       for a transaction.   See DDIC STRUCTURE BDCDATA
+*----------------------------------------------------------------------*
+*       PROGRAM    Program name
+*       DYNPRO     Current Dynpro
+*----------------------------------------------------------------------*
+FORM bdc_dynpro USING program TYPE ibipbdcd-program
+                      dynpro  TYPE clike.
+
+  CLEAR i_bdcdata.                     "Clear header record
+  i_bdcdata-program  = program.
+  i_bdcdata-dynpro   = dynpro.
+  i_bdcdata-dynbegin = 'X'.            "New dynpro flag (X/_)
+  APPEND i_bdcdata.
+* curr_dynpro_index = syst-tabix.      " note index to bdcdata
+  g_curr_program = program.            " record the current screen
+  g_curr_dynpro  = dynpro.
+
+ENDFORM.                    "bdc_dynpro
+
+*----------------------------------------------------------------------*
+*       FORM BDC_FIELD
+*----------------------------------------------------------------------*
+*       Build the DYNPRO Table BDCDATA, with the field information.
+*       Here we a defining a field and its contents for the currently
+*       Active dynpro.  (Maintain BDCDATA)
+*----------------------------------------------------------------------*
+*  -->  FIELD_NAME    Name of field on the DYNPRO
+*       FIELD_VALUE   Contents of the field
+*----------------------------------------------------------------------*
+FORM bdc_field USING field_name  TYPE clike
+                     field_value TYPE simple. "any type could be passed
+
+  DATA: fieldtype.
+  CLEAR i_bdcdata.
+  DESCRIBE FIELD field_value TYPE fieldtype.
+  i_bdcdata-fnam = field_name.
+  IF fieldtype = 'D'.                  "is it a date field
+    WRITE field_value TO i_bdcdata-fval.
+  ELSE.
+    i_bdcdata-fval = field_value.
+  ENDIF.
+  APPEND i_bdcdata.
+
+ENDFORM.                    "bdc_field
+
+*Text symbol text£º
+*001:General selections
+*002:Further selections
+*003: 1780002 / 2997901
+*004:Delete old data
+*005:Overdue
+*006:> 720
+*007:Program cannot be run in background
+*008:Read Allocation data
+*C01:Profit center
+*C02:Customer
+*C03:Customer name
+*C04:Document type
+*C05:Document nr
+*C06:Document date
+*C07:Due date
+*C08:Non due
+*C09:Keydate
+*C10:Segment
+*C11:Billing doc.
+*C12:Reference key 2
+*C13:Reference Hdr.
+*C14:Invoice ref.
+*C15:Bline Date
+*C16:Document currency
+*C17:Company currency
+*C18:Exchange rate
+*C19:sum for amounts days overdue
+*C20:Sales Organisation
+*C21:Distribution Channel
+*C22:Division
+*C23:Sales District
+*C24:Sales Office
+*C25:Sales Group
+*C26:Amount in doc curr
+*S06:Without Revaluation
+*S07:With Revaluation
+
+*S08:Revaluation Option
+*Selection text£º
+*P_BUKRS:        Company code
+*P_KEYDAT:        Open Item Keydate

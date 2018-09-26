@@ -1,0 +1,3917 @@
+**&---------------------------------------------------------------------
+*&                                                                     *
+*&               Report  ZFCORRFA_FAGL  Version 7.4                    *
+*&                                                                     *
+*&**********************************************************************
+**                                                                     *
+*&         !!!!!!!!!!  CAUTION:     !!!!!!!!!!                         *
+*&        This report must only be used in update mode                 *
+*&           after consultation with SAP.                              *
+**                                                                     *
+*&**********************************************************************
+*&
+*& - Purpose:
+*& This report corrects the functional area in the entry view (= BSEG
+*& table (Field BSEG-FKBER) and the assigned NewGL tables:
+*&
+*& The derivation of the functional area is processed anew and
+*& the new functional area is then stored in the FI documents (in the
+*& BSEG-table and the NewGL Tables).
+*& In General Ledger View only those ledgers are corrected  when the
+*& assigned scenario of the ledger is FIN_UKV(Cost of Sales Accounting)
+*&
+*& In case the functional area is a splitting characteristics then
+*& it must be doublechecked with NewGL experts if a correction of
+*& the FAGL_SPLINFO* tables is necessery as well.
+*&
+*&
+*& - Integration
+*& This report is not suitable for PS accounting and those applications
+*& which do not follow the standard functional area derivation logic.
+*& CO documents and CO totals are not corrected by this report.
+*&
+*&
+*& - Parameters:
+*&     PR_BUKRS   Company Code
+*&     PR_GJAHR   Fiscal Year
+*&     PR_BELNR   Document Number
+*&     PR_BUZEI   Line item
+*&
+*&   Restrctions at Document Header level
+*&     PR_BSTAT   Document Status
+*&     PR_BLART   Document type
+*&     PR_MONAT   Posting period
+*&     PR_ACTIV   Business Transaction
+*&     PR_AWTYP   Reference procedure
+*&     PR_AWKEY     Object key
+*&
+*&   Extended Restrictions for Line Items
+*&     PR_ACCNT   Account Number
+*&     PR_FKBER   Functional Area
+*&     PR_KOSTL   Cost Center
+*&     PR_AUFNR   Order Number
+*&     PR_PROJK   WBS Element
+*&
+*&   * Control Parameters
+*&     PD_LIST1   Detail Lists
+*&     PD_TESTR   Test Run
+*&     PD_ONLYC   Display only changes positions
+*&     PD_KCOBL   Switch off K_COBL_CHECK
+*&                In case simple FA derivation has to be processed
+*&                (for example only from ACCOUNT or substitution amd
+*&                CO objects and CO validation is not required.
+*&
+*&     PD_FRCGL   Force NewGL correction
+*&                (When BSEG is correct but NewGL Tables incorrect)
+*&     PD_SPACE   Substitute also, if the new Functional Area = SPACE.
+*&                Although the new derived functional area is SPACE
+*&                then the the tables will be updated
+*&
+*&     PD_DOCHG   Update Document Change Log:
+*&                Changes of the document are logged. That helps to
+*&                analyze what was changed and when...
+*&
+*&     PD_STIDX   Store results into INDX cluster table
+*&
+*&     PD_AEDAT   BW Line Item Extractor Log: Table BWFI_AEDAT
+*&                Register DocNo in BW Log Table for Changed FI Documents
+*&
+*&   * Exceptional Derivation: 3 Types of derivation are possible
+*&     PD_STNRD   Standard Derivation (Cost object/Account/Subst)
+*&     PD_SONLY   Derive ONLY from specific Substition
+*&     PD_CONLY   Only substitute with Constant Functional Area
+*&
+*&
+*&     Derivation Types:
+*&
+*&     o Standard Derivation:
+*&       The priority of the standard derivation is as follows:
+*&       1) Manual Entry (highest priority).
+*&          The report cannot identify functional areas in the document
+*&          that has been entered manually. Therefore, such a functional
+*&          area will be overwritten by a functional area determined
+*&          from substitution, cost *& element/GL Account or Cost object
+*&
+*&       2) Substitution FI/0006, FI/0005
+*&       3) Cost Element, GL/Account
+*&       4)	Cost Object
+*&
+*&     o Derive only from Substitution:
+*&       The system tries to determine the functional area only within
+*&       the selected substitution (FI/0006, FI/0005)
+*&
+*&     o Constant Functional Area
+*&       The system substitutes the functional area with a constant
+*&       value.
+*&       This setting is used in order to simulate a manual entry.
+*&
+*&     ************************************************************
+*&     Enter 'UPDATE' in the command field changes into UPDATE mode
+*&     ************************************************************
+*&
+*& The report works in the following way:
+*& 1) The FI documents are selected from the BSEG and BKPF tables.
+*& 2) The selected entries are transformed into ACCIT and ACCHD
+*&    or COBL (if FAREA_FROM_COBL = X)
+*& 3) According to the selected derivation strategy the program derives
+*&    the functional area based on the information in the ACCIT and
+*&    ACCHD or COBL structures.
+*&
+*& This reports works well for all FI documents which were posted
+*& directly in FI, e.g. using the FB01 transaction, since all
+*& information of the posting is available in the BSEG and BKPF tables.
+*&
+*& But a wrong functional area might be derived for FI documents which
+*& were originally posted in other modules, e.g. in MM:
+*& For such FI documents the complete information of the original
+*& MM posting is NOT available: The original ACCIT and ACCHD entries
+*& cannot be recreated any more by using only the information which
+*& is stored in the BSEG/BKPF tables.
+*& Hence please use this report only for FI documents which were
+*& posted in FI and not for those which were posted in other modules
+*& like FI.
+*& Please note: In most cases this report will work fine also for
+*& FI documents from MM etc., since the most common fields like
+*& account, cost center category etc. will be filled for all documents.
+*& If the report does not fullfill your needs, maybe because
+*& the derivation of functional areas for documents from MM
+*& does not work as desired, please proceed as described in
+*& OSS note nr. 115840.
+*&
+
+REPORT  ZFCORRFA_FAGL.
+*=======================================================================
+* global data:
+*=======================================================================
+
+TYPE-POOLS: SLIS, ABAP, SSCR.
+
+TABLES: BKPF, BSEG, CSKSZ, COBL, T022, TTYPT, EBKN.
+CONSTANTS: c_txtlen        TYPE I VALUE 120,
+           c_fkber_dumy(4) TYPE c VALUE '!$!$',
+           c_pos1          TYPE I VALUE '36'.
+
+TYPES:
+BEGIN OF TY_S_DOCTAB,
+MANDT   TYPE  SY-MANDT,
+BUKRS   TYPE  BSEG-BUKRS,
+GJAHR   TYPE  BSEG-GJAHR,
+BELNR   TYPE  BSEG-BELNR,
+BUZEI   TYPE  BSEG-BUZEI,
+END OF TY_S_DOCTAB,
+TY_T_DOCTAB  TYPE  TABLE OF  TY_S_DOCTAB.
+
+TYPES:
+BEGIN OF TY_BKPFKEY,
+  BUKRS LIKE BKPF-BUKRS,
+  BELNR LIKE BKPF-BELNR,
+  GJAHR LIKE BKPF-GJAHR,
+END OF TY_BKPFKEY.
+
+TYPES TTY_ROOSOURCE TYPE TABLE OF ROOSOURCE. "for BW Check
+
+DATA z_version TYPE CHAR10.
+
+DATA:
+GS_DOCTAB       TYPE  TY_S_DOCTAB,
+GT_DOCTAB       TYPE  TY_T_DOCTAB,
+GT_SEL_DOCS     TYPE  TY_BKPFKEY OCCURS 0,
+GS_SEL_DOCS     TYPE  TY_BKPFKEY,
+GT_BKPF_ALL     LIKE  BKPF     OCCURS 0,
+GT_BSEG         LIKE  BSEG     OCCURS 0,
+GT_BSEG_ADD     LIKE  BSEG_ADD OCCURS 0,
+GS_BSEG_ADD     LIKE  BSEG_ADD,
+GS_BKPF         LIKE  BKPF,
+GS_BSEG         LIKE  BSEG,
+GT_ACCHD_TEMP   LIKE  ACCHD OCCURS 0 WITH HEADER LINE,
+GT_ACCIT_TEMP   LIKE  ACCIT OCCURS 0 WITH HEADER LINE,
+GT_ACCCR_TEMP   LIKE  ACCCR OCCURS 0 WITH HEADER LINE,
+GS_FAGL_ACTIVEC LIKE FAGL_ACTIVEC,
+GD_FKBER_SPLITT TYPE CHAR1,
+GD_FAGLBSIS     TYPE CHAR1,
+GD_FAGLBSAS     TYPE CHAR1,
+GS_COCODE_SPLIT TYPE FAGL_SPLIT_ACTC,
+GS_SUBKEY_ACTIVE      TYPE fcom_s_subkey_active,
+GT_PRINT        TYPE SLIS_PRINT_ALV,
+GT_RSPARAMS TYPE STANDARD TABLE OF rsparams.
+
+DATA:
+GD_ZEILE(22),
+GD_SUBRC              TYPE  SY-SUBRC,
+GD_CURSOR_BKPF        TYPE  CURSOR,      "Cursor for SELECT BSEG
+GD_OLD_FAREA          TYPE  BSEG-FKBER_LONG,
+                            "old (unchanged) functional area
+GD_NEW_FAREA          TYPE  BSEG-FKBER_LONG,
+GD_FLAG_ERROR_RECORD  TYPE  BOOLE-BOOLE,
+GD_COUNTER_PROCESSED  TYPE  I,        "number of processed BSEGs
+GD_COUNTER_CHANGED    TYPE  I,        "number of BSEGs with chaged Farea
+GD_COUNTER_MSG_ALL    TYPE  I,        "number of all appeared messages
+GD_COUNTER_FI_DOCS    TYPE  I,        "number of documents processed
+GD_MAX_SEVERITY_REC   LIKE  SY-SUBRC, "severity of mesgs of record
+GD_REC_CORRECTED      LIKE  SY-TFILL, "number of BSEG rec. corrected
+GD_LINES_ITAB         LIKE  SY-TABIX, "number of lines in internal table
+GD_START_DATE         LIKE  SY-DATUM,
+GD_START_TIME         LIKE  SY-UZEIT.
+* structure of final list:
+DATA:
+BEGIN OF GT_FINAL_LIST OCCURS 0,
+      BUKRS LIKE COS_BSEG_FKBER_CHANGE-BUKRS,
+      BELNR LIKE COS_BSEG_FKBER_CHANGE-BELNR,
+      BUZEI LIKE COS_BSEG_FKBER_CHANGE-BUZEI,
+      GJAHR LIKE COS_BSEG_FKBER_CHANGE-GJAHR,
+      FKBER_NEW  LIKE COS_BSEG_FKBER_CHANGE-FKBER_NEW,
+      FKBER_OLD  LIKE COS_BSEG_FKBER_CHANGE-FKBER_OLD,
+      FLAG_MSG   LIKE COS_BSEG_FKBER_CHANGE-FLAG_MSG,
+      ORIGIN     TYPE CHAR15,
+      BSTAT LIKE BKPF-BSTAT,
+      RLDNR LIKE BKPF-RLDNR,
+      LDGRP LIKE BKPF-LDGRP,
+END OF GT_FINAL_LIST.
+
+*************
+*** Data Declaration for NewGL correction
+*** INDX_KEY for data export of GT_NEWGL_NEW to INDX
+DATA: exp_key(22) TYPE c.
+DATA: BEGIN OF indx_key,
+      key1(7) TYPE c VALUE 'SALDO_0',
+      date    LIKE sy-datlo,
+      time    LIKE sy-timlo,
+      END OF indx_key.
+
+* DATA: wa_faglflexa TYPE faglflexa.
+
+*** insert of lines and update totals
+*** changed from FAGLFLEXA to GLU1 to be generic
+*** ledger information
+TYPES: BEGIN OF TY_LEDGERTAB,
+         rldnr   TYPE t881-rldnr,
+         tab     TYPE t881-tab,
+         tabname TYPE t800a-ntable,
+       END OF TY_LEDGERTAB.
+
+TYPES TTY_LEDGERTAB TYPE SORTED TABLE OF TY_LEDGERTAB
+                    WITH UNIQUE KEY rldnr.
+
+
+* DATA: it_ledger_corr TYPE TTY_LEDGERTAB WITH HEADER LINE.
+
+
+DATA:  t_glu1 TYPE TABLE OF glu1 WITH HEADER LINE.
+
+*DATA:  IT_LEDGERTAB TYPE TTY_LEDGERTAB WITH HEADER LINE.
+
+TYPES: BEGIN OF docs,
+         bukrs TYPE bukrs,
+         belnr TYPE belnr,
+         gjahr TYPE gjahr,
+         mtext TYPE CHAR255,
+         sever TYPE CHAR1,
+         type  TYPE CHAR1,
+       END OF docs.
+
+*** changed from FAGLFLEXA to GLU1 to be generic
+TYPES: BEGIN OF TY_GLDATA_CORR.
+        INCLUDE STRUCTURE glu1.
+TYPES: x_nocorr(1) TYPE c,
+       END OF TY_GLDATA_CORR.
+
+DATA: t_error_position TYPE gmess_position_tab,
+      l_error_position LIKE LINE OF t_error_position.
+
+DATA: GT_NEWGL_NEW TYPE TABLE OF TY_GLDATA_CORR WITH HEADER LINE.
+*      WITH UNIQUE KEY ryear docnr rldnr rbukrs docln.
+
+DATA: GT_NEWGL_OLD TYPE  TABLE OF TY_GLDATA_CORR WITH HEADER LINE.
+*      WITH UNIQUE KEY ryear docnr rldnr rbukrs docln.
+
+
+DATA: it_docs TYPE SORTED TABLE OF docs WITH HEADER LINE
+      WITH UNIQUE KEY bukrs belnr gjahr.
+
+DATA: cnt TYPE p,
+      head(1) TYPE c.
+
+*** update table
+*** changed from FAGLFLEXA to GLU1 to be generic
+*DATA: it_flex_upd TYPE TABLE OF glu1 WITH HEADER LINE.
+
+TYPES: BEGIN OF dele_key,
+       ryear  TYPE glu1-ryear,
+       docnr  TYPE glu1-docnr,
+       rldnr  TYPE glu1-rldnr,
+       rbukrs TYPE glu1-rbukrs,
+       docln  TYPE glu1-docln,
+       END OF dele_key.
+DATA: it_dele_key TYPE TABLE OF dele_key WITH HEADER LINE.
+
+*** temporary table for flexa
+
+** Selection of Flexa..
+DATA: IT_CORR_BSEG TYPE BSEG OCCURS 0 WITH HEADER LINE.
+
+DATA: BEGIN OF GT_NEWGL_BSEG OCCURS 0,
+        BUKRS TYPE BSEG-BUKRS,
+        BELNR TYPE BSEG-BELNR,
+        GJAHR TYPE BSEG-GJAHR,
+        BUZEI TYPE BSEG-BUZEI,
+        OLD_FKBER_LONG TYPE BSEG-FKBER_LONG,
+        NEW_FKBER_LONG TYPE BSEG-FKBER_LONG,
+       END OF GT_NEWGL_BSEG.
+
+DATA: BEGIN OF GT_NEWGL_OUTPUT OCCURS 0,
+       RLDNR  TYPE FAGLFLEXA-RLDNR,
+       RBUKRS TYPE FAGLFLEXA-RBUKRS,
+       DOCNR TYPE FAGLFLEXA-DOCNR,
+       BELNR TYPE FAGLFLEXA-BELNR,
+       RYEAR TYPE FAGLFLEXA-RYEAR,
+       RACCT TYPE FAGLFLEXA-RACCT,
+       DOCLN TYPE FAGLFLEXA-DOCLN,
+       BUZEI TYPE FAGLFLEXA-BUZEI,
+       FKBER_OLD TYPE FAGLFLEXA-RFAREA,
+       FKBER_NEW TYPE FAGLFLEXA-RFAREA,
+      END OF GT_NEWGL_OUTPUT.
+
+DATA: BEGIN OF GT_MSGOUTPUT OCCURS 1,
+        RATING(1) TYPE C,
+        TEXT      LIKE T100-TEXT,
+      END OF GT_MSGOUTPUT.
+
+DATA: L_KTOPL LIKE T001-KTOPL.
+
+DATA: GD_TABIX LIKE SY-TABIX.
+DATA: EXPERT.
+
+DATA: flg_update type i value 0.
+DATA: ld_infomsg(1) type c.
+
+DATA gt_t001q TYPE TABLE OF t001q.
+DATA gs_t001q LIKE t001q.
+DATA GD_EVENT LIKE t001q-event.
+
+
+TYPES: TY_MSGTXT(c_txtlen) TYPE c.
+TYPES: TY_OUTTXT(35) TYPE c.
+
+DATA: BEGIN OF t_dis_fields OCCURS 0,
+      substit     LIKE T001Q-SUBST,
+      event       LIKE T001Q-EVENT,
+    END OF t_dis_fields.
+
+DATA: BEGIN OF gt_fields_lst OCCURS 5.
+INCLUDE  STRUCTURE help_value.
+DATA: END   OF gt_fields_lst.
+DATA: h_selectfield LIKE help_info-fieldname,
+      gd_ind         LIKE sy-tabix.
+
+DATA: BEGIN OF gs_view_tables,
+        tab_bsis        TYPE TABNAME16 Value 'BSIS',
+        class_bsis      LIKE DD02V-TABCLASS,
+        tab_faglbsis    TYPE TABNAME16 Value 'FAGLBSIS',
+        class_faglbsis      LIKE DD02V-TABCLASS,
+        tab_bsas        TYPE TABNAME16 Value 'BSAS',
+        class_bsas      LIKE DD02V-TABCLASS,
+        tab_faglbsas    TYPE TABNAME16 Value 'FAGLBSAS',
+        class_faglbsas  LIKE DD02V-TABCLASS,
+        tab_bsik        TYPE TABNAME16 Value 'BSIK',
+        class_bsik      LIKE DD02V-TABCLASS,
+        tab_bsak        TYPE TABNAME16 Value 'BSAK',
+        class_bsak      LIKE DD02V-TABCLASS,
+        tab_bsid        TYPE TABNAME16 Value 'BSID',
+        class_bsid      LIKE DD02V-TABCLASS,
+        tab_bsad        TYPE TABNAME16 Value 'BSAD',
+        class_bsad      LIKE DD02V-TABCLASS,
+        tab_faglflext   TYPE TABNAME16 Value 'FAGLFLEXT',
+        class_faglflext LIKE DD02V-TABCLASS,
+    END OF gs_view_tables.
+
+DATA: gh_pspnr    TYPE matnr,
+      gh_restrict TYPE sscr_restrict,
+      gh_ass      TYPE sscr_ass,
+      gh_opt      TYPE sscr_opt_list.
+
+* Message Texts
+DATA zmtext01 TYPE TY_MSGTXT.
+DATA zmtext02 TYPE TY_MSGTXT.
+DATA zmtext03 TYPE TY_MSGTXT.
+DATA zmtext04 TYPE TY_MSGTXT.
+DATA zmtext05 TYPE TY_MSGTXT.
+DATA zmtext06 TYPE TY_MSGTXT.
+DATA zmtext07 TYPE TY_MSGTXT.
+DATA zmtext08 TYPE TY_MSGTXT.
+DATA zmtext09 TYPE TY_MSGTXT.
+DATA zmtext10 TYPE TY_MSGTXT.
+DATA zmtext11 TYPE TY_MSGTXT.
+
+
+* Texts for List Output
+
+DATA zotext01 TYPE TY_OUTTXT.
+DATA zotext02 TYPE TY_OUTTXT.
+DATA zotext03 TYPE TY_OUTTXT.
+DATA zotext04 TYPE TY_OUTTXT.
+DATA zotext05 TYPE TY_OUTTXT.
+DATA zotext06 TYPE TY_OUTTXT.
+DATA zotext07 TYPE TY_OUTTXT.
+DATA zotext08 TYPE TY_OUTTXT.
+DATA zotext09 TYPE TY_OUTTXT.
+DATA zotext10 TYPE TY_OUTTXT.
+DATA zotext11 TYPE TY_OUTTXT.
+DATA zotext12 TYPE TY_OUTTXT.
+DATA zotext13 TYPE TY_OUTTXT.
+DATA zotext14 TYPE TY_OUTTXT.
+DATA zotext15 TYPE TY_OUTTXT.
+DATA zotext16 TYPE TY_OUTTXT.
+DATA zotext17 TYPE TY_OUTTXT.
+DATA zotext18 TYPE TY_OUTTXT.
+DATA zotext19 TYPE TY_OUTTXT.
+DATA zotext20 TYPE TY_OUTTXT.
+DATA zotext21 TYPE TY_OUTTXT.
+DATA zotext22 TYPE TY_OUTTXT.
+DATA zotext23 TYPE TY_OUTTXT.
+DATA zotext24 TYPE TY_OUTTXT.
+DATA zotext25 TYPE TY_OUTTXT.
+DATA zotext26 TYPE TY_OUTTXT.
+
+*=======================================================================
+* selection screen:
+*=======================================================================
+
+* key fields of BSEG/BKPF-table:
+SELECTION-SCREEN BEGIN OF BLOCK B WITH FRAME TITLE tb.
+
+* Company Code
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(20) zatext01 FOR FIELD PR_BUKRS.
+SELECTION-SCREEN POSITION POS_LOW.
+SELECT-OPTIONS PR_BUKRS FOR BKPF-BUKRS MEMORY ID BUK OBLIGATORY.
+SELECTION-SCREEN END OF LINE.
+
+* Fiscal Year
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(20) zatext02 FOR FIELD PR_GJAHR.
+SELECTION-SCREEN POSITION POS_LOW.
+SELECT-OPTIONS PR_GJAHR FOR BKPF-GJAHR MEMORY ID GJR OBLIGATORY.
+SELECTION-SCREEN END OF LINE.
+
+* Document Number
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(20) zatext03 FOR FIELD PR_BELNR.
+SELECTION-SCREEN POSITION POS_LOW.
+SELECT-OPTIONS PR_BELNR FOR BKPF-BELNR MEMORY ID BLN.
+SELECTION-SCREEN END OF LINE.
+
+* Document Line Item Number (Position)
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(20) zatext04 FOR FIELD PR_BUZEI .
+SELECTION-SCREEN POSITION POS_LOW.
+SELECT-OPTIONS PR_BUZEI FOR BSEG-BUZEI MEMORY ID BUZ.
+SELECTION-SCREEN END OF LINE.
+
+SELECTION-SCREEN END OF BLOCK B.
+
+* select options for header:
+SELECTION-SCREEN BEGIN OF BLOCK C WITH FRAME TITLE tc.
+
+* Document Status
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(23) zatext25 FOR FIELD PR_BSTAT.
+SELECTION-SCREEN POSITION POS_LOW.
+SELECT-OPTIONS PR_BSTAT FOR BKPF-BSTAT.
+SELECTION-SCREEN END OF LINE.
+
+* Document Type
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(20) zatext05 FOR FIELD PR_BLART.
+SELECTION-SCREEN POSITION POS_LOW.
+SELECT-OPTIONS PR_BLART FOR BKPF-BLART MEMORY ID BAR.
+SELECTION-SCREEN END OF LINE.
+
+* Period
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(20) zatext06 FOR FIELD PR_MONAT.
+SELECTION-SCREEN POSITION POS_LOW.
+SELECT-OPTIONS PR_MONAT FOR BKPF-MONAT MEMORY ID PER.
+SELECTION-SCREEN END OF LINE.
+
+* Business Transaction
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(20) zatext07 FOR FIELD PR_ACTIV.
+SELECTION-SCREEN POSITION POS_LOW.
+SELECT-OPTIONS PR_ACTIV FOR T022-ACTIVITY.
+SELECTION-SCREEN END OF LINE.
+
+* Reference Procedure
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(20) zatext08 FOR FIELD PR_AWTYP.
+SELECTION-SCREEN POSITION POS_LOW.
+SELECT-OPTIONS PR_AWTYP FOR TTYPT-AWTYP MEMORY ID RPR.
+SELECTION-SCREEN END OF LINE.
+
+* Object Key
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(20) zatext09 FOR FIELD PR_AWKEY.
+SELECTION-SCREEN POSITION POS_LOW.
+SELECT-OPTIONS PR_AWKEY FOR BKPF-AWKEY.
+SELECTION-SCREEN END OF LINE.
+
+SELECTION-SCREEN END OF BLOCK C.
+
+* select options for line item:
+SELECTION-SCREEN BEGIN OF BLOCK D WITH FRAME TITLE td.
+
+* Account Number
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(20) zatext10 FOR FIELD PR_ACCNT.
+SELECTION-SCREEN POSITION POS_LOW.
+SELECT-OPTIONS PR_ACCNT FOR BSEG-HKONT      MEMORY ID ACC.
+SELECTION-SCREEN END OF LINE.
+
+* Functional Area
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(20) zatext11 FOR FIELD PR_FKBER.
+SELECTION-SCREEN POSITION POS_LOW.
+SELECT-OPTIONS PR_FKBER FOR COBL-FKBER MEMORY ID FBE.
+SELECTION-SCREEN END OF LINE.
+
+* Cost Center
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(20) zatext12 FOR FIELD PR_KOSTL.
+SELECTION-SCREEN POSITION POS_LOW.
+SELECT-OPTIONS PR_KOSTL FOR CSKSZ-KOSTL MEMORY ID KOS.
+SELECTION-SCREEN END OF LINE.
+
+* Order Number
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(20) zatext13 FOR FIELD PR_AUFNR.
+SELECTION-SCREEN POSITION POS_LOW.
+SELECT-OPTIONS PR_AUFNR FOR BSEG-AUFNR MEMORY ID ANR.
+SELECTION-SCREEN END OF LINE.
+
+* WBS Element  (Work Breakdown Structure Element)
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(20) zatext24 FOR FIELD PR_AUFNR.
+SELECTION-SCREEN POSITION POS_LOW.
+SELECT-OPTIONS PR_PROJK FOR EBKN-PS_PSP_PNR  NO INTERVALS.
+SELECTION-SCREEN END OF LINE.
+
+SELECTION-SCREEN END OF BLOCK D.
+
+* control parameters:
+SELECTION-SCREEN BEGIN OF BLOCK E WITH FRAME  TITLE te.
+
+* Display detail List
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(20) zatext16 FOR FIELD PD_LIST1.
+SELECTION-SCREEN POSITION 36.
+PARAMETERS PD_LIST1 LIKE COFI_SCR-FLG_LIST  DEFAULT 'X'.
+SELECTION-SCREEN END OF LINE.
+
+* Display only changed line items
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(20) zatext17 FOR FIELD PD_ONLYC.
+SELECTION-SCREEN POSITION 36.
+PARAMETERS PD_ONLYC TYPE CHAR1 AS CHECKBOX DEFAULT ' '.
+SELECTION-SCREEN END OF LINE.
+
+* Switch off K_COBL_CHECK
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(22) zatext27 FOR FIELD PD_KCOBL.
+SELECTION-SCREEN POSITION 36.
+PARAMETERS PD_KCOBL TYPE CHAR1 AS CHECKBOX DEFAULT ' '.
+SELECTION-SCREEN END OF LINE.
+
+
+* TEST RUN
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(20) zatext14 FOR FIELD PD_TESTR.
+SELECTION-SCREEN POSITION 36.
+PARAMETERS PD_TESTR LIKE COFI_SCR-FLG_TEST  DEFAULT 'X' MODIF ID INC.
+SELECTION-SCREEN END OF LINE.
+
+* Force Correction of NewGL Tables
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(20) zatext15 FOR FIELD PD_FRCGL.
+SELECTION-SCREEN POSITION 36.
+PARAMETERS PD_FRCGL TYPE CHAR1 AS CHECKBOX  DEFAULT ' ' MODIF ID INC.
+SELECTION-SCREEN END OF LINE.
+
+* X = Substitute also, if the new Functional Area = SPACE
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(20) zatext19 FOR FIELD PD_SPACE.
+SELECTION-SCREEN POSITION 36.
+PARAMETERS PD_SPACE TYPE CHAR1 AS CHECKBOX  DEFAULT ' ' MODIF ID INC.
+SELECTION-SCREEN END OF LINE.
+
+* Update Document Change Log
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(20) zatext23 FOR FIELD PD_DOCHG.
+SELECTION-SCREEN POSITION 36.
+PARAMETERS PD_DOCHG TYPE CHAR1 AS CHECKBOX  DEFAULT 'X' MODIF ID INC.
+SELECTION-SCREEN END OF LINE.
+
+* Store results in cluster table
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(20) zatext18 FOR FIELD PD_STIDX.
+SELECTION-SCREEN POSITION 36.
+PARAMETERS PD_STIDX AS CHECKBOX DEFAULT ' ' MODIF ID INC.
+SELECTION-SCREEN END OF LINE.
+
+* BW LI-Extractor: Store DocNo in BWFI_AEDAT
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(25) zatext26 FOR FIELD PD_AEDAT.
+SELECTION-SCREEN POSITION 36.
+PARAMETERS PD_AEDAT AS CHECKBOX DEFAULT ' ' MODIF ID INC.
+SELECTION-SCREEN END OF LINE.
+
+SELECTION-SCREEN END OF BLOCK E.
+
+* Exceptional derivation
+SELECTION-SCREEN BEGIN OF BLOCK F WITH FRAME  TITLE tf.
+
+* Only derive FA standard way
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(30) zatext21 FOR FIELD PD_STNRD.
+SELECTION-SCREEN POSITION POS_LOW.
+PARAMETERS PD_STNRD RADIOBUTTON GROUP SBS USER-COMMAND SBS DEFAULT 'X'.
+SELECTION-SCREEN END OF LINE.
+
+* Only derive from Substition Flag
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(30) zatext20 FOR FIELD PD_SONLY.
+SELECTION-SCREEN POSITION POS_LOW.
+PARAMETERS PD_SONLY RADIOBUTTON GROUP SBS.
+PARAMETERS PD_SUBST LIKE V_T001Q-SUBST MODIF ID SUB.
+SELECTION-SCREEN END OF LINE.
+
+* Substitute only Constant Functional Area
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(30) zatext22 FOR FIELD PD_CONLY .
+SELECTION-SCREEN POSITION POS_LOW.
+PARAMETERS PD_CONLY RADIOBUTTON GROUP SBS.
+PARAMETERS PC_FKBER LIKE COBL-FKBER MODIF ID CON.
+SELECTION-SCREEN END OF LINE.
+
+SELECTION-SCREEN END OF BLOCK F.
+
+***********************************************************************
+
+
+AT SELECTION-SCREEN.
+  PERFORM CHECK_INPUT.
+  IF ld_infomsg IS INITIAL. "Display Infornation only once
+    IF NOT ( GD_FKBER_SPLITT IS INITIAL ) AND
+       NOT ( GS_FAGL_ACTIVEC-ACTIVE IS INITIAL ).
+      MESSAGE I016(GU) WITH zmtext09." FKBER used for DocSplit
+      ld_infomsg = 'X'.
+    ENDIF.
+  ENDIF.
+
+AT SELECTION-SCREEN OUTPUT.
+  PERFORM SCREEN_OUTPUT.
+
+AT SELECTION-SCREEN ON BLOCK F.
+  IF NOT PD_STNRD IS INITIAL.
+    CLEAR PD_SUBST.
+    CLEAR PC_FKBER.
+  ENDIF.
+  IF NOT PD_SONLY IS INITIAL.
+    CLEAR PC_FKBER.
+  ENDIF.
+  IF NOT PD_CONLY IS INITIAL.
+    CLEAR PD_SUBST.
+  ENDIF.
+
+* Check Substitution entry
+  IF sy-ucomm ne 'SBS'   AND
+     PD_SUBST IS INITIAL AND
+     PD_STNRD IS INITIAL AND
+     PD_CONLY IS INITIAL.
+    SET CURSOR FIELD 'PD_SUBST'.
+    MESSAGE E129(GB).
+  ENDIF.
+  IF sy-ucomm ne 'SBS'       AND
+     NOT PD_SUBST IS INITIAL AND
+     PD_CONLY IS INITIAL     AND
+     PD_STNRD IS INITIAL.
+    REFRESH gt_t001q.
+    SELECT * FROM t001q
+          INTO CORRESPONDING FIELDS OF TABLE gt_t001q
+          WHERE event =  GD_EVENT
+          AND   activ <> space
+          AND   subst = PD_SUBST.
+    IF SY-SUBRC <> 0.
+      SET CURSOR FIELD 'PD_SUBST'.
+      MESSAGE E127(GB) WITH PD_SUBST.
+    ENDIF.
+  ENDIF.
+
+* Functional Area Constant Entry
+  DATA GD_DUMYFKBER LIKE TFKB-FKBER.
+  IF sy-ucomm ne 'SBS'       AND
+     PD_SONLY IS INITIAL     AND
+     PD_STNRD IS INITIAL.
+    REFRESH gt_t001q.
+    SELECT SINGLE FKBER FROM TFKB INTO GD_DUMYFKBER
+          WHERE FKBER = PC_FKBER.
+    IF SY-SUBRC <> 0.
+      GD_DUMYFKBER = PC_FKBER.
+      IF GD_DUMYFKBER IS INITIAL.
+        GD_DUMYFKBER = '''     ''(SPACE)'.
+      ENDIF.
+      SET CURSOR FIELD 'PC_FKBER'.
+      MESSAGE E370(FC) WITH GD_DUMYFKBER.
+    ENDIF.
+  ENDIF.
+
+
+
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR PD_SUBST.
+  REFRESH: gt_fields_lst, gt_t001q, t_dis_fields.
+  SELECT * FROM t001q
+         INTO CORRESPONDING FIELDS OF TABLE gt_t001q
+         WHERE event =  GD_EVENT
+         AND   activ <> space
+         AND   subst <> space.
+  LOOP AT gt_t001q INTO gs_t001q.
+    t_dis_fields-substit = gs_t001q-subst.
+    t_dis_fields-event   = gs_t001q-event.
+    COLLECT t_dis_fields.
+  ENDLOOP.
+
+  CLEAR gt_fields_lst.
+  gt_fields_lst-tabname = 'T001Q'.
+  gt_fields_lst-fieldname = 'SUBST'.
+  gt_fields_lst-selectflag = 'X'.
+  APPEND gt_fields_lst.
+  CLEAR gt_fields_lst.
+  gt_fields_lst-tabname = 'T001Q'.
+  gt_fields_lst-fieldname = 'EVENT'.
+  APPEND gt_fields_lst.
+
+  CALL FUNCTION 'HELP_VALUES_GET_NO_DD_NAME'
+    EXPORTING
+      selectfield = h_selectfield
+      display     = ' '
+      titel       = zatext20
+    IMPORTING
+      ind         = GD_IND
+    TABLES
+      fields      = gt_fields_lst
+      full_table  = t_dis_fields
+    EXCEPTIONS
+      OTHERS      = 1.
+  IF gd_ind NE 0 AND sy-subrc = 0.
+    READ TABLE t_dis_fields INDEX gd_ind.
+    IF SY-SUBRC = 0.
+      PD_SUBST = t_dis_fields-substit.
+    ENDIF.
+  ENDIF.
+
+*=======================================================================
+INITIALIZATION.
+*=======================================================================
+* Program Version of Correction Program
+  z_version = '7.3'.
+* Selection Texts
+  tb = 'Document Selection'.                                "#EC NOTEXT
+  tc = 'Restrictions at Document Header Level'.             "#EC NOTEXT
+  td = 'Extended Restrictions for Line items'.              "#EC NOTEXT
+  te = 'Control Parameters'.                                "#EC NOTEXT
+  tf = 'Exceptional derivation'.                            "#EC NOTEXT
+
+* Parameter Texts
+  zatext01 = 'Company Code'.                                "#EC NOTEXT
+  zatext02 = 'Fiscal Year'.                                 "#EC NOTEXT
+  zatext03 = 'Document Number'.                             "#EC NOTEXT
+  zatext04 = 'Line item'.                                   "#EC NOTEXT
+  zatext05 = 'Document type'.                               "#EC NOTEXT
+  zatext06 = 'Posting period'.                              "#EC NOTEXT
+  zatext07 = 'Business Transaction'.                        "#EC NOTEXT
+  zatext08 = 'Reference procedure'.                         "#EC NOTEXT
+  zatext09 = 'Object key'.                                  "#EC NOTEXT
+  zatext10 = 'G/L Account'.                                 "#EC NOTEXT
+  zatext11 = 'Functional Area'.                             "#EC NOTEXT
+  zatext12 = 'Cost Center'.                                 "#EC NOTEXT
+  zatext13 = 'Order Number'.                                "#EC NOTEXT
+  zatext14 = 'Test Run'.                                    "#EC NOTEXT
+  zatext15 = 'Force correction of NewGL Tables'.            "#EC NOTEXT
+  zatext16 = 'Detail Lists'.                                "#EC NOTEXT
+  zatext17 = 'Display only changed line items'.             "#EC NOTEXT
+  zatext18 = 'Results into INDX cluster table'.             "#EC NOTEXT
+  zatext19 = 'Substitute also if new FA=SPACE'.             "#EC NOTEXT
+  zatext20 = 'Derive only from Substitution'.               "#EC NOTEXT
+  zatext21 = 'Standard Derivation'.                         "#EC NOTEXT
+  zatext22 = 'Constant Functional Area'.                    "#EC NOTEXT
+  zatext23 = 'Update Document Change Log'.                  "#EC NOTEXT
+  zatext24 = 'WBS Element'.                                 "#EC NOTEXT
+  zatext25 = 'Document Status (BSTAT)'.                     "#EC NOTEXT
+  zatext26 = 'BW-Extractor: DocNo in BWFI_AEDAT'.           "#EC NOTEXT
+  zatext27 = 'Switch off K_COBL_CHECK'.                     "#EC NOTEXT
+
+* Message Texts
+  zmtext01 = '$ $ cannot be repaired using this Report'.    "#EC NOTEXT
+  zmtext02 =
+  'Public Sect. active: This program is not suitable for PS accounting'.
+                                                            "#EC NOTEXT
+  zmtext03 = 'Unexpected Line Items: More than 1 Company code: $'.
+                                                            "#EC NOTEXT
+  zmtext04 = 'No entries found in ACCIT FOR DOCUMENT $'.    "#EC NOTEXT
+  zmtext05 = 'DATABASE UPDATE FAILED FOR DOCUMENT $'.       "#EC NOTEXT
+  zmtext06 = 'Doc.Split active in Company Code $'.          "#EC NOTEXT
+  zmtext07 =
+  'Warning: Document Split Active for Functional Area in client $'.
+                                                            "#EC NOTEXT
+  zmtext08 =
+*'BW Delta Upload for Ledger $ - After correction process full upload.'.
+*                                                           "#EC NOTEXT
+  zmtext08 =
+ 'Attention: BW active. Ledger $, Data Source $.'.
+                                                            "#EC NOTEXT
+
+  zmtext10 =
+ 'No controlling area assigned to company code $. Check Note 740519 [5]'.
+                                                            "#EC NOTEXT
+  zmtext11 =
+ 'CO Real Time Integration documents involved. See note 740519 [6]'.
+                                                            "#EC NOTEXT
+* Texts for List Output
+  zotext01 = '*** Entry-View (BSEG) ***'.                   "#EC NOTEXT
+  zotext02 = '*** NewGL View ***'.                          "#EC NOTEXT
+  zotext03 = 'Program'.                                     "#EC NOTEXT
+  zotext04 = 'Processing Type'.                             "#EC NOTEXT
+  zotext05 = 'Update Run'.                                  "#EC NOTEXT
+  zotext06 = 'Test-Run'.                                    "#EC NOTEXT
+  zotext07 = 'Number of Messages'.                          "#EC NOTEXT
+  zotext08 = 'No. of processed documents'.                  "#EC NOTEXT
+  zotext09 = 'No. of processed line items'.                 "#EC NOTEXT
+  zotext10 = '(Only changed line items displayed)'.         "#EC NOTEXT
+  zotext11 = 'Number of changed line items'.                "#EC NOTEXT
+  zotext12 = 'Start Date'.                                  "#EC NOTEXT
+  zotext13 = 'Start Time'.                                  "#EC NOTEXT
+  zotext14 = 'Results in INDX-Cluster Key'.                 "#EC NOTEXT
+  zotext15 = '*** Messages ***'.                            "#EC NOTEXT
+  zotext16 = 'Origin FA'.                                   "#EC NOTEXT
+  zotext17 = 'Origin Funct. Area'.                          "#EC NOTEXT
+  zotext18 = 'Origin of New Functional Area'.               "#EC NOTEXT
+  zotext19 = 'Bal.Sheet Acct'.                              "#EC NOTEXT
+  zotext20 = 'Account/HKONT '.                              "#EC NOTEXT
+  zotext21 = 'CO Object'.                                   "#EC NOTEXT
+  zotext22 = 'Substitution 6'.                              "#EC NOTEXT
+  zotext23 = 'Substitution 5'.                              "#EC NOTEXT
+  zotext24 = '*No Derivation*'.                             "#EC NOTEXT
+  zotext25 = 'Derivation Type'.                             "#EC NOTEXT
+  zotext26 =  'Constant FA'.                                "#EC NOTEXT
+
+* Begin: Restrictions for WBS element: Only single Values
+  CLEAR gh_opt.
+  gh_opt-name       = 'OL_PR_PROJK'.
+  gh_opt-options-eq = 'X'.  "Allow only single values
+  APPEND gh_opt TO gh_restrict-opt_list_tab.
+
+*# Zuordnung zu den Selektionsfeldern
+  CLEAR gh_ass.
+  MOVE: 'S'         TO gh_ass-kind,
+        'PR_PROJK'     TO gh_ass-name,
+        'I'         TO gh_ass-sg_main,
+        'OL_PR_PROJK'  TO gh_ass-op_main.
+  APPEND gh_ass TO gh_restrict-ass_tab.
+
+*# Restriktionen aktivieren
+  CALL FUNCTION 'SELECT_OPTIONS_RESTRICT'
+    EXPORTING
+      restriction            = gh_restrict
+    EXCEPTIONS
+      too_late               = 1
+      repeated               = 2
+      selopt_without_options = 3
+      selopt_without_signs   = 4
+      invalid_sign           = 5
+      empty_option_list      = 6
+      invalid_kind           = 7
+      repeated_kind_a        = 8
+      OTHERS                 = 9.
+* End: Restrictions for WBS element: Only single Values
+
+* Get NewGL Customizing Settings
+  PERFORM CHECK_GL_SETTINGS.
+
+
+*=======================================================================
+START-OF-SELECTION.
+*=======================================================================
+
+* Initialize fields:
+  CLEAR: GD_NEW_FAREA, GD_FLAG_ERROR_RECORD, GD_COUNTER_PROCESSED,
+         GD_COUNTER_CHANGED, GD_COUNTER_MSG_ALL, GD_COUNTER_FI_DOCS,
+         GD_MAX_SEVERITY_REC, GD_REC_CORRECTED, GD_LINES_ITAB.
+
+* Initialize Message Queue:
+  CALL FUNCTION 'MESSAGES_INITIALIZE'.
+
+*** local update task
+  SET UPDATE TASK LOCAL.
+***
+
+* Record Start Time and Date
+  GD_START_DATE = SY-DATLO.
+  GD_START_TIME = SY-TIMLO.
+
+* Check if public sector derivation logic for functional area
+* is active; if yes, then do not derive it in thid program,
+* since public sector programs will derive it:
+
+  IF ( gs_subkey_active-f_ps_function = abap_true ).
+    PD_TESTR = 'X'.
+    PERFORM CREATE_INFO_MESSAGE
+                USING 'E'
+                      zmtext02 "Public Sector is active
+                      SPACE
+                      SPACE
+                      SPACE
+                      SPACE.
+  ENDIF.
+
+
+* Update History
+  PERFORM update_T800HIST.
+
+* CHECK BW extractors & Document Split based Company Codes
+  PERFORM CHECK_BASICS.
+
+* Derivation only by Substitution ?
+  IF NOT PD_STNRD IS INITIAL.
+    CLEAR PD_SUBST.
+  ENDIF.
+
+
+* Select the documents keys into internal table GT_SEL_DOCS
+  SELECT * FROM BKPF INTO CORRESPONDING FIELDS OF TABLE GT_SEL_DOCS
+         WHERE  BUKRS IN  PR_BUKRS
+         AND    GJAHR IN  PR_GJAHR
+         AND    BELNR IN  PR_BELNR
+         AND    BLART IN  PR_BLART
+         AND    MONAT IN  PR_MONAT
+         AND    GLVOR IN  PR_ACTIV
+         AND    AWTYP IN  PR_AWTYP
+         AND    AWKEY IN  PR_AWKEY
+         AND    BSTAT IN  PR_BSTAT
+         ORDER BY PRIMARY KEY.
+
+
+* Process each document
+  LOOP AT GT_SEL_DOCS INTO GS_SEL_DOCS.
+    REFRESH: GT_BKPF_ALL, GT_BSEG.
+    CLEAR:   GT_BKPF_ALL, GT_BSEG.
+
+    REFRESH: GT_NEWGL_BSEG.
+    CLEAR: GT_NEWGL_BSEG.
+    CLEAR: GD_LINES_ITAB.
+    SELECT SINGLE * FROM BKPF INTO GS_BKPF
+                    WHERE BUKRS = GS_SEL_DOCS-BUKRS
+                      AND BELNR = GS_SEL_DOCS-BELNR
+                      AND GJAHR = GS_SEL_DOCS-GJAHR.
+
+* Check if CO document from Real Time Integration
+    IF GS_BKPF-GLVOR eq 'COFI'.
+      PERFORM CREATE_INFO_MESSAGE
+                  USING 'W'
+                        zmtext11 "CO Document involved
+                        GS_BKPF-BELNR
+                        GS_BKPF-BUKRS
+                        SPACE
+                        SPACE.
+    ENDIF.
+
+
+    REFRESH: GT_BSEG, GT_BSEG_ADD.
+
+* Check for ledger specific documents
+    IF GS_BKPF-BSTAT eq 'L'.
+*     Ledger specific posting without leading ledger
+      SELECT * FROM BSEG_ADD
+               INTO  TABLE GT_BSEG_ADD
+               WHERE  BUKRS = GS_BKPF-BUKRS
+               AND    GJAHR = GS_BKPF-GJAHR
+               AND    BELNR = GS_BKPF-BELNR
+               AND    BUZEI IN  PR_BUZEI.
+      IF SY-SUBRC = 0.
+        PERFORM PROCESS_BSEG_ADD.
+      ENDIF.
+    ELSE.
+*     Leading Ledger involved
+      SELECT * FROM BSEG
+               INTO  TABLE GT_BSEG
+               WHERE  BUKRS = GS_BKPF-BUKRS
+               AND    GJAHR = GS_BKPF-GJAHR
+               AND    BELNR = GS_BKPF-BELNR
+               AND    BUZEI IN PR_BUZEI.
+      IF SY-SUBRC = 0.
+        PERFORM PROCESS_BSEG.
+      ENDIF.
+    ENDIF.
+
+*   Update NewGL ?
+    IF NOT PD_FRCGL IS INITIAL "Correction of NewGL Tables
+       AND PD_TESTR IS INITIAL."Test Run = OFF
+      flg_update = 1.
+    ENDIF.
+
+*    Select NewGL Data                                       *
+    PERFORM SELECT_FLEXA.
+
+    IF PD_TESTR NE 'X' and flg_update = 1.
+*     Adjust NewGL Documents and Totals
+      PERFORM ADJUST_FAGL.
+      COMMIT WORK.
+    ENDIF.
+
+*   execute database commit every 50 documents:
+    ADD 1 TO GD_COUNTER_FI_DOCS.
+  ENDLOOP.
+  CALL FUNCTION 'DB_COMMIT'.
+
+*=======================================================================
+END-OF-SELECTION.
+*=======================================================================
+
+  IF ( SY-BATCH = 'X' ).
+*   make sure that messages are written into job log:
+    CALL FUNCTION 'MESSAGES_SHOW'
+      EXCEPTIONS
+        NO_MESSAGES = 0.
+  ENDIF.
+
+* display final list:
+
+
+*   display messages
+  PERFORM DISPLAY_FINAL_LIST_0.
+
+  IF ( PD_LIST1 = 'X' ).
+*  display final list: entry view
+    PERFORM DISPLAY_FINAL_LIST_2
+            TABLES  GT_FINAL_LIST
+            USING   PD_TESTR.
+
+*   display final list: NewGL view
+    PERFORM DISPLAY_FINAL_LIST_4.
+
+* List Display
+    CALL FUNCTION 'REUSE_ALV_BLOCK_LIST_DISPLAY'
+      EXPORTING
+        IS_PRINT = GT_PRINT.
+  ELSE.
+*   write only a header:
+    CALL FUNCTION 'REUSE_ALV_BLOCK_LIST_DISPLAY'
+      EXPORTING
+        IS_PRINT = GT_PRINT.
+  ENDIF.
+
+
+*=======================================================================
+* forms:
+*=======================================================================
+*&---------------------------------------------------------------------*
+*&      Form  BSEG_TO_ACCIT_TRANSFORM
+*&---------------------------------------------------------------------*
+FORM BSEG_TO_ACCIT_TRANSFORM
+     TABLES   ET_ACCHD_TEMP  STRUCTURE  ACCHD
+              ET_ACCIT_TEMP  STRUCTURE  ACCIT
+              ET_ACCCR_TEMP  STRUCTURE  ACCCR
+     USING    IS_BKPF        LIKE       BKPF
+              IS_BSEG        LIKE       BSEG
+     CHANGING ED_SUBRC       LIKE       SY-SUBRC.
+
+  FIELD-SYMBOLS:
+  <LS_ACCIT>  TYPE  ACCIT.
+
+  DATA:
+  LT_BKPF_TEMP    LIKE  BKPF  OCCURS 0 WITH HEADER LINE,
+  LT_BSEG_TEMP    LIKE  BSEG  OCCURS 0 WITH HEADER LINE,
+  LS_AUFKV        LIKE  AUFKV.
+
+  REFRESH: ET_ACCHD_TEMP, ET_ACCIT_TEMP.
+  CLEAR:   ET_ACCHD_TEMP, ET_ACCIT_TEMP.
+
+  CLEAR ED_SUBRC.
+
+  APPEND:  IS_BKPF  TO  LT_BKPF_TEMP,
+           IS_BSEG  TO  LT_BSEG_TEMP.
+
+  CALL FUNCTION 'FI_DOC_TO_ACC_TRANSFORM'
+    TABLES
+      T_BKPF        = LT_BKPF_TEMP
+      T_BSEG        = LT_BSEG_TEMP
+      T_ACCHD       = ET_ACCHD_TEMP
+      T_ACCIT       = ET_ACCIT_TEMP
+      T_ACCCR       = ET_ACCCR_TEMP
+    EXCEPTIONS
+      ERROR_MESSAGE = 1
+      OTHERS        = 2.
+
+  IF ( SY-SUBRC <> 0 ).
+*   error during transforming BSEG/BKPF into  ACCIT/ACCHD:
+    CALL FUNCTION 'MESSAGE_STORE'
+      EXPORTING
+        MSGTY = SYST-MSGTY
+        TXTNR = SYST-MSGNO
+        ARBGB = SYST-MSGID
+        MSGV1 = SYST-MSGV1
+        MSGV2 = SYST-MSGV2
+        MSGV3 = SYST-MSGV3
+        MSGV4 = SYST-MSGV4.
+    ED_SUBRC = 1.
+    EXIT.
+  ENDIF.      "sy-subrc <> 0
+
+  IF ( NOT  IS_BSEG-AUFNR  IS  INITIAL ).
+*   order assigned: fill also field ACCIT-AUTYP which is not
+*   filled by the above function module:
+    CALL FUNCTION 'K_ORDER_READ'
+      EXPORTING
+        AUFNR         = IS_BSEG-AUFNR
+      IMPORTING
+        I_AUFKV       = LS_AUFKV
+      EXCEPTIONS
+        ERROR_MESSAGE = 1
+        OTHERS        = 2.
+    IF ( SY-SUBRC <> 0 ).
+      CALL FUNCTION 'MESSAGE_STORE'
+        EXPORTING
+          MSGTY = SYST-MSGTY
+          TXTNR = SYST-MSGNO
+          ARBGB = SYST-MSGID
+          MSGV1 = SYST-MSGV1
+          MSGV2 = SYST-MSGV2
+          MSGV3 = SYST-MSGV3
+          MSGV4 = SYST-MSGV4.
+      ED_SUBRC = 1.
+    ELSE.
+*     fill autyp:
+      READ TABLE ET_ACCIT_TEMP  INDEX 1  ASSIGNING  <LS_ACCIT>.
+      IF ( SY-SUBRC = 0 ).
+        <LS_ACCIT>-AUTYP = LS_AUFKV-AUTYP.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    "BSEG_TO_ACCIT_TRANSFORM
+*&---------------------------------------------------------------------*
+*&      Form  FILL_MSG_IDENTIFIER
+*&---------------------------------------------------------------------*
+FORM FILL_MSG_IDENTIFIER
+     USING     ID_COMP_CODE  LIKE  BSEG-BUKRS
+               ID_DOCNR      LIKE  BSEG-BELNR
+               ID_BUZEI      LIKE  BSEG-BUZEI
+               ID_YEAR       LIKE  BSEG-GJAHR
+     CHANGING  ED_MSG_IDENT  TYPE  CHAR22.
+
+  CLEAR ED_MSG_IDENT.
+  CONCATENATE ID_COMP_CODE ID_DOCNR ID_BUZEI ID_YEAR
+                 INTO ED_MSG_IDENT.
+
+ENDFORM.                    "FILL_MSG_IDENTIFIER
+*&---------------------------------------------------------------------*
+*&      Form  FILL_FINAL_LIST
+*&---------------------------------------------------------------------*
+FORM FILL_FINAL_LIST
+     TABLES   CT_FINAL_LIST  STRUCTURE  COS_BSEG_FKBER_CHANGE
+     USING    IS_BSEG        LIKE       BSEG
+              IS_BKPF        LIKE       BKPF
+              ID_OLD_FAREA   LIKE       BSEG-FKBER_LONG
+              ID_NEW_FAREA   LIKE       BSEG-FKBER_LONG
+              ID_FLAG_ERROR  LIKE       BOOLE-BOOLE
+              ID_MSG_IDENT   TYPE       CHAR22
+              ID_ORIGIN      TYPE       CHAR15.
+
+  DATA:
+  LS_FINAL_LIST  LIKE  GT_FINAL_LIST,
+  LD_COUNT       LIKE  SY-TABIX.
+
+  CLEAR LS_FINAL_LIST-FLAG_MSG.
+  MOVE-CORRESPONDING  IS_BKPF  TO  LS_FINAL_LIST.
+  MOVE-CORRESPONDING  IS_BSEG  TO  LS_FINAL_LIST.
+  LS_FINAL_LIST-FKBER_OLD  = ID_OLD_FAREA.
+  LS_FINAL_LIST-FKBER_NEW  = ID_NEW_FAREA.
+  LS_FINAL_LIST-ORIGIN     = ID_ORIGIN.
+
+
+* check if there are messages:
+  CALL FUNCTION 'MESSAGES_COUNT'
+    EXPORTING
+      LINE_FROM     = ID_MSG_IDENT
+      LINE_TO       = ID_MSG_IDENT
+    IMPORTING
+      COUNT         = LD_COUNT
+    EXCEPTIONS
+      ERROR_MESSAGE = 0
+      OTHERS        = 0.
+
+  IF ( LD_COUNT > 0 ).
+    LS_FINAL_LIST-FLAG_MSG = 'X'.
+  ENDIF.
+
+  APPEND  LS_FINAL_LIST  TO  CT_FINAL_LIST.
+
+ENDFORM.                    "FILL_FINAL_LIST
+
+*&---------------------------------------------------------------------*
+*&      Form  DISPLAY_FINAL_LIST_0
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM DISPLAY_FINAL_LIST_0.
+
+  DATA:
+   LT_FIELDCAT     TYPE SLIS_FIELDCAT_ALV OCCURS 0 WITH HEADER LINE,
+   LS_ALV_COMMANDS TYPE SLIS_EVENT_EXIT,
+   LT_ALV_COMMANDS TYPE SLIS_T_EVENT_EXIT,
+   LS_ALV_EVENTS   TYPE SLIS_ALV_EVENT,
+   LT_ALV_EVENTS   TYPE SLIS_T_EVENT,
+   LS_LAYOUT       TYPE SLIS_LAYOUT_ALV,
+   LS_VARIANT      LIKE DISVARIANT,
+   LD_REPID        LIKE SY-REPID,
+   LD_LINES        LIKE SY-TABIX.
+
+  DATA:  LT_MESG         TYPE  TSMESG,
+         LS_MESG         TYPE LINE OF TSMESG.
+
+  CALL FUNCTION 'MESSAGES_GIVE'
+    TABLES
+      T_MESG = LT_MESG.
+
+  REFRESH GT_MSGOUTPUT.
+  LD_REPID = SY-REPID.
+
+  LOOP AT LT_MESG INTO LS_MESG.
+    CASE LS_MESG-MSGTY.
+      WHEN 'E'.
+        GT_MSGOUTPUT-RATING = '1'. "Red Light
+      WHEN 'W'.
+        GT_MSGOUTPUT-RATING = '2'. "Yellow Light
+      WHEN OTHERS.
+        GT_MSGOUTPUT-RATING = '3'. "Green Light
+    ENDCASE.
+    GT_MSGOUTPUT-TEXT = LS_MESG-TEXT.
+    COLLECT GT_MSGOUTPUT.
+  ENDLOOP.
+  DESCRIBE TABLE GT_MSGOUTPUT LINES ld_lines.
+
+  IF ld_lines < 1.
+    GT_MSGOUTPUT-RATING = '3'. "Green Light
+    IF GD_COUNTER_FI_DOCS = 0.
+      GT_MSGOUTPUT-TEXT = 'No documents selected'.          "#EC NOTEXT
+    ELSE.
+      GT_MSGOUTPUT-TEXT = 'Data processed without errors'.  "#EC NOTEXT
+    ENDIF.
+    APPEND GT_MSGOUTPUT.
+  ENDIF.
+
+  LS_LAYOUT-F2CODE = 'CHOOSE'.
+  LS_LAYOUT-LIGHTS_FIELDNAME  = 'RATING'.
+  LS_LAYOUT-INFO_FIELDNAME    = 'LISTINFO'.
+
+  LS_ALV_EVENTS-NAME = 'TOP_OF_LIST'.
+  LS_ALV_EVENTS-FORM = 'ALV_TOP_OF_LIST0'.
+  APPEND LS_ALV_EVENTS TO LT_ALV_EVENTS.
+
+
+  PERFORM PROVIDE_FIELDINFO USING 'TEXT'
+                                  'T100'
+                                  '1'
+                         CHANGING LT_FIELDCAT.
+  APPEND LT_FIELDCAT.
+
+  PERFORM PROVIDE_FIELDINFO USING 'RATING'
+                                  'HRT1048'
+                                  '2'
+                         CHANGING LT_FIELDCAT.
+  APPEND LT_FIELDCAT.
+
+* Initialize ALV Output
+  CALL FUNCTION 'REUSE_ALV_BLOCK_LIST_INIT'
+    EXPORTING
+      I_CALLBACK_PROGRAM      = ld_repid
+      I_CALLBACK_USER_COMMAND = 'USER_COMMAND_DSP'.
+
+
+** now show the final list with posted records
+  CALL FUNCTION 'REUSE_ALV_BLOCK_LIST_APPEND'
+    EXPORTING
+      IS_LAYOUT                  = LS_LAYOUT
+      IT_FIELDCAT                = LT_FIELDCAT[]
+      I_TABNAME                  = 'GT_MSGOUTPUT'
+      IT_EVENTS                  = LT_ALV_EVENTS
+    TABLES
+      T_OUTTAB                   = GT_MSGOUTPUT[]
+    EXCEPTIONS
+      PROGRAM_ERROR              = 1
+      MAXIMUM_OF_APPENDS_REACHED = 2
+      OTHERS                     = 3.
+  IF SY-SUBRC <> 0.
+    MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+         WITH  SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+  ENDIF.
+ENDFORM.                    "DISPLAY_FINAL_LIST_0
+
+
+*&---------------------------------------------------------------------*
+*&      Form  DISPLAY_FINAL_LIST_2
+*&---------------------------------------------------------------------*
+FORM DISPLAY_FINAL_LIST_2
+     TABLES   IT_FINAL_LIST   STRUCTURE  COS_BSEG_FKBER_CHANGE
+     USING    ID_PD_TESTR     LIKE       BOOLE-BOOLE.
+
+  DATA:
+  LT_FIELDCAT     TYPE SLIS_FIELDCAT_ALV OCCURS 0 WITH HEADER LINE,
+  LS_ALV_COMMANDS TYPE SLIS_EVENT_EXIT,
+  LT_ALV_COMMANDS TYPE SLIS_T_EVENT_EXIT,
+  LS_ALV_EVENTS   TYPE SLIS_ALV_EVENT,
+  LT_ALV_EVENTS   TYPE SLIS_T_EVENT,
+  LS_LAYOUT       TYPE SLIS_LAYOUT_ALV,
+  LS_VARIANT      LIKE DISVARIANT,
+  LD_REPID        LIKE SY-REPID,
+  LT_MESG         TYPE  TSMESG,
+  LS_MESG         TYPE LINE OF TSMESG.
+
+  LD_REPID        = SY-REPID.
+* Fill table for events, that will be processed in this FM:
+* The header of the alv list is writen in the form 'ALV_TOP_OF_LIST1'
+  LS_ALV_EVENTS-NAME = 'TOP_OF_LIST'.
+  LS_ALV_EVENTS-FORM = 'ALV_TOP_OF_LIST1'.
+  APPEND LS_ALV_EVENTS TO LT_ALV_EVENTS.
+
+  LS_ALV_EVENTS-NAME = 'USER_COMMAND'.
+  LS_ALV_EVENTS-FORM = 'USER_COMMAND_DSP'.
+  APPEND LS_ALV_EVENTS TO LT_ALV_EVENTS.
+
+  LS_ALV_EVENTS-NAME = 'CALLER_EXIT'.
+  LS_ALV_EVENTS-FORM = 'USER_COMMAND_DSP'.
+  APPEND LS_ALV_EVENTS TO LT_ALV_EVENTS.
+
+  LS_LAYOUT-F2CODE = 'CHOOSE'.
+
+* Fill fieldcatalog from ddic strucure cofi_iccf_alv
+* This catalog (itab) contains information on the fields to write
+* on the list.
+  CALL FUNCTION 'REUSE_ALV_FIELDCATALOG_MERGE'
+    EXPORTING
+      I_STRUCTURE_NAME       = 'COS_BSEG_FKBER_CHANGE'
+    CHANGING
+      CT_FIELDCAT            = LT_FIELDCAT[]
+    EXCEPTIONS
+      INCONSISTENT_INTERFACE = 1
+      PROGRAM_ERROR          = 2
+      OTHERS                 = 3.
+  IF SY-SUBRC <> 0.
+    MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+            WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+  ENDIF.
+
+  PERFORM PROVIDE_FIELDINFO USING 'BSTAT'
+                                  'BKPF'
+                                  '9'
+                         CHANGING LT_FIELDCAT.
+  APPEND LT_FIELDCAT.
+
+
+  PERFORM PROVIDE_FIELDINFO USING 'RLDNR'
+                                  'BKPF'
+                                  '9'
+                         CHANGING LT_FIELDCAT.
+  APPEND LT_FIELDCAT.
+
+  PERFORM PROVIDE_FIELDINFO USING 'LDGRP'
+                                  'BKPF'
+                                  '10'
+                         CHANGING LT_FIELDCAT.
+  APPEND LT_FIELDCAT.
+
+  PERFORM PROVIDE_FIELDINFO USING 'ORIGIN'
+                                  'CLS_CHARACT'
+                                  '11'
+                         CHANGING LT_FIELDCAT.
+  APPEND LT_FIELDCAT.
+
+
+  SORT  GT_FINAL_LIST  BY  BUKRS  GJAHR BELNR  BUZEI.
+
+  PERFORM MODIFY_FIELDCAT_FINAL1
+          TABLES LT_FIELDCAT
+                 GT_FINAL_LIST.
+
+* Display only changed positions:
+  IF NOT PD_ONLYC  IS INITIAL.
+    LOOP AT GT_FINAL_LIST.
+      IF  GT_FINAL_LIST-FKBER_OLD eq GT_FINAL_LIST-FKBER_NEW
+      AND GT_FINAL_LIST-FLAG_MSG IS INITIAL.
+        DELETE GT_FINAL_LIST.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+
+  CALL FUNCTION 'REUSE_ALV_BLOCK_LIST_APPEND'
+    EXPORTING
+      IS_LAYOUT                  = LS_LAYOUT
+      IT_FIELDCAT                = LT_FIELDCAT[]
+      I_TABNAME                  = 'GT_FINAL_LIST'
+      IT_EVENTS                  = LT_ALV_EVENTS
+    TABLES
+      T_OUTTAB                   = GT_FINAL_LIST
+    EXCEPTIONS
+      PROGRAM_ERROR              = 1
+      MAXIMUM_OF_APPENDS_REACHED = 2
+      OTHERS                     = 3.
+  IF SY-SUBRC <> 0.
+    MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+         WITH  SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+  ENDIF.
+
+
+ENDFORM.                    "DISPLAY_FINAL_LIST_2
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  DISPLAY_FINAL_LIST_4
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM DISPLAY_FINAL_LIST_4.
+
+  DATA:
+  LT_FIELDCAT     TYPE SLIS_FIELDCAT_ALV OCCURS 0 WITH HEADER LINE,
+  LS_ALV_COMMANDS TYPE SLIS_EVENT_EXIT,
+  LT_ALV_COMMANDS TYPE SLIS_T_EVENT_EXIT,
+  LS_ALV_EVENTS   TYPE SLIS_ALV_EVENT,
+  LT_ALV_EVENTS   TYPE SLIS_T_EVENT,
+  LS_LAYOUT       TYPE SLIS_LAYOUT_ALV,
+  LS_VARIANT      LIKE DISVARIANT,
+  LD_REPID        LIKE SY-REPID,
+  LT_MESG         TYPE  TSMESG,
+  LS_MESG         TYPE LINE OF TSMESG,
+  LD_TABNAME      TYPE slis_tabname.
+
+  LD_REPID        = SY-REPID.
+* Fill table for events, that will be processed in this FM:
+* The header of the alv list is writen in the form 'ALV_TOP_OF_LIST1'
+  LS_ALV_EVENTS-NAME = 'TOP_OF_LIST'.
+  LS_ALV_EVENTS-FORM = 'ALV_TOP_OF_LIST2'.
+  APPEND LS_ALV_EVENTS TO LT_ALV_EVENTS.
+
+  LS_LAYOUT-F2CODE = 'CHOOSE'.
+
+* Fill fieldcatalog from ddic strucure cofi_iccf_alv
+* This catalog (itab) contains information on the fields to write
+* on the list.
+  ld_tabname = 'GT_NEWGL_OUTPUT'.
+
+  CALL FUNCTION 'REUSE_ALV_FIELDCATALOG_MERGE'
+    EXPORTING
+      I_STRUCTURE_NAME       = 'COS_BSEG_FKBER_CHANGE'
+    CHANGING
+      CT_FIELDCAT            = LT_FIELDCAT[]
+    EXCEPTIONS
+      INCONSISTENT_INTERFACE = 1
+      PROGRAM_ERROR          = 2
+      OTHERS                 = 3.
+
+  IF SY-SUBRC <> 0.
+    MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+            WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+  ENDIF.
+
+
+  PERFORM PROVIDE_FIELDINFO USING 'RLDNR'
+                                  'BKPF'
+                                  '9'
+                         CHANGING LT_FIELDCAT.
+  APPEND LT_FIELDCAT.
+
+  PERFORM PROVIDE_FIELDINFO USING 'RYEAR'
+                                  'GLU1'
+                                  '10'
+                         CHANGING LT_FIELDCAT.
+  APPEND LT_FIELDCAT.
+
+  PERFORM PROVIDE_FIELDINFO USING 'RACCT'
+                                  'GLU1'
+                                  '11'
+                         CHANGING LT_FIELDCAT.
+  APPEND LT_FIELDCAT.
+
+  PERFORM PROVIDE_FIELDINFO USING 'DOCNR'
+                                  'GLU1'
+                                  '11'
+                         CHANGING LT_FIELDCAT.
+  APPEND LT_FIELDCAT.
+
+  PERFORM PROVIDE_FIELDINFO USING 'DOCLN'
+                                  'GLU1'
+                                  '12'
+                         CHANGING LT_FIELDCAT.
+  APPEND LT_FIELDCAT.
+
+  PERFORM PROVIDE_FIELDINFO USING 'RBUKRS'
+                                  'GLU1'
+                                  '13'
+                         CHANGING LT_FIELDCAT.
+  APPEND LT_FIELDCAT.
+
+
+
+  PERFORM MODIFY_FIELDCAT_FINAL2
+        TABLES LT_FIELDCAT
+               GT_FINAL_LIST.
+
+* Display only changed positions:
+  IF NOT PD_ONLYC  IS INITIAL.
+    LOOP AT GT_NEWGL_OUTPUT.
+      IF  GT_NEWGL_OUTPUT-FKBER_OLD eq GT_NEWGL_OUTPUT-FKBER_NEW.
+        DELETE GT_NEWGL_OUTPUT.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+
+
+** now show the final list with posted records
+  CALL FUNCTION 'REUSE_ALV_BLOCK_LIST_APPEND'
+    EXPORTING
+      IS_LAYOUT                  = LS_LAYOUT
+      IT_FIELDCAT                = LT_FIELDCAT[]
+      I_TABNAME                  = ld_tabname
+      IT_EVENTS                  = LT_ALV_EVENTS
+    TABLES
+      T_OUTTAB                   = GT_NEWGL_OUTPUT[]
+    EXCEPTIONS
+      PROGRAM_ERROR              = 1
+      MAXIMUM_OF_APPENDS_REACHED = 2
+      OTHERS                     = 3.
+  IF SY-SUBRC <> 0.
+    MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+         WITH  SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+  ENDIF.
+
+ENDFORM.                    "DISPLAY_FINAL_LIST_4
+
+
+*&---------------------------------------------------------------------*
+*&      Form  MODIFY_FIELDCAT_FINAL1
+*&---------------------------------------------------------------------*
+FORM MODIFY_FIELDCAT_FINAL1
+     TABLES CT_FIELDCAT       TYPE       SLIS_T_FIELDCAT_ALV
+            IT_FINAL_LIST     STRUCTURE  COS_BSEG_FKBER_CHANGE.
+
+  FIELD-SYMBOLS:
+  <LS_FIELDCAT>  TYPE  LINE OF SLIS_T_FIELDCAT_ALV.
+
+  LOOP AT  CT_FIELDCAT  ASSIGNING  <LS_FIELDCAT>.
+
+    CASE <LS_FIELDCAT>-FIELDNAME.
+      WHEN 'BSTAT'.     <LS_FIELDCAT>-COL_POS = 1.
+      WHEN 'BUKRS'.     <LS_FIELDCAT>-COL_POS = 2.
+      WHEN 'BELNR'.
+        <LS_FIELDCAT>-COL_POS = 3.
+        <LS_FIELDCAT>-HOTSPOT = 'X'.
+      WHEN 'GJAHR'.     <LS_FIELDCAT>-COL_POS = 4.
+      WHEN 'BUZEI'.     <LS_FIELDCAT>-COL_POS = 5.
+      WHEN 'FKBER_OLD'. <LS_FIELDCAT>-COL_POS = 6.
+      WHEN 'FKBER_NEW'. <LS_FIELDCAT>-COL_POS = 7.
+      WHEN 'ORIGIN'.
+        <LS_FIELDCAT>-COL_POS = 8.
+        <LS_FIELDCAT>-OUTPUTLEN = 15.
+        <LS_FIELDCAT>-SELTEXT_S = zotext16. "Origin Functional Area
+        <LS_FIELDCAT>-SELTEXT_M = zotext17. "Origin Functional Area
+        <LS_FIELDCAT>-SELTEXT_L = zotext18. "Origin Functional Area
+        CLEAR <LS_FIELDCAT>-REF_FIELDNAME.
+        CLEAR <LS_FIELDCAT>-REF_TABNAME.
+      WHEN 'LDGRP'.     <LS_FIELDCAT>-COL_POS = 9.
+      WHEN 'RLDNR'.     <LS_FIELDCAT>-COL_POS = 10.
+      WHEN 'FLAG_MSG'.
+        <LS_FIELDCAT>-COL_POS = 11.
+        <LS_FIELDCAT>-HOTSPOT = 'X'.
+        <LS_FIELDCAT>-OUTPUTLEN = 10.
+      WHEN OTHERS. DELETE CT_FIELDCAT.
+    ENDCASE.
+  ENDLOOP.
+  SORT CT_FIELDCAT BY COL_POS.
+ENDFORM.                    " MODIFY_FIELDCAT_FINAL1
+
+*&---------------------------------------------------------------------*
+*&      Form  MODIFY_FIELDCAT_FINAL2
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->CT_FIELDCAT    text
+*      -->IT_FINAL_LIST  text
+*----------------------------------------------------------------------*
+FORM MODIFY_FIELDCAT_FINAL2
+     TABLES CT_FIELDCAT       TYPE       SLIS_T_FIELDCAT_ALV
+            IT_FINAL_LIST     STRUCTURE  COS_BSEG_FKBER_CHANGE.
+
+  FIELD-SYMBOLS:
+  <LS_FIELDCAT>  TYPE  LINE OF SLIS_T_FIELDCAT_ALV.
+
+  LOOP AT  CT_FIELDCAT  ASSIGNING  <LS_FIELDCAT>.
+
+    CASE <LS_FIELDCAT>-FIELDNAME.
+      WHEN 'RLDNR'. <LS_FIELDCAT>-COL_POS = 1.
+      WHEN 'RBUKRS'. <LS_FIELDCAT>-COL_POS = 2.
+      WHEN 'DOCNR'. <LS_FIELDCAT>-COL_POS = 3.
+      WHEN 'BELNR'.
+        <LS_FIELDCAT>-COL_POS = 4.
+        <LS_FIELDCAT>-NO_OUT = 'X'.
+      WHEN 'RYEAR'. <LS_FIELDCAT>-COL_POS = 5.
+      WHEN 'DOCLN'. <LS_FIELDCAT>-COL_POS = 6.
+      WHEN 'FKBER_OLD'. <LS_FIELDCAT>-COL_POS = 7.
+      WHEN 'FKBER_NEW'. <LS_FIELDCAT>-COL_POS = 8.
+      WHEN OTHERS. DELETE CT_FIELDCAT.
+    ENDCASE.
+
+  ENDLOOP.
+ENDFORM.                    " MODIFY_FIELDCAT_FINAL2
+
+
+*&---------------------------------------------------------------------*
+*&    Form  ALV_COMMANDS_LIST
+*&---------------------------------------------------------------------*
+FORM ALV_COMMANDS_LIST                                      "#EC CALLED
+     USING ID_UCOMM     LIKE  SY-UCOMM
+           IS_SELFIELD  TYPE  SLIS_SELFIELD.
+
+  CASE ID_UCOMM.
+    WHEN 'CHOOSE'.
+*     F2 on any field:
+      CASE  IS_SELFIELD-SEL_TAB_FIELD.
+        WHEN 'GT_FINAL_LIST-FLAG_MSG'.
+*         user clicked on a record of list:
+          READ TABLE GT_FINAL_LIST  INDEX  IS_SELFIELD-TABINDEX.
+          IF ( SY-SUBRC = 0 ).
+            PERFORM FILL_MSG_IDENTIFIER
+                    USING     GT_FINAL_LIST-BUKRS
+                              GT_FINAL_LIST-BELNR
+                              GT_FINAL_LIST-BUZEI
+                              GT_FINAL_LIST-GJAHR
+                    CHANGING  GD_ZEILE.
+*           display messages for this record:
+            CALL FUNCTION 'MESSAGES_SHOW'
+              EXPORTING
+                LINE_FROM = GD_ZEILE
+                LINE_TO   = GD_ZEILE.
+          ENDIF.
+        WHEN 'GD_COUNTER_MSG_ALL'.
+*         display messages:
+          CALL FUNCTION 'MESSAGES_SHOW'.
+        WHEN 'GT_FINAL_LIST-BELNR'.
+*         display FI document:
+          READ TABLE GT_FINAL_LIST  INDEX  IS_SELFIELD-TABINDEX.
+          IF ( SY-SUBRC = 0 ).
+            SET PARAMETER ID 'BLN' FIELD GT_FINAL_LIST-BELNR.
+            SET PARAMETER ID 'BUK' FIELD GT_FINAL_LIST-BUKRS.
+            SET PARAMETER ID 'GJR' FIELD GT_FINAL_LIST-GJAHR.
+            CALL TRANSACTION 'FB03' AND SKIP FIRST SCREEN. "#EC CI_CALLTA
+          ENDIF.
+      ENDCASE.
+    WHEN OTHERS.
+
+  ENDCASE.
+
+ENDFORM.                    "ALV_COMMANDS_LIST
+
+*&---------------------------------------------------------------------*
+*&    Form  ALV_TOP_OF_LIST1: Entry View
+*&---------------------------------------------------------------------*
+FORM ALV_TOP_OF_LIST1.                                      "#EC CALLED
+  SKIP 2.
+  WRITE /2 zotext01. "Entry View
+ENDFORM.                    "ALV_TOP_OF_LIST1
+
+*&---------------------------------------------------------------------*
+*&      Form  ALV_TOP_OF_LIST2
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM ALV_TOP_OF_LIST2.
+
+  SKIP 3.
+  WRITE / zotext02. "NewGL View
+
+ENDFORM.                    "ALV_TOP_OF_LIST2
+
+*&---------------------------------------------------------------------*
+*&      Form  ALV_TOP_OF_LIST0
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM ALV_TOP_OF_LIST0.
+  DATA: LD_LEN TYPE i.
+  DATA  ld_program TYPE CHAR40.
+
+  WRITE: /.
+  WRITE: /3 zotext03.  "Program Name
+  CONCATENATE SY-REPID ' ( ' z_version ')' INTO ld_program.
+  WRITE AT 40  ld_program.
+
+  WRITE: /3 zotext04."Processing Type
+  IF ( PD_TESTR IS INITIAL ).
+    LD_LEN = strlen( zotext05 ).
+    WRITE AT 40(LD_LEN) zotext05 COLOR COL_NORMAL."Update Run
+  ELSE.
+    LD_LEN = strlen( zotext06 ).
+    WRITE AT 40(LD_LEN) zotext06 COLOR COL_NORMAL."Test Run
+  ENDIF.
+
+  WRITE: /3 zotext25. "Derivation Type
+  IF NOT PD_STNRD IS INITIAL.
+    WRITE AT 40 zatext21."Standard Derivation
+  ENDIF.
+  IF NOT PD_SONLY IS INITIAL. "Derivation from Substitution
+    LD_LEN = strlen( zatext20 ).
+    WRITE AT 40(LD_LEN) zatext20.
+    WRITE PD_SUBST.
+  ENDIF.
+  IF NOT PD_CONLY IS INITIAL. "Substitute Constant FA
+    LD_LEN = strlen( zatext20 ).
+    WRITE AT 40(LD_LEN) zatext22.
+    WRITE PD_SUBST.
+  ENDIF.
+
+* check if there are messages:
+  CALL FUNCTION 'MESSAGES_COUNT'
+    IMPORTING
+      COUNT         = GD_COUNTER_MSG_ALL
+    EXCEPTIONS
+      ERROR_MESSAGE = 0
+      OTHERS        = 0.
+
+  WRITE: /3 zotext07."No. of Message
+
+  FORMAT HOTSPOT ON.
+  WRITE AT 40  GD_COUNTER_MSG_ALL LEFT-JUSTIFIED.           "#EC NOTEXT
+  FORMAT HOTSPOT OFF.
+
+  SKIP 1.
+  WRITE: /3 zotext08.
+  WRITE AT 40  GD_COUNTER_FI_DOCS LEFT-JUSTIFIED.           "#EC NOTEXT
+
+  WRITE: /3 zotext09."No. of processed line items
+  WRITE AT 40  GD_COUNTER_PROCESSED LEFT-JUSTIFIED.
+  IF NOT PD_ONLYC IS INITIAL.
+    WRITE zotext10. "Only changed LI displayed
+  ENDIF.
+
+  WRITE: /3 zotext11."Number of changed line items
+  WRITE AT 40  GD_COUNTER_CHANGED LEFT-JUSTIFIED.
+  SKIP 1.
+
+  WRITE: /3 zotext12. "Start Date
+  WRITE AT 40  GD_START_DATE LEFT-JUSTIFIED.
+  WRITE: /3 zotext13. "Start Time
+  WRITE AT 40  GD_START_TIME   LEFT-JUSTIFIED.              "#EC NOTEXT
+  IF PD_STIDX = 'X' AND PD_TESTR IS INITIAL.                "#EC NOTEXT
+    SKIP 1.
+    WRITE: /3 zotext14. "Results in INDX-Cluster Key
+    WRITE AT 40 exp_key LEFT-JUSTIFIED.
+  ENDIF.
+  SKIP 3.
+  WRITE /2 zotext15. "Messages
+
+ENDFORM.                    "ALV_TOP_OF_LIST0
+
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_FLEXA
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM SELECT_FLEXA .
+  DATA ld_index  LIKE SY-TABIX.
+  DATA ld_rldnr1 TYPE RLDNR.
+  DATA ld_bukrs  TYPE BUKRS.
+  DATA ld_oldfkber TYPE FKBER.
+  DATA LT_LEDGERTAB TYPE TTY_LEDGERTAB.
+  DATA LS_LEDGERTAB TYPE TY_LEDGERTAB.
+  DATA LT_BUKRS TYPE TABLE OF BUKRS.
+  DATA LD_LINES TYPE SY-TABIX.
+  DATA: LT_GLDATA_TMP TYPE TABLE OF glu1 WITH HEADER LINE.
+
+
+  CLEAR: GT_NEWGL_OLD,GT_NEWGL_NEW.
+  REFRESH: GT_NEWGL_OLD,GT_NEWGL_NEW.
+
+  LOOP AT GT_NEWGL_BSEG.
+    COLLECT GT_NEWGL_BSEG-BUKRS INTO LT_BUKRS.
+    LD_BUKRS = GT_NEWGL_BSEG-BUKRS.
+  ENDLOOP.
+  DESCRIBE TABLE LT_BUKRS LINES LD_LINES.
+  IF LD_LINES > 1.
+    PERFORM CREATE_INFO_MESSAGE
+                USING 'E'
+                      zmtext03 "Unexpected Company Code
+                      GT_NEWGL_BSEG-BUKRS
+                      SPACE
+                      SPACE
+                      SPACE.
+    CLEAR LD_BUKRS.
+  ENDIF.
+
+*******************************************************************
+**   Get all affected Ledgers                                     *
+*******************************************************************
+  IF LD_LINES = 1.
+    PERFORM GET_LEDGER_FOR_BUKRS
+                USING ld_bukrs
+                      LT_LEDGERTAB.
+  ENDIF.
+
+  LOOP AT GT_NEWGL_BSEG.
+** Loop at Ledgertab
+    LOOP AT LT_LEDGERTAB INTO LS_LEDGERTAB.
+      REFRESH LT_GLDATA_TMP.
+      CLEAR   LT_GLDATA_TMP.
+      SELECT * FROM (LS_LEDGERTAB-TABNAME)
+           INTO CORRESPONDING FIELDS OF TABLE LT_GLDATA_TMP
+              WHERE RLDNR  = LS_LEDGERTAB-RLDNR
+                AND RBUKRS = GT_NEWGL_BSEG-BUKRS
+                AND GJAHR  = GT_NEWGL_BSEG-GJAHR
+                AND BELNR  = GT_NEWGL_BSEG-BELNR
+                AND BUZEI  = GT_NEWGL_BSEG-BUZEI.
+      IF SY-SUBRC = 0.
+        LOOP AT LT_GLDATA_TMP.
+          ld_oldfkber = LT_GLDATA_TMP-RFAREA.
+          APPEND LT_GLDATA_TMP TO GT_NEWGL_OLD.
+          MOVE-CORRESPONDING LT_GLDATA_TMP TO GT_NEWGL_OUTPUT.
+          GT_NEWGL_OUTPUT-FKBER_OLD = ld_oldfkber.
+          GT_NEWGL_OUTPUT-FKBER_NEW = GT_NEWGL_BSEG-NEW_FKBER_LONG.
+          APPEND GT_NEWGL_OUTPUT.
+        ENDLOOP.
+
+        LOOP AT LT_GLDATA_TMP.
+          LT_GLDATA_TMP-RFAREA =  GT_NEWGL_BSEG-NEW_FKBER_LONG.
+          APPEND LT_GLDATA_TMP TO GT_NEWGL_NEW.
+        ENDLOOP.
+
+      ENDIF.
+    ENDLOOP.
+  ENDLOOP.
+
+
+ENDFORM.                    " SELECT_FLEXA
+
+*&---------------------------------------------------------------------*
+*&      Form  ADJUST_FAGL
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM adjust_fagl .
+
+  DATA: ld_index  LIKE SY-TABIX,
+        ld_rldnr1 TYPE RLDNR.
+
+  DATA ld_bukrs  TYPE BUKRS.
+  DATA LT_LEDGERTAB TYPE TTY_LEDGERTAB.
+  DATA LS_LEDGERTAB TYPE TY_LEDGERTAB.
+  DATA LT_BUKRS TYPE TABLE OF BUKRS.
+  DATA LD_LINES TYPE SY-TABIX.
+
+  DATA: x_dele(1) TYPE c.
+  DATA: LT_NEWGL_OLD_UPD TYPE TABLE OF glu1 WITH HEADER LINE.
+  DATA: LT_NEWGL_UPD_TOTALS TYPE TABLE OF glu1 WITH HEADER LINE.
+  DATA: LT_USED LIKE rgiuse OCCURS 0 WITH HEADER LINE.
+  DATA: LT_GLU1_ADD LIKE rgiad2 OCCURS 0 WITH HEADER LINE.
+  DATA: ld_offset LIKE t800a-fldgr,
+        ld_rpmax  LIKE t800a-fldgr.
+
+
+  CHECK PD_TESTR IS INITIAL.
+
+  LOOP AT GT_NEWGL_BSEG.
+    COLLECT GT_NEWGL_BSEG-BUKRS INTO LT_BUKRS.
+    LD_BUKRS = GT_NEWGL_BSEG-BUKRS.
+  ENDLOOP.
+  DESCRIBE TABLE LT_BUKRS LINES LD_LINES.
+  IF LD_LINES > 1.
+    PERFORM CREATE_INFO_MESSAGE
+                USING 'E'
+                      zmtext03 "Unexpected Lines
+                      GT_NEWGL_BSEG-BELNR
+                      SPACE
+                      SPACE
+                      SPACE.
+
+    CLEAR LD_BUKRS.
+  ENDIF.
+
+*******************************************************************
+**   Get all affected Ledgers                                     *
+*******************************************************************
+
+  PERFORM GET_LEDGER_FOR_BUKRS
+            USING ld_bukrs
+                  LT_LEDGERTAB.
+
+*******************************************************************
+**  Step 1: Undo totals for existing items with/without Func Area *
+*******************************************************************
+
+  LOOP AT LT_LEDGERTAB INTO LS_LEDGERTAB.
+    REFRESH LT_NEWGL_OLD_UPD.
+*** build-up items for undoing totals
+    LOOP AT GT_NEWGL_OLD
+      WHERE    rldnr = LS_LEDGERTAB-RLDNR
+        AND x_nocorr = SPACE.
+      CLEAR LT_NEWGL_OLD_UPD.
+      MOVE-CORRESPONDING GT_NEWGL_OLD TO LT_NEWGL_OLD_UPD.
+      LT_NEWGL_OLD_UPD-tsl = LT_NEWGL_OLD_UPD-tsl * -1.
+      LT_NEWGL_OLD_UPD-hsl = LT_NEWGL_OLD_UPD-hsl * -1.
+      LT_NEWGL_OLD_UPD-ksl = LT_NEWGL_OLD_UPD-ksl * -1.
+      LT_NEWGL_OLD_UPD-osl = LT_NEWGL_OLD_UPD-osl * -1.
+      LT_NEWGL_OLD_UPD-wsl = LT_NEWGL_OLD_UPD-wsl * -1.
+      LT_NEWGL_OLD_UPD-msl = LT_NEWGL_OLD_UPD-msl * -1.
+      CLEAR LT_NEWGL_OLD_UPD-timestamp. "Otherwise collect will fail!!
+      APPEND LT_NEWGL_OLD_UPD.
+    ENDLOOP.
+    DESCRIBE TABLE LT_NEWGL_OLD_UPD LINES sy-tfill.
+    IF sy-tfill > 0.
+      CLEAR lt_used. REFRESH lt_used.
+      lt_used-tab = LS_LEDGERTAB-tabname.
+      lt_used-progroup = 'A'.
+      APPEND lt_used.
+
+      REFRESH lt_glu1_add.
+      LOOP AT LT_NEWGL_OLD_UPD.
+        CALL FUNCTION 'G_MAX_PERIOD_AND_OFFSET_GET'
+          EXPORTING
+            period = LT_NEWGL_OLD_UPD-poper
+            table  = LS_LEDGERTAB-tab
+          IMPORTING
+            offset = ld_offset
+            rpmax  = ld_rpmax.
+        MOVE-CORRESPONDING LT_NEWGL_OLD_UPD TO lt_glu1_add.
+        lt_glu1_add-rpmax = ld_rpmax.
+        lt_glu1_add-buchkreis = LT_NEWGL_OLD_UPD-rbukrs.
+        lt_glu1_add-glsip = ' '.
+        lt_glu1_add-offset = ld_offset.
+        lt_glu1_add-post = 'X'.
+        APPEND lt_glu1_add.
+      ENDLOOP.
+      CALL FUNCTION 'G_GLDB_POSTING_A'
+        TABLES
+          int_used     = lt_used
+          int_glu1     = LT_NEWGL_OLD_UPD
+          int_glu1_add = lt_glu1_add.
+    ENDIF.
+  ENDLOOP.
+
+*******************************************************************
+**  Step 2: Update Line Items with New Functional Area            *
+*******************************************************************
+  LOOP AT LT_LEDGERTAB INTO LS_LEDGERTAB.
+    REFRESH LT_NEWGL_UPD_TOTALS.
+    LOOP AT GT_NEWGL_NEW WHERE rldnr = LS_LEDGERTAB-rldnr.
+      MOVE-CORRESPONDING GT_NEWGL_NEW TO LT_NEWGL_UPD_TOTALS.
+      CLEAR LT_NEWGL_UPD_TOTALS-timestamp."Otherwise collect fails!!
+      APPEND LT_NEWGL_UPD_TOTALS.
+
+*       Now update the ledger line item table for selected ledgers
+      UPDATE (LS_LEDGERTAB-TABNAME) SET RFAREA = GT_NEWGL_NEW-RFAREA
+             WHERE RYEAR  = GT_NEWGL_NEW-RYEAR
+               AND DOCNR  = GT_NEWGL_NEW-DOCNR
+               AND RLDNR  = GT_NEWGL_NEW-RLDNR
+               AND RBUKRS = GT_NEWGL_NEW-RBUKRS
+               AND DOCLN  = GT_NEWGL_NEW-DOCLN.
+    ENDLOOP.
+
+
+*******************************************************************
+**  Step 3: Update Totals with New Functional Area                *
+*******************************************************************
+    CLEAR lt_used. REFRESH lt_used.
+    lt_used-tab = LS_LEDGERTAB-tabname.
+    lt_used-progroup = 'A'.
+    APPEND lt_used.
+*** Refresh table because of loop over RLDNR
+    REFRESH lt_glu1_add.
+    LOOP AT LT_NEWGL_UPD_TOTALS.
+      CALL FUNCTION 'G_MAX_PERIOD_AND_OFFSET_GET'
+        EXPORTING
+          period = LT_NEWGL_UPD_TOTALS-poper
+          table  = LS_LEDGERTAB-tab
+        IMPORTING
+          offset = ld_offset
+          rpmax  = ld_rpmax.
+      MOVE-CORRESPONDING LT_NEWGL_UPD_TOTALS TO lt_glu1_add.
+      lt_glu1_add-rpmax = ld_rpmax.
+      lt_glu1_add-buchkreis = LT_NEWGL_UPD_TOTALS-rbukrs.
+      lt_glu1_add-glsip = ' '.
+      lt_glu1_add-offset = ld_offset.
+      lt_glu1_add-post = 'X'.
+      APPEND lt_glu1_add.
+    ENDLOOP.
+
+    CALL FUNCTION 'G_GLDB_POSTING_A'
+      TABLES
+        int_used     = lt_used
+        int_glu1     = LT_NEWGL_UPD_TOTALS
+        int_glu1_add = lt_glu1_add.
+  ENDLOOP.
+
+**************************************************************
+*** Export GT_NEWGL_NEW, GT_NEWGL_OLD to database table INDX *
+**************************************************************
+  IF PD_STIDX = 'X'.
+    CLEAR exp_key.
+    indx_key-date = sy-datlo.
+    indx_key-time = sy-timlo.
+    EXPORT
+      GT_NEWGL_NEW
+      GT_NEWGL_OLD
+    TO DATABASE indx(dp) ID indx_key.
+    IF sy-subrc = 0.
+      CONCATENATE indx_key-key1 indx_key-date indx_key-time
+      INTO exp_key.
+    ENDIF.
+  ENDIF.
+
+
+ENDFORM.                    " ADJUST_FAGL
+
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM CHECK_INPUT .
+
+  IF SY-UCOMM EQ 'UPDATE'. EXPERT = 'X'. ENDIF.
+
+ENDFORM.                    " CHECK_INPUT
+
+*&---------------------------------------------------------------------*
+*&      Form  SCREEN_OUTPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM SCREEN_OUTPUT .
+
+  IF SY-BATCH IS INITIAL.
+    PD_TESTR = 'X'.
+  ENDIF.
+  LOOP AT SCREEN.
+    IF SCREEN-GROUP1 = 'INC'.
+      IF EXPERT = 'X'.
+        SCREEN-INVISIBLE = 0.
+      ELSE.
+        SCREEN-INVISIBLE = 1.
+      ENDIF.
+    ENDIF.
+    IF  SCREEN-GROUP1 = 'SUB'
+    AND PD_SONLY IS INITIAL.
+      SCREEN-INVISIBLE = '1'.
+      SCREEN-ACTIVE = '0'.
+    ENDIF.
+    IF  SCREEN-GROUP1 = 'SUB'
+    AND NOT PD_SONLY IS INITIAL.
+      SCREEN-INVISIBLE = '0'.
+      SCREEN-ACTIVE = '1'.
+    ENDIF.
+
+    IF  SCREEN-GROUP1 = 'CON'
+    AND PD_CONLY IS INITIAL.
+      SCREEN-INVISIBLE = '1'.
+      SCREEN-ACTIVE = '0'.
+    ENDIF.
+    IF  SCREEN-GROUP1 = 'CON'
+    AND NOT PD_CONLY IS INITIAL.
+      SCREEN-INVISIBLE = '0'.
+      SCREEN-ACTIVE = '1'.
+    ENDIF.
+    MODIFY SCREEN.
+  ENDLOOP.
+
+ENDFORM.                    " SCREEN_OUTPUT
+
+
+*&---------------------------------------------------------------------*
+*&      Form  SUBSTITUTE_COBL
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->PS_BSEG    text
+*----------------------------------------------------------------------*
+FORM SUBSTITUTE_COBL USING PS_BKPF      TYPE BKPF
+                           PS_BSEG      TYPE BSEG
+                  CHANGING PD_NEW_FAREA TYPE FKBER
+                           PD_ORIGIN    TYPE CHAR15.
+
+
+  DATA LS_COBL LIKE  COBL.
+  DATA LS_COBL_SUB LIKE  COBL.
+  DATA ld_xbilk TYPE flag.
+
+  CLEAR: PD_NEW_FAREA.
+  MOVE-CORRESPONDING PS_BKPF TO ls_cobl.
+  CALL FUNCTION 'MOVE_BSEG_TO_COBL'
+    EXPORTING
+      I_BSEG         = PS_BSEG
+    CHANGING
+      C_COBL         = ls_cobl
+    EXCEPTIONS
+      INTERNAL_ERROR = 1
+      OTHERS         = 2.
+  IF SY-SUBRC <> 0.
+    MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+            WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+  ENDIF.
+
+* Determine Account Assignment Type CO_KAKST/CO_KAAUF/CO_KAPRO...
+* in order to validate if object is a real account assignment
+
+  IF PD_KCOBL IS INITIAL.
+    CALL FUNCTION 'K_COBL_CHECK'
+      EXPORTING
+        I_COBL       = ls_cobl
+        I_SOFT_CHECK = 'X'
+      IMPORTING
+        E_COBL       = ls_cobl.
+  ENDIF.
+*    Clear for new derivation.
+  CLEAR ls_cobl-fkber.
+
+  IF NOT PD_STNRD IS INITIAL. "Standard Derivation Functional Area
+
+    CALL FUNCTION 'FAGL_FUNC_AREA_FRM_COBL_DERIVE'
+      EXPORTING
+        I_COBL         = ls_cobl
+      IMPORTING
+        E_COBL         = ls_cobl
+      EXCEPTIONS
+        ERROR_OCCURRED = 1
+        NOT_FOUND      = 2
+        OTHERS         = 3.
+    IF SY-SUBRC <> 0.
+      CALL FUNCTION 'MESSAGE_STORE'
+        EXPORTING
+          MSGTY = SYST-MSGTY
+          TXTNR = SYST-MSGNO
+          ARBGB = SYST-MSGID
+          MSGV1 = SYST-MSGV1
+          MSGV2 = SYST-MSGV2
+          MSGV3 = SYST-MSGV3
+          MSGV4 = SYST-MSGV4.
+    ENDIF.
+
+    PD_NEW_FAREA = ls_cobl-fkber.
+
+    PERFORM FIND_ORIGIN1 USING ls_cobl
+                      CHANGING PD_ORIGIN.
+
+  ELSE. "Derivation Functional Area only by Substitution
+
+    PERFORM determine_account_type
+            IN PROGRAM SAPLFAGL_FUNC_AREA_DERIVE
+            USING     ls_cobl
+            CHANGING  ld_xbilk.
+    IF NOT ld_xbilk IS INITIAL.
+      PD_ORIGIN = zotext19."Balance Sheet Acct
+      EXIT.
+    ENDIF.
+
+* Call substitution FI/0006:
+    IF NOT PD_SONLY IS INITIAL.
+      ls_cobl-fkber = c_fkber_dumy.
+      PERFORM exec_subst_fi_0006
+              IN PROGRAM SAPLFAGL_FUNC_AREA_DERIVE
+              USING    ls_cobl
+                       PD_SUBST
+              CHANGING ls_cobl_sub." fkber is filled
+
+      IF ls_cobl_sub-fkber <> c_fkber_dumy.
+        PD_ORIGIN = zotext22. "Substitution 6
+        PD_NEW_FAREA = ls_cobl_sub-fkber.
+      ELSE.
+        PD_ORIGIN = zotext24. "No Derivation
+        CLEAR ls_cobl-fkber.
+        CLEAR PD_NEW_FAREA.
+      ENDIF.
+    ENDIF.
+* Substitute only constant functional area:
+    IF NOT PD_CONLY IS INITIAL.
+      PD_ORIGIN = zotext26. "Constant FA
+      PD_NEW_FAREA = PC_FKBER.
+    ENDIF.
+
+  ENDIF.
+
+ENDFORM.                    "SUBSTITUTE_COBL
+
+*&---------------------------------------------------------------------*
+*&      Form  SUBSTITUTE_ACCIT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->PS_BSEG    text
+*----------------------------------------------------------------------*
+FORM SUBSTITUTE_ACCIT USING PS_BKPF TYPE BKPF
+                            PS_BSEG TYPE BSEG
+                   CHANGING PD_NEW_FAREA TYPE FKBER
+                            PD_ORIGIN    TYPE CHAR15.
+
+  DATA: LS_ACCHD LIKE ACCHD,
+        LS_ACCIT LIKE ACCIT,
+        LD_FLG_SUBST_EXECUTED  LIKE  BOOLE-BOOLE.
+
+
+
+*     transform  BSEG/BKPF  to  ACCIT/ACCHD:
+  PERFORM BSEG_TO_ACCIT_TRANSFORM
+          TABLES    GT_ACCHD_TEMP
+                    GT_ACCIT_TEMP
+                    GT_ACCCR_TEMP
+          USING     PS_BKPF
+                    PS_BSEG
+          CHANGING  GD_SUBRC.
+
+  IF ( GD_SUBRC <> 0 ).
+*       error during transforming BSEG/BKPF into  ACCIT/ACCHD:
+*       do not process this record:
+****        CONTINUE.
+  ENDIF.
+
+  IF NOT PD_STNRD IS INITIAL. "Standard Derivation Functional Area
+
+    CALL FUNCTION 'AC_DOCUMENT_FAREA_SET'
+      TABLES
+        T_ACCHD       = GT_ACCHD_TEMP
+        T_ACCIT       = GT_ACCIT_TEMP
+      EXCEPTIONS
+        ERROR_MESSAGE = 1
+        OTHERS        = 2.
+    IF ( SY-SUBRC <> 0 ).
+      CALL FUNCTION 'MESSAGE_STORE'
+        EXPORTING
+          MSGTY = SYST-MSGTY
+          TXTNR = SYST-MSGNO
+          ARBGB = SYST-MSGID
+          MSGV1 = SYST-MSGV1
+          MSGV2 = SYST-MSGV2
+          MSGV3 = SYST-MSGV3
+          MSGV4 = SYST-MSGV4.
+    ENDIF.      "SY-SUBRC <> 0
+*     check if error occurred:
+    CALL FUNCTION 'MESSAGES_COUNT'
+      EXPORTING
+        LINE_FROM     = GD_ZEILE
+        LINE_TO       = GD_ZEILE
+      IMPORTING
+        MAX_SEVERITY  = GD_MAX_SEVERITY_REC
+      EXCEPTIONS
+        ERROR_MESSAGE = 0
+        OTHERS        = 0.
+
+    IF ( GD_MAX_SEVERITY_REC > 8 ).
+      GD_FLAG_ERROR_RECORD  = 'X'.
+    ELSE.
+      CLEAR GD_FLAG_ERROR_RECORD.
+    ENDIF.
+
+    READ TABLE  GT_ACCIT_TEMP  INDEX 1.
+    IF ( SY-SUBRC = 0 ).
+*       entry found in ACCIT (a must!):
+      PD_NEW_FAREA = GT_ACCIT_TEMP-FKBER.
+    ELSE.
+      PERFORM CREATE_INFO_MESSAGE
+                  USING 'E'
+                        zmtext04 "No entries found
+                        GD_ZEILE
+                        SPACE
+                        SPACE
+                        SPACE.
+    ENDIF.
+    PERFORM FIND_ORIGIN2 USING GT_ACCHD_TEMP
+                               GT_ACCIT_TEMP
+                      CHANGING PD_ORIGIN.
+
+
+  ELSE. "Derivation Functional Area only by Substitution
+* Call substitution FI/0005:
+    MOVE-CORRESPONDING GT_ACCHD_TEMP TO LS_ACCHD.
+    MOVE-CORRESPONDING GT_ACCIT_TEMP TO LS_ACCIT.
+
+    IF NOT LS_ACCIT-XBILK IS INITIAL.
+      PD_ORIGIN = zotext19."Balance Sheet Acct
+      EXIT.
+    ENDIF.
+* Call substitution FI/0005:
+    IF NOT PD_SONLY IS INITIAL.
+      PERFORM exec_subst_fi_0005
+              IN PROGRAM SAPLAC_FAREA_SET
+              USING     LS_ACCHD
+                        PD_SUBST
+              CHANGING  LS_ACCIT
+                        LD_FLG_SUBST_EXECUTED.
+
+      IF LS_ACCIT-FKBER <> GT_ACCIT_TEMP-FKBER.
+        PD_ORIGIN = zotext23. "Substitution 5
+        PD_NEW_FAREA = LS_ACCIT-FKBER.
+      ELSE.
+        IF PD_ORIGIN IS INITIAL.
+          PD_ORIGIN = zotext24. " -> No derivation
+        ENDIF.
+      ENDIF.
+    ENDIF.
+* Substitute only constant functional area:
+    IF NOT PD_CONLY IS INITIAL.
+      PD_ORIGIN = zotext26. "Constant FA
+      PD_NEW_FAREA = PC_FKBER.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    "SUBSTITUTE_ACCIT
+
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_GL_SETTINGS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM CHECK_GL_SETTINGS.
+
+  DATA:  LT_SPLIT_FIELDS TYPE TTFIELDNAME,
+         LS_SPLIT_FIELDS TYPE FIELDNAME.
+  DATA:  ld_subrc LIKE SY-SUBRC,
+         ld_tab_findx LIKE DD02L-TABNAME,
+         ld_tabix LIKE SY-TABIX.
+
+  CLEAR GD_FKBER_SPLITT.
+  SELECT SINGLE * FROM FAGL_ACTIVEC INTO GS_FAGL_ACTIVEC.
+  IF SY-SUBRC <> 0.
+    CLEAR GS_FAGL_ACTIVEC.
+  ENDIF.
+
+* Get Splitfields
+  CALL FUNCTION 'FAGL_GET_SPLITFIELDS_ACCIT'
+    EXPORTING
+      I_CLIENT        = SY-MANDT
+*     I_ALL           = 'X' "compatibel with ECC5.0
+    IMPORTING
+      ET_FIELDS_ACCIT = LT_SPLIT_FIELDS.
+
+  LOOP AT LT_SPLIT_FIELDS INTO LS_SPLIT_FIELDS.
+    IF LS_SPLIT_FIELDS EQ 'FKBER'.
+      GD_FKBER_SPLITT = 'X'.
+    ENDIF.
+  ENDLOOP.
+
+* Check First if EhP Functionality is available
+  CLEAR: GD_FAGLBSIS, GD_FAGLBSAS.
+  ld_tab_findx = 'FAGLBSIS'.
+  CALL FUNCTION 'DB_EXISTS_TABLE'
+    EXPORTING
+      TABNAME = ld_tab_findx
+    IMPORTING
+      SUBRC   = ld_subrc.
+  IF ld_subrc = 0.
+    SELECT COUNT(*) FROM (ld_tab_findx) INTO ld_tabix UP TO 1 ROWS.
+    IF ld_tabix > 0. "Entries exist
+      GD_FAGLBSIS = 'X'.
+    ENDIF.
+  ENDIF.
+
+  ld_tab_findx = 'FAGLBSAS'.
+  CALL FUNCTION 'DB_EXISTS_TABLE'
+    EXPORTING
+      TABNAME = ld_tab_findx
+    IMPORTING
+      SUBRC   = ld_subrc.
+  IF ld_subrc = 0.
+    SELECT COUNT(*) FROM (ld_tab_findx) INTO ld_tabix UP TO 1 ROWS.
+    IF ld_tabix > 0. "Entries exist
+      GD_FAGLBSAS = 'X'.
+    ENDIF.
+  ENDIF.
+
+* Is Public Sector Active ?
+  CALL FUNCTION 'K_GET_ACTIVE_APPLICATIONS'
+    IMPORTING
+      es_subkey_active = gs_subkey_active.
+
+* Events For Substitution
+  IF NOT ( GS_FAGL_ACTIVEC-FAREA_FROM_COBL IS INITIAL ).
+    GD_EVENT = '0006'.
+  ELSE.
+    GD_EVENT = '0005'.
+  ENDIF.
+
+* Check if sFin is involved.
+
+  PERFORM CHECK_TABLE_CLASS USING gs_view_tables-tab_bsis
+                         CHANGING gs_view_tables-class_bsis.
+
+  PERFORM CHECK_TABLE_CLASS USING gs_view_tables-tab_faglbsis
+                         CHANGING gs_view_tables-class_faglbsis.
+
+  PERFORM CHECK_TABLE_CLASS USING gs_view_tables-tab_bsas
+                         CHANGING gs_view_tables-class_bsas.
+
+  PERFORM CHECK_TABLE_CLASS USING gs_view_tables-tab_faglbsas
+                         CHANGING gs_view_tables-class_faglbsas.
+
+  PERFORM CHECK_TABLE_CLASS USING gs_view_tables-tab_bsik
+                         CHANGING gs_view_tables-class_bsik.
+
+  PERFORM CHECK_TABLE_CLASS USING gs_view_tables-tab_bsak
+                         CHANGING gs_view_tables-class_bsak.
+
+  PERFORM CHECK_TABLE_CLASS USING gs_view_tables-tab_bsid
+                         CHANGING gs_view_tables-class_bsid.
+
+  PERFORM CHECK_TABLE_CLASS USING gs_view_tables-tab_bsad
+                         CHANGING gs_view_tables-class_bsad.
+
+  PERFORM CHECK_TABLE_CLASS USING gs_view_tables-tab_faglflext
+                         CHANGING gs_view_tables-class_faglflext.
+
+
+
+
+ENDFORM.                    "CHECK_GL_SETTINGS
+
+
+*&---------------------------------------------------------------------*
+*&      Form  PROCESS_BSEG
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM PROCESS_BSEG.
+
+  DATA LD_ORIGIN       TYPE CHAR15.
+  DATA LS_NEW_BSEG     TYPE BSEG.
+  DATA LS_OLD_BSEG     TYPE BSEG.
+  DATA LS_NEW_BSEG_ADD TYPE BSEG_ADD.
+  DATA LS_OLD_BSEG_ADD TYPE BSEG_ADD.
+
+* UPDATE NewGL Tables only when UPDATE on BSEG is succesful
+  CLEAR flg_update.
+
+*   keep only those BSEG entries which match with the entered
+*   selection criteria:
+  LOOP AT GT_BSEG  INTO  GS_BSEG
+*    FKBER, HKONT, AUFNR, KOSTL, PROJK were not used in select statement
+*    since BSEG is a cluster table:
+    WHERE FKBER_LONG IN  PR_FKBER
+    AND   HKONT      IN  PR_ACCNT
+    AND   KOSTL      IN  PR_KOSTL
+    AND   AUFNR      IN  PR_AUFNR
+    AND   PROJK      IN  PR_PROJK.
+
+*     init some data:
+    CLEAR: GD_FLAG_ERROR_RECORD, GD_ZEILE.
+    CLEAR: LS_NEW_BSEG, LS_OLD_BSEG, LS_NEW_BSEG_ADD,
+           LS_OLD_BSEG_ADD.
+
+    MOVE-CORRESPONDING GS_BSEG TO: LS_NEW_BSEG, LS_OLD_BSEG.
+
+    GD_OLD_FAREA = GS_BSEG-FKBER_LONG.
+*     default: no change:
+    GD_NEW_FAREA = GS_BSEG-FKBER_LONG.
+
+    PERFORM FILL_MSG_IDENTIFIER
+            USING     GS_BSEG-BUKRS
+                      GS_BSEG-BELNR
+                      GS_BSEG-BUZEI
+                      GS_BSEG-GJAHR
+            CHANGING  GD_ZEILE.
+
+*     set header for messages:
+    CALL FUNCTION 'MESSAGE_LINE_SET'
+      EXPORTING
+        ZEILE = GD_ZEILE.
+
+*   functional area will only be derived anew, if it is
+*   initial or else the it could be a manual entry:
+    GD_OLD_FAREA = GS_BSEG-FKBER_LONG.
+
+    CLEAR GS_BSEG-FKBER_LONG.
+    CLEAR GS_BSEG-FKBER.
+
+**************************************************************
+*           FKBEr Substition / Derivation                    *
+**************************************************************
+    IF NOT ( GS_FAGL_ACTIVEC-FAREA_FROM_COBL IS INITIAL ).
+      PERFORM SUBSTITUTE_COBL USING GS_BKPF
+                                    GS_BSEG
+                           CHANGING GD_NEW_FAREA
+                                    LD_ORIGIN.
+    ELSE.
+      PERFORM SUBSTITUTE_ACCIT USING GS_BKPF
+                                     GS_BSEG
+                            CHANGING GD_NEW_FAREA
+                                     LD_ORIGIN.
+
+    ENDIF.
+
+    IF NOT PD_SPACE IS INITIAL. "Update also FA with SPACE
+      MOVE-CORRESPONDING GS_BSEG TO GT_NEWGL_BSEG.
+      GT_NEWGL_BSEG-OLD_FKBER_LONG = GD_OLD_FAREA.
+      GT_NEWGL_BSEG-NEW_FKBER_LONG = GD_NEW_FAREA.
+      APPEND GT_NEWGL_BSEG.
+    ELSE.
+      IF GD_NEW_FAREA NE ' '."Only update when FA <> SPACE
+        MOVE-CORRESPONDING GS_BSEG TO GT_NEWGL_BSEG.
+        GT_NEWGL_BSEG-OLD_FKBER_LONG = GD_OLD_FAREA.
+        GT_NEWGL_BSEG-NEW_FKBER_LONG = GD_NEW_FAREA.
+        APPEND GT_NEWGL_BSEG.
+      ENDIF.
+    ENDIF.
+
+    IF ( GD_NEW_FAREA <> GD_OLD_FAREA ).
+      IF ( PD_TESTR             = ' ' ) AND
+         ( GD_FLAG_ERROR_RECORD = ' ' ).      "no errors so far
+*    Only substitute FA with SPACE when PD_SPACE = 'X'.
+        IF ( PD_SPACE IS INITIAL  AND
+             NOT GD_NEW_FAREA IS INITIAL ) OR
+           ( NOT PD_SPACE IS INITIAL ).
+
+*           no testrun; update database:
+**************************************************************
+*                   UPDATE BSEG                              *
+**************************************************************
+          UPDATE  BSEG SET  FKBER_LONG = GD_NEW_FAREA
+                            FKBER      = GD_NEW_FAREA(4)
+                  WHERE  BUKRS = GS_BSEG-BUKRS
+                  AND    BELNR = GS_BSEG-BELNR
+                  AND    GJAHR = GS_BSEG-GJAHR
+                  AND    BUZEI = GS_BSEG-BUZEI.
+
+          IF ( SY-SUBRC <> 0 ).
+*             error during update:
+            flg_update = 0.
+            GD_FLAG_ERROR_RECORD = 'X'.
+            PERFORM CREATE_INFO_MESSAGE
+                        USING 'E'
+                              zmtext05 "Database Update Failed
+                              GD_ZEILE
+                              SPACE
+                              SPACE
+                              SPACE.
+
+          ELSE.       "no error
+            flg_update = 1.
+          ENDIF.      "error during update
+**************************************************************
+*        UPDATE  BSIS BSAS BSIK BSAK BSID                    *
+**************************************************************
+* BSIS BSAS BSIK BSAK BSID BSAD:   Not available in SFIN
+
+          FIELD-SYMBOLS <BSEG_XLGCLR> TYPE ANY.
+          DATA          ld_dummy TYPE CHAR1.
+
+          ASSIGN COMPONENT 'XLGCLR' OF STRUCTURE GS_BSEG TO <BSEG_XLGCLR>.
+          IF SY-SUBRC <> 0.
+            ASSIGN ld_dummy TO <BSEG_XLGCLR>.
+          ENDIF.
+
+          IF <BSEG_XLGCLR> eq SPACE.
+            IF gs_view_tables-class_bsis EQ 'TRANSP'.
+              UPDATE  (gs_view_tables-tab_bsis) SET  FKBER = GD_NEW_FAREA
+                         WHERE  BUKRS  = GS_BSEG-BUKRS
+                         AND    HKONT  = GS_BSEG-HKONT
+                         AND    AUGDT  = GS_BSEG-AUGDT
+                         AND    AUGBL  = GS_BSEG-AUGBL
+                         AND    ZUONR  = GS_BSEG-ZUONR
+                         AND    GJAHR  = GS_BSEG-GJAHR
+                         AND    BELNR  = GS_BSEG-BELNR
+                         AND    BUZEI  = GS_BSEG-BUZEI.
+            ENDIF.
+*
+            IF gs_view_tables-class_bsas EQ 'TRANSP'.
+              UPDATE  (gs_view_tables-tab_bsas) SET  FKBER = GD_NEW_FAREA
+                          WHERE  BUKRS  = GS_BSEG-BUKRS
+                            AND    HKONT  = GS_BSEG-HKONT
+                            AND    AUGDT  = GS_BSEG-AUGDT
+                            AND    AUGBL  = GS_BSEG-AUGBL
+                            AND    ZUONR  = GS_BSEG-ZUONR
+                            AND    GJAHR  = GS_BSEG-GJAHR
+                            AND    BELNR  = GS_BSEG-BELNR
+                            AND    BUZEI  = GS_BSEG-BUZEI.
+            ENDIF.
+          ELSE. "Clearing Specific to Ledger Groups
+            IF GS_BSEG-AUGBL = SPACE.
+              IF gs_view_tables-class_faglbsis EQ 'TRANSP'.
+                UPDATE  (gs_view_tables-tab_faglbsis) SET  FKBER = GD_NEW_FAREA
+                           WHERE  BUKRS  = GS_BSEG-BUKRS
+                           AND    HKONT  = GS_BSEG-HKONT
+                           AND    AUGDT  = GS_BSEG-AUGDT
+                           AND    AUGBL  = GS_BSEG-AUGBL
+                           AND    ZUONR  = GS_BSEG-ZUONR
+                           AND    GJAHR  = GS_BSEG-GJAHR
+                           AND    BELNR  = GS_BSEG-BELNR
+                           AND    BUZEI  = GS_BSEG-BUZEI.
+              ENDIF.
+*
+              IF gs_view_tables-class_faglbsas EQ 'TRANSP'.
+                UPDATE  (gs_view_tables-tab_faglbsas) SET  FKBER = GD_NEW_FAREA
+                           WHERE  BUKRS  = GS_BSEG-BUKRS
+                             AND  HKONT  = GS_BSEG-HKONT
+                             AND  AUGDT  = GS_BSEG-AUGDT
+                             AND  AUGBL  = GS_BSEG-AUGBL
+                             AND  ZUONR  = GS_BSEG-ZUONR
+                             AND  GJAHR  = GS_BSEG-GJAHR
+                             AND  BELNR  = GS_BSEG-BELNR
+                             AND  BUZEI  = GS_BSEG-BUZEI.
+              ENDIF.
+            ENDIF.
+          ENDIF.
+
+          IF gs_view_tables-class_bsik EQ 'TRANSP'.
+            UPDATE (gs_view_tables-tab_bsik) SET  FKBER = GD_NEW_FAREA
+                           WHERE  BUKRS   = GS_BSEG-BUKRS
+                             AND  LIFNR   = GS_BSEG-HKONT
+                             AND  UMSKS   = GS_BSEG-UMSKS
+                             AND  UMSKZ   = GS_BSEG-UMSKZ
+                             AND  AUGDT   = GS_BSEG-AUGDT
+                             AND  AUGBL   = GS_BSEG-AUGBL
+                             AND  ZUONR   = GS_BSEG-ZUONR
+                             AND  GJAHR   = GS_BSEG-GJAHR
+                             AND  BELNR   = GS_BSEG-BELNR
+                             AND  BUZEI   = GS_BSEG-BUZEI.
+          ENDIF.
+
+          IF gs_view_tables-class_bsak EQ 'TRANSP'.
+            UPDATE (gs_view_tables-tab_bsak) SET  FKBER = GD_NEW_FAREA
+                       WHERE  BUKRS   = GS_BSEG-BUKRS
+                         AND  LIFNR   = GS_BSEG-HKONT
+                         AND  UMSKS   = GS_BSEG-UMSKS
+                         AND  UMSKZ   = GS_BSEG-UMSKZ
+                         AND  AUGDT   = GS_BSEG-AUGDT
+                         AND  AUGBL   = GS_BSEG-AUGBL
+                         AND  ZUONR   = GS_BSEG-ZUONR
+                         AND  GJAHR   = GS_BSEG-GJAHR
+                         AND  BELNR   = GS_BSEG-BELNR
+                         AND  BUZEI   = GS_BSEG-BUZEI.
+          ENDIF.
+
+          IF gs_view_tables-class_bsid EQ 'TRANSP'.
+            UPDATE  (gs_view_tables-tab_bsid) SET  FKBER = GD_NEW_FAREA
+                       WHERE  BUKRS   = GS_BSEG-BUKRS
+                         AND  KUNNR   = GS_BSEG-KUNNR
+                         AND  UMSKS   = GS_BSEG-UMSKS
+                         AND  UMSKZ   = GS_BSEG-UMSKZ
+                         AND  AUGDT   = GS_BSEG-AUGDT
+                         AND  AUGBL   = GS_BSEG-AUGBL
+                         AND  ZUONR   = GS_BSEG-ZUONR
+                         AND  GJAHR   = GS_BSEG-GJAHR
+                         AND  BELNR   = GS_BSEG-BELNR
+                         AND  BUZEI   = GS_BSEG-BUZEI.
+          ENDIF.
+
+          IF gs_view_tables-class_bsad EQ 'TRANSP'.
+            UPDATE  (gs_view_tables-tab_bsad) SET  FKBER = GD_NEW_FAREA
+                       WHERE  BUKRS   = GS_BSEG-BUKRS
+                         AND  KUNNR   = GS_BSEG-KUNNR
+                         AND  UMSKS   = GS_BSEG-UMSKS
+                         AND  UMSKZ   = GS_BSEG-UMSKZ
+                         AND  AUGDT   = GS_BSEG-AUGDT
+                         AND  AUGBL   = GS_BSEG-AUGBL
+                         AND  ZUONR   = GS_BSEG-ZUONR
+                         AND  GJAHR   = GS_BSEG-GJAHR
+                         AND  BELNR   = GS_BSEG-BELNR
+                         AND  BUZEI   = GS_BSEG-BUZEI.
+          ENDIF.
+
+          ADD 1 TO GD_COUNTER_CHANGED.
+          IF flg_update = 1.
+            IF PD_AEDAT IS NOT INITIAL. "UPDATE BW LOG
+              PERFORM UPDATE_BWFI_AEDAT USING GS_BSEG."BW LOG
+            ENDIF.
+            LS_NEW_BSEG-FKBER      = GD_NEW_FAREA(4).
+            LS_NEW_BSEG-FKBER_LONG = GD_NEW_FAREA.
+            PERFORM WRITE_CHANGE_DOC
+              USING GS_BKPF
+                    LS_OLD_BSEG      "OLD_BSEG
+                    LS_NEW_BSEG      "NEW_BSEG
+                    LS_OLD_BSEG_ADD  "OLD BSEG_ADD
+                    LS_NEW_BSEG_ADD. "NEW BSEG_ADD
+          ENDIF."flg_update = 1
+        ENDIF. ""Only subst. FA with SPACE when PD_SPACE = 'X'.
+      ENDIF.        "no test run
+    ENDIF.          "farea changed
+    ADD 1 TO GD_COUNTER_PROCESSED.
+*     fill final list for display:
+    IF ( PD_LIST1 = 'X' ).
+*       final list wanted:
+      PERFORM FILL_FINAL_LIST
+              TABLES  GT_FINAL_LIST
+              USING   GS_BSEG
+                      GS_BKPF
+                      GD_OLD_FAREA          "old functional area
+                      GD_NEW_FAREA          "new functional area
+                      GD_FLAG_ERROR_RECORD
+                      GD_ZEILE
+                      LD_ORIGIN.
+    ENDIF.      "final list wanted
+  ENDLOOP.
+
+ENDFORM.                    "PROCESS_BSEG
+
+*&---------------------------------------------------------------------*
+*&      Form  PROCESS_BSEG_ADD
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM PROCESS_BSEG_ADD.
+  DATA LD_ORIGIN TYPE CHAR15.
+  DATA LS_NEW_BSEG     TYPE BSEG.
+  DATA LS_OLD_BSEG     TYPE BSEG.
+  DATA LS_NEW_BSEG_ADD TYPE BSEG_ADD.
+  DATA LS_OLD_BSEG_ADD TYPE BSEG_ADD.
+
+  DATA: BEGIN OF ls_miss_fields,
+          AUGDT LIKE BSEG-AUGDT,
+          AUGBL LIKE BSEG-AUGBL,
+        END OF ls_miss_fields.
+
+
+* UPDATE NewGL Tables only when UPDATE on BSEG_ADD is succesful
+  CLEAR flg_update.
+
+*   keep only those BSEG_ADD entries which match with the entered
+*   selection criteria:
+  LOOP AT GT_BSEG_ADD  INTO GS_BSEG_ADD
+*   FKBER, HKONT, AUFNR, KOSTL, PROJK were not used in select statement,
+*   since BSEG is a cluster table:
+    WHERE FKBER IN  PR_FKBER
+    AND   HKONT IN  PR_ACCNT
+    AND   KOSTL IN  PR_KOSTL
+    AND   AUFNR IN  PR_AUFNR
+    AND   PROJK IN  PR_PROJK.
+
+*     init some data:
+    CLEAR: GD_FLAG_ERROR_RECORD, GD_ZEILE.
+    CLEAR: LS_NEW_BSEG, LS_OLD_BSEG, LS_NEW_BSEG_ADD,
+           LS_OLD_BSEG_ADD.
+    CLEAR  ls_miss_fields.
+
+    MOVE-CORRESPONDING GS_BSEG_ADD TO: LS_NEW_BSEG_ADD, LS_OLD_BSEG_ADD, ls_miss_fields.
+
+    GD_OLD_FAREA = GS_BSEG_ADD-FKBER.
+*     default: no change:
+    GD_NEW_FAREA = GS_BSEG_ADD-FKBER.
+
+    PERFORM FILL_MSG_IDENTIFIER
+            USING     GS_BSEG_ADD-BUKRS
+                      GS_BSEG_ADD-BELNR
+                      GS_BSEG_ADD-BUZEI+3(3)
+                      GS_BSEG_ADD-GJAHR
+            CHANGING  GD_ZEILE.
+
+*     set header for messages:
+    CALL FUNCTION 'MESSAGE_LINE_SET'
+      EXPORTING
+        ZEILE = GD_ZEILE.
+
+*     functional area will only be derived anew, if it is
+*     initial:
+    GD_OLD_FAREA = GS_BSEG_ADD-FKBER.
+
+    CLEAR GS_BSEG_ADD-FKBER.
+
+**************************************************************
+*           FKBER Substition / Derivation                    *
+**************************************************************
+    CLEAR GS_BSEG.
+    MOVE-CORRESPONDING GS_BSEG_ADD TO GS_BSEG.
+    IF NOT ( GS_FAGL_ACTIVEC-FAREA_FROM_COBL IS INITIAL ).
+      PERFORM SUBSTITUTE_COBL USING GS_BKPF
+                                    GS_BSEG
+                           CHANGING GD_NEW_FAREA
+                                    LD_ORIGIN.
+      .
+    ELSE.
+      PERFORM SUBSTITUTE_ACCIT USING GS_BKPF
+                                     GS_BSEG
+                            CHANGING GD_NEW_FAREA
+                                     LD_ORIGIN.
+    ENDIF.
+
+    CLEAR GT_NEWGL_BSEG.
+    IF NOT PD_SPACE IS INITIAL. "Update also FA with SPACE
+      MOVE-CORRESPONDING GS_BSEG_ADD TO GT_NEWGL_BSEG.
+      GT_NEWGL_BSEG-OLD_FKBER_LONG = GD_OLD_FAREA.
+      GT_NEWGL_BSEG-NEW_FKBER_LONG = GD_NEW_FAREA.
+      APPEND GT_NEWGL_BSEG.
+    ELSE.
+      IF GD_NEW_FAREA NE ' '."Only update when FA <> SPACE
+        MOVE-CORRESPONDING GS_BSEG_ADD TO GT_NEWGL_BSEG.
+        GT_NEWGL_BSEG-OLD_FKBER_LONG = GD_OLD_FAREA.
+        GT_NEWGL_BSEG-NEW_FKBER_LONG = GD_NEW_FAREA.
+        APPEND GT_NEWGL_BSEG.
+      ENDIF.
+    ENDIF.
+
+    IF ( GD_NEW_FAREA <> GD_OLD_FAREA ).
+      IF ( PD_TESTR             = ' ' ) AND
+         ( GD_FLAG_ERROR_RECORD = ' ' ).      "no errors so far
+*           No testrun -> update database
+
+*    Only substitute FA with SPACE when PD_SPACE = 'X'.
+        IF ( PD_SPACE IS INITIAL  AND
+             NOT GD_NEW_FAREA IS INITIAL ) OR
+           ( NOT PD_SPACE IS INITIAL ).
+
+**************************************************************
+*                   UPDATE BSEG_ADD                          *
+**************************************************************
+          UPDATE BSEG_ADD SET  FKBER = GD_NEW_FAREA(4)
+                  WHERE  BUKRS = GS_BSEG_ADD-BUKRS
+                  AND    BELNR = GS_BSEG_ADD-BELNR
+                  AND    GJAHR = GS_BSEG_ADD-GJAHR
+                  AND    BUZEI = GS_BSEG_ADD-BUZEI.
+
+          IF ( SY-SUBRC <> 0 ).
+*             error during update:
+            flg_update = 0.
+            GD_FLAG_ERROR_RECORD = 'X'.
+            PERFORM CREATE_INFO_MESSAGE
+                        USING 'E'
+                              zmtext05 "Database Update Failed
+                              GD_ZEILE
+                              SPACE
+                              SPACE
+                              SPACE.
+
+          ELSE.       "no error
+            flg_update = 1.
+          ENDIF.      "error during update
+
+
+
+          FIELD-SYMBOLS <BSEG_ADD_XLGCLR> TYPE ANY.
+          DATA          ld_dummy TYPE CHAR1.
+
+          ASSIGN COMPONENT 'XLGCLR' OF STRUCTURE GS_BSEG_ADD TO <BSEG_ADD_XLGCLR>.
+          IF SY-SUBRC <> 0.
+            ASSIGN ld_dummy TO <BSEG_ADD_XLGCLR>.
+          ENDIF.
+
+
+          IF <BSEG_ADD_XLGCLR> eq SPACE.
+            IF gs_view_tables-class_bsis EQ 'TRANSP'.
+              UPDATE  (gs_view_tables-tab_bsis) SET  FKBER = GD_NEW_FAREA
+                         WHERE  BUKRS  = GS_BSEG_ADD-BUKRS
+                         AND    HKONT  = GS_BSEG_ADD-HKONT
+                         AND    AUGDT  = ls_miss_fields-augdt
+                         AND    AUGBL  = ls_miss_fields-augbl
+                         AND    ZUONR  = GS_BSEG_ADD-ZUONR
+                         AND    GJAHR  = GS_BSEG_ADD-GJAHR
+                         AND    BELNR  = GS_BSEG_ADD-BELNR
+                         AND    BUZEI  = GS_BSEG_ADD-BUZEI.
+            ENDIF.
+*
+            IF gs_view_tables-class_bsas EQ 'TRANSP'.
+              UPDATE  (gs_view_tables-tab_bsas) SET  FKBER = GD_NEW_FAREA
+                          WHERE    BUKRS  = GS_BSEG_ADD-BUKRS
+                            AND    HKONT  = GS_BSEG_ADD-HKONT
+                            AND    AUGDT  = ls_miss_fields-augdt
+                            AND    AUGBL  = ls_miss_fields-augbl
+                            AND    ZUONR  = GS_BSEG_ADD-ZUONR
+                            AND    GJAHR  = GS_BSEG_ADD-GJAHR
+                            AND    BELNR  = GS_BSEG_ADD-BELNR
+                            AND    BUZEI  = GS_BSEG_ADD-BUZEI.
+            ENDIF.
+          ELSE. "Clearing Specific to Ledger Groups
+            IF GS_BSEG_ADD = SPACE.
+              IF gs_view_tables-class_faglbsis EQ 'TRANSP'.
+                UPDATE  (gs_view_tables-tab_faglbsis) SET  FKBER = GD_NEW_FAREA
+                           WHERE  BUKRS  = GS_BSEG_ADD-BUKRS
+                           AND    HKONT  = GS_BSEG_ADD-HKONT
+                           AND    AUGDT  = ls_miss_fields-augdt
+                           AND    AUGBL  = ls_miss_fields-augbl
+                           AND    ZUONR  = GS_BSEG_ADD-ZUONR
+                           AND    GJAHR  = GS_BSEG_ADD-GJAHR
+                           AND    BELNR  = GS_BSEG_ADD-BELNR
+                           AND    BUZEI  = GS_BSEG_ADD-BUZEI.
+              ENDIF.
+*
+              IF gs_view_tables-class_faglbsas EQ 'TRANSP'.
+                UPDATE  (gs_view_tables-tab_faglbsas) SET  FKBER = GD_NEW_FAREA
+                           WHERE  BUKRS  = GS_BSEG_ADD-BUKRS
+                             AND  HKONT  = GS_BSEG_ADD-HKONT
+                             AND  AUGDT  = ls_miss_fields-augdt
+                             AND  AUGBL  = ls_miss_fields-augbl
+                             AND  ZUONR  = GS_BSEG_ADD-ZUONR
+                             AND  GJAHR  = GS_BSEG_ADD-GJAHR
+                             AND  BELNR  = GS_BSEG_ADD-BELNR
+                             AND  BUZEI  = GS_BSEG_ADD-BUZEI.
+              ENDIF.
+            ENDIF.
+          ENDIF.
+
+
+          ADD 1 TO  GD_COUNTER_CHANGED.
+        ENDIF."Only subst. FA with SPACE when PD_SPACE = 'X'.
+      ENDIF.        "no test run
+      IF flg_update = 1.
+        IF PD_AEDAT IS NOT INITIAL. "UPDATE BW LOG
+          CLEAR GS_BSEG.
+          MOVE-CORRESPONDING GS_BSEG_ADD TO GS_BSEG.
+          PERFORM UPDATE_BWFI_AEDAT USING GS_BSEG."BW LOG
+        ENDIF.
+        LS_NEW_BSEG_ADD-FKBER = GD_NEW_FAREA(4).
+        PERFORM WRITE_CHANGE_DOC
+          USING GS_BKPF
+                LS_OLD_BSEG     "OLD_BSEG
+                LS_NEW_BSEG     "NEW_BSEG
+                LS_OLD_BSEG_ADD "OLD BSEG_ADD
+                LS_NEW_BSEG_ADD."NEW BSEG_ADD
+      ENDIF."flg_update = 1
+
+    ENDIF.          "farea changed
+    ADD 1  TO  GD_COUNTER_PROCESSED.
+*     fill final list for display:
+    IF ( PD_LIST1 = 'X' ).
+*       final list wanted:
+      PERFORM FILL_FINAL_LIST
+              TABLES  GT_FINAL_LIST
+              USING   GS_BSEG
+                      GS_BKPF
+                      GD_OLD_FAREA          "old functional area
+                      GD_NEW_FAREA          "new functional area
+                      GD_FLAG_ERROR_RECORD
+                      GD_ZEILE
+                      LD_ORIGIN.
+    ENDIF.      "final list wanted
+  ENDLOOP.
+
+ENDFORM.                    "PROCESS_BSEG_ADD
+*&---------------------------------------------------------------------*
+*&      Form  ADD_FIELDCAT1
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM PROVIDE_FIELDINFO USING p_fieldname TYPE FIELDNAME
+                             p_table     TYPE TABNAME
+                             p_number
+                    CHANGING PS_FIELDCAT TYPE SLIS_FIELDCAT_ALV.
+
+  DATA: LD_FIELDINFO TYPE SLIS_T_FIELDCAT_ALV.
+  DATA: LS_FIELDINFO LIKE dfies.
+
+  CLEAR PS_FIELDCAT.
+  CALL FUNCTION 'G_FIELD_READ'
+    EXPORTING
+      TABLE      = p_table
+      FIELDNAME  = p_fieldname
+      TEXT_FLAG  = 'X'
+      LANGU      = SY-LANGU
+    IMPORTING
+      FIELD_ATTR = LS_FIELDINFO
+    EXCEPTIONS
+      NOT_FOUND  = 1
+      OTHERS     = 2.
+  IF SY-SUBRC <> 0.
+    MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+            WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+  ENDIF.
+
+* MOVE-CORRESPONDING LS_FIELDINFO TO PS_FIELDCAT.
+  PS_FIELDCAT-FIELDNAME = ls_fieldinfo-fieldname.
+  PS_FIELDCAT-REF_TABNAME = p_table.
+  PS_FIELDCAT-ref_fieldname = ls_fieldinfo-fieldname.
+  PS_FIELDCAT-seltext_s = ls_fieldinfo-SCRTEXT_S.
+  PS_FIELDCAT-KEY = ' '.
+  PS_FIELDCAT-COL_POS = p_number.
+
+ENDFORM.                    " ADD_FIELDCAT1
+
+*&---------------------------------------------------------------------*
+*&      Form  USER_COMMAND_DSP
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->RF_UCOMM     text
+*      -->RS_SELFIELD  text
+*----------------------------------------------------------------------*
+FORM USER_COMMAND_DSP USING RF_UCOMM    LIKE SY-UCOMM
+                            RS_SELFIELD TYPE SLIS_SELFIELD.
+  IF RF_UCOMM eq 'CHOOSE'.
+    IF RS_SELFIELD-TABNAME eq 'GT_FINAL_LIST'.
+      READ TABLE GT_FINAL_LIST  INDEX  RS_SELFIELD-TABINDEX.
+      IF ( SY-SUBRC = 0 ).
+        IF NOT RS_SELFIELD-VALUE IS INITIAL AND
+          NOT RS_SELFIELD-VALUE eq 'X'.
+          SET PARAMETER ID 'BLN' FIELD GT_FINAL_LIST-BELNR.
+          SET PARAMETER ID 'BUK' FIELD GT_FINAL_LIST-BUKRS.
+          SET PARAMETER ID 'GJR' FIELD GT_FINAL_LIST-GJAHR.
+          CALL TRANSACTION 'FB03' AND SKIP FIRST SCREEN. "#EC CI_CALLTA
+        ELSE.
+*      user clicked on the message item:
+          PERFORM FILL_MSG_IDENTIFIER
+                  USING     GT_FINAL_LIST-BUKRS
+                            GT_FINAL_LIST-BELNR
+                            GT_FINAL_LIST-BUZEI
+                            GT_FINAL_LIST-GJAHR
+                  CHANGING  GD_ZEILE.
+*          display messages for this record:
+          CALL FUNCTION 'MESSAGES_SHOW'
+            EXPORTING
+              LINE_FROM = GD_ZEILE
+              LINE_TO   = GD_ZEILE.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+    IF RS_SELFIELD-TABNAME eq 'GT_FINAL_LIST-FLAG_MSG'.
+*    user clicked on a record of list:
+      READ TABLE GT_FINAL_LIST  INDEX  RS_SELFIELD-TABINDEX.
+      IF ( SY-SUBRC = 0 ).
+        PERFORM FILL_MSG_IDENTIFIER
+                USING     GT_FINAL_LIST-BUKRS
+                          GT_FINAL_LIST-BELNR
+                          GT_FINAL_LIST-BUZEI
+                          GT_FINAL_LIST-GJAHR
+                CHANGING  GD_ZEILE.
+*       display messages for this record:
+        CALL FUNCTION 'MESSAGES_SHOW'
+          EXPORTING
+            LINE_FROM = GD_ZEILE
+            LINE_TO   = GD_ZEILE.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+ENDFORM.                    "USER_COMMAND_DSP
+
+*&---------------------------------------------------------------------*
+*&      Form  FIND_ORIGIN1
+*&---------------------------------------------------------------------*
+*       Deriving from COBL
+*----------------------------------------------------------------------*
+FORM FIND_ORIGIN1 USING PS_COBL TYPE COBL
+              CHANGING PD_ORIGIN TYPE CHAR15.
+  CONSTANTS c_val1 TYPE FKBER VALUE '_*_'.
+  DATA E_COBL TYPE  COBL.
+  DATA lb_func_area_derived TYPE flag.
+  DATA ld_memfkber TYPE COBL-FKBER.
+  DATA ld_xbilk TYPE flag.
+  DATA ls_cobl2 TYPE COBL.
+
+  CLEAR PD_ORIGIN.
+  PERFORM determine_account_type
+          IN PROGRAM SAPLFAGL_FUNC_AREA_DERIVE
+          USING     PS_COBL
+          CHANGING  ld_xbilk.
+
+  IF NOT ld_xbilk IS INITIAL.
+    PD_ORIGIN = zotext19."Balance Sheet Acct
+    EXIT.
+  ENDIF.
+
+* 1. step: try to get functional area from account:
+  PERFORM derive_func_area_from_account
+          IN PROGRAM SAPLFAGL_FUNC_AREA_DERIVE
+          USING    PS_COBL
+          CHANGING e_cobl-fkber
+                   lb_func_area_derived.
+  IF lb_func_area_derived = ABAP_TRUE.
+    ld_memfkber = e_cobl-fkber.
+    PD_ORIGIN = zotext20. "Account/HKONT
+  ENDIF.
+
+* 2. step: try to get functional area from the CO object:
+  IF ( lb_func_area_derived = abap_false ).
+*   functional area was not derived from account; try to get
+*   it from the CO object:
+    PERFORM derive_farea_from_co_object
+            IN PROGRAM SAPLFAGL_FUNC_AREA_DERIVE
+            USING     PS_COBL
+            CHANGING  e_cobl-fkber.
+    IF e_cobl-fkber <> ld_memfkber.
+      PD_ORIGIN = zotext21. "CO Object
+      ld_memfkber = e_cobl-fkber.
+    ENDIF.
+  ENDIF.
+
+* 3. step: call substitution FI/0006 if it is active:
+  CLEAR ls_cobl2.
+  MOVE-CORRESPONDING ps_cobl TO ls_cobl2.
+  ls_cobl2-fkber = c_fkber_dumy.
+  PERFORM process_subst_fi_0006
+          IN PROGRAM SAPLFAGL_FUNC_AREA_DERIVE
+          USING     ls_cobl2
+          CHANGING  ls_cobl2.   "fkber is filled
+  IF ls_cobl2-fkber <> c_fkber_dumy.
+    PD_ORIGIN = zotext22. "Substitution 6
+  ELSE.
+    IF PD_ORIGIN IS INITIAL.
+      PD_ORIGIN = zotext24. "No Derivation
+    ENDIF.
+  ENDIF.
+
+
+ENDFORM.                    "FIND_ORIGIN
+
+*&---------------------------------------------------------------------*
+*&      Form  FIND_ORIGIN2
+*&---------------------------------------------------------------------*
+*       Deriving from Interface Tables ACC*
+*----------------------------------------------------------------------*
+*      -->PS_COBL    text
+*      -->PD_ORIGIN  text
+*----------------------------------------------------------------------*
+FORM FIND_ORIGIN2 USING PS_ACCHD TYPE ACCHD
+                        PS_ACCIT TYPE ACCIT
+               CHANGING PD_ORIGIN TYPE CHAR15.
+  CONSTANTS c_val1 TYPE FKBER VALUE '_*_'.
+  DATA lb_func_area_derived TYPE flag.
+  DATA ld_memfkber TYPE COBL-FKBER.
+  DATA ld_xbilk TYPE flag.
+
+  CLEAR PD_ORIGIN.
+
+
+*   CO assignment type fields not filled.
+*   fill it here:
+  DATA: LD_ACCHD LIKE ACCHD,
+        LD_ACCIT LIKE  ACCIT,
+        LD_FLG_SUBST_EXECUTED  LIKE  BOOLE-BOOLE.
+
+  MOVE-CORRESPONDING PS_ACCHD TO LD_ACCHD.
+  MOVE-CORRESPONDING PS_ACCIT TO LD_ACCIT.
+
+  IF NOT LD_ACCIT-XBILK  IS INITIAL.
+    PD_ORIGIN = zotext19."Balance Sheet Acct
+    EXIT.
+  ENDIF.
+
+  PERFORM FILL_CO_ASSIGNMENT_TYPE_FIELDS
+          IN PROGRAM SAPLAC_FAREA_SET
+          USING  LD_ACCHD
+       CHANGING  LD_ACCIT.
+
+* 1. step: try to get functional area from account/co-elem:
+  PERFORM GET_FAREA_FROM_ACCOUNT
+          IN PROGRAM SAPLAC_FAREA_SET
+          USING     LD_ACCIT
+          CHANGING  LD_ACCIT-FKBER
+                    lb_func_area_derived.
+
+  IF lb_func_area_derived = ABAP_TRUE.
+    ld_memfkber = LD_ACCIT-FKBER.
+    PD_ORIGIN = zotext20. "Account/HKONT
+  ENDIF.
+
+
+* 2. step: try to get functional area from the CO object:
+  IF ( lb_func_area_derived = abap_false ).
+    PERFORM GET_FAREA_FROM_CO_OBJECT
+            IN PROGRAM SAPLAC_FAREA_SET
+            USING     LD_ACCIT
+            CHANGING  LD_ACCIT-FKBER.
+    IF LD_ACCIT-FKBER <> ld_memfkber.
+      PD_ORIGIN = zotext21. "CO Object
+      ld_memfkber = LD_ACCIT-FKBER.
+    ENDIF.
+  ENDIF.
+
+* 3. step: call substitution FI/0005 if it is active:
+  ld_accit-fkber = c_fkber_dumy.
+  PERFORM PROCESS_SUBST_FI_0005
+          IN PROGRAM SAPLAC_FAREA_SET
+          USING     LD_ACCHD
+          CHANGING  LD_ACCIT
+                    LD_FLG_SUBST_EXECUTED.
+  IF LD_ACCIT-fkber <> c_fkber_dumy.
+    PD_ORIGIN = zotext23. "Substitution 5
+  ELSE.
+    IF PD_ORIGIN IS INITIAL.
+      PD_ORIGIN = zotext24. " -> No derivation
+    ENDIF.
+  ENDIF.
+ENDFORM.                    "FIND_ORIGIN2
+*---------------------------------------------------------------------*
+*       FORM UPDATE_T800HIST                                          *
+*---------------------------------------------------------------------*
+FORM update_T800HIST.
+
+  DATA: lt_rsparams TYPE STANDARD TABLE OF rsparams.
+  DATA:   ld_fmod_name TYPE RS38L_FNAM.
+  DATA:   ls_tfdir LIKE TFDIR.
+
+*Update only in production run
+  CHECK PD_TESTR = space.
+
+*Get selection parameters
+  CALL FUNCTION 'RS_REFRESH_FROM_SELECTOPTIONS'
+    EXPORTING
+      CURR_REPORT     = sy-repid
+    TABLES
+      SELECTION_TABLE = lt_rsparams.
+
+* Delete all initial paremeters and select options
+  delete lt_rsparams where kind = 'P'
+                       and low  is initial.
+
+  delete lt_rsparams where kind = 'S'
+                       and sign is initial.
+
+* Delete all unnecessary selection parameters
+  delete lt_rsparams where
+         selname = 'PD_LIST1'  or
+         selname = 'PD_TESTR'  or
+         selname = 'PD_STIDX'.
+
+  gt_rsparams[] = lt_rsparams.
+
+  ld_fmod_name = 'G_UPDATE_T800HIST'.
+  SELECT SINGLE * FROM tfdir INTO ls_tfdir
+                  WHERE funcname = ld_fmod_name.
+
+*Update them in T800HISTH and T800HISTP
+  IF SY-SUBRC = 0.
+    CALL FUNCTION ld_fmod_name
+      EXPORTING
+        I_OBJNAME  = sy-repid
+      TABLES
+        T_RSPARAMS = lt_rsparams.
+  ENDIF.
+endform.                    "update_T800HIST
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_LEDGER_FOR_BUKRS
+*&---------------------------------------------------------------------*
+*      Get all NewGL Ledgers with FIN_UKV scenario (cost of sales)
+*----------------------------------------------------------------------*
+*      -->P_BUKRS         text
+*      -->PT_LEDGERTABLE  text
+*----------------------------------------------------------------------*
+FORM GET_LEDGER_FOR_BUKRS USING P_BUKRS        TYPE BUKRS
+                                PT_LEDGERTABLE TYPE TTY_LEDGERTAB.
+  TYPES: BEGIN OF TY_LD_BUKRS,
+           rldnr   TYPE t881-rldnr,
+           bukrs   TYPE BUKRS,
+           tab     TYPE t881-tab,
+           tabname TYPE t800a-ntable,
+         END OF TY_LD_BUKRS.
+
+  DATA: LT_LEDGERS     TYPE FAGL_RLDNR_TAB,
+        LS_LEDGERS     TYPE  TY_LEDGERTAB,
+        LD_INDEX       LIKE SY-TABIX,
+        LD_RLDNR1      LIKE T881-RLDNR,
+        LS_T800A       LIKE T800A,
+        LD_SITAB       TYPE T800A-NTABLE,
+        LS_LEDGERTABLE TYPE TY_LEDGERTAB,
+        LS_T881 LIKE T881,
+        LS_LD_BUKRS TYPE TY_LD_BUKRS.
+
+  STATICS LST_LD_BUKRS TYPE TABLE OF TY_LD_BUKRS.
+
+* Check if Company Code already Buffer
+  READ TABLE LST_LD_BUKRS WITH KEY BUKRS =  P_BUKRS
+                          TRANSPORTING NO FIELDS
+                          BINARY SEARCH.
+  IF SY-SUBRC = 0.
+    LOOP AT LST_LD_BUKRS INTO LS_LD_BUKRS
+                        WHERE BUKRS = P_BUKRS.
+      MOVE-CORRESPONDING LS_LD_BUKRS TO LS_LEDGERTABLE.
+      APPEND LS_LEDGERTABLE TO PT_LEDGERTABLE.
+    ENDLOOP.
+    EXIT.
+  ENDIF.
+
+
+  REFRESH: LT_LEDGERS, PT_LEDGERTABLE.
+  CLEAR LT_LEDGERS.
+  CALL FUNCTION 'FAGL_GET_ALL_LEDGERS_IN_BUKRS'
+    EXPORTING
+      I_BUKRS    = P_BUKRS
+    IMPORTING
+      ET_LEDGERS = LT_LEDGERS.
+
+* Remove all GL-Ledger without FIN_UKV scenario
+* FIN_UKV = Cost of Sales Accounting scenario
+
+  LOOP AT LT_LEDGERS INTO LS_LEDGERS.
+    ld_index = SY-TABIX.
+    SELECT SINGLE RLDNR INTO ld_rldnr1
+           FROM FAGL_LEDGER_SCEN
+           WHERE    RLDNR = LS_LEDGERS
+           AND   SCENARIO = 'FIN_UKV'.
+    IF SY-SUBRC <> 0.
+      DELETE LT_LEDGERS INDEX ld_index.
+    ENDIF.
+  ENDLOOP.
+
+*** Build-up LedgerTab
+  LOOP AT LT_LEDGERS INTO LS_LEDGERS.
+    CLEAR: LS_T881, LS_LD_BUKRS.
+    CALL FUNCTION 'G_GET_LEDGER_INFO'
+      EXPORTING
+        I_RLDNR              = LS_LEDGERS-RLDNR
+      IMPORTING
+        E_LEDGER_INFO        = LS_T881
+      EXCEPTIONS
+        NO_LEDGER_INFO_FOUND = 1
+        NO_KEYFIG_INFO_FOUND = 2
+        NO_LEDGER_TEXT_FOUND = 3
+        OTHERS               = 4.
+    IF SY-SUBRC <> 0.
+      MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+      WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+    ENDIF.
+
+    CALL FUNCTION 'G_GET_TABLE_INFO'
+      EXPORTING
+        I_TAB                = LS_T881-TAB
+      IMPORTING
+        E_TAB_INFO           = LS_T800A
+      EXCEPTIONS
+        NO_TABLE_INFO_FOUND  = 1
+        NO_KEYFIG_INFO_FOUND = 2
+        OTHERS               = 3.
+    IF SY-SUBRC <> 0.
+      MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+      WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+    ENDIF.
+    LD_SITAB = LS_T800A-NTABLE.
+    MOVE-CORRESPONDING LS_T881 TO LS_LEDGERTABLE.
+    LS_LEDGERTABLE-tabname = LD_SITAB.
+    INSERT LS_LEDGERTABLE INTO TABLE PT_LEDGERTABLE.
+    MOVE-CORRESPONDING LS_LEDGERTABLE TO LS_LD_BUKRS.
+    LS_LD_BUKRS-BUKRS = P_BUKRS.
+    IF NOT LS_LD_BUKRS-BUKRS IS INITIAL.
+      COLLECT LS_LD_BUKRS INTO LST_LD_BUKRS.
+    ENDIF.
+  ENDLOOP.
+  SORT LST_LD_BUKRS BY BUKRS RLDNR.
+ENDFORM.                    "GET_LEDGER_FOR_BUKRS
+
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_BIW_DATASOURCES_FOR_LEDGER
+*&---------------------------------------------------------------------*
+*       BW: Is delta uplaoad activ? If yes then Ful Upload required
+*----------------------------------------------------------------------*
+*      -->P_LEDGER       text
+*      -->P_DELTA_INTIT  text
+*      -->PT_ROOSOURCE   text
+*----------------------------------------------------------------------*
+FORM GET_BIW_DATASOURCES_FOR_LEDGER
+                             USING P_LEDGER TYPE RLDNR
+                                   P_DELTA_INTIT TYPE CHAR1
+                          CHANGING PT_ROOSOURCE TYPE TTY_ROOSOURCE.
+
+  DATA: ls_ledger_info like t881,
+        ld_lead_rldnr type rldnr,
+        ld_GLFLEX_ACTIVE type boole_d,
+        lt_881is_pi like t881is_pi occurs 0 with header line,
+        lT_ROOSOURCE like  ROOSOURCE occurs 0 with header line,
+        lT_ROOSPRMSC like  ROOSPRMSC occurs 0 with header line,
+        lT_ROOSPRMSF like  ROOSPRMSF occurs 0 with header line,
+        LD_RLOGSYS1  TYPE  LOGSYS,
+        LD_RLOGSYS2  TYPE  LOGSYS,
+        ld_fmod_name TYPE RS38L_FNAM,
+         ls_tfdir LIKE TFDIR.
+
+  REFRESH PT_ROOSOURCE.
+  ld_fmod_name = 'G_BIW_DATASOURCES_FOR_LEDGER'.
+  SELECT SINGLE * FROM tfdir INTO ls_tfdir
+                  WHERE funcname = ld_fmod_name.
+  IF SY-SUBRC = 0.
+    CALL FUNCTION ld_fmod_name
+      EXPORTING
+        I_RLDNR            = P_LEDGER
+        I_ONLY_DELTA_INITS = 'X'
+      TABLES
+        T_ROOSOURCE        = lT_ROOSOURCE
+        T_ROOSPRMSC        = lT_ROOSPRMSC
+        T_ROOSPRMSF        = lT_ROOSPRMSF.
+*   Append global return tables
+    append lines of lt_roosource to PT_ROOSOURCE.
+    EXIT.
+  ENDIF.
+
+* Get own logical system
+  CALL FUNCTION 'RSAN_LOGSYS_DETERMINE'
+    EXPORTING
+      i_client = sy-mandt
+    IMPORTING
+      e_logsys = LD_RLOGSYS2.
+
+* Get ledger information
+  CALL FUNCTION 'G_GET_LEDGER_INFO'
+    EXPORTING
+      I_RLDNR              = p_ledger
+    IMPORTING
+      E_LEDGER_INFO        = ls_ledger_info
+    EXCEPTIONS
+      NO_LEDGER_TEXT_FOUND = 3.
+
+* Process different ledgers
+  case p_ledger.
+    when '00'.
+      lt_881is_pi-rldnr = p_ledger.
+      lt_881is_pi-isource = '0FI_GL_1'.
+      append lt_881is_pi.
+
+      lt_881is_pi-rldnr = p_ledger.
+      lt_881is_pi-isource = '0FI_GL_4'.
+      append lt_881is_pi.
+
+      lt_881is_pi-rldnr = p_ledger.
+      lt_881is_pi-isource = '0FI_GL_6'.
+      append lt_881is_pi.
+
+    when '0F'.
+      lt_881is_pi-rldnr = p_ledger.
+      lt_881is_pi-isource = '0FI_GL_2'.
+      append lt_881is_pi.
+
+      lt_881is_pi-rldnr = p_ledger.
+      lt_881is_pi-isource = '0FI_GL_7'.
+      append lt_881is_pi.
+
+    when others.
+*     Get fix datasources for NewGL
+*    (e.g. 0FI_GL_10 for leading ledger)
+      if ls_ledger_info-glflex ne space and
+         ls_ledger_info-xleading ne space.
+        select * from roosource into table lt_roosource
+        where oltpsource like '0FI_GL%'
+          and objvers       = 'A'.                    "#EC CI_SGLSELECT
+        loop at lt_roosource.
+          check lt_roosource-oltpsource ne '0FI_GL_1'
+            and lt_roosource-oltpsource ne '0FI_GL_2'
+            and lt_roosource-oltpsource ne '0FI_GL_6'
+            and lt_roosource-oltpsource ne '0FI_GL_7'.
+          lt_881is_pi-rldnr = p_ledger.
+          lt_881is_pi-isource = lt_roosource-oltpsource.
+          append lt_881is_pi.
+        endloop.
+        refresh lt_roosource.
+      endif.
+  endcase.
+
+* Get all user defined datasources out of t881IS_PI
+* independently from ledger
+  select * from t881is_pi appending table lt_881is_pi
+    where rldnr = p_ledger.
+
+* Process also line item datasources
+  loop at lt_881is_pi where not sisource is initial.
+    lt_881is_pi-isource = lt_881is_pi-sisource.
+    clear lt_881is_pi-sisource.
+    append lt_881is_pi.
+  endloop.
+
+*Now read all necessary informations for
+*assigned datasources
+  loop at lt_881is_pi.
+    if not lt_881is_pi-isource is initial.
+      perform get_isource_info tables  lT_ROOSOURCE
+                                       lt_roosprmsc
+                                       lt_roosprmsf
+                               using   lt_881is_pi-isource
+                                       P_DELTA_INTIT
+                                       LD_RLOGSYS1
+                                       LD_RLOGSYS2.
+*   Append global return tables
+      append lines of lt_roosource to PT_ROOSOURCE.
+    endif.
+  endloop.
+
+
+
+ENDFORM.                    "GET_BIW_DATASOURCES_FOR_LEDGER
+
+
+*&---------------------------------------------------------------------*
+*&      Form  get_isource_info
+*&---------------------------------------------------------------------*
+*      BW Check Sorce Info
+*----------------------------------------------------------------------*
+*      -->LT_ROOSOURCE        text
+*      -->LT_ROOSPRMSC        text
+*      -->LT_ROOSPRMSF        text
+*      -->I_SOURCE            text
+*      -->I_ONLY_DELTA_INITS  text
+*      -->I_RLOGSYS           text
+*      -->I_SLOGSYS           text
+*----------------------------------------------------------------------*
+form get_isource_info tables  lT_ROOSOURCE structure ROOSOURCE
+                              lt_roosprmsc structure roosprmsc
+                              lt_roosprmsf structure roosprmsf
+                      using   i_source type ROOSOURCE-OLTPSOURCE
+                              I_ONLY_DELTA_INITS type xflag
+                              i_rlogsys type logsys
+                              i_slogsys type logsys.
+
+  clear:   lT_ROOSOURCE, lt_roosprmsc, lt_roosprmsf.
+  refresh: lT_ROOSOURCE, lt_roosprmsc, lt_roosprmsf.
+
+* Delta initializations
+  if not i_only_delta_inits is initial.
+    SELECT * FROM  roosprmsc into TABLE lt_roosprmsc
+             WHERE oltpsource = i_source
+             AND   slogsys    = i_slogsys
+             and   initstate ne space.
+  else.
+    SELECT * FROM  roosprmsc into TABLE lt_roosprmsc
+             WHERE oltpsource = i_source
+             AND   slogsys    = i_slogsys.
+  endif.
+
+* If exactly one receiving LOGSYS is required
+* delete all others
+  if not i_rlogsys is initial.
+    delete lt_roosprmsc where rlogsys ne i_rlogsys.
+  endif.
+
+* Filter values for delta initializations
+  SELECT * FROM  roosprmsf into TABLE lt_roosprmsf
+           WHERE oltpsource = i_source
+           AND   slogsys    = i_slogsys.
+  if not i_only_delta_inits is initial.
+    loop at lt_roosprmsf.
+      read table lt_roosprmsc with key
+           oltpsource = lt_roosprmsf-oltpsource
+           SLOGSYS    = lt_roosprmsf-slogsys
+           RLOGSYS    = lt_roosprmsf-rlogsys
+           INITRNR    = lt_roosprmsf-initrnr.
+      if sy-subrc ne 0.
+        delete lt_roosprmsf.
+      endif.
+    endloop.
+  endif.
+
+* If exactly one receiving LOGSYS is required
+* delete all others
+  if not i_rlogsys is initial.
+    delete lt_roosprmsf where rlogsys ne i_rlogsys.
+  endif.
+
+* Header of ROOSOURCE
+  SELECT * FROM  roosource into TABLE lt_roosource
+           WHERE oltpsource = i_source
+           AND   objvers    = 'A'.                    "#EC CI_SGLSELECT
+  if not i_only_delta_inits is initial.
+    loop at lt_roosource.
+      read table lt_roosprmsc with key
+           oltpsource = lt_roosource-oltpsource.
+      if sy-subrc ne 0.
+        delete lt_roosource.
+      endif.
+    endloop.
+  endif.
+endform.                    "get_isource_info
+
+
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_BASICS
+*&---------------------------------------------------------------------*
+*       Check Ledger using Delta Upload, Document Split Active
+*----------------------------------------------------------------------*
+FORM CHECK_BASICS .
+  DATA: LT_BUKRS      TYPE  TABLE OF BUKRS,
+        LT_LEDGERTAB1 TYPE TTY_LEDGERTAB,
+        LT_LEDGERTAB2 TYPE TABLE OF TY_LEDGERTAB,
+        LS_LEDGERTAB  TYPE TY_LEDGERTAB,
+        LT_ROOSOURCE  TYPE TTY_ROOSOURCE,
+        LS_ROOSOURCE  TYPE LINE OF TTY_ROOSOURCE,
+        LS_SPLIT_ACTC TYPE FAGL_SPLIT_ACTC,
+        LD_BUKRS      TYPE BUKRS,
+        LD_LINES      LIKE SY-TABIX,
+        LS_T001       TYPE T001.
+
+  SELECT BUKRS FROM T001 INTO TABLE LT_BUKRS
+              WHERE BUKRS IN PR_BUKRS.
+  LOOP AT LT_BUKRS INTO LD_BUKRS.
+    SELECT SINGLE * FROM FAGL_SPLIT_ACTC
+                    INTO LS_SPLIT_ACTC
+                  WHERE  BUKRS eq LD_BUKRS.
+    IF  ( LS_SPLIT_ACTC-B_INACTIVE IS INITIAL )
+    AND ( NOT GS_FAGL_ACTIVEC-SPLITMETHD IS INITIAL ).
+
+      PERFORM CREATE_INFO_MESSAGE
+                  USING 'W'
+                        zmtext06 "Doc Split Active in CoCode
+                        LD_BUKRS
+                        SPACE
+                        SPACE
+                        SPACE.
+    ENDIF.
+
+    PERFORM GET_LEDGER_FOR_BUKRS
+              USING    ld_bukrs
+              CHANGING LT_LEDGERTAB1.
+    LOOP AT LT_LEDGERTAB1 INTO LS_LEDGERTAB.
+      COLLECT LS_LEDGERTAB INTO LT_LEDGERTAB2.
+    ENDLOOP.
+  ENDLOOP.
+
+  IF NOT ( GD_FKBER_SPLITT IS INITIAL ) AND
+     NOT ( GS_FAGL_ACTIVEC-ACTIVE IS INITIAL ).
+    PERFORM CREATE_INFO_MESSAGE
+                USING 'W'
+                      zmtext07 "Doc Split Active
+                      SY-MANDT
+                      SPACE
+                      SPACE
+                      SPACE.
+  ENDIF.
+
+  LOOP AT LT_LEDGERTAB2 INTO LS_LEDGERTAB.
+
+*  Now Check if BW Delta Extractor is used:
+    PERFORM GET_BIW_DATASOURCES_FOR_LEDGER
+               USING LS_LEDGERTAB-RLDNR
+                     'X'
+           CHANGING LT_ROOSOURCE.
+    DESCRIBE TABLE LT_ROOSOURCE LINES ld_lines.
+    IF ld_lines > 0.
+      LOOP AT LT_ROOSOURCE INTO LS_ROOSOURCE.
+        PERFORM CREATE_INFO_MESSAGE
+                    USING 'W'
+                          zmtext08 "BW Delta Upload !!!
+                          LS_LEDGERTAB-RLDNR
+                          LS_ROOSOURCE-OLTPSOURCE
+                          SPACE
+                          SPACE.
+      ENDLOOP.
+
+    ENDIF.
+  ENDLOOP.
+* Check Authority for company code
+  LOOP AT LT_BUKRS INTO LD_BUKRS.
+    AUTHORITY-CHECK OBJECT 'F_BKPF_BUK'
+      ID 'ACTVT' FIELD '02'
+      ID 'BUKRS' FIELD LD_BUKRS.
+    IF sy-subrc NE 0.
+      MESSAGE e083(F5) WITH LD_BUKRS.
+    ENDIF.
+*   Check Authority for company code / Ledger
+    LOOP AT LT_LEDGERTAB2 INTO LS_LEDGERTAB.
+      AUTHORITY-CHECK OBJECT 'F_FAGL_LDR'
+               ID 'BUKRS' FIELD LD_BUKRS
+               ID 'GLRLDNR' FIELD LS_LEDGERTAB-RLDNR
+               ID 'GLRRCTY' FIELD '0'
+               ID 'GLRVERS' FIELD '001'
+               ID 'ACTVT' FIELD '02'.
+      IF SY-SUBRC <> 0.
+        MESSAGE E027(FAGL_POST_SERVICE) WITH LS_LEDGERTAB-RLDNR
+                                             LD_BUKRS.
+      ENDIF.
+    ENDLOOP.
+  ENDLOOP.
+
+* Check if company code is assigned to controlling area
+  SELECT * FROM T001 INTO ls_t001
+              WHERE BUKRS IN PR_BUKRS.
+
+    IF ls_t001-kokfi IS INITIAL.
+      PERFORM CREATE_INFO_MESSAGE
+                  USING 'W'
+                        zmtext10
+                        ls_t001-bukrs
+                        SPACE
+                        SPACE
+                        SPACE.
+
+    ENDIF.
+
+
+  ENDSELECT.
+
+
+ENDFORM.                    "CHECK_BASICS
+
+*&---------------------------------------------------------------------*
+*&      Form  CREATE_INFO_MESSAGE
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->PD_MSGTYPE text
+*      -->PD_TEXT    text
+*      -->PD_VAR1    text
+*      -->PD_VAR2    text
+*      -->PD_VAR3    text
+*      -->PD_VAR4    text
+*----------------------------------------------------------------------*
+FORM CREATE_INFO_MESSAGE USING PD_MSGTYPE TYPE CHAR1
+                               PD_TEXT TYPE TY_MSGTXT
+                               PD_VAR1
+                               PD_VAR2
+                               PD_VAR3
+                               PD_VAR4.
+
+  DATA LD_TEXT1 TYPE TY_MSGTXT.
+  DATA LD_TEXT2 TYPE TY_MSGTXT.
+  DATA LD_TEXT3 TYPE TY_MSGTXT.
+  DATA LD_LEN TYPE i.
+  DATA LD_START TYPE i.
+  DATA LD_LEN2 TYPE i.
+
+  DATA LD_CHAR(1) TYPE c.
+
+  LD_START = 25.
+  LD_TEXT1 = PD_TEXT.
+  IF NOT PD_VAR1 IS INITIAL.
+    REPLACE '$' INTO LD_TEXT1 WITH PD_VAR1.
+  ENDIF.
+
+  IF NOT PD_VAR2 IS INITIAL.
+    REPLACE '$' INTO LD_TEXT1 WITH PD_VAR2.
+  ENDIF.
+
+  IF NOT PD_VAR3 IS INITIAL.
+    REPLACE '$' INTO LD_TEXT1 WITH PD_VAR3.
+  ENDIF.
+
+  IF NOT PD_VAR4 IS INITIAL.
+    REPLACE '$' INTO LD_TEXT1 WITH PD_VAR4.
+  ENDIF.
+  CONDENSE LD_TEXT1.
+  LD_LEN = strlen( LD_TEXT1 ).
+  IF LD_LEN > 50.
+    DO 28 TIMES.
+      LD_CHAR = LD_TEXT1+LD_START(1).
+      IF LD_CHAR IS INITIAL.
+        LD_TEXT3 = LD_TEXT1(LD_START).
+        LD_LEN2 = LD_START + 1.
+        LD_TEXT2 = LD_TEXT1+LD_LEN2.
+        EXIT.
+      ENDIF.
+      ADD 1 TO LD_START.
+    ENDDO.
+  ENDIF.
+
+  IF LD_LEN > 50.
+    LD_TEXT1 = LD_TEXT3.
+  ENDIF.
+
+  CALL FUNCTION 'MESSAGE_STORE'
+    EXPORTING
+      MSGTY = PD_MSGTYPE
+      TXTNR = '016'
+      ARBGB = 'GU'
+      MSGV1 = LD_TEXT1
+      MSGV2 = LD_TEXT2
+      MSGV3 = ''
+      MSGV4 = ''.
+ENDFORM.                    "CREATE_INFO_MESSAGE
+
+*&---------------------------------------------------------------------*
+*&      Form  WRITE_CHANGE_DOC
+*&---------------------------------------------------------------------*
+FORM write_change_doc using ps_bkpf TYPE BKPF
+                            ps_old_bseg TYPE BSEG
+                            ps_new_bseg TYPE BSEG
+                            ps_old_bseg_add TYPE BSEG_ADD
+                            ps_new_bseg_add TYPE BSEG_ADD.
+
+
+  DATA: ls_objectid TYPE cdhdr-objectid.
+  DATA: dummy_n_bkdf TYPE bkdf.
+  DATA: dummy_o_bkdf TYPE bkdf.
+  DATA: ls_n_bkpf TYPE bkpf.
+  DATA: ls_o_bkpf TYPE bkpf.
+  DATA: dummy_xbsec TYPE TABLE OF fbsec.
+  DATA: dummy_ybsec TYPE TABLE OF fbsec.
+  DATA: dummy_xbsed TYPE TABLE OF fbsed.
+  DATA: dummy_ybsed TYPE TABLE OF fbsed.
+  DATA: lt_o_bseg TYPE TABLE OF fbseg.
+  DATA: lt_n_bseg TYPE TABLE OF fbseg.
+  DATA: ls_bseg TYPE bseg.
+  DATA: ls_fbseg TYPE fbseg.
+  DATA: lt_o_bseg_add TYPE TABLE OF fbseg_add.
+  DATA: lt_n_bseg_add TYPE TABLE OF fbseg_add.
+  DATA: ls_bseg_add TYPE bseg_add.
+  DATA: ls_fbseg_add TYPE fbseg_add.
+  DATA: dummy_xbset TYPE TABLE OF fbset.
+  DATA: dummy_ybset TYPE TABLE OF fbset.
+
+*** Check if doc changes are required
+  CHECK NOT PD_DOCHG IS INITIAL.
+
+*** initialize all structures
+  CLEAR: dummy_n_bkdf, dummy_o_bkdf, ls_n_bkpf, ls_o_bkpf.
+  CLEAR: ls_bseg, ls_fbseg, ls_bseg_add, ls_fbseg_add.
+  REFRESH: dummy_xbsec, dummy_ybsec, dummy_xbsed, dummy_ybsed,
+           lt_n_bseg, lt_o_bseg, lt_n_bseg_add, lt_o_bseg_add,
+           dummy_xbset, dummy_ybset.
+*** create OBJECTID
+  CLEAR ls_objectid.
+  ls_objectid(3)    = ps_bkpf-mandt.
+  ls_objectid+3(4)  = ps_bkpf-bukrs.
+  ls_objectid+7(10) = ps_bkpf-belnr.
+  ls_objectid+17(4) = ps_bkpf-gjahr.
+*** populate data: BKPF
+  ls_n_bkpf = ps_bkpf.
+  ls_o_bkpf = ps_bkpf.
+
+*** populate data: BSEG
+  APPEND ps_new_bseg TO lt_n_bseg.
+  APPEND ps_old_bseg TO lt_o_bseg.
+
+*** populate data: BSEG_ADD
+  APPEND ps_new_bseg_add TO lt_n_bseg_add.
+  APPEND ps_old_bseg_add TO lt_o_bseg_add.
+
+*** call FM once for entire document
+  CALL FUNCTION 'BELEG_WRITE_DOCUMENT'
+    EXPORTING
+      objectid     = ls_objectid
+      utime        = sy-timlo
+      udate        = sy-datlo
+      username     = sy-uname
+      tcode        = sy-tcode
+      n_bkdf       = dummy_n_bkdf
+      o_bkdf       = dummy_o_bkdf
+      n_bkpf       = ls_n_bkpf
+      o_bkpf       = ls_o_bkpf
+*     upd_bkpf     = 'U'
+      upd_bseg     = 'U'
+      upd_bseg_add = 'U'
+    TABLES
+      xbsec        = dummy_xbsec
+      ybsec        = dummy_ybsec
+      xbsed        = dummy_xbsed
+      ybsed        = dummy_ybsed
+      xbseg        = lt_n_bseg
+      ybseg        = lt_o_bseg
+      xbseg_add    = lt_n_bseg_add
+      ybseg_add    = lt_o_bseg_add
+      xbset        = dummy_xbset
+      ybset        = dummy_ybset.
+
+ENDFORM.                    " WRITE_CHANGE_DOC
+
+*&---------------------------------------------------------------------*
+*&      Form  UPDATE_BWFI_AEDAT
+*&---------------------------------------------------------------------*
+*       UPDATE Table BWFI_AEDAT  Log Table for Changed FI Documents    *
+*                    For BW Extractor FI                               *
+*----------------------------------------------------------------------*
+*      -->PS_BSEG    BSEG                                              *
+*----------------------------------------------------------------------*
+FORM UPDATE_BWFI_AEDAT USING ps_bseg TYPE BSEG.
+
+  DATA ld_program TYPE RSDSWHERE-LINE.
+
+  ld_program = syst-cprog.
+  CALL FUNCTION 'OPEN_FI_PERFORM_00005011_P'
+    EXPORTING
+      i_chgtype   = 'U'
+      i_origin    = ld_program
+      i_tabname   = 'BSEG'
+      i_structure = ps_bseg
+    EXCEPTIONS
+      error       = 1
+      OTHERS      = 2.
+  IF sy-subrc = 4.
+    message id sy-msgid type sy-msgty number sy-msgno
+          with sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+ENDFORM.                    "UPDATE_BWFI_AEDAT
+
+
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_TABLE_CLASS
+*&---------------------------------------------------------------------*
+*       Checks if table is transparent or a view                       *
+*                    For sFIN                                          *
+*----------------------------------------------------------------------*
+
+FORM CHECK_TABLE_CLASS USING p_tab TYPE TABNAME16
+                    CHANGING p_tabclass LIKE DD02V-TABCLASS.
+
+  DATA ls_table_attr  TYPE dd02v.
+  DATA ld_name        TYPE  DDOBJNAME.
+
+  ld_name = p_tab.
+  CALL FUNCTION 'DDIF_TABL_GET'
+    EXPORTING
+      NAME          = ld_name
+      STATE         = 'A'
+    IMPORTING
+      DD02V_WA      = ls_table_attr
+    EXCEPTIONS
+      ILLEGAL_INPUT = 1
+      OTHERS        = 2.
+  IF SY-SUBRC <> 0.
+    CLEAR p_tabclass.
+  ELSE.
+    p_tabclass = ls_table_attr-tabclass.
+  ENDIF.
+
+
+
+ENDFORM.

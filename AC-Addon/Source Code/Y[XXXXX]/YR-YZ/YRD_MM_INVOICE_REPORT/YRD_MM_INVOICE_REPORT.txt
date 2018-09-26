@@ -1,0 +1,440 @@
+REPORT yrd_mm_invoice_report MESSAGE-ID m8.
+*---------------------------------------------------------------------*
+*Management Summary
+*RDC need a report to show out the blocked invoice with price variance only.
+*That means the selected invoice should fulfil below criteria:
+*1 Invoice is blocked
+*2 All item in this blocked invoice is due to price variance, not contain other reason.
+*
+*Logic:
+*Basic logic is the same with standard Tcode MRBR , get the data from selection screen.
+*Check invoice number selected. If all the block reason is price ,then keep the record and display.
+*If one of the item in the selected in invoice has the block reason other than price difference, then delete this record.
+*---------------------------------------------------------------------*
+
+*---------------------------------------------------------------------*
+* Data: databases
+*---------------------------------------------------------------------*
+TABLES: rbkp_blocked,rbkp,vbrp.
+
+*---------------------------------------------------------------------*
+* Data: Parameters and Select-options
+*---------------------------------------------------------------------*
+* Frame "Selection" ----- --------------------------------------------
+SELECTION-SCREEN BEGIN OF BLOCK selection WITH FRAME TITLE text-010.
+SELECT-OPTIONS:
+      so_mrm_z FOR rbkp_blocked-mrm_zlspr NO-DISPLAY,
+      so_bukrs FOR rbkp_blocked-bukrs MEMORY ID buk,
+      so_belnr FOR rbkp_blocked-belnr,
+      so_gjahr FOR rbkp_blocked-gjahr,
+      so_lifnr FOR rbkp_blocked-lifnr MATCHCODE OBJECT kred,
+      so_budat FOR rbkp_blocked-budat,
+      so_faell FOR rbkp_blocked-faell,
+      so_ekgrp FOR rbkp_blocked-ekgrp,
+      so_werks FOR vbrp-werks,
+      so_xblnr FOR rbkp-xblnr,
+      so_usnam FOR rbkp_blocked-usnam.
+SELECTION-SCREEN END OF BLOCK selection.
+
+** Frame "Processing" --------------------------------------------------
+*SELECTION-SCREEN BEGIN OF BLOCK processing WITH FRAME TITLE text-030.
+*SELECTION-SCREEN BEGIN OF LINE.
+*SELECTION-SCREEN POSITION 1.
+*PARAMETERS pa_xmanu LIKE rm08mrbr-manu DEFAULT 'X'
+*                   RADIOBUTTON GROUP val.
+*SELECTION-SCREEN COMMENT 3(30) text-040 FOR FIELD pa_xmanu.
+*SELECTION-SCREEN POSITION 40.
+*PARAMETERS pa_xauto LIKE rm08mrbr-auto
+*                   RADIOBUTTON GROUP val.
+*SELECTION-SCREEN COMMENT 43(30) text-050 FOR FIELD pa_xauto.
+*SELECTION-SCREEN END OF LINE.
+*SELECTION-SCREEN BEGIN OF LINE.
+*PARAMETERS: pa_xskto LIKE rm08mrbr-skto AS CHECKBOX.
+*SELECTION-SCREEN COMMENT 3(30) text-055
+*                               FOR FIELD pa_xskto.
+*SELECTION-SCREEN END OF LINE.
+*SELECTION-SCREEN END OF BLOCK processing.
+
+
+
+** Rahmen "BLOCKING_TYPE" (rbkp_blocked-mrm_zlspr) ---------------------
+*SELECTION-SCREEN BEGIN OF BLOCK blocking_type
+*                                WITH FRAME TITLE text-060.
+*SELECTION-SCREEN BEGIN OF LINE.
+*PARAMETERS: pa_xspgr LIKE rm08mrbr-spgr DEFAULT 'X'
+*                     RADIOBUTTON GROUP spv.
+*SELECTION-SCREEN COMMENT 3(30) text-061
+*                               FOR FIELD pa_xspgr.
+*SELECTION-SCREEN END OF LINE.
+*SELECTION-SCREEN BEGIN OF LINE.
+*PARAMETERS: pa_zlspr LIKE rm08mrbr-zlspr
+*                     RADIOBUTTON GROUP spv.
+*SELECTION-SCREEN COMMENT 3(30) text-063
+*                               FOR FIELD pa_zlspr.
+*SELECTION-SCREEN END OF LINE.
+*SELECTION-SCREEN BEGIN OF LINE.
+*PARAMETERS: pa_stoch LIKE rm08mrbr-stoch
+*                     RADIOBUTTON GROUP spv.
+*SELECTION-SCREEN COMMENT 3(30) text-062
+*                               FOR FIELD pa_stoch.
+*SELECTION-SCREEN END OF LINE.
+**ENHANCEMENT-POINT RM08RELEASE_01 SPOTS ES_RM08RELEASE STATIC.
+*SELECTION-SCREEN END OF BLOCK blocking_type.
+
+* Rahmen "Anzeigen" ----------------------------------------------------
+SELECTION-SCREEN SKIP.
+SELECTION-SCREEN BEGIN OF BLOCK anzeigen WITH FRAME TITLE text-065.
+* Anzeigevariante
+PARAMETERS: pa_varia LIKE disvariant-variant.
+SELECTION-SCREEN END OF BLOCK anzeigen.
+
+*---------------------------------------------------------------------**
+* Data: Includes for internal tables, fields, constants etc.
+*---------------------------------------------------------------------**
+INCLUDE yrd_mrm_const_mrm.
+INCLUDE yrd_mrm_const_common.
+
+*---------------------------------------------------------------------**
+* Data: Type-pools, internal tables, fields, constants etc.
+*---------------------------------------------------------------------**
+TYPE-POOLS: mmcr,mrm,slis.
+
+TYPES: BEGIN OF s_incomplete,
+        belnr        TYPE re_belnr,
+        gjahr        TYPE gjahr,
+       END OF   s_incomplete.
+TYPES: t_incomplete TYPE TABLE OF s_incomplete.
+
+DATA: tab_rbkp_blocked TYPE mrm_tab_rbkp_blocked WITH HEADER LINE,
+      tab_arbkp TYPE mrm_tab_arbkp,
+      tab_arseg TYPE mrm_tab_arseg,
+      tab_released_arbkp TYPE mrm_tab_arbkp,
+      tab_incomplete TYPE t_incomplete,
+      ekgrp_in_list TYPE c,
+      release_auto TYPE c,             " flag for ALV list
+      gv_ivext_changed TYPE xfeld.     "NCF IV
+
+*ENHANCEMENT-POINT RM08RELEASE_02 SPOTS ES_RM08RELEASE STATIC.
+*---------------------------------------------------------------------**
+* Data: Constants
+*---------------------------------------------------------------------**
+CONSTANTS:
+      c_repid TYPE sy-repid VALUE 'YRD_MM_INVOICE_REPORT',
+      c_save(1)     TYPE  c            VALUE 'A',
+      c_top_of_list TYPE slis_formname VALUE 'TOP_OF_LIST',
+      c_top_of_page TYPE slis_formname VALUE 'TOP_OF_PAGE',
+      c_tab_arseg   TYPE slis_tabname  VALUE 'TAB_ARSEG',
+      c_tab_arbkp   TYPE slis_tabname  VALUE 'TAB_ARBKP'.
+
+DATA: f_mrm_zlspr       LIKE rbkp_blocked-mrm_zlspr,
+      f_list_lines      TYPE i,
+      f_ekgrp_selection TYPE boole-boole.  " selection with purch.group
+
+DATA: s_variant      LIKE  disvariant,
+      s_var_usr      LIKE  disvariant.
+
+*---------------------------------------------------------------------**
+* Initialization.
+*---------------------------------------------------------------------**
+INITIALIZATION.
+
+*ENHANCEMENT-POINT RM08RELEASE_05 SPOTS ES_RM08RELEASE STATIC .
+
+* Schalter Varianten benutzerspezifisch/allgemein speicherbar setzen
+  PERFORM variant_init.
+* Get default variant
+  s_var_usr = s_variant.
+  CALL FUNCTION 'REUSE_ALV_VARIANT_DEFAULT_GET'
+    EXPORTING
+      i_save     = c_save
+    CHANGING
+      cs_variant = s_var_usr
+    EXCEPTIONS
+      not_found  = 2.
+  IF sy-subrc = 0.
+    pa_varia =  s_var_usr-variant.
+  ENDIF.
+* Enhancement point for POWL
+*ENHANCEMENT-POINT EHP603_RM08RELEASE_01 SPOTS ES_RM08RELEASE_EHP603.
+
+
+
+*ENHANCEMENT-POINT RM08RELEASE_03 SPOTS ES_RM08RELEASE.
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR pa_varia.
+  PERFORM f4_varia CHANGING pa_varia.
+
+*---------------------------------------------------------------------*
+*        AT SELECTION SCREEN                                          *
+*---------------------------------------------------------------------*
+AT SELECTION-SCREEN.
+
+  IF NOT pa_varia IS INITIAL.
+    MOVE s_variant TO s_var_usr.
+    MOVE pa_varia TO s_var_usr-variant.
+    CALL FUNCTION 'REUSE_ALV_VARIANT_EXISTENCE'
+      EXPORTING
+        i_save     = c_save
+      CHANGING
+        cs_variant = s_var_usr.
+    s_variant = s_var_usr.
+  ELSE.
+    PERFORM variant_init.
+  ENDIF.
+
+*  CLEAR release_auto.
+*  IF pa_xauto = 'X'.
+*    release_auto = 'X'.
+*    IF pa_xspgr IS INITIAL.
+*      MESSAGE e655.
+*    ENDIF.
+*  ENDIF.
+
+**--- F_MRM_ZLSPR fill  -----------------------------------------------*
+*  IF NOT pa_xspgr IS INITIAL.
+*    f_mrm_zlspr = c_mrm_zlspr_a.
+*  ELSEIF NOT pa_zlspr IS INITIAL.
+*    f_mrm_zlspr = c_mrm_zlspr_m.
+*  ELSEIF NOT pa_stoch IS INITIAL.
+*    f_mrm_zlspr = c_mrm_zlspr_s.
+*  ELSE.
+*    MESSAGE a607 WITH 'RM08RELEASE'.
+*  ENDIF.
+  f_mrm_zlspr = c_mrm_zlspr_a.
+
+*---------------------------------------------------------------------*
+START-OF-SELECTION.
+
+* Selection from RBKP_BLOCKED -----------------------------------------*
+  READ TABLE so_ekgrp INDEX 1.
+  IF sy-subrc EQ 0.
+    f_ekgrp_selection = c_x.
+    SELECT * FROM rbkp_blocked INTO TABLE tab_rbkp_blocked
+       WHERE    mrm_zlspr  = f_mrm_zlspr
+         AND    bukrs      IN so_bukrs
+         AND    gjahr      IN so_gjahr
+         AND    lifnr      IN so_lifnr
+         AND    belnr      IN so_belnr
+         AND    usnam      IN so_usnam
+         AND    budat      IN so_budat
+         AND    faell      IN so_faell
+         AND
+         (      ekgrp      IN so_ekgrp
+         OR     ekgrp      EQ space  ).
+  ELSE.
+    SELECT * FROM rbkp_blocked INTO TABLE tab_rbkp_blocked
+       WHERE    mrm_zlspr  = f_mrm_zlspr
+         AND    bukrs      IN so_bukrs
+         AND    gjahr      IN so_gjahr
+         AND    lifnr      IN so_lifnr
+         AND    belnr      IN so_belnr
+         AND    usnam      IN so_usnam
+         AND    budat      IN so_budat
+         AND    faell      IN so_faell.
+  ENDIF.
+
+  IF sy-subrc <> 0.
+    MESSAGE s654.
+    IF sy-batch = space.
+      LEAVE TO TRANSACTION sy-tcode.
+    ELSE.
+      LEAVE.
+    ENDIF.
+  ENDIF.
+
+  SORT tab_rbkp_blocked BY gjahr belnr.
+
+*--- call BAdI to execute additional checks before release (start)-----*
+  CALL FUNCTION 'MRMBADI_RELEASE_CHECK'
+    EXPORTING
+      ti_rbkp_blocked = tab_rbkp_blocked[]
+    IMPORTING
+      te_rbkp_blocked = tab_rbkp_blocked[].
+  READ TABLE tab_rbkp_blocked INDEX 1.
+  IF sy-subrc <> 0.
+    MESSAGE s654.
+    IF sy-batch = space.
+      LEAVE TO TRANSACTION sy-tcode.
+    ELSE.
+      LEAVE.
+    ENDIF.
+  ENDIF.
+
+*--- call BAdI to execute additional checks before release (end)-------*
+
+  CLEAR ekgrp_in_list.
+
+  PERFORM authority_check TABLES tab_rbkp_blocked.
+
+  PERFORM header_data_read TABLES tab_rbkp_blocked
+                                  tab_arbkp.
+
+  PERFORM item_data_read    TABLES tab_arbkp
+                                     tab_arseg
+                            USING    f_ekgrp_selection
+                            CHANGING tab_incomplete.
+  SORT tab_arseg BY gjahr belnr koart buzei.
+  DESCRIBE TABLE tab_arseg LINES f_list_lines.
+  IF f_list_lines EQ 0
+   AND NOT ( sy-msgid = 'M8' AND sy-msgno = '657'
+   AND ekgrp_in_list = 'X' ).
+    MESSAGE s658.
+    LEAVE TO TRANSACTION sy-tcode.
+  ENDIF.
+
+  PERFORM text_check TABLES tab_arbkp
+                            tab_arseg
+                     USING  release_auto.
+
+*-------------------------- RDC (start)--------------------------------------*
+  PERFORM rdc_check TABLES tab_arseg.
+*-------------------------- RDC (end)----------------------------------------*
+
+  PERFORM alv_list USING    release_auto
+                            s_variant
+                   CHANGING tab_arbkp
+                            tab_arseg
+                            tab_released_arbkp.
+
+*----- Include f¨¹r Formroutinen --------------------------------------*
+  INCLUDE yrd_rm08release_f1.              " Formroutinen des Reports
+*ENHANCEMENT-POINT RM08RELEASE_04 SPOTS ES_RM08RELEASE STATIC.
+
+
+
+
+
+
+
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  RDC_CHECK
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_TAB_ARSEG  text
+*----------------------------------------------------------------------*
+FORM rdc_check  TABLES t_arseg TYPE mrm_tab_arseg.
+  DATA: wa_arseg TYPE mrm_arseg.
+
+
+*check Plant
+  IF so_werks IS NOT INITIAL.
+    LOOP AT t_arseg INTO wa_arseg.
+      IF wa_arseg-werks IN so_werks.
+      ELSE.
+        DELETE t_arseg.
+      ENDIF.
+      CLEAR: wa_arseg.
+    ENDLOOP.
+  ENDIF.
+*check Reference
+  IF so_xblnr IS NOT INITIAL.
+    LOOP AT t_arseg INTO wa_arseg.
+      SELECT SINGLE * FROM rbkp
+              WHERE belnr = wa_arseg-belnr
+                AND gjahr = wa_arseg-gjahr
+                AND bukrs = wa_arseg-bukrs.
+      IF sy-subrc = 0.
+        IF rbkp-xblnr IN so_xblnr.
+        ELSE.
+          DELETE t_arseg.
+        ENDIF.
+      ENDIF.
+      CLEAR: wa_arseg,rbkp.
+    ENDLOOP.
+  ENDIF.
+
+*add Reference
+  LOOP AT t_arseg INTO wa_arseg.
+    SELECT SINGLE * FROM rbkp
+            WHERE belnr = wa_arseg-belnr
+              AND gjahr = wa_arseg-gjahr
+              AND bukrs = wa_arseg-bukrs.
+    IF sy-subrc = 0.
+      wa_arseg-lfbnr = rbkp-xblnr.
+      MODIFY t_arseg FROM wa_arseg.
+    ENDIF.
+    CLEAR: rbkp.
+  ENDLOOP.
+
+*If all the block reason is price ,then keep the record and display.
+*If one of the item in the selected in invoice has the block reason other than price difference, then delete this record.
+  DATA: tt_arseg TYPE TABLE OF mrm_arseg WITH HEADER LINE.
+  CLEAR: tt_arseg,tt_arseg[].
+  tt_arseg[] = t_arseg[].
+
+  LOOP AT t_arseg INTO wa_arseg.
+    IF wa_arseg-spgrp = 'X'.
+      LOOP AT tt_arseg WHERE belnr = wa_arseg-belnr
+                        AND gjahr = wa_arseg-gjahr
+                        AND bukrs = wa_arseg-bukrs.
+        IF tt_arseg-spgrg = 'X' OR
+           tt_arseg-spgrm = 'X' OR
+           tt_arseg-spgrc = 'X' OR
+           tt_arseg-spgrs = 'X' OR
+           tt_arseg-spgrt = 'X' OR
+           tt_arseg-spgrq = 'X'.
+
+          LOOP AT t_arseg INTO wa_arseg
+                           WHERE belnr = tt_arseg-belnr
+                             AND gjahr = tt_arseg-gjahr
+                             AND bukrs = tt_arseg-bukrs.
+            DELETE t_arseg.
+          ENDLOOP.
+        ENDIF.
+      ENDLOOP.
+    ENDIF.
+  ENDLOOP.
+
+  LOOP AT t_arseg INTO wa_arseg.
+    IF wa_arseg-spgrg = 'X' OR
+       wa_arseg-spgrm = 'X' OR
+       wa_arseg-spgrc = 'X' OR
+       wa_arseg-spgrs = 'X' OR
+       wa_arseg-spgrt = 'X' OR
+       wa_arseg-spgrq = 'X'.
+      DELETE t_arseg.
+    ENDIF.
+    CLEAR: wa_arseg.
+  ENDLOOP.
+
+
+ENDFORM.                    " RDC_CHECK
+
+*Text symbol text£º
+*010:Selection of Blocked Invoices
+*020:Selection of Blocking Reasons
+*030:Processing
+*040:Release Manually
+*050:Release Automatically
+*051:Following invoices were released
+*055:Move Cash Disc. Date
+*060:Blocking Procedure
+*061:Blocked Due to Variances
+*062:Stochastically Blocked
+*063:Manual Payment Block
+*064:WEB Invoice
+*065:Display options
+*066:Status
+*067:Blkg Reason Invalid
+*068:Blkg Reason Deleted
+*069:Release Invoice
+*070:Incorrect
+*071:Blocked
+*090:Cleared by Netting
+
+*P01:Save Changes
+*Selection text£º
+*PA_VARIA:        Variant
+*SO_BELNR:        Invoice Document
+*SO_BUDAT:        Posting Date
+*SO_BUKRS:        Company Code
+*SO_EKGRP:        Purchasing Group
+*SO_FAELL:        Due Date
+*SO_GJAHR:        Fiscal Year
+*SO_LIFNR:        Vendor
+*SO_USNAM:        User
+*SO_WERKS:        Plant
+*SO_XBLNR:        Reference

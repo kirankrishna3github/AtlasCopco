@@ -1,0 +1,830 @@
+REPORT YSE_AUTO_PLANNED_SEO MESSAGE-ID ih
+                NO STANDARD PAGE HEADING.
+
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME     |CORRECTION NUMBER| CHANGE REFERENCE # *
+*----------------------------------------------------------------------*
+* MOD-001 |08.10.2013|L. Mertens           |CD1K977782| CR2765         *
+*----------------------------------------------------------------------*
+TABLES: viqmelst,
+        viqmel,
+        rihea.
+
+DATA: BEGIN OF object_tab OCCURS 0,
+        qmnum type qmnum,
+        strmn type strmn,
+        equnr type equnr,
+        iwerk type iwerk,
+        objnr type j_objnr,
+        qmtxt type qmtxt,
+        bstnk type bstkd,
+      END OF object_tab.
+
+DATA: BEGIN OF h_status_tab OCCURS 20.
+        INCLUDE STRUCTURE jstat.
+DATA: END OF h_status_tab.
+
+DATA: BEGIN OF h_status_text_tab OCCURS 20,
+        txt04 LIKE tj02t-txt04.
+DATA: END OF h_status_text_tab.
+
+data: gv_cnt_ok(3)   type n,
+      gv_answer,
+      no                         value '.',
+      yes                        VALUE '+',
+      gv_msg(119)    type c,
+      gv_mestx       like t100-text,
+      gv_ctam,
+      gv_auart          type auart,
+      gv_bemot          type bemot,
+      gv_cc             type bukrs,
+      gv_bwkey          type bwkey,
+      gv_bukrs          type bukrs.
+
+DATA: begin of i_logtab occurs 0,
+        code(1)    type c,
+        msg(119)   type c,
+      end of i_logtab.
+
+DATA: i_bdcdata LIKE bdcdata OCCURS 0 WITH HEADER LINE,
+      struct_bdcdata TYPE bdcdata,
+      lv_mode(1)     type c value 'N',
+      gt_err    LIKE BDCMSGCOLL occurs 0 with header line.
+
+* BAPI Sales order change
+DATA: BEGIN OF ls_order_header_inx.
+        INCLUDE STRUCTURE bapisdh1x.
+DATA: END   OF ls_order_header_inx.
+
+DATA: ls_order_item_in TYPE bapisditm.
+DATA: lt_order_item_in TYPE crmt_bapisditm_t.
+DATA: ls_order_item_inx TYPE bapisditmx.
+DATA: lt_order_item_inx TYPE crmt_bapisditmx_t.
+
+* Return
+DATA: lt_return TYPE STANDARD TABLE OF bapiret2,
+      ls_return LIKE bapiret2.
+
+DATA: BEGIN OF it_vbap OCCURS 0,
+        vbeln TYPE vbeln_va,
+        posnr TYPE posnr_va,
+        werks TYPE werks_ext,
+      END OF it_vbap.
+
+DATA: lv_caufvd(35) TYPE c  VALUE '(SAPLCOZF)CAUFVD',
+      lv_t399a_glob(35) TYPE c VALUE '(SAPLIMSM)T399A_GLOB'.
+
+FIELD-SYMBOLS: <fs_caufvd> TYPE caufvd,
+               <fs_t399a_glob> TYPE t399a.
+
+*
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE text-f01.
+SELECT-OPTIONS:
+iwerk      FOR      viqmelst-iwerk,
+qmnum      for      viqmelst-qmnum.
+SELECTION-SCREEN END OF BLOCK b1.
+
+*
+RANGES: stat     FOR viqmelst-stat,
+        stae1    FOR rihea-i_qstatex.
+
+*---------------------------------------------------------------------
+* START-OF-SELECTION
+*---------------------------------------------------------------------
+START-OF-SELECTION.
+
+  REFRESH object_tab.
+  CLEAR   object_tab.
+
+* Fill status in table for selection
+  PERFORM fill_stat.
+
+* Read notifications
+  PERFORM sel_notif.
+
+  LOOP AT object_tab.
+*.. Check status
+    PERFORM status_proof_l USING gv_answer.
+    IF gv_answer = no.
+      DELETE object_tab.
+    ENDIF.
+  endloop.
+
+*---------------------------------------------------------------------
+* END-OF-SELECTION
+*---------------------------------------------------------------------
+END-OF-SELECTION.
+
+  IF object_tab[] IS INITIAL.
+    write: / text-I00.
+    EXIT.
+  ENDIF.
+
+  SORT object_tab BY qmnum.
+
+  clear gv_cnt_ok.
+
+  loop at object_tab.
+    perform create_service_order using object_tab-qmnum object_tab-qmtxt
+         object_tab-strmn object_tab-equnr object_tab-iwerk object_tab-bstnk.
+  endloop.
+
+  if not i_logtab[] is initial.
+    perform list_logtab.
+  endif.
+
+
+*--- S U B R O U T I N E S -------------------------------------------*
+*---------------------------------------------------------------------*
+*       FORM STATUS_PROOF_L                                           *
+*---------------------------------------------------------------------*
+*       Status checking                                               *
+*---------------------------------------------------------------------*
+*  -->  F_ANSWER                                                      *
+*---------------------------------------------------------------------*
+FORM status_proof_l USING f_answer TYPE char01.
+
+  DATA: h_stat_flag.
+
+  REFRESH: h_status_tab,
+           h_status_text_tab.
+
+  CALL FUNCTION 'STATUS_READ'
+    EXPORTING
+      objnr            = object_tab-objnr
+      only_active      = 'X'
+    TABLES
+      status           = h_status_tab
+    EXCEPTIONS
+      object_not_found = 01.
+
+  CHECK sy-subrc = 0.
+
+  f_answer = no.
+
+  h_stat_flag = ' '.
+  LOOP AT h_status_tab.
+    check h_status_tab-stat  IN stat.
+    h_stat_flag = 'X'.
+    EXIT.
+  ENDLOOP.
+  IF h_stat_flag = ' '.
+    EXIT.
+  ENDIF.
+
+*
+  LOOP AT h_status_tab.
+    CALL FUNCTION 'STATUS_NUMBER_CONVERSION'
+      EXPORTING
+        language      = sy-langu
+        objnr         = object_tab-objnr
+        status_number = h_status_tab-stat
+      IMPORTING
+        txt04         = h_status_text_tab-txt04
+      EXCEPTIONS
+        OTHERS        = 01.
+    IF sy-subrc = 0.
+      APPEND h_status_text_tab.
+    ENDIF.
+  ENDLOOP.
+
+* Exclude orders assigned (ORAS)
+  h_stat_flag = ' '.
+  LOOP AT h_status_text_tab.
+    CHECK h_status_text_tab-txt04 EQ 'ORAS'.
+    h_stat_flag = 'X'.
+    EXIT.
+  ENDLOOP.
+  IF h_stat_flag = 'X'.
+    EXIT.
+  ENDIF.
+
+  f_answer = yes.
+
+ENDFORM.                    "status_proof_l
+
+*&---------------------------------------------------------------------*
+*&      Form  SEL_NOTIF
+*&---------------------------------------------------------------------*
+*       Select notifications                                           *
+*----------------------------------------------------------------------*
+FORM sel_notif.
+
+  DATA: lt_viqmel_iflos   TYPE TABLE OF viqmel_iflos,
+        lv_task_determine type task_determine.
+
+  FIELD-SYMBOLS: <l_viqmel_iflos> LIKE viqmel_iflos.
+
+  SELECT * FROM VIQMEL
+      INTO CORRESPONDING FIELDS OF TABLE lt_viqmel_iflos
+                        WHERE iwerk IN iwerk
+                          and qmnum in qmnum
+                          and qmart in ('Z4', 'X4').
+
+* Fill object_tab
+  LOOP AT lt_viqmel_iflos ASSIGNING <l_viqmel_iflos>.
+*.. Check if 'Determine tasks' flag is set
+    clear lv_task_determine.
+    select single task_determine into lv_task_determine
+       from MPOS where wapos = <l_viqmel_iflos>-wapos.
+
+    if sy-subrc = 0 and lv_task_determine = 'X'.
+      MOVE-CORRESPONDING <l_viqmel_iflos> TO object_tab.
+      APPEND object_tab.
+    else.
+      continue.
+    endif.
+  ENDLOOP.
+
+ENDFORM.                               " SEL_NOTIF
+
+*&---------------------------------------------------------------------*
+*&      Form  fill_stat
+*&---------------------------------------------------------------------*
+*       fill status for selection
+*----------------------------------------------------------------------*
+FORM fill_stat.
+
+  CLEAR stat.
+  REFRESH stat.
+  stat-option     = 'EQ'.
+  stat-sign       = 'I'.
+
+* open
+  stat-low     = 'I0068'.
+  APPEND stat.
+
+* in process
+  stat-low     = 'I0070'.
+  APPEND stat.
+
+ENDFORM.                    " fill_stat
+
+*&---------------------------------------------------------------------*
+*&      Form  create_service_order
+*&---------------------------------------------------------------------*
+*       If conditions are fulfilled create service order
+*----------------------------------------------------------------------*
+*  -->  P_QMNUM : notification number
+*  -->  P_QMTXT : notification short text
+*  -->  P_STRMN : required start date notification
+*  -->  P_EQUNR : equipment number
+*  -->  P_IWERK : maintenance planning plant
+*  -->  P_BSTNK : Customer purchase order number
+*----------------------------------------------------------------------*
+FORM create_service_order using p_qmnum type qmnum
+                                p_qmtxt type qmtxt
+                                p_strmn type strmn
+                                p_equnr type equnr
+                                p_iwerk type iwerk
+                                p_bstnk type bstkd.
+
+  data: lv_datum          like sy-datum,
+        lv_yweek          type yweek,
+        lv_days(3)        type n,
+        lt_afih like afih OCCURS 0 WITH HEADER LINE.
+
+  refresh lt_afih.
+
+* check if requested start date is x weeks ahead
+  select single yweek into lv_yweek
+    from yse_auto_pl_seo
+    where iwerk = p_iwerk.
+
+  if sy-subrc <> 0.
+*.. &1 : Pl.Plant &2 not in table YSE_AUTO_PL_SEO
+    MESSAGE i258(yam_re) WITH p_qmnum p_iwerk INTO gv_msg.
+    PERFORM add_message_to_tab using gv_msg 'A'.
+    return.
+  endif.
+
+  lv_days = 7 * lv_yweek.
+  lv_datum = sy-datum + lv_days.
+  if p_strmn not between sy-datum and lv_datum.
+*.. &1 : Requested start date &2 must be within &3 weeks
+    MESSAGE i257(yam_re) WITH p_qmnum p_strmn lv_yweek INTO gv_msg.
+    PERFORM add_message_to_tab using gv_msg 'A'.
+    return.
+  endif.
+
+* No open order on the equipment
+  select * into table lt_afih
+      from afih
+      where equnr eq p_equnr
+        and iphas ne '6'.
+
+  if not lt_afih[] is initial.
+*.. &1 : Open order(s) on the equipment &2
+    MESSAGE i253(yam_re) WITH p_qmnum p_equnr INTO gv_msg.
+    PERFORM add_message_to_tab using gv_msg 'A'.
+    return.
+  endif.
+
+* Finally, create service order
+  refresh: i_bdcdata,
+           gt_err.
+
+* Determine if plant is a CT-AM plant
+  select single bwkey into gv_bwkey
+    from t001W where werks = p_iwerk.
+
+  select single bukrs into gv_bukrs
+    from t001K WHERE bwkey = gv_bwkey.
+
+  SELECT SINGLE bukrs INTO gv_cc
+    FROM yam_ctam_ccodes WHERE bukrs = gv_bukrs.
+
+  IF sy-subrc = 0.          " CT-AM
+    gv_auart = 'ZSM3'.
+    gv_bemot = 'SP'.
+
+    perform fill_bdcdata using p_qmnum gv_auart gv_bemot p_equnr.
+    call transaction 'IW52' using i_bdcdata
+            mode lv_mode update 'S' messages into gt_err.
+  ELSE.                     " SEED
+    perform fill_bdcdata_X4 using p_qmnum p_bstnk p_qmtxt.
+    call transaction 'IW52' using i_bdcdata
+            mode lv_mode update 'S' messages into gt_err.
+
+*.. to create the service order
+    IF sy-subrc = 0.
+      REFRESH : it_vbap,
+                lt_order_item_in,
+                lt_order_item_inx,
+                lt_return.
+      CLEAR :   ls_order_header_inx,
+                ls_order_item_in,
+                ls_order_item_inx.
+
+      GET PARAMETER ID 'AUN' FIELD viqmel-vbeln.
+      SELECT vbeln posnr werks FROM vbap INTO TABLE it_vbap
+                  WHERE vbeln = viqmel-vbeln.
+
+      CALL FUNCTION 'PMSDO_RESET'.
+
+      ASSIGN (lv_t399a_glob) TO <fs_t399a_glob>.
+      IF sy-subrc = 0.
+        CLEAR : <fs_t399a_glob>-iwerk,
+                <fs_t399a_glob>-svobj,
+                <fs_t399a_glob>-svobj_id.
+      ENDIF.
+
+      LOOP AT it_vbap.
+*...... Itemnumber
+        ls_order_item_in-itm_number  = it_vbap-posnr.
+        ls_order_item_inx-itm_number = it_vbap-posnr.
+*...... Plant
+        ls_order_item_in-plant = it_vbap-werks.
+      ENDLOOP.
+
+*.... bapi_salesorder_change in separate program via submit
+      SUBMIT yse_call_bapisalesorderchange
+          WITH p_vbeln = viqmel-vbeln
+          WITH p_posnr = it_vbap-posnr
+          WITH p_werks = it_vbap-werks
+          AND RETURN.
+
+      DATA: reprice_handle TYPE REF TO ycl_se_seo_crea_reprice,
+            reprice_root   TYPE REF TO ycl_se_seo_crea_reprice_root,
+            lv_vbeln       TYPE vbeln,
+            et_return      LIKE bapiret2 OCCURS 0 WITH HEADER LINE,
+            lv_vbtyp       TYPE vbtyp,
+            lv_count       TYPE sytabix,
+            rspar_tab      TYPE TABLE OF rsparams,
+            rspar_line     TYPE rsparams,
+            lv_qmnum       TYPE qmnum.
+
+      lv_vbeln = viqmel-vbeln.
+      CLEAR lv_qmnum.
+      GET PARAMETER ID 'IQM' FIELD lv_qmnum.
+
+      CALL FUNCTION 'YSE_CHECK_LOCKS_SERV'
+        EXPORTING
+          vbeln         = lv_vbeln
+        IMPORTING
+          number        = lv_count
+        TABLES
+          it_return     = et_return.
+
+      IF lv_count = 0.
+        SELECT SINGLE vbtyp FROM vbak INTO lv_vbtyp
+                   WHERE vbeln EQ lv_vbeln.
+
+        IF lv_vbtyp = 'C'.  "Sales order
+          TRY.
+              reprice_handle = ycl_se_seo_crea_reprice=>attach_for_write( ).
+              CREATE OBJECT reprice_root AREA HANDLE reprice_handle.
+              reprice_handle->set_root( reprice_root ).
+              reprice_root->set_reprice( ).
+              reprice_handle->detach_commit( ).
+            CATCH cx_shm_attach_error.
+          ENDTRY.
+
+          CALL FUNCTION 'YSE_SDI_COST_ESTIMATE_CREA'
+            EXPORTING
+              im_vbeln = lv_vbeln.
+
+          TRY.
+              reprice_handle = ycl_se_seo_crea_reprice=>attach_for_write( ).
+              CREATE OBJECT reprice_root AREA HANDLE reprice_handle.
+              reprice_handle->set_root( reprice_root ).
+              reprice_root->clear_reprice( ).
+              reprice_handle->detach_commit( ).
+            CATCH cx_shm_attach_error.
+          ENDTRY.
+        ENDIF.  "Sales order
+      ENDIF.
+
+*.... For all relevant lines in the service sales order update the seo with
+*.... defaults
+      CALL FUNCTION 'YSE_CHECK_LOCKS_SERV'
+        EXPORTING
+          vbeln         = lv_vbeln
+        IMPORTING
+          number        = lv_count
+        TABLES
+          it_return       = et_return.
+
+      IF lv_count = 0.
+        LOOP AT it_vbap.
+          refresh rspar_tab.
+
+          rspar_line-selname = 'SO_VBELN'.
+          rspar_line-kind    = 'S'.
+          rspar_line-sign    = 'I'.
+          rspar_line-option  = 'EQ'.
+          rspar_line-low     = it_vbap-vbeln.
+          APPEND rspar_line TO rspar_tab.
+
+          rspar_line-selname = 'SO_POSNR'.
+          rspar_line-kind    = 'S'.
+          rspar_line-sign    = 'I'.
+          rspar_line-option  = 'EQ'.
+          rspar_line-low     = it_vbap-posnr.
+          APPEND rspar_line TO rspar_tab.
+
+          SUBMIT yse_seo_update_at_crea WITH SELECTION-TABLE rspar_tab
+            AND RETURN.
+        ENDLOOP.
+      ENDIF.
+
+      CALL FUNCTION 'YSE_CHECK_LOCKS_SERV'
+      EXPORTING
+         vbeln         = lv_vbeln
+      IMPORTING
+         number        = lv_count
+      TABLES
+        it_return      = et_return.
+
+      IF lv_count = 0.
+*...... Link the notif to the seo
+        LOOP AT it_vbap.
+          refresh rspar_tab.
+
+          rspar_line-selname = 'SO_QMNUM'.
+          rspar_line-kind    = 'S'.
+          rspar_line-sign    = 'I'.
+          rspar_line-option  = 'EQ'.
+          rspar_line-low     = lv_qmnum.
+          APPEND rspar_line TO rspar_tab.
+
+          rspar_line-selname = 'SO_VBELN'.
+          rspar_line-kind    = 'S'.
+          rspar_line-sign    = 'I'.
+          rspar_line-option  = 'EQ'.
+          rspar_line-low     = it_vbap-vbeln.
+          APPEND rspar_line TO rspar_tab.
+
+          rspar_line-selname = 'SO_POSNR'.
+          rspar_line-kind    = 'S'.
+          rspar_line-sign    = 'I'.
+          rspar_line-option  = 'EQ'.
+          rspar_line-low     = it_vbap-posnr.
+          APPEND rspar_line TO rspar_tab.
+
+          SUBMIT yse_seo_link_to_notif WITH SELECTION-TABLE rspar_tab
+            AND RETURN.
+        ENDLOOP.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+  if sy-subrc <> 0.
+*.. &1 : Creation of service order failed !
+    MESSAGE i256(yam_re) WITH p_qmnum INTO gv_msg.
+    PERFORM add_message_to_tab using gv_msg 'A'.
+    perform get_trans_messages tables gt_err.
+    return.
+  endif.
+
+  add 1 to gv_cnt_ok.
+
+ENDFORM.                    " create_service_order
+
+*&---------------------------------------------------------------------*
+*&      Form  add_message_to_tab
+*&---------------------------------------------------------------------*
+*       Add messages to log
+*----------------------------------------------------------------------*
+FORM add_message_to_tab using p_msg p_code.
+
+  i_logtab-msg  = p_msg.
+  i_logtab-code = p_code.
+  append i_logtab.
+  clear i_logtab.
+
+ENDFORM.                    " add_message_to_tab
+
+*&---------------------------------------------------------------------*
+*&      Form  list_logtab
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM list_logtab .
+
+  data: lv_cnt_nok(3) type n.
+
+  leave to list-processing.
+
+  clear lv_cnt_nok.
+  loop at i_logtab.
+    if i_logtab-code = 'A'.
+      write: / i_logtab-msg.
+      add 1 to lv_cnt_nok.
+    else.
+      format color col_negative.
+      write: /13 i_logtab-msg.
+      format reset.
+    endif.
+  endloop.
+
+  refresh i_logtab.
+  clear i_logtab.
+
+* Write totals
+  skip 2.
+  write: / text-100, gv_cnt_ok,                 " orders created
+         / text-101, lv_cnt_nok.                " notifs not converted
+
+ENDFORM.                    " list_logtab
+
+*&---------------------------------------------------------------------*
+*&      Form  get_trans_messages
+*&---------------------------------------------------------------------*
+*       Get the errormessages from the performed transaction
+*----------------------------------------------------------------------*
+*  -->  p_errtab    Table with errormessages
+*----------------------------------------------------------------------*
+FORM get_trans_messages tables p_errtab structure gt_err.
+
+  loop at p_errtab where msgtyp = 'E' or
+                         msgtyp = 'A'.
+
+    CALL FUNCTION 'RH_MESSAGE_GET'
+      EXPORTING
+*        SPRSL                   = SY-LANGU
+        arbgb                   = p_errtab-msgid
+        msgnr                   = p_errtab-msgnr
+        msgv1                   = p_errtab-msgv1
+        msgv2                   = p_errtab-msgv2
+        msgv3                   = p_errtab-msgv3
+        msgv4                   = p_errtab-msgv4
+      IMPORTING
+        msgtext                 = gv_mestx
+      EXCEPTIONS
+        message_not_found       = 1
+        OTHERS                  = 2.
+
+    IF sy-subrc = 0.
+      perform add_message_to_tab using gv_mestx 'M'.
+    endif.
+
+  endloop.
+
+ENDFORM.                    " get_trans_messages
+
+*&---------------------------------------------------------------------*
+*&      Form  fill_bdcdata
+*&---------------------------------------------------------------------*
+*       Fill internal table with bdcdata
+*----------------------------------------------------------------------*
+*  -->  p_notifnr   Notification number
+*----------------------------------------------------------------------*
+FORM fill_bdcdata using p_notifnr p_auart p_bemot r_equnr.
+
+  data: lv_kmatn type kmatn.
+
+*
+  perform fill_bdcdata in program yam_common_routines
+           using    'SAPLIQS0'  '0100'  'X'  ''  ''
+           changing struct_bdcdata.
+  append struct_bdcdata  to i_bdcdata.
+  clear  struct_bdcdata.
+
+  perform fill_bdcdata in program yam_common_routines
+           using    ''  ''  ''  'RIWO00-QMNUM'  p_notifnr
+           changing struct_bdcdata.
+  append struct_bdcdata  to i_bdcdata.
+  clear  struct_bdcdata.
+
+  perform fill_bdcdata in program yam_common_routines
+           using    ''  ''  ''  'BDC_OKCODE'  '/00'
+           changing struct_bdcdata.
+  append struct_bdcdata  to i_bdcdata.
+  clear  struct_bdcdata.
+
+*
+  perform fill_bdcdata in program yam_common_routines
+           using    'SAPLIQS0'  '7200'  'X'  ''  ''
+           changing struct_bdcdata.
+  append struct_bdcdata  to i_bdcdata.
+  clear  struct_bdcdata.
+
+  perform fill_bdcdata in program yam_common_routines
+           using    ''  ''  ''  'BDC_OKCODE'  '=COAE'
+           changing struct_bdcdata.
+  append struct_bdcdata  to i_bdcdata.
+  clear  struct_bdcdata.
+
+*
+  perform fill_bdcdata in program yam_common_routines
+           using    'SAPLIQS0'  '8030'  'X'  ''  ''
+           changing struct_bdcdata.
+  append struct_bdcdata  to i_bdcdata.
+  clear  struct_bdcdata.
+
+  perform fill_bdcdata in program yam_common_routines
+           using    ''  ''  ''  'RIWO00-AUART'  p_auart
+           changing struct_bdcdata.
+  append struct_bdcdata  to i_bdcdata.
+  clear  struct_bdcdata.
+
+  perform fill_bdcdata in program yam_common_routines
+           using    ''  ''  ''  'BDC_OKCODE'  '=WEIT'
+           changing struct_bdcdata.
+  append struct_bdcdata  to i_bdcdata.
+  clear  struct_bdcdata.
+
+* begin of delete MOD-001
+** If configurable material equi-kmatn --> extra screen
+*  clear lv_kmatn.
+*  select single kmatn into lv_kmatn
+*    from equi where equnr = r_equnr.
+*
+*  if sy-subrc = 0 and
+*     not lv_kmatn is initial.
+*    perform fill_bdcdata in program yam_common_routines
+*             using    'SAPLCEI0'  '0109'  'X'  ''  ''
+*             changing struct_bdcdata.
+*    append struct_bdcdata  to i_bdcdata.
+*    clear  struct_bdcdata.
+*
+*    perform fill_bdcdata in program yam_common_routines
+*             using    ''  ''  ''  'BDC_OKCODE'  '=BACK'
+*             changing struct_bdcdata.
+*    append struct_bdcdata  to i_bdcdata.
+*    clear  struct_bdcdata.
+*  endif.
+* end of delete MOD-001
+
+*
+  perform fill_bdcdata in program yam_common_routines
+           using    'SAPLCOIH'  '3000'  'X'  ''  ''
+           changing struct_bdcdata.
+  append struct_bdcdata  to i_bdcdata.
+  clear  struct_bdcdata.
+
+  perform fill_bdcdata in program yam_common_routines
+           using    ''  ''  ''  'CAUFVD-BEMOT'  p_bemot
+           changing struct_bdcdata.
+  append struct_bdcdata  to i_bdcdata.
+  clear  struct_bdcdata.
+
+  perform fill_bdcdata in program yam_common_routines
+           using    ''  ''  ''  'BDC_OKCODE'  '=BU'
+           changing struct_bdcdata.
+  append struct_bdcdata  to i_bdcdata.
+  clear  struct_bdcdata.
+
+ENDFORM.                    " fill_bdcdata
+
+*&---------------------------------------------------------------------*
+*&      Form  fill_bdcdata_X4
+*&---------------------------------------------------------------------*
+*       Fill internal table with bdcdata for SEED
+*----------------------------------------------------------------------*
+*  -->  r_notifnr   Notification number
+*----------------------------------------------------------------------*
+FORM fill_bdcdata_X4 using r_notifnr r_bstnk r_qmtxt.
+
+*
+  perform fill_bdcdata in program yam_common_routines
+           using    'SAPLIQS0'  '0100'  'X'  ''  ''
+           changing struct_bdcdata.
+  append struct_bdcdata  to i_bdcdata.
+  clear  struct_bdcdata.
+
+  perform fill_bdcdata in program yam_common_routines
+           using    ''  ''  ''  'RIWO00-QMNUM'  r_notifnr
+           changing struct_bdcdata.
+  append struct_bdcdata  to i_bdcdata.
+  clear  struct_bdcdata.
+
+  perform fill_bdcdata in program yam_common_routines
+           using    ''  ''  ''  'BDC_OKCODE'  '/00'
+           changing struct_bdcdata.
+  append struct_bdcdata  to i_bdcdata.
+  clear  struct_bdcdata.
+
+*
+  perform fill_bdcdata in program yam_common_routines
+           using    'SAPLIQS0'  '7200'  'X'  ''  ''
+           changing struct_bdcdata.
+  append struct_bdcdata  to i_bdcdata.
+  clear  struct_bdcdata.
+
+  perform fill_bdcdata in program yam_common_routines
+           using    ''  ''  ''  'BDC_OKCODE'  '=VA02'
+           changing struct_bdcdata.
+  append struct_bdcdata  to i_bdcdata.
+  clear  struct_bdcdata.
+
+*
+  perform fill_bdcdata in program yam_common_routines
+           using    'SAPMV45A'  '4001'  'X'  ''  ''
+           changing struct_bdcdata.
+  append struct_bdcdata  to i_bdcdata.
+  clear  struct_bdcdata.
+
+  perform fill_bdcdata in program yam_common_routines
+           using    ''  ''  ''  'RV45A-MABNR(01)'  '10000370288'
+           changing struct_bdcdata.
+  append struct_bdcdata  to i_bdcdata.
+  clear  struct_bdcdata.
+
+  if r_bstnk is initial.
+    perform fill_bdcdata in program yam_common_routines
+             using    ''  ''  ''  'VBKD-BSTKD'  r_qmtxt
+             changing struct_bdcdata.
+    append struct_bdcdata  to i_bdcdata.
+    clear  struct_bdcdata.
+  endif.
+
+  perform fill_bdcdata in program yam_common_routines
+           using    ''  ''  ''  'BDC_OKCODE'  '/00'
+           changing struct_bdcdata.
+  append struct_bdcdata  to i_bdcdata.
+  clear  struct_bdcdata.
+
+*
+  perform fill_bdcdata in program yam_common_routines
+           using    'SAPLSPO4'  '0300'  'X'  ''  ''
+           changing struct_bdcdata.
+  append struct_bdcdata  to i_bdcdata.
+  clear  struct_bdcdata.
+
+  perform fill_bdcdata in program yam_common_routines
+           using    ''  ''  ''  'BDC_OKCODE'  '=FURT'
+           changing struct_bdcdata.
+  append struct_bdcdata  to i_bdcdata.
+  clear  struct_bdcdata.
+
+*
+  perform fill_bdcdata in program yam_common_routines
+           using    'SAPMV45A'  '4001'  'X'  ''  ''
+           changing struct_bdcdata.
+  append struct_bdcdata  to i_bdcdata.
+  clear  struct_bdcdata.
+
+  perform fill_bdcdata in program yam_common_routines
+           using    ''  ''  ''  'BDC_OKCODE'  '/EBAC1'
+           changing struct_bdcdata.
+  append struct_bdcdata  to i_bdcdata.
+  clear  struct_bdcdata.
+
+*
+  perform fill_bdcdata in program yam_common_routines
+           using    'SAPLIQS0'  '7200'  'X'  ''  ''
+           changing struct_bdcdata.
+  append struct_bdcdata  to i_bdcdata.
+  clear  struct_bdcdata.
+
+  perform fill_bdcdata in program yam_common_routines
+           using    ''  ''  ''  'BDC_OKCODE'  '=BUCH'
+           changing struct_bdcdata.
+  append struct_bdcdata  to i_bdcdata.
+  clear  struct_bdcdata.
+
+ENDFORM.                    " fill_bdcdata_X4
+
+*Text symbol text£º
+*100:Number of orders created              :
+*101:Number of notifications not converted :
+*F01:Notification Selection
+
+*I00:No notifications selected
+*Selection text£º
+*IWERK:D       .
+*QMNUM:D       .

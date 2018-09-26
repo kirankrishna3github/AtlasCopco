@@ -1,0 +1,483 @@
+**********************************************************************
+* Program ID        : YSE_FI_RU_CLEARING_W_REFKEY2                   *
+* Program title     : Clearing invoices/DP's with REFKEY2            *
+* Author            : Luc Mertens USG Innotiv                        *
+* Date              : 23/02/2010                                     *
+* Functional spec   : RU-CR1284                                      *
+* CHANGE REQUEST NR : CD1K954831                                     *
+* Description       : The purpose of this program is to have an      *
+*      easy way to clear invoices with dowpayments and dp-rebookings *
+**********************************************************************
+* MOD-001 | 01.10.2010 |L. Mertens  USG Innotiv| CD1K959736 | CR1567 *
+*--------------------------------------------------------------------*
+report yse_fi_ru_clearing_w_refkey2.
+*
+tables: bsid.
+*
+data:
+  gv_mode    type c             value 'N',
+  gv_mestx   LIKE t100-text,
+  gv_msgnr   LIKE t100-msgnr,
+  gv_vbelv   type vbfa-vbelv,
+  gv_idx(02) type n,
+  gv_scr_fld(20) TYPE c.
+
+data:
+  begin of gt_bsid occurs 0,
+    bukrs like bsid-bukrs,
+    kunnr like bsid-kunnr,
+    belnr like bsid-belnr,
+    gjahr like bsid-gjahr,
+    buzei like bsid-buzei,
+    vbeln like bsid-vbeln,
+  end of gt_bsid.
+
+* begin of insert MOD-001
+data:
+  begin of gt_bsid_2 occurs 0,
+    bukrs like bsid-bukrs,
+    kunnr like bsid-kunnr,
+    belnr like bsid-belnr,
+    gjahr like bsid-gjahr,
+    buzei like bsid-buzei,
+    xblnr type bsid-xblnr,
+  end of gt_bsid_2.
+
+data:
+    gv_xref2 type bsid-xref2.
+* end of insert MOD-001
+
+DATA: i_bdcdata LIKE bdcdata OCCURS 0 WITH HEADER LINE,
+      struct_bdcdata TYPE bdcdata,
+      gt_err    LIKE bdcmsgcoll OCCURS 0 WITH HEADER LINE.
+*
+constants:
+      c_m            type c           value 'M',
+      c_o            type c           value 'O',
+      c_p            type c           value 'P',
+      c_g            type c           value 'G',
+      c_c            type c           value 'C'.
+
+*selection screen layout:
+selection-screen begin of block b1 with frame title text-001.
+select-options:
+   s_kunnr for bsid-kunnr.
+parameters:
+   p_bukrs type bukrs obligatory memory id buk.
+selection-screen end of block b1.
+selection-screen skip.
+
+*item selection:
+selection-screen begin of block items with frame title text-002.
+parameters:
+   p_stida like rfpdo-allgstid default sy-datlo obligatory.
+selection-screen end of block items.
+
+
+*--------------------------------------------------------------------------
+AT SELECTION-SCREEN ON p_bukrs.
+
+  AUTHORITY-CHECK OBJECT 'YAM_BUKRS'
+           ID 'BUKRS' FIELD p_bukrs.
+
+  IF sy-subrc NE 0.
+*.. No authorization for company code
+    MESSAGE E001(00) WITH text-e01 p_bukrs.
+  ENDIF.
+
+
+*--------------------------------------------------------------------------
+START-OF-SELECTION.
+
+* Select customer accounting documents
+  PERFORM select_bsid.
+
+  if gt_bsid[] is initial.
+    MESSAGE s047(ih).
+    exit.
+  ENDIF.
+
+* Look for sales order number and fill the field XREF2
+  loop at gt_bsid.
+
+    select single vbelv
+      into gv_vbelv
+      from VBFA where vbeln   eq gt_bsid-vbeln
+                  and vbtyp_n in (c_m, c_o, c_p)  " M = invoice, O = credit note, P = debit memo
+                  and vbtyp_v in (c_c, c_g).      " C = order, G = contract
+
+    if sy-subrc = 0.
+*.... Fill the reference key 2 by sales ordernr. via FB02
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+        EXPORTING
+          INPUT  = gv_vbelv
+        IMPORTING
+          OUTPUT = gv_vbelv.
+
+      perform sub_fill_sonr.
+
+      call transaction 'FB02' using i_bdcdata
+        update 'S' mode gv_mode messages into gt_err.
+
+      loop at gt_err where msgtyp = 'A' or msgtyp = 'E'.
+      endloop.
+
+      IF sy-subrc IS INITIAL.
+        WRITE: / gt_bsid-kunnr, gt_bsid-belnr, 25 text-e07.
+        perform sub_write_message.
+      endif.
+    else.
+      WRITE: / gt_bsid-kunnr, gt_bsid-belnr, 25 text-e05.
+    endif.
+
+  endloop.
+
+* begin of insert MOD-001
+* Select customer 'RD' documents
+  PERFORM select_bsid_2.
+
+  if NOT gt_bsid_2[] is initial.
+
+*.. Look for invoice and fill the field XREF2
+    loop at gt_bsid_2.
+
+      select single xref2
+        into gv_xref2
+        from BSEG where bukrs eq gt_bsid_2-bukrs
+                    and belnr eq gt_bsid_2-xblnr
+                    AND gjahr eq gt_bsid_2-gjahr
+                    AND buzei eq gt_bsid_2-buzei.
+
+      if sy-subrc = 0.
+*...... Fill the reference key 2 via FB02
+        perform sub_fill_xref2.
+
+        call transaction 'FB02' using i_bdcdata
+          update 'S' mode gv_mode messages into gt_err.
+
+        loop at gt_err where msgtyp = 'A' or msgtyp = 'E'.
+        endloop.
+
+        IF sy-subrc IS INITIAL.
+          WRITE: / gt_bsid_2-kunnr, gt_bsid_2-belnr, 25 text-e07.
+          perform sub_write_message.
+        endif.
+      else.
+        WRITE: / gt_bsid_2-kunnr, gt_bsid_2-belnr, 25 text-e08.
+      endif.
+
+    endloop.
+
+  endif.
+* end of insert MOD-001
+
+*--------------------------------------------------------------------------
+END-OF-SELECTION.
+
+  skip 2.
+  write: 'End of program'.
+
+*--------------------------------------------------------------------------
+* S U B R O U T I N E S
+*--------------------------------------------------------------------------
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_bsid
+*&---------------------------------------------------------------------*
+*       Select customer accounting documents
+*----------------------------------------------------------------------*
+FORM SELECT_bsid .
+
+  SELECT kunnr bukrs belnr gjahr buzei vbeln
+    FROM bsid INTO corresponding fields of TABLE gt_bsid
+      WHERE bukrs EQ p_bukrs
+        and kunnr in s_kunnr
+        AND ( augbl eq space or
+              augdt gt p_stida )
+        and blart eq 'RV'
+        and xref2 eq space.
+
+ENDFORM.                    " SELECT_bsid
+
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_bsid_2                             mod-001
+*&---------------------------------------------------------------------*
+*       Select customer 'RD' documents
+*----------------------------------------------------------------------*
+FORM SELECT_bsid_2.
+
+  SELECT kunnr bukrs belnr gjahr buzei xblnr
+    FROM bsid INTO corresponding fields of TABLE gt_bsid_2
+      WHERE bukrs EQ p_bukrs
+        and kunnr in s_kunnr
+        AND ( augbl eq space or
+              augdt gt p_stida )
+        and blart eq 'RD'
+        and xref2 eq space.
+
+ENDFORM.                    " SELECT_bsid_2
+
+*&---------------------------------------------------------------------*
+*&      Form  SUB_FILL_SONR
+*&---------------------------------------------------------------------*
+*       Fill reference key 2 from sales order number
+*----------------------------------------------------------------------*
+FORM SUB_FILL_SONR.
+
+  refresh: i_bdcdata,
+           gt_err.
+*
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    'SAPMF05L'  '0100'  'X'  ''   ''
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    ''  ''  ''  'RF05L-BELNR'  gt_bsid-belnr
+          CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    ''  ''  ''  'RF05L-BUKRS'  gt_bsid-bukrs
+          CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    ''  ''  ''  'RF05L-GJAHR'  gt_bsid-gjahr
+          CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    ''  ''  ''  'BDC_OKCODE'  '/00'
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+*
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    'SAPMF05L'  '0700'  'X'  ''   ''
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  gv_idx = gt_bsid-buzei.
+  clear gv_scr_fld.
+  concatenate 'RF05L-ANZDT(' gv_idx ')' into gv_scr_fld.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+         USING    ''  ''  ''  'BDC_CURSOR' gv_scr_fld
+         CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+         USING    ''  ''  ''  'BDC_OKCODE'  '=PK'
+         CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+*
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    'SAPMF05L'  '0301'  'X'  ''   ''
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    ''  ''  ''  'BDC_OKCODE'  '=ZK'
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+*
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    'SAPMF05L'  '1301'  'X'  ''   ''
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    ''  ''  ''  'BSEG-XREF2'  gv_vbelv
+          CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    ''  ''  ''  'BDC_OKCODE'  '=ENTR'
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+*
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    'SAPMF05L'  '0301'  'X'  ''   ''
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    ''  ''  ''  'BDC_OKCODE'  '=AE'
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+ENDFORM.                    " SUB_FILL_SONR
+
+*&---------------------------------------------------------------------*
+*&      Form  SUB_FILL_XREF2                           mod-001
+*&---------------------------------------------------------------------*
+*       Fill reference key 2
+*----------------------------------------------------------------------*
+FORM SUB_FILL_XREF2.
+
+  refresh: i_bdcdata,
+           gt_err.
+*
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    'SAPMF05L'  '0100'  'X'  ''   ''
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    ''  ''  ''  'RF05L-BELNR'  gt_bsid_2-belnr
+          CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    ''  ''  ''  'RF05L-BUKRS'  gt_bsid_2-bukrs
+          CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    ''  ''  ''  'RF05L-GJAHR'  gt_bsid_2-gjahr
+          CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    ''  ''  ''  'BDC_OKCODE'  '/00'
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+*
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    'SAPMF05L'  '0700'  'X'  ''   ''
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  gv_idx = gt_bsid_2-buzei.
+  clear gv_scr_fld.
+  concatenate 'RF05L-ANZDT(' gv_idx ')' into gv_scr_fld.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+         USING    ''  ''  ''  'BDC_CURSOR' gv_scr_fld
+         CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+         USING    ''  ''  ''  'BDC_OKCODE'  '=PK'
+         CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+*
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    'SAPMF05L'  '0301'  'X'  ''   ''
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    ''  ''  ''  'BDC_OKCODE'  '=ZK'
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+*
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    'SAPMF05L'  '1301'  'X'  ''   ''
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    ''  ''  ''  'BSEG-XREF2'  gv_xref2
+          CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    ''  ''  ''  'BDC_OKCODE'  '=ENTR'
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+*
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    'SAPMF05L'  '0301'  'X'  ''   ''
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    ''  ''  ''  'BDC_OKCODE'  '=AE'
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+
+ENDFORM.                    " SUB_FILL_XREF2
+
+*&---------------------------------------------------------------------*
+*&      Form  SUB_WRITE_MESSAGE
+*&---------------------------------------------------------------------*
+*       Write error messages from B-I sessions
+*----------------------------------------------------------------------*
+FORM SUB_WRITE_MESSAGE .
+
+  LOOP AT gt_err.
+    gv_msgnr = gt_err-msgnr.
+    CALL FUNCTION 'RH_MESSAGE_GET'
+      EXPORTING
+*        SPRSL                   = SY-LANGU
+        arbgb                   = sy-msgid
+        msgnr                   = gv_msgnr
+        msgv1                   = sy-msgv1
+        msgv2                   = sy-msgv2
+        msgv3                   = sy-msgv3
+        msgv4                   = sy-msgv4
+      IMPORTING
+        msgtext                 = gv_mestx
+      EXCEPTIONS
+        message_not_found       = 1
+        OTHERS                  = 2.
+
+    IF sy-subrc = 0.
+      WRITE: / gv_mestx.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    " SUB_WRITE_MESSAGE
+
+*Text symbol text£º
+*001:Customer selection
+*002:Line item selection
+*005:Type
+*E05:Sales document not found
+*E07:Transaction FB02 failed - Refkey2 not filled !
+
+*E08:RV document not found
+*Selection text£º
+*P_BUKRS:D       .
+*P_OPSEL:D       .
+*P_STIDA:D       .
+*S_KUNNR:        Customer account

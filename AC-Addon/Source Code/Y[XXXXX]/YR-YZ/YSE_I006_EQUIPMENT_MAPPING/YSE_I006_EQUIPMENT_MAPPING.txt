@@ -1,0 +1,1665 @@
+
+*----------------------------------------------------------------------*
+* PROGRAM ID           : YSE_I006_EQUIPMENT_MAPPING                    *
+* PROGRAM TITLE        : Equipment Completion                          *
+* AUTHOR               : Marc Jacobs                                   *
+* DATE                 : 09/02/2007                                    *
+* DEVELOPMENT ID       : P025                                          *
+*                                                                      *
+* CHANGE REQUEST NUMBER:                                               *
+*                                                                      *
+************************************************************************
+* Program Description:  Mapping sales order info to equipment.         *
+*                         - category                                   *
+*                         - object type                                *
+*                         - ship-to-address                            *
+*                         - company code                               *
+*                         - constr.type                                *
+*                         - sales and distribution info                *
+*                       This program runs before program P025.         *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME         |CORRECTION Nr| CHANGE REFERENCE # *
+*----------------------------------------------------------------------*
+* MOD-001 |2007.07.27| L.Mertens    |CD1K918366   |                    *
+*           -correction logic                                          *
+* MOD-002 |2007.08.07| L. Mertens   |CD1K918689   |                    *
+*           - take out partner function '1D'                           *
+* MOD-003 |2007.08.09| L.Mertens    |CD1K918824   |                    *
+*           - change selection of equipments                           *
+* MOD-004 |2007.11.30| M.Jacobs     |CD1K923942   |                    *
+*           - change company code and sales org. of the equipment      *
+*             if new sales org in table YSE_I006_MAPPING               *
+* MOD-005 |2008.09.18| M.Jacobs     |CD1K943426  |                     *
+*           - display mode variable                                    *
+* MOD-006 |2008.11.03| M.Jacobs     |CD1K944337  |                     *
+*           - change status esto to avlb and back to esto              *
+* MOD-007 |2010.09.22| L.Mertens    |CD1K959526  |  CR1601             *
+*           - take Ship-to party linked to SO-item if available        *
+*           - When no Ship-to party found (exists in DC 01 but         *
+*             not in DC11), skip this partner                          *
+* MOD-008 |2011.07.08| L.Mertens    |CD1K966317  |                     *
+*           - bugfix missing measuring points                          *
+* MOD-009 |2016.04.15| Anda Wu      |CD1K988682  | CR3911              *
+*           - Add End-customer partner in Equipment                    *
+*           - Bugfix - Partner misssing in equipment                   *
+************************************************************************
+REPORT  yse_p006_equipment_mapping NO STANDARD PAGE HEADING
+                                   LINE-SIZE 165
+                                   LINE-COUNT 80
+                                   MESSAGE-ID yse_i006.
+
+************************************************************************
+*                   C O N S T A N T S                                  *
+************************************************************************
+CONSTANTS :c_equipment(10)    TYPE c VALUE 'EQUIPMENT' ,
+           c_x                TYPE c VALUE 'X',
+           c_y                TYPE c VALUE 'Y',
+           c_z                TYPE c VALUE 'Z',
+           c_5(1)             TYPE n VALUE 5,
+           c_i0184            LIKE jest-stat  VALUE 'I0184',   "ESTO
+           c_vtweg(2)         TYPE c VALUE '11'.     " distrib. channel
+************************************************************************
+*                   V A R I A B L E S                                  *
+************************************************************************
+DATA:  g_erdat         TYPE equi-erdat ,             " Order Number
+       g_werks         TYPE equi-werk  ,             " Plant
+       g_default(1)    TYPE c,                       " default values
+       g_subrc         TYPE subrc,
+       g_text(100)     TYPE c,
+       g_runhours_exist,
+       l_mpobj         TYPE imptt-mpobj ,
+       g_point         LIKE imptt-point,
+       g_valuefield    TYPE zvalue_field,
+       g_old_procedure TYPE c,
+       g_new_procedure TYPE c,
+       g_vbelv         TYPE lips-vbelv,
+       g_vgpos         TYPE lips-vgpos,
+       g_posnr         TYPE lips-posnr,
+       g_iwerk         TYPE vbap-werks,
+       g_tplnr         TYPE yse_i006_mapping-tplnr,
+       g_ingrp         TYPE yse_i006_mapping-ingrp,
+       g_eqtyp         TYPE yse_i006_equicat-eqtyp,
+       g_vgbel         TYPE lips-vgbel,
+       g_ekgrp         TYPE t024-ekgrp,
+       g_eknam         TYPE t024-eknam,
+       g_bukrs         TYPE ekko-bukrs,
+       g_adrnr         TYPE vbpa-adrnr,
+       g_vkorg         TYPE vbak-vkorg,
+* begin of insertion MOD-004
+       g_n_vkorg       TYPE vbak-vkorg,
+* end of insertion MOD-004
+       g_ekorg         TYPE ekko-ekorg,
+       g_matnr         TYPE ekpo-matnr,
+       g_spart         TYPE vbak-spart,
+       g_objnr         TYPE ihpa-objnr,
+       g_status_esto(1) TYPE c,
+       g_indx(2)       TYPE n,
+       g_scr_fld(20)   TYPE c,
+       g_equnr         TYPE equi-equnr ,             " Equipment Number
+       gv_mestx        LIKE t100-text,
+       gv_spaces(48)   TYPE c,
+       gv_objnr        LIKE jest-objnr,              " object number
+       gv_msgnr        LIKE t100-msgnr.
+
+
+DATA: gv_fb_addr_get_selection  LIKE addr1_sel.
+* begin of insert MOD-005
+DATA : gv_mode(1)     TYPE c VALUE 'N'.
+* end of insertion MOD-005
+
+************************************************************************
+*                  T A B L E S                                         *
+************************************************************************
+TABLES : lips,
+         sadr,
+         vbak,
+         vbap,
+         ekko,
+         ekpo,
+         ihpa,
+         yse_i006_mapping,
+         yse_po_sorg_porg,
+         yse_i006_equicat.
+************************************************************************
+*                  I N T E R N A L   T A B L E S                       *
+************************************************************************
+
+** Equipment details
+DATA : BEGIN OF i_equi OCCURS 0,
+          equnr TYPE equi-equnr,         " Equipment Number
+          erdat TYPE equi-erdat,         " Equipment Creation Date
+          matnr TYPE equi-matnr,         " Material Number
+          sernr TYPE equi-sernr,         " Serial Number
+          obknr TYPE objk-obknr,         " object nr
+          lief_nr TYPE ser01-lief_nr,    " delivery
+          posnr TYPE ser01-posnr,        " delivery item
+       END OF i_equi.
+
+** Order partners
+DATA : BEGIN OF i_partnr OCCURS 0,
+          parvw TYPE vbpa-parvw,         " partner function
+          kunnr TYPE vbpa-kunnr,         " partner number
+       END OF i_partnr.
+
+** Status table
+DATA: BEGIN OF i_status OCCURS 0,
+         equnr TYPE equi-equnr,         " Equipment Number
+         matnr TYPE equi-matnr,         " Material Number
+         sernr TYPE equi-sernr,         " Serial Number
+         statusmsg(100) TYPE c,         " Status message
+      END OF i_status.
+
+DATA: l_struct_bdcdata  TYPE bdcdata ,             "BDCDATA table
+      l_i_bdcdata TYPE STANDARD TABLE OF bdcdata,  "Table for BDC data
+      gt_err         LIKE bdcmsgcoll OCCURS 0 WITH HEADER LINE.
+
+
+************************************************************************
+*       S E L E C T - O P T I O N S / P A R A M E T E R S              *
+************************************************************************
+
+SELECTION-SCREEN : BEGIN OF BLOCK b1 WITH FRAME TITLE text-001.
+
+SELECT-OPTIONS: s_erdat FOR g_erdat .                "creation date
+SELECT-OPTIONS: s_equnr FOR g_equnr .                "equipment number
+
+SELECTION-SCREEN: END OF BLOCK b1.
+
+************************************************************************
+*    Selection Screen Validations                                      *
+************************************************************************
+AT SELECTION-SCREEN .
+
+AT SELECTION-SCREEN ON s_equnr.
+  IF NOT s_equnr[] IS INITIAL .
+    SELECT equnr INTO g_equnr
+           UP TO 1 ROWS
+           FROM equi
+           WHERE equnr IN s_equnr.
+    ENDSELECT .
+    IF sy-subrc NE 0.
+      MESSAGE e001.
+    ENDIF.
+  ENDIF .
+
+************************************************************************
+*       S T A R T - O F - S E L E C T I O N    E V E N T               *
+************************************************************************
+START-OF-SELECTION.
+
+** get Equipment Numbers based on the Selection Criteria
+  PERFORM get_equipment_numbers .
+
+** update the selected equipments
+  PERFORM loop-over-iequi.
+
+************************************************************************
+*       E N D - O F - S E L E C T I O N    E V E N T                   *
+***********************************************************************
+END-OF-SELECTION .
+
+** Print a report of the selected equipments and the updates
+
+  IF NOT i_status[] IS INITIAL .
+    WRITE:/ text-014 .
+    WRITE: text-015 ,
+    sy-datum , sy-uzeit .
+    ULINE AT /1(165).
+    WRITE:  /1  text-016     ,
+             20 text-017     ,
+             39 text-018     ,
+             58 text-019     .
+    ULINE AT /1(165).
+    LOOP AT i_status .
+      AT NEW equnr .
+        SKIP 1 .
+      ENDAT .
+      WRITE: / i_status-equnr, i_status-matnr,
+               i_status-sernr , i_status-statusmsg  .
+
+    ENDLOOP .
+  ENDIF .
+
+*&---------------------------------------------------------------------*
+*&      Form  Get_Equipment_Numbers
+*&---------------------------------------------------------------------*
+*       Get the Equipments based on Selection Criteria
+*----------------------------------------------------------------------*
+FORM get_equipment_numbers .
+
+  REFRESH i_equi.
+
+  DATA: l_date TYPE sy-datum .
+
+* begin of change MOD-003
+* l_date = sy-datum - 1 .
+  l_date = sy-datum - 60.
+* end of change MOD-003
+
+** IF selection screen date range and equipment no. range are not
+** provided --> take equipments of yesterday and today
+
+  IF s_erdat[] IS INITIAL AND s_equnr[] IS INITIAL .
+    SELECT a~equnr a~erdat a~matnr a~sernr
+           b~obknr c~lief_nr c~posnr
+           INTO TABLE i_equi
+           FROM ( (  equi AS a JOIN objk AS b
+               ON a~equnr = b~equnr   )
+                JOIN ser01 AS c
+              ON c~obknr = b~obknr )
+           WHERE a~erdat BETWEEN l_date AND sy-datum
+           AND  a~eqart = ' '
+********Begin of MOD-009 INSERT
+           AND c~vbtyp = 'J'.
+********End of MOD-009 INSERT
+
+    IF sy-subrc NE 0  .
+*  Write Error message - No data available for the Selection Criteria
+      WRITE: / text-002 .
+    ELSE .
+      DELETE ADJACENT DUPLICATES FROM i_equi COMPARING equnr .
+    ENDIF .
+
+  ELSE .
+
+** IF selection screen date range or equipment no. range are
+** provided in the selection screen
+
+    SELECT a~equnr a~erdat a~matnr a~sernr
+           b~obknr c~lief_nr c~posnr
+           INTO TABLE i_equi
+           FROM ( (  equi AS a JOIN objk AS b
+                     ON a~equnr = b~equnr   )
+                      JOIN ser01 AS c
+                    ON c~obknr = b~obknr )
+                 WHERE a~equnr IN s_equnr
+                 AND   a~erdat IN s_erdat
+                 AND  a~eqart = ' '
+********Begin of MOD-009 INSERT
+                 AND c~vbtyp = 'J'.
+********End of MOD-009 INSERT      .
+
+    IF sy-subrc NE 0  .
+*  Write Error message - No data available for the Selection Criteria
+      WRITE: / text-002 .
+    ELSE .
+      DELETE ADJACENT DUPLICATES FROM i_equi COMPARING equnr .
+    ENDIF .
+  ENDIF .
+
+ENDFORM.                    " Get_Equipment_Numbers
+*&---------------------------------------------------------------------*
+*&      Form  loop_over_iequi
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM loop-over-iequi.
+
+  IF NOT i_equi[] IS INITIAL.
+    LOOP AT i_equi.
+      CLEAR : g_vbelv,
+              g_posnr,
+              g_vgpos,
+              g_vgbel,
+              g_ekgrp,
+              g_bukrs,
+              g_eqtyp.
+      SELECT SINGLE * FROM lips
+       WHERE vbeln = i_equi-lief_nr
+         AND posnr = i_equi-posnr.
+      IF sy-subrc = 0.
+        MOVE lips-vbelv TO g_vbelv.
+        MOVE lips-posnr TO g_posnr.
+        MOVE lips-vgbel TO g_vgbel.
+        MOVE lips-vgpos TO g_vgpos.
+        SELECT SINGLE * FROM ekko WHERE ebeln = g_vgbel.
+        IF sy-subrc IS INITIAL.
+          MOVE ekko-ekgrp TO g_ekgrp.
+          MOVE ekko-bukrs TO g_bukrs.
+          SELECT SINGLE * FROM yse_i006_equicat
+                WHERE ekgrp = g_ekgrp.
+          IF sy-subrc = 0.
+            MOVE yse_i006_equicat-eqtyp TO g_eqtyp.
+          ENDIF.
+        ENDIF.
+* check equipment status = ESTO
+        g_status_esto = 'N'.
+        CONCATENATE 'IE' i_equi-equnr INTO gv_objnr.
+
+        CALL FUNCTION 'STATUS_CHECK'
+          EXPORTING
+            objnr             = gv_objnr
+            status            = c_i0184
+          EXCEPTIONS
+            object_not_found  = 1
+            status_not_active = 2
+            OTHERS            = 3.
+
+        IF sy-subrc EQ 0.
+          g_status_esto = 'Y'.
+* begin of insert MOD-003
+* begin of change MOD-006
+*          CONTINUE.
+          PERFORM change_status_esto_to_avlb.
+* end of change MOD-006
+* end of insert MOD-003
+        ENDIF.
+* equipment update
+        PERFORM update-equipments.
+* begin of insert MOD-006
+        IF g_status_esto = 'Y'.
+          PERFORM change_status_avlb_to_esto.
+        ENDIF.
+* end of insert MOD-006
+      ELSE.
+        PERFORM status_message_update USING i_equi-equnr
+                                            i_equi-matnr
+                                            i_equi-sernr
+                                            text-003 .
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+ENDFORM.                    "loop-over-iequi
+*&---------------------------------------------------------------------*
+*&      Form  update equipments
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM update-equipments.
+
+********* Call Transaction IE02 ***********************
+
+** screen get equipment
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    'SAPMIEQ0'  '0100'  'X'  ''  ''
+          CHANGING l_struct_bdcdata.
+  APPEND l_struct_bdcdata  TO l_i_bdcdata.
+  CLEAR  l_struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_OKCODE'  '/00'
+          CHANGING l_struct_bdcdata.
+  APPEND l_struct_bdcdata  TO l_i_bdcdata.
+  CLEAR  l_struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_CURSOR'  'RM63E-EQUNR'
+          CHANGING l_struct_bdcdata.
+  APPEND l_struct_bdcdata  TO l_i_bdcdata.
+  CLEAR  l_struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'RM63E-EQUNR'  i_equi-equnr
+          CHANGING l_struct_bdcdata.
+  APPEND l_struct_bdcdata  TO l_i_bdcdata.
+  CLEAR  l_struct_bdcdata.
+
+** next screen (object type = Equipment)
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    'SAPMIEQ0'  '0101'  'X'  ''  ''
+          CHANGING l_struct_bdcdata.
+  APPEND l_struct_bdcdata  TO l_i_bdcdata.
+  CLEAR  l_struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    ''  ''  ''  'BDC_OKCODE'  '=T\02'
+           CHANGING l_struct_bdcdata.
+  APPEND l_struct_bdcdata  TO l_i_bdcdata.
+  CLEAR  l_struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_CURSOR'  'ITOB-EQART'
+          CHANGING l_struct_bdcdata.
+  APPEND l_struct_bdcdata  TO l_i_bdcdata.
+  CLEAR  l_struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'ITOB-EQART'  c_equipment
+          CHANGING l_struct_bdcdata.
+  APPEND l_struct_bdcdata  TO l_i_bdcdata.
+  CLEAR  l_struct_bdcdata.
+
+
+** Screen 4 (address)
+* with an ordernumber
+  IF NOT g_vbelv IS INITIAL.
+
+    CLEAR : g_adrnr.
+    SELECT SINGLE adrnr INTO g_adrnr FROM vbpa WHERE
+          vbeln = g_vbelv AND posnr = '0000' AND parvw = 'WE'.
+    IF sy-subrc IS INITIAL.
+      CLEAR gv_fb_addr_get_selection.
+      gv_fb_addr_get_selection-addrnumber = g_adrnr.
+      CALL FUNCTION 'ADDR_GET'
+        EXPORTING
+          address_selection = gv_fb_addr_get_selection
+          address_group     = 'CA01'
+        IMPORTING
+          sadr              = sadr
+        EXCEPTIONS
+          OTHERS            = 01.
+      IF sy-subrc NE 0.
+        CLEAR sadr.
+      ELSE.
+* fill address
+        PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                USING    'SAPMIEQ0'  '0101'  'X'  ''  ''
+                CHANGING l_struct_bdcdata.
+        APPEND l_struct_bdcdata  TO l_i_bdcdata.
+        CLEAR  l_struct_bdcdata.
+
+        PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                 USING    ''  ''  ''  'BDC_OKCODE'  '=ADRE'
+                 CHANGING l_struct_bdcdata.
+        APPEND l_struct_bdcdata  TO l_i_bdcdata.
+        CLEAR  l_struct_bdcdata.
+
+        PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                USING    'SAPLSZA1'  '0201'  'X'  ''  ''
+                CHANGING l_struct_bdcdata.
+        APPEND l_struct_bdcdata  TO l_i_bdcdata.
+        CLEAR  l_struct_bdcdata.
+
+        PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                 USING    ''  ''  ''  'BDC_OKCODE'  '=CONT'
+                 CHANGING l_struct_bdcdata.
+        APPEND l_struct_bdcdata  TO l_i_bdcdata.
+        CLEAR  l_struct_bdcdata.
+* name 1
+        PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_CURSOR'  'ADDR1_DATA-NAME1'
+          CHANGING l_struct_bdcdata.
+        APPEND l_struct_bdcdata  TO l_i_bdcdata.
+        CLEAR  l_struct_bdcdata.
+
+        PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'ADDR1_DATA-NAME1'  sadr-name1
+          CHANGING l_struct_bdcdata.
+        APPEND l_struct_bdcdata  TO l_i_bdcdata.
+        CLEAR  l_struct_bdcdata.
+* street
+        PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_CURSOR'  'ADDR1_DATA-STREET'
+          CHANGING l_struct_bdcdata.
+        APPEND l_struct_bdcdata  TO l_i_bdcdata.
+        CLEAR  l_struct_bdcdata.
+
+        PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'ADDR1_DATA-STREET'  sadr-stras
+          CHANGING l_struct_bdcdata.
+        APPEND l_struct_bdcdata  TO l_i_bdcdata.
+        CLEAR  l_struct_bdcdata.
+* postal code
+        PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_CURSOR'  'ADDR1_DATA-POST_CODE1'
+          CHANGING l_struct_bdcdata.
+        APPEND l_struct_bdcdata  TO l_i_bdcdata.
+        CLEAR  l_struct_bdcdata.
+
+        PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'ADDR1_DATA-POST_CODE1'  sadr-pstlz
+          CHANGING l_struct_bdcdata.
+        APPEND l_struct_bdcdata  TO l_i_bdcdata.
+        CLEAR  l_struct_bdcdata.
+* city
+        PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_CURSOR'  'ADDR1_DATA-CITY1'
+          CHANGING l_struct_bdcdata.
+        APPEND l_struct_bdcdata  TO l_i_bdcdata.
+        CLEAR  l_struct_bdcdata.
+
+        PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'ADDR1_DATA-CITY1'  sadr-ort01
+          CHANGING l_struct_bdcdata.
+        APPEND l_struct_bdcdata  TO l_i_bdcdata.
+        CLEAR  l_struct_bdcdata.
+* country
+        PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_CURSOR'  'ADDR1_DATA-COUNTRY'
+          CHANGING l_struct_bdcdata.
+        APPEND l_struct_bdcdata  TO l_i_bdcdata.
+        CLEAR  l_struct_bdcdata.
+
+        PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'ADDR1_DATA-COUNTRY'  sadr-land1
+          CHANGING l_struct_bdcdata.
+        APPEND l_struct_bdcdata  TO l_i_bdcdata.
+        CLEAR  l_struct_bdcdata.
+* language
+        PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_CURSOR'  'ADDR1_DATA-LANGU'
+          CHANGING l_struct_bdcdata.
+        APPEND l_struct_bdcdata  TO l_i_bdcdata.
+        CLEAR  l_struct_bdcdata.
+
+        PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'ADDR1_DATA-LANGU'  sadr-spras
+          CHANGING l_struct_bdcdata.
+        APPEND l_struct_bdcdata  TO l_i_bdcdata.
+        CLEAR  l_struct_bdcdata.
+
+* other fields in address
+* get info from VBAK
+        CLEAR: g_vkorg,
+               g_spart,
+               g_iwerk,
+               g_ingrp,
+               g_tplnr.
+        SELECT SINGLE * FROM vbak WHERE vbeln = g_vbelv.
+        IF sy-subrc IS INITIAL.
+          MOVE vbak-vkorg TO g_vkorg.
+          MOVE vbak-spart TO g_spart.
+          SELECT SINGLE * FROM yse_i006_mapping
+           WHERE vkorg = g_vkorg.
+          IF sy-subrc IS INITIAL.
+            MOVE yse_i006_mapping-iwerk TO g_iwerk.
+            MOVE yse_i006_mapping-ingrp TO g_ingrp.
+            MOVE yse_i006_mapping-tplnr TO g_tplnr.
+* begin of insertion MOD-004
+            MOVE yse_i006_mapping-n_vkorg TO g_n_vkorg.
+            IF NOT g_n_vkorg IS INITIAL.
+              SELECT SINGLE bukrs INTO g_bukrs FROM tvko
+                   WHERE vkorg = g_n_vkorg.
+            ENDIF.
+* end of insertion MOD-004
+          ENDIF.
+        ENDIF.
+
+* next screen
+        PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                USING    'SAPMIEQ0'  '0101'  'X'  ''  ''
+                CHANGING l_struct_bdcdata.
+        APPEND l_struct_bdcdata  TO l_i_bdcdata.
+        CLEAR  l_struct_bdcdata.
+* to next screen
+        PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                 USING    ''  ''  ''  'BDC_OKCODE'  '=T\03'
+                 CHANGING l_struct_bdcdata.
+        APPEND l_struct_bdcdata  TO l_i_bdcdata.
+        CLEAR  l_struct_bdcdata.
+* next screen
+        PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                USING    'SAPMIEQ0'  '0101'  'X'  ''  ''
+                CHANGING l_struct_bdcdata.
+        APPEND l_struct_bdcdata  TO l_i_bdcdata.
+        CLEAR  l_struct_bdcdata.
+
+        PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                 USING    ''  ''  ''  'BDC_OKCODE'  '=T\04'
+                 CHANGING l_struct_bdcdata.
+        APPEND l_struct_bdcdata  TO l_i_bdcdata.
+        CLEAR  l_struct_bdcdata.
+* company
+        PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_CURSOR'  'ITOB-BUKRS'
+          CHANGING l_struct_bdcdata.
+        APPEND l_struct_bdcdata  TO l_i_bdcdata.
+        CLEAR  l_struct_bdcdata.
+
+        PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'ITOB-BUKRS'  g_bukrs
+          CHANGING l_struct_bdcdata.
+        APPEND l_struct_bdcdata  TO l_i_bdcdata.
+        CLEAR  l_struct_bdcdata.
+* planning plant
+        PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_CURSOR'  'ITOB-IWERK'
+          CHANGING l_struct_bdcdata.
+        APPEND l_struct_bdcdata  TO l_i_bdcdata.
+        CLEAR  l_struct_bdcdata.
+
+        PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'ITOB-IWERK'  g_iwerk
+          CHANGING l_struct_bdcdata.
+        APPEND l_struct_bdcdata  TO l_i_bdcdata.
+        CLEAR  l_struct_bdcdata.
+* planner group
+        PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_CURSOR'  'ITOB-INGRP'
+          CHANGING l_struct_bdcdata.
+        APPEND l_struct_bdcdata  TO l_i_bdcdata.
+        CLEAR  l_struct_bdcdata.
+
+        PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'ITOB-INGRP'  g_ingrp
+          CHANGING l_struct_bdcdata.
+        APPEND l_struct_bdcdata  TO l_i_bdcdata.
+        CLEAR  l_struct_bdcdata.
+* to structure
+        PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                USING    'SAPMIEQ0'  '0101'  'X'  ''  ''
+                CHANGING l_struct_bdcdata.
+        APPEND l_struct_bdcdata  TO l_i_bdcdata.
+        CLEAR  l_struct_bdcdata.
+
+        PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                 USING    ''  ''  ''  'BDC_OKCODE'  '=CIPL'
+                 CHANGING l_struct_bdcdata.
+        APPEND l_struct_bdcdata  TO l_i_bdcdata.
+        CLEAR  l_struct_bdcdata.
+* functional location
+        PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                USING    'SAPLIEL2'  '0100'  'X'  ''  ''
+                CHANGING l_struct_bdcdata.
+        APPEND l_struct_bdcdata  TO l_i_bdcdata.
+        CLEAR  l_struct_bdcdata.
+
+        PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                 USING    ''  ''  ''  'BDC_OKCODE'  '=EXIT'
+                 CHANGING l_struct_bdcdata.
+        APPEND l_struct_bdcdata  TO l_i_bdcdata.
+        CLEAR  l_struct_bdcdata.
+* if equipment status = ESTO --> functional location cannot
+* be updated
+* begin of deletion MOD-006
+*        IF g_status_esto = 'N'.
+* end of deletion MOD-006
+* if equipment category changes to X or Y (see field g_eqtyp
+* then do not fill functional location
+        IF ( g_eqtyp = c_x OR g_eqtyp = c_y ).
+* begin of insert MOD-001
+        ELSE.
+* end of insert MOD-001
+          PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+            USING    ''  ''  ''  'BDC_CURSOR'  'IEQINSTALL-TPLNR'
+            CHANGING l_struct_bdcdata.
+          APPEND l_struct_bdcdata  TO l_i_bdcdata.
+          CLEAR  l_struct_bdcdata.
+
+          PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+            USING    ''  ''  ''  'IEQINSTALL-TPLNR'  g_tplnr
+            CHANGING l_struct_bdcdata.
+          APPEND l_struct_bdcdata  TO l_i_bdcdata.
+          CLEAR  l_struct_bdcdata.
+        ENDIF.
+* begin of deletion MOD-006
+*        ENDIF.
+* end of deletion MOD-006
+* next screen
+        PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                USING    'SAPMIEQ0'  '0101'  'X'  ''  ''
+                CHANGING l_struct_bdcdata.
+        APPEND l_struct_bdcdata  TO l_i_bdcdata.
+        CLEAR  l_struct_bdcdata.
+* to next screen
+        PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+* begin of change MOD-008
+*                 USING    ''  ''  ''  'BDC_OKCODE'  '=T\05'
+                 USING    ''  ''  ''  'BDC_OKCODE'  '=PART'
+* end of change MOD-008
+                 CHANGING l_struct_bdcdata.
+        APPEND l_struct_bdcdata  TO l_i_bdcdata.
+        CLEAR  l_struct_bdcdata.
+* next screen (partners)
+        PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+* begin of change MOD-008
+*                USING    'SAPMIEQ0'  '0101'  'X'  ''  ''
+                USING    'SAPLIPAR'  '0200'  'X'  ''  ''
+* end of change MOD-008
+                CHANGING l_struct_bdcdata.
+        APPEND l_struct_bdcdata  TO l_i_bdcdata.
+        CLEAR  l_struct_bdcdata.
+
+* to next screen (sales and distribution)
+        PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+* begin of change MOD-008
+*                 USING    ''  ''  ''  'BDC_OKCODE'  '=T\06'
+                 USING    ''  ''  ''  'BDC_OKCODE'  '=BACK'
+* end of change MOD-008
+                 CHANGING l_struct_bdcdata.
+        APPEND l_struct_bdcdata  TO l_i_bdcdata.
+        CLEAR  l_struct_bdcdata.
+
+* get corresponding partners and fill fields
+        REFRESH i_partnr.
+* check if there are already equipment-partners
+        CONCATENATE 'IE' i_equi-equnr INTO g_objnr.
+        SELECT * FROM ihpa WHERE objnr = g_objnr.
+        ENDSELECT.
+* if no partners on equipment yet
+        IF sy-subrc <> 0.
+          SELECT parvw kunnr INTO CORRESPONDING FIELDS OF
+             TABLE i_partnr FROM vbpa WHERE vbeln = g_vbelv
+* begin of insert MOD-007
+             AND posnr = '000000'
+* end of insert MOD-007
+* begin of insert MOD-002
+             AND NOT parvw = '1D'
+* end of insert MOD-002
+             AND NOT kunnr = ' '.
+          g_indx = 0.
+
+* begin of insert MOD-007
+*.. take Shipto and contact person linked to SO-item if available
+          LOOP AT i_partnr.
+            IF i_partnr-parvw = 'WE'.
+              SELECT SINGLE kunnr INTO i_partnr-kunnr
+                FROM vbpa WHERE vbeln eq g_vbelv
+                            AND posnr eq g_posnr
+                            AND parvw eq i_partnr-parvw
+                            AND kunnr ne ' '.
+              IF sy-subrc = 0.
+                MODIFY i_partnr TRANSPORTING kunnr.
+              ENDIF.
+
+              IF NOT g_n_vkorg IS INITIAL.
+                g_vkorg = g_n_vkorg.
+              ENDIF.
+              SELECT SINGLE kunnr INTO i_partnr-kunnr
+                FROM knvv WHERE kunnr eq i_partnr-kunnr
+                            AND vkorg eq g_vkorg
+                            AND vtweg eq '11'
+                            AND spart eq g_spart.
+              IF sy-subrc <> 0.
+                DELETE i_partnr.
+              ENDIF.
+            ENDIF.
+          ENDLOOP.
+* end of insert MOD-007
+
+* loop over partners
+          LOOP AT i_partnr.
+            g_indx = g_indx + 1.
+
+            CONCATENATE 'IHPA-PARVW(' g_indx ')' INTO g_scr_fld.
+
+            PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+              USING    ''  ''  ''  'BDC_CURSOR'  g_scr_fld
+              CHANGING l_struct_bdcdata.
+            APPEND l_struct_bdcdata  TO l_i_bdcdata.
+            CLEAR  l_struct_bdcdata.
+
+            PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+              USING    ''  ''  ''  g_scr_fld i_partnr-parvw
+              CHANGING l_struct_bdcdata.
+            APPEND l_struct_bdcdata  TO l_i_bdcdata.
+            CLEAR  l_struct_bdcdata.
+
+            CONCATENATE 'IHPA-PARNR(' g_indx ')' INTO g_scr_fld.
+
+            PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+              USING    ''  ''  ''  'BDC_CURSOR'  g_scr_fld
+              CHANGING l_struct_bdcdata.
+            APPEND l_struct_bdcdata  TO l_i_bdcdata.
+            CLEAR  l_struct_bdcdata.
+
+            PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+              USING    ''  ''  ''  g_scr_fld i_partnr-kunnr
+              CHANGING l_struct_bdcdata.
+            APPEND l_struct_bdcdata  TO l_i_bdcdata.
+            CLEAR  l_struct_bdcdata.
+
+            CLEAR g_scr_fld.
+          ENDLOOP.
+        ENDIF.
+
+* begin of insert MOD-008
+        PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                USING    'SAPMIEQ0'  '0101'  'X'  ''  ''
+                CHANGING l_struct_bdcdata.
+        APPEND l_struct_bdcdata  TO l_i_bdcdata.
+        CLEAR  l_struct_bdcdata.
+
+        PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                 USING    ''  ''  ''  'BDC_OKCODE'  '=T\06'
+                 CHANGING l_struct_bdcdata.
+        APPEND l_struct_bdcdata  TO l_i_bdcdata.
+        CLEAR  l_struct_bdcdata.
+* end of insert MOD-008
+
+* next screen (sales and distribution)
+        PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                USING    'SAPMIEQ0'  '0101'  'X'  ''  ''
+                CHANGING l_struct_bdcdata.
+        APPEND l_struct_bdcdata  TO l_i_bdcdata.
+        CLEAR  l_struct_bdcdata.
+* save
+        PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                 USING    ''  ''  ''  'BDC_OKCODE'  '=BU'
+                 CHANGING l_struct_bdcdata.
+        APPEND l_struct_bdcdata  TO l_i_bdcdata.
+        CLEAR  l_struct_bdcdata.
+* sales organisation
+* begin of insertion MOD-004
+        IF NOT g_n_vkorg IS INITIAL.
+          g_vkorg = g_n_vkorg.
+        ENDIF.
+* end of insertion MOD-004
+        IF NOT g_vkorg IS INITIAL.
+          PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+            USING    ''  ''  ''  'BDC_CURSOR'  'ITOB-VKORG'
+            CHANGING l_struct_bdcdata.
+          APPEND l_struct_bdcdata  TO l_i_bdcdata.
+          CLEAR  l_struct_bdcdata.
+
+          PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+            USING    ''  ''  ''  'ITOB-VKORG'  g_vkorg
+            CHANGING l_struct_bdcdata.
+          APPEND l_struct_bdcdata  TO l_i_bdcdata.
+          CLEAR  l_struct_bdcdata.
+* distribution channel(always 11)
+          PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+            USING    ''  ''  ''  'BDC_CURSOR'  'ITOB-VTWEG'
+            CHANGING l_struct_bdcdata.
+          APPEND l_struct_bdcdata  TO l_i_bdcdata.
+          CLEAR  l_struct_bdcdata.
+
+          PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+            USING    ''  ''  ''  'ITOB-VTWEG'  c_vtweg
+            CHANGING l_struct_bdcdata.
+          APPEND l_struct_bdcdata  TO l_i_bdcdata.
+          CLEAR  l_struct_bdcdata.
+* division
+          PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+            USING    ''  ''  ''  'BDC_CURSOR'  'ITOB-SPART'
+            CHANGING l_struct_bdcdata.
+          APPEND l_struct_bdcdata  TO l_i_bdcdata.
+          CLEAR  l_struct_bdcdata.
+
+          PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+            USING    ''  ''  ''  'ITOB-SPART'  g_spart
+            CHANGING l_struct_bdcdata.
+          APPEND l_struct_bdcdata  TO l_i_bdcdata.
+          CLEAR  l_struct_bdcdata.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+*
+* there is no ordernumber
+*
+  ELSE.
+* get delivery address from the line item linked to the equipment in
+* the purchase order
+    SELECT SINGLE * FROM ekpo WHERE
+     ebeln = g_vgbel AND ebelp = g_vgpos.
+    IF sy-subrc = 0.
+      MOVE ekpo-adrn2 TO g_adrnr.
+      MOVE ekpo-matnr TO g_matnr.
+      IF sy-subrc IS INITIAL.
+        CLEAR gv_fb_addr_get_selection.
+        gv_fb_addr_get_selection-addrnumber = g_adrnr.
+        CALL FUNCTION 'ADDR_GET'
+          EXPORTING
+            address_selection = gv_fb_addr_get_selection
+            address_group     = 'CA01'
+          IMPORTING
+            sadr              = sadr
+          EXCEPTIONS
+            OTHERS            = 01.
+        IF sy-subrc NE 0.
+          CLEAR sadr.
+        ELSE.
+* fill address
+          PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                  USING    'SAPMIEQ0'  '0101'  'X'  ''  ''
+                  CHANGING l_struct_bdcdata.
+          APPEND l_struct_bdcdata  TO l_i_bdcdata.
+          CLEAR  l_struct_bdcdata.
+
+          PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                   USING    ''  ''  ''  'BDC_OKCODE'  '=ADRE'
+                   CHANGING l_struct_bdcdata.
+          APPEND l_struct_bdcdata  TO l_i_bdcdata.
+          CLEAR  l_struct_bdcdata.
+
+          PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                  USING    'SAPLSZA1'  '0201'  'X'  ''  ''
+                  CHANGING l_struct_bdcdata.
+          APPEND l_struct_bdcdata  TO l_i_bdcdata.
+          CLEAR  l_struct_bdcdata.
+
+          PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                   USING    ''  ''  ''  'BDC_OKCODE'  '=CONT'
+                   CHANGING l_struct_bdcdata.
+          APPEND l_struct_bdcdata  TO l_i_bdcdata.
+          CLEAR  l_struct_bdcdata.
+* name 1
+          PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+            USING    ''  ''  ''  'BDC_CURSOR'  'ADDR1_DATA-NAME1'
+            CHANGING l_struct_bdcdata.
+          APPEND l_struct_bdcdata  TO l_i_bdcdata.
+          CLEAR  l_struct_bdcdata.
+
+          PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+            USING    ''  ''  ''  'ADDR1_DATA-NAME1'  sadr-name1
+            CHANGING l_struct_bdcdata.
+          APPEND l_struct_bdcdata  TO l_i_bdcdata.
+          CLEAR  l_struct_bdcdata.
+* street
+          PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+            USING    ''  ''  ''  'BDC_CURSOR'  'ADDR1_DATA-STREET'
+            CHANGING l_struct_bdcdata.
+          APPEND l_struct_bdcdata  TO l_i_bdcdata.
+          CLEAR  l_struct_bdcdata.
+
+          PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+            USING    ''  ''  ''  'ADDR1_DATA-STREET'  sadr-stras
+            CHANGING l_struct_bdcdata.
+          APPEND l_struct_bdcdata  TO l_i_bdcdata.
+          CLEAR  l_struct_bdcdata.
+* postal code
+          PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+            USING    ''  ''  ''  'BDC_CURSOR'  'ADDR1_DATA-POST_CODE1'
+            CHANGING l_struct_bdcdata.
+          APPEND l_struct_bdcdata  TO l_i_bdcdata.
+          CLEAR  l_struct_bdcdata.
+
+          PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+            USING    ''  ''  ''  'ADDR1_DATA-POST_CODE1'  sadr-pstlz
+            CHANGING l_struct_bdcdata.
+          APPEND l_struct_bdcdata  TO l_i_bdcdata.
+          CLEAR  l_struct_bdcdata.
+* city
+          PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+            USING    ''  ''  ''  'BDC_CURSOR'  'ADDR1_DATA-CITY1'
+            CHANGING l_struct_bdcdata.
+          APPEND l_struct_bdcdata  TO l_i_bdcdata.
+          CLEAR  l_struct_bdcdata.
+
+          PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+            USING    ''  ''  ''  'ADDR1_DATA-CITY1'  sadr-ort01
+            CHANGING l_struct_bdcdata.
+          APPEND l_struct_bdcdata  TO l_i_bdcdata.
+          CLEAR  l_struct_bdcdata.
+* country
+          PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+            USING    ''  ''  ''  'BDC_CURSOR'  'ADDR1_DATA-COUNTRY'
+            CHANGING l_struct_bdcdata.
+          APPEND l_struct_bdcdata  TO l_i_bdcdata.
+          CLEAR  l_struct_bdcdata.
+
+          PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+            USING    ''  ''  ''  'ADDR1_DATA-COUNTRY'  sadr-land1
+            CHANGING l_struct_bdcdata.
+          APPEND l_struct_bdcdata  TO l_i_bdcdata.
+          CLEAR  l_struct_bdcdata.
+* language
+          PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+            USING    ''  ''  ''  'BDC_CURSOR'  'ADDR1_DATA-LANGU'
+            CHANGING l_struct_bdcdata.
+          APPEND l_struct_bdcdata  TO l_i_bdcdata.
+          CLEAR  l_struct_bdcdata.
+
+          PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+            USING    ''  ''  ''  'ADDR1_DATA-LANGU'  sadr-spras
+            CHANGING l_struct_bdcdata.
+          APPEND l_struct_bdcdata  TO l_i_bdcdata.
+          CLEAR  l_struct_bdcdata.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+* get company code and sales org from purchase order
+    CLEAR : g_bukrs,
+            g_ekorg.
+
+    SELECT SINGLE * FROM ekko
+      WHERE ebeln = g_vgbel.
+    IF sy-subrc = 0.
+      MOVE ekko-bukrs TO g_bukrs.
+      MOVE ekko-ekorg TO g_ekorg.
+* get corresponding yse_i006_mapping record
+      CLEAR: g_vkorg,
+             g_iwerk,
+             g_ingrp,
+             g_tplnr.
+      SELECT SINGLE * FROM yse_po_sorg_porg
+        WHERE ekorg = g_ekorg.
+      IF sy-subrc IS INITIAL.
+        MOVE yse_po_sorg_porg-vkorg TO g_vkorg.
+        SELECT SINGLE * FROM yse_i006_mapping
+          WHERE vkorg = g_vkorg.
+        IF sy-subrc IS INITIAL.
+          MOVE yse_i006_mapping-iwerk TO g_iwerk.
+          MOVE yse_i006_mapping-ingrp TO g_ingrp.
+          MOVE yse_i006_mapping-tplnr TO g_tplnr.
+* begin of insertion MOD-004
+          MOVE yse_i006_mapping-n_vkorg TO g_n_vkorg.
+          IF NOT g_n_vkorg IS INITIAL.
+            SELECT SINGLE bukrs INTO g_bukrs FROM tvko
+                 WHERE vkorg = g_n_vkorg.
+          ENDIF.
+* end of insertion MOD-004
+        ENDIF.
+      ENDIF.
+
+* next screen
+      PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+              USING    'SAPMIEQ0'  '0101'  'X'  ''  ''
+              CHANGING l_struct_bdcdata.
+      APPEND l_struct_bdcdata  TO l_i_bdcdata.
+      CLEAR  l_struct_bdcdata.
+* to next screen
+      PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+               USING    ''  ''  ''  'BDC_OKCODE'  '=T\03'
+               CHANGING l_struct_bdcdata.
+      APPEND l_struct_bdcdata  TO l_i_bdcdata.
+      CLEAR  l_struct_bdcdata.
+* next screen
+      PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+              USING    'SAPMIEQ0'  '0101'  'X'  ''  ''
+              CHANGING l_struct_bdcdata.
+      APPEND l_struct_bdcdata  TO l_i_bdcdata.
+      CLEAR  l_struct_bdcdata.
+
+      PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+               USING    ''  ''  ''  'BDC_OKCODE'  '=T\04'
+               CHANGING l_struct_bdcdata.
+      APPEND l_struct_bdcdata  TO l_i_bdcdata.
+      CLEAR  l_struct_bdcdata.
+* company
+      PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+        USING    ''  ''  ''  'BDC_CURSOR'  'ITOB-BUKRS'
+        CHANGING l_struct_bdcdata.
+      APPEND l_struct_bdcdata  TO l_i_bdcdata.
+      CLEAR  l_struct_bdcdata.
+
+      PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+        USING    ''  ''  ''  'ITOB-BUKRS'  g_bukrs
+        CHANGING l_struct_bdcdata.
+      APPEND l_struct_bdcdata  TO l_i_bdcdata.
+      CLEAR  l_struct_bdcdata.
+* planning plant
+      PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+        USING    ''  ''  ''  'BDC_CURSOR'  'ITOB-IWERK'
+        CHANGING l_struct_bdcdata.
+      APPEND l_struct_bdcdata  TO l_i_bdcdata.
+      CLEAR  l_struct_bdcdata.
+
+      PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+        USING    ''  ''  ''  'ITOB-IWERK'  g_iwerk
+        CHANGING l_struct_bdcdata.
+      APPEND l_struct_bdcdata  TO l_i_bdcdata.
+      CLEAR  l_struct_bdcdata.
+* planner group
+      PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+        USING    ''  ''  ''  'BDC_CURSOR'  'ITOB-INGRP'
+        CHANGING l_struct_bdcdata.
+      APPEND l_struct_bdcdata  TO l_i_bdcdata.
+      CLEAR  l_struct_bdcdata.
+
+      PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+        USING    ''  ''  ''  'ITOB-INGRP'  g_ingrp
+        CHANGING l_struct_bdcdata.
+      APPEND l_struct_bdcdata  TO l_i_bdcdata.
+      CLEAR  l_struct_bdcdata.
+* to structure
+      PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+              USING    'SAPMIEQ0'  '0101'  'X'  ''  ''
+              CHANGING l_struct_bdcdata.
+      APPEND l_struct_bdcdata  TO l_i_bdcdata.
+      CLEAR  l_struct_bdcdata.
+
+      PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+               USING    ''  ''  ''  'BDC_OKCODE'  '=CIPL'
+               CHANGING l_struct_bdcdata.
+      APPEND l_struct_bdcdata  TO l_i_bdcdata.
+      CLEAR  l_struct_bdcdata.
+* Const type
+      PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+        USING    ''  ''  ''  'BDC_CURSOR'  'ITOB-SUBMT'
+        CHANGING l_struct_bdcdata.
+      APPEND l_struct_bdcdata  TO l_i_bdcdata.
+      CLEAR  l_struct_bdcdata.
+
+      PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+        USING    ''  ''  ''  'ITOB-SUBMT'  g_matnr
+        CHANGING l_struct_bdcdata.
+      APPEND l_struct_bdcdata  TO l_i_bdcdata.
+      CLEAR  l_struct_bdcdata.
+* functional location
+      PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+              USING    'SAPLIEL2'  '0100'  'X'  ''  ''
+              CHANGING l_struct_bdcdata.
+      APPEND l_struct_bdcdata  TO l_i_bdcdata.
+      CLEAR  l_struct_bdcdata.
+
+      PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+               USING    ''  ''  ''  'BDC_OKCODE'  '=EXIT'
+               CHANGING l_struct_bdcdata.
+      APPEND l_struct_bdcdata  TO l_i_bdcdata.
+      CLEAR  l_struct_bdcdata.
+* if equipment status = ESTO --> functional location cannot
+* be updated
+* begin of deletion MOD-006
+*      IF g_status_esto = 'N'.
+* end of deletion MOD-006
+* if equipment category changes to X or Y (see field g_eqtyp
+* then do not fill functional location
+      IF ( g_eqtyp = c_x OR g_eqtyp = c_y ).
+* begin of insert MOD-001
+      ELSE.
+* end of insert MOD-001
+        PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_CURSOR'  'IEQINSTALL-TPLNR'
+          CHANGING l_struct_bdcdata.
+        APPEND l_struct_bdcdata  TO l_i_bdcdata.
+        CLEAR  l_struct_bdcdata.
+
+        PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'IEQINSTALL-TPLNR'  g_tplnr
+          CHANGING l_struct_bdcdata.
+        APPEND l_struct_bdcdata  TO l_i_bdcdata.
+        CLEAR  l_struct_bdcdata.
+      ENDIF.
+* begin of deletion MOD-006
+*      ENDIF.
+* end of deletion MOD-006
+    ENDIF.
+* next screen (sales and distribution)
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+            USING    'SAPMIEQ0'  '0101'  'X'  ''  ''
+            CHANGING l_struct_bdcdata.
+    APPEND l_struct_bdcdata  TO l_i_bdcdata.
+    CLEAR  l_struct_bdcdata.
+* save
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+             USING    ''  ''  ''  'BDC_OKCODE'  '=BU'
+             CHANGING l_struct_bdcdata.
+    APPEND l_struct_bdcdata  TO l_i_bdcdata.
+    CLEAR  l_struct_bdcdata.
+
+  ENDIF.
+
+* Perform Call Transaction to update the equipment
+  IF NOT l_i_bdcdata[] IS INITIAL.
+    CALL TRANSACTION 'IE02' USING l_i_bdcdata
+* begin of change mod-005
+*    MODE 'N' UPDATE 'S' MESSAGES INTO gt_err.
+    MODE gv_mode UPDATE 'S' MESSAGES INTO gt_err.
+* end of change mod-005
+    IF sy-subrc NE 0 .
+** Populate Status table with Call Transaction failed
+      PERFORM status_message_update USING i_equi-equnr
+                                          i_equi-matnr
+                                          i_equi-sernr
+                                          text-012 .
+      LOOP AT gt_err.
+        gv_msgnr = gt_err-msgnr.
+        CALL FUNCTION 'RH_MESSAGE_GET'
+          EXPORTING
+*           SPRSL                   = SY-LANGU
+            arbgb                   = sy-msgid
+            msgnr                   = gv_msgnr
+            msgv1                   = sy-msgv1
+            msgv2                   = sy-msgv2
+            msgv3                   = sy-msgv3
+            msgv4                   = sy-msgv4
+          IMPORTING
+            msgtext                 = gv_mestx
+          EXCEPTIONS
+            message_not_found       = 1
+            OTHERS                  = 2.
+        IF sy-subrc = 0.
+          PERFORM status_message_update USING i_equi-equnr
+                                              i_equi-matnr
+                                              i_equi-sernr
+                                              gv_mestx.
+        ENDIF.
+      ENDLOOP.
+
+    ENDIF.
+  ENDIF.
+
+** second update : equipment category
+
+  REFRESH: l_i_bdcdata,
+           gt_err.
+
+** screen get equipment
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    'SAPMIEQ0'  '0100'  'X'  ''  ''
+          CHANGING l_struct_bdcdata.
+  APPEND l_struct_bdcdata  TO l_i_bdcdata.
+  CLEAR  l_struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_OKCODE'  '/00'
+          CHANGING l_struct_bdcdata.
+  APPEND l_struct_bdcdata  TO l_i_bdcdata.
+  CLEAR  l_struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_CURSOR'  'RM63E-EQUNR'
+          CHANGING l_struct_bdcdata.
+  APPEND l_struct_bdcdata  TO l_i_bdcdata.
+  CLEAR  l_struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'RM63E-EQUNR'  i_equi-equnr
+          CHANGING l_struct_bdcdata.
+  APPEND l_struct_bdcdata  TO l_i_bdcdata.
+  CLEAR  l_struct_bdcdata.
+
+** next Screen (edit - change category depending on Lease - No Lease)
+** see table yse_I006_equicat with key purchasing group
+  CLEAR: g_eqtyp.
+
+  SELECT SINGLE * FROM yse_i006_equicat
+      WHERE ekgrp = g_ekgrp.
+  IF sy-subrc = 0.
+    MOVE yse_i006_equicat-eqtyp TO g_eqtyp.
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+            USING    'SAPMIEQ0'  '0101'  'X'  ''  ''
+            CHANGING l_struct_bdcdata.
+    APPEND l_struct_bdcdata  TO l_i_bdcdata.
+    CLEAR  l_struct_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+             USING    ''  ''  ''  'BDC_OKCODE'  '=CHT'
+             CHANGING l_struct_bdcdata.
+    APPEND l_struct_bdcdata  TO l_i_bdcdata.
+    CLEAR  l_struct_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+            USING    'SAPMIEQ0'  '6150'  'X'  ''  ''
+            CHANGING l_struct_bdcdata.
+    APPEND l_struct_bdcdata  TO l_i_bdcdata.
+    CLEAR  l_struct_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+             USING    ''  ''  ''  'BDC_OKCODE'  '=NEXT'
+             CHANGING l_struct_bdcdata.
+    APPEND l_struct_bdcdata  TO l_i_bdcdata.
+    CLEAR  l_struct_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+            USING    ''  ''  ''  'BDC_CURSOR'  'EQUI-EQTYP'
+            CHANGING l_struct_bdcdata.
+    APPEND l_struct_bdcdata  TO l_i_bdcdata.
+    CLEAR  l_struct_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+            USING    ''  ''  ''  'EQUI-EQTYP'  g_eqtyp
+            CHANGING l_struct_bdcdata.
+    APPEND l_struct_bdcdata  TO l_i_bdcdata.
+    CLEAR  l_struct_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+            USING    'SAPMIEQ0'  '0101'  'X'  ''  ''
+            CHANGING l_struct_bdcdata.
+    APPEND l_struct_bdcdata  TO l_i_bdcdata.
+    CLEAR  l_struct_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+             USING    ''  ''  ''  'BDC_OKCODE'  '=BU'
+             CHANGING l_struct_bdcdata.
+    APPEND l_struct_bdcdata  TO l_i_bdcdata.
+    CLEAR  l_struct_bdcdata.
+
+  ELSE.
+    REFRESH: l_i_bdcdata,
+             gt_err.
+  ENDIF.
+
+* Perform Call Transaction to update the equipment
+  IF NOT l_i_bdcdata[] IS INITIAL.
+    CALL TRANSACTION 'IE02' USING l_i_bdcdata
+* begin of change mod-005
+*    MODE 'N' UPDATE 'S' MESSAGES INTO gt_err.
+    MODE gv_mode UPDATE 'S' MESSAGES INTO gt_err.
+* end of change mod-005
+    IF sy-subrc NE 0 .
+** Populate Status table with Call Transaction failed
+      PERFORM status_message_update USING i_equi-equnr
+                                          i_equi-matnr
+                                          i_equi-sernr
+                                          text-012.
+      LOOP AT gt_err.
+        gv_msgnr = gt_err-msgnr.
+        CALL FUNCTION 'RH_MESSAGE_GET'
+          EXPORTING
+*           SPRSL                   = SY-LANGU
+            arbgb                   = sy-msgid
+            msgnr                   = gv_msgnr
+            msgv1                   = sy-msgv1
+            msgv2                   = sy-msgv2
+            msgv3                   = sy-msgv3
+            msgv4                   = sy-msgv4
+          IMPORTING
+            msgtext                 = gv_mestx
+          EXCEPTIONS
+            message_not_found       = 1
+            OTHERS                  = 2.
+        IF sy-subrc = 0.
+          PERFORM status_message_update USING i_equi-equnr
+                                              i_equi-matnr
+                                              i_equi-sernr
+                                              gv_mestx.
+        ENDIF.
+      ENDLOOP.
+    ENDIF.
+  ENDIF.
+
+
+
+
+ENDFORM.                    "update-equipments
+
+*&---------------------------------------------------------------------*
+*&      Form  Status_message_update
+*&---------------------------------------------------------------------*
+*       Populate status message table
+*----------------------------------------------------------------------*
+*      -->P_I_EQUI_EQUNR  Equipment Number
+*      -->P_I_EQUI_MATNR  Material Number
+*      -->P_I_EQUI_SERNR  Serial Number
+*      -->P_TEXT          Status Message Text
+*----------------------------------------------------------------------*
+FORM status_message_update  USING    p_i_equi_equnr TYPE any
+                                     p_i_equi_matnr TYPE any
+                                     p_i_equi_sernr TYPE any
+                                     p_text   TYPE any .
+
+  i_status-equnr = p_i_equi_equnr .
+  i_status-matnr = p_i_equi_matnr .
+  i_status-sernr = p_i_equi_sernr .
+  i_status-statusmsg = p_text     .
+  APPEND i_status .
+  CLEAR  i_status .
+
+ENDFORM.                    " Status_message_update
+
+*&---------------------------------------------------------------------*
+*&      Form  change_status_esto_to_avlb
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM change_status_esto_to_avlb.
+
+* screen get equipment
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    'SAPMIEQ0'  '0100'  'X'  ''  ''
+          CHANGING l_struct_bdcdata.
+  APPEND l_struct_bdcdata  TO l_i_bdcdata.
+  CLEAR  l_struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_OKCODE'  '/00'
+          CHANGING l_struct_bdcdata.
+  APPEND l_struct_bdcdata  TO l_i_bdcdata.
+  CLEAR  l_struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_CURSOR'  'RM63E-EQUNR'
+          CHANGING l_struct_bdcdata.
+  APPEND l_struct_bdcdata  TO l_i_bdcdata.
+  CLEAR  l_struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'RM63E-EQUNR'  i_equi-equnr
+          CHANGING l_struct_bdcdata.
+  APPEND l_struct_bdcdata  TO l_i_bdcdata.
+  CLEAR  l_struct_bdcdata.
+
+* to special serial no. functions (manual transaction)
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    'SAPMIEQ0'  '0101'  'X'  ''  ''
+          CHANGING l_struct_bdcdata.
+  APPEND l_struct_bdcdata  TO l_i_bdcdata.
+  CLEAR  l_struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_OKCODE'  '=MV'
+          CHANGING l_struct_bdcdata.
+  APPEND l_struct_bdcdata  TO l_i_bdcdata.
+  CLEAR  l_struct_bdcdata.
+
+* put status from from stock on
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    'SAPMIEQ0'  '1800'  'X'  ''  ''
+           CHANGING l_struct_bdcdata.
+  APPEND l_struct_bdcdata  TO l_i_bdcdata.
+  CLEAR  l_struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_OKCODE'  '=MVA'
+          CHANGING l_struct_bdcdata.
+  APPEND l_struct_bdcdata  TO l_i_bdcdata.
+  CLEAR  l_struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_CURSOR'  'RISA0-V_OF_STOCK'
+          CHANGING l_struct_bdcdata.
+  APPEND l_struct_bdcdata  TO l_i_bdcdata.
+  CLEAR  l_struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'RISA0-V_OF_STOCK'  c_x
+          CHANGING l_struct_bdcdata.
+  APPEND l_struct_bdcdata  TO l_i_bdcdata.
+  CLEAR  l_struct_bdcdata.
+
+* save
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    'SAPMIEQ0'  '0101'  'X'  ''  ''
+       CHANGING l_struct_bdcdata.
+  APPEND l_struct_bdcdata  TO l_i_bdcdata.
+  CLEAR  l_struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_OKCODE'  '=BU'
+          CHANGING l_struct_bdcdata.
+  APPEND l_struct_bdcdata  TO l_i_bdcdata.
+  CLEAR  l_struct_bdcdata.
+
+* Perform Call Transaction to update the equipment
+  IF NOT l_i_bdcdata[] IS INITIAL.
+    CALL TRANSACTION 'IE02' USING l_i_bdcdata
+* begin of change mod-005
+*    MODE 'N' UPDATE 'S' MESSAGES INTO gt_err.
+    MODE gv_mode UPDATE 'S' MESSAGES INTO gt_err.
+* end of change mod-005
+    IF sy-subrc NE 0 .
+** Populate Status table with Call Transaction failed
+      PERFORM status_message_update USING i_equi-equnr
+                                          i_equi-matnr
+                                          i_equi-sernr
+                                          text-012.
+      LOOP AT gt_err.
+        gv_msgnr = gt_err-msgnr.
+        CALL FUNCTION 'RH_MESSAGE_GET'
+          EXPORTING
+*           SPRSL                   = SY-LANGU
+            arbgb                   = sy-msgid
+            msgnr                   = gv_msgnr
+            msgv1                   = sy-msgv1
+            msgv2                   = sy-msgv2
+            msgv3                   = sy-msgv3
+            msgv4                   = sy-msgv4
+          IMPORTING
+            msgtext                 = gv_mestx
+          EXCEPTIONS
+            message_not_found       = 1
+            OTHERS                  = 2.
+        IF sy-subrc = 0.
+          PERFORM status_message_update USING i_equi-equnr
+                                              i_equi-matnr
+                                              i_equi-sernr
+                                              gv_mestx.
+        ENDIF.
+      ENDLOOP.
+    ENDIF.
+  ENDIF.
+
+  REFRESH: l_i_bdcdata,
+           gt_err.
+
+ENDFORM.                    "change_status_esto_to_avlb
+
+*&---------------------------------------------------------------------*
+*&      Form  change_status_avlb_to_esto
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM change_status_avlb_to_esto.
+
+* screen get equipment
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    'SAPMIEQ0'  '0100'  'X'  ''  ''
+          CHANGING l_struct_bdcdata.
+  APPEND l_struct_bdcdata  TO l_i_bdcdata.
+  CLEAR  l_struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_OKCODE'  '/00'
+          CHANGING l_struct_bdcdata.
+  APPEND l_struct_bdcdata  TO l_i_bdcdata.
+  CLEAR  l_struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_CURSOR'  'RM63E-EQUNR'
+          CHANGING l_struct_bdcdata.
+  APPEND l_struct_bdcdata  TO l_i_bdcdata.
+  CLEAR  l_struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'RM63E-EQUNR'  i_equi-equnr
+          CHANGING l_struct_bdcdata.
+  APPEND l_struct_bdcdata  TO l_i_bdcdata.
+  CLEAR  l_struct_bdcdata.
+
+* to special serial no. functions (manual transaction)
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    'SAPMIEQ0'  '0101'  'X'  ''  ''
+          CHANGING l_struct_bdcdata.
+  APPEND l_struct_bdcdata  TO l_i_bdcdata.
+  CLEAR  l_struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_OKCODE'  '=MV'
+          CHANGING l_struct_bdcdata.
+  APPEND l_struct_bdcdata  TO l_i_bdcdata.
+  CLEAR  l_struct_bdcdata.
+
+* put status from from stock on
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    'SAPMIEQ0'  '1800'  'X'  ''  ''
+           CHANGING l_struct_bdcdata.
+  APPEND l_struct_bdcdata  TO l_i_bdcdata.
+  CLEAR  l_struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_OKCODE'  '=MVA'
+          CHANGING l_struct_bdcdata.
+  APPEND l_struct_bdcdata  TO l_i_bdcdata.
+  CLEAR  l_struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_CURSOR'  'RISA0-V_TO_STOCK'
+          CHANGING l_struct_bdcdata.
+  APPEND l_struct_bdcdata  TO l_i_bdcdata.
+  CLEAR  l_struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'RISA0-V_TO_STOCK'  c_x
+          CHANGING l_struct_bdcdata.
+  APPEND l_struct_bdcdata  TO l_i_bdcdata.
+  CLEAR  l_struct_bdcdata.
+
+* save
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    'SAPMIEQ0'  '0101'  'X'  ''  ''
+       CHANGING l_struct_bdcdata.
+  APPEND l_struct_bdcdata  TO l_i_bdcdata.
+  CLEAR  l_struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_OKCODE'  '=BU'
+          CHANGING l_struct_bdcdata.
+  APPEND l_struct_bdcdata  TO l_i_bdcdata.
+  CLEAR  l_struct_bdcdata.
+
+* Perform Call Transaction to update the equipment
+  IF NOT l_i_bdcdata[] IS INITIAL.
+    CALL TRANSACTION 'IE02' USING l_i_bdcdata
+* begin of change mod-005
+*    MODE 'N' UPDATE 'S' MESSAGES INTO gt_err.
+    MODE gv_mode UPDATE 'S' MESSAGES INTO gt_err.
+* end of change mod-005
+    IF sy-subrc NE 0 .
+** Populate Status table with Call Transaction failed
+      PERFORM status_message_update USING i_equi-equnr
+                                          i_equi-matnr
+                                          i_equi-sernr
+                                          text-012.
+      LOOP AT gt_err.
+        gv_msgnr = gt_err-msgnr.
+        CALL FUNCTION 'RH_MESSAGE_GET'
+          EXPORTING
+*           SPRSL                   = SY-LANGU
+            arbgb                   = sy-msgid
+            msgnr                   = gv_msgnr
+            msgv1                   = sy-msgv1
+            msgv2                   = sy-msgv2
+            msgv3                   = sy-msgv3
+            msgv4                   = sy-msgv4
+          IMPORTING
+            msgtext                 = gv_mestx
+          EXCEPTIONS
+            message_not_found       = 1
+            OTHERS                  = 2.
+        IF sy-subrc = 0.
+          PERFORM status_message_update USING i_equi-equnr
+                                              i_equi-matnr
+                                              i_equi-sernr
+                                              gv_mestx.
+        ENDIF.
+      ENDLOOP.
+    ENDIF.
+  ENDIF.
+
+  REFRESH: l_i_bdcdata,
+           gt_err.
+
+ENDFORM.                    "change_status_avlb_to_esto
+
+*Text symbol text£º
+*001:Selection Screen Input
+*002:No data available for the Selection Criteria
+*003:No SD document delivery found(table LIPS)
+*004:Invalid purchase group
+*005:Vendor Warranty Information populated
+*006:Warranty Information not populated - Sel. Screen Checkbox not checked
+*007:Measurement Points populated
+*008:Measuring Points not populated - Sel. Screen Checkbox not checked
+*009:Measuring Points already available,  no Meas Point details to be created
+*010:No Measuring Points available in the custom table
+*011:Characteristic ZAM_MODEL or  characteristic value not available
+*012:Call Transaction failed !!
+*013:Characteristic Name is invalid, check Characteristic -
+*014:Atlas Copco - Warranty/Meas.point/Configuration data
+*015:creation for new equipments status report as on -
+*016:Equipment Number
+*017:Material Number
+*018:Serial Number
+*019:Status Message
+*020:Measurement Points populated with default measuring points.
+*023:Vendor Warranty Details already available - Vendor Warranty Info not populated
+*025:Customer Warranty Information populated
+*026:Material or PGC not available
+*027:MP already available or one of char.names is invalid, no MP details created
+*028:PRODH not available - Configuration data not populated
+*029:No Profitcenter available - Configuration data not populated
+*030:Configuration data populated
+*031:Configuration data not populated - Sel. Screen Checkbox not checked
+*032:Configuration data already available
+*033:Call Transaction 'IK02' failed !!
+*034:'Annual estimate' in & populated
+*035:& not available - 'Annual estimate' not populated
+*036:Invalid product hierarchy
+*037:Record does not exist in YSE_P025_PARMS
+
+*038:No configurable material available in YSE_P025_PARMS
+*Selection text£º
+*P_KMATN:        Create Configuration tab
+*P_LANGU:        Language for char. description
+*P_MEAS:        Create  Measuring Points
+*P_WERKS:        Plant
+*P_WNTYCU:        Create Customer Warranty info
+*P_WNTYVE:        Create Vendor Warranty info
+*S_EQUNR:        Equipment Number
+*S_ERDAT:        Equipment Creation Date

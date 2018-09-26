@@ -1,0 +1,820 @@
+*&---------------------------------------------------------------------*
+*& Report  YSE_EQUI_DISMANTLE                                          *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+*& This report will dismantle the equipments and install these to      *
+*& new functional location                                             *
+*&---------------------------------------------------------------------*
+*& Modifications                                                       *
+*&---------------------------------------------------------------------*
+* MOD-001|20  .  .  |                 |CD1K9     |                     *
+* MOD-002|2012.04.17|Johnny Wu        |CD1K971381|                     *
+* MOD-003|2014.11.20|Raghavendra      |CD1K984038|CR-3121              *
+* Req: install several Equi in 1 same FL(validate                      *
+*1. if FL and Eequipment are from same country or different            *
+*2. if Equipment is in inactive or deletion status then throw error)   *
+*&---------------------------------------------------------------------*
+************************************************************************
+REPORT  yse_equi_dismantle MESSAGE-ID yam_re.
+
+*.................. Tables definitions................................ *
+*TABLES: equi.                          " Commented by MOD-003
+
+*.................. Variable definitions.............................. *
+TYPE-POOLS: slis.
+*begin of insertion mod-003
+TYPES:BEGIN OF ty_equip,
+      equnr TYPE equnr,
+      del   TYPE char1,
+      END OF ty_equip.
+DATA: gt_equip TYPE STANDARD TABLE OF ty_equip,
+      wa_equip TYPE ty_equip,
+      gv_equi  TYPE c.
+*end of insertion mod-003
+*.. Global variables
+DATA: gv_msg    TYPE c,
+      gv_handle TYPE balloghndl,
+      gv_log    TYPE c.
+
+DATA: BEGIN OF gt_equi OCCURS 0,
+        equnr   TYPE equnr,
+      END OF gt_equi.
+
+DATA: gt_errmsg TYPE TABLE OF bdcmsgcoll,
+      wa_errmsg LIKE LINE OF gt_errmsg.
+
+DATA: i_inherit_flags LIKE inheritance_flags,
+      s_equi          LIKE v_equi,
+      r_iflo          LIKE iflo.
+
+DATA: gv_tplma      TYPE tplma,
+      gv_mode       TYPE c VALUE 'N'.
+
+DATA: i_bdcdata      LIKE bdcdata OCCURS 0 WITH HEADER LINE,
+      struct_bdcdata TYPE bdcdata.
+*begin of insertion mod-003
+CONSTANTS:c_onli   TYPE char4  VALUE 'ONLI',
+          c_sjob   TYPE char4  VALUE 'SJOB',
+          c_x      TYPE char1  VALUE 'X',
+          c_msgid  TYPE char20 VALUE 'YAM_RE',
+          c_msgno  TYPE char3  VALUE '162',
+          c_msgno1 TYPE char3  VALUE '163'.
+
+DATA: lv_equnr TYPE equnr,
+      lv_sernr TYPE gernr.
+*end of insertion mod-003
+*.................. Layout selection screen........................... *
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE text-b01.
+PARAMETERS:
+  p_tplnr      TYPE      v_equi-tplnr OBLIGATORY.
+SELECT-OPTIONS:
+  s_equnr      FOR       lv_equnr MATCHCODE OBJECT equi OBLIGATORY,
+  s_sernr      FOR       lv_sernr.
+SELECTION-SCREEN END OF BLOCK b1.
+
+
+*.................. Selection screen validations...................... *
+AT SELECTION-SCREEN ON p_tplnr.
+
+  SELECT SINGLE tplma INTO gv_tplma
+       FROM iflo
+       WHERE tplnr = p_tplnr.
+
+  IF sy-subrc = 0.
+*Begin of Deletion mod-003
+*    IF NOT gv_tplma IS INITIAL.
+**.... Functional location is not country level
+*      MESSAGE e001(00) WITH text-e01.
+*    ENDIF.
+*End of deletion mod-003
+    gv_tplma = p_tplnr."+mod-003
+  ELSE.
+*.. Functional location does not exist
+    MESSAGE e001(00) WITH text-e02.
+  ENDIF.
+*begin of insertion MOD-003
+AT SELECTION-SCREEN ON s_equnr.
+*Check that equipment is not assigned to FL of different country
+  IF sy-ucomm EQ c_onli OR
+     sy-ucomm EQ c_sjob OR
+     sy-batch EQ c_x.
+    PERFORM chk_country_for_equip_fl.
+  ENDIF.
+*end of insertion MOD-003
+AT SELECTION-SCREEN ON BLOCK b1.
+
+  IF s_equnr IS INITIAL AND s_sernr IS INITIAL.
+*.. At least one equipment/serial number is to be selected
+    MESSAGE e001(00) WITH text-e05.
+  ENDIF.
+
+*.................. Main program...................................... *
+START-OF-SELECTION.
+
+* Transaction counter
+  CALL METHOD ycl_statistics=>record_transaction.
+
+* Initialization
+  PERFORM initialization.
+
+* Select the relevant equipments
+  PERFORM select_equipments.
+
+* Install equipments
+  IF gt_equi[] IS INITIAL.
+*    MESSAGE e001(00) WITH text-e04."-mod-003
+  ELSE.
+    PERFORM install_equipments.
+  ENDIF.
+*begin of insertion mod-003
+  LOOP AT gt_equip INTO wa_equip.
+    gv_equi = c_x.
+    PERFORM add_message_to_log.
+    CLEAR wa_equip.
+  ENDLOOP.
+  CLEAR:gv_equi.
+*end of insertion mod-003
+* Save application log
+  PERFORM save_application_log.
+
+* Display log
+  IF NOT gv_log IS INITIAL.
+    PERFORM display_log.
+  ENDIF.
+
+************************************************************************
+* S U B R O U T I N E S                                                *
+*&---------------------------------------------------------------------*
+*&      Form  initialization
+*&---------------------------------------------------------------------*
+*       Perform the necessary initialization actions
+*----------------------------------------------------------------------*
+FORM initialization.
+
+*.. Local variables
+  DATA: ls_log    TYPE bal_s_log.
+
+  ls_log-object = 'YSE_EQUI_DISM'.
+
+*.. Create application log
+  CALL FUNCTION 'BAL_LOG_CREATE'
+    EXPORTING
+      i_s_log                 = ls_log
+    IMPORTING
+      e_log_handle            = gv_handle
+    EXCEPTIONS
+      log_header_inconsistent = 1
+      OTHERS                  = 2.
+
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+ENDFORM.                    " initialization
+
+*&---------------------------------------------------------------------*
+*&      Form  select_equipments
+*&---------------------------------------------------------------------*
+*       Select the relevant equipment information
+*----------------------------------------------------------------------*
+FORM select_equipments.
+  DATA: ls_equi LIKE LINE OF gt_equi,"+mod-003
+        lv_idx  TYPE sy-tabix."+mod-003
+  SELECT equnr
+    INTO CORRESPONDING FIELDS OF TABLE gt_equi
+    FROM equi
+    WHERE equnr IN s_equnr
+      AND sernr IN s_sernr.
+
+  SORT gt_equi BY equnr.
+*Remove the equipments which are from different country
+*begin of insertion mod-003
+  LOOP AT gt_equi INTO ls_equi.
+    lv_idx = sy-tabix.
+    CLEAR wa_equip.
+    READ TABLE gt_equip INTO wa_equip WITH KEY equnr = ls_equi-equnr
+                                      BINARY SEARCH.
+    IF sy-subrc EQ 0.
+      DELETE gt_equi INDEX lv_idx.
+    ENDIF.
+  ENDLOOP.
+*end of insertion mod-003
+ENDFORM.                    " select_equipments
+
+*&---------------------------------------------------------------------*
+*&      Form  install_equipments
+*&---------------------------------------------------------------------*
+*       Make installation of the equipments which were selected
+*----------------------------------------------------------------------*
+FORM install_equipments.
+
+* Local variables
+  DATA: lc_return LIKE bapiret2.
+
+* Lock functional location
+  CALL FUNCTION 'ENQUEUE_EIFLOT'
+    EXPORTING
+      tplnr          = p_tplnr
+    EXCEPTIONS
+      foreign_lock   = 1
+      system_failure = 2
+      OTHERS         = 3.
+
+  IF sy-subrc <> 0.
+*.. Func.loc &1 already locked by user &2. Install not possible
+    syst-msgv4 = syst-msgv1.
+    MESSAGE e130 WITH p_tplnr sy-msgv4 INTO gv_msg.
+    PERFORM add_message_to_log.
+    EXIT.
+  ENDIF.
+
+  LOOP AT gt_equi.
+*.. Dismantle equipment
+    CALL FUNCTION 'BAPI_EQUI_DISMANTLE'
+      EXPORTING
+        equipment = gt_equi-equnr
+      IMPORTING
+        return    = lc_return.
+    COMMIT WORK AND WAIT.                                     " +MOD-003.
+
+*.. If the Equip. has been dismantled from existing location, assign
+*.. the Equipment to the new functional location.
+    IF NOT lc_return IS INITIAL.
+*.... Error in dismantling the equipment &1
+      MESSAGE e125 WITH gt_equi-equnr INTO gv_msg.
+      PERFORM add_message_to_log.
+    ELSE.
+*      COMMIT WORK AND WAIT.                                     " Commented by EXTRRS -- By CR 3121 -- Based on SAP reply
+
+*.... Clear maintenance plant and sales area
+      PERFORM prep_change_equipment.
+      CALL TRANSACTION 'IE02' USING i_bdcdata
+          MODE gv_mode UPDATE 'S' MESSAGES INTO gt_errmsg.
+
+      IF sy-subrc <> 0.
+        LOOP AT gt_errmsg INTO wa_errmsg
+             WHERE msgtyp EQ 'E'.
+          MESSAGE ID wa_errmsg-msgid TYPE wa_errmsg-msgtyp
+               NUMBER wa_errmsg-msgnr INTO gv_msg
+            WITH wa_errmsg-msgv1 wa_errmsg-msgv2
+                 wa_errmsg-msgv3 wa_errmsg-msgv4.
+          PERFORM add_message_to_log.
+        ENDLOOP.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+* Begin of insertion MOD-003
+  LOOP AT gt_equi.
+*...... If the equipment can not be assigned to the Function Location,
+*...... Generate a warning.
+    CLEAR: i_inherit_flags,
+           s_equi,
+           r_iflo.
+
+    MOVE 'X' TO: i_inherit_flags-stort,
+                 i_inherit_flags-msgrp,
+                 i_inherit_flags-beber,
+                 i_inherit_flags-ppsid,
+                 i_inherit_flags-abckz,
+                 i_inherit_flags-eqfnr,
+                 i_inherit_flags-gsber,
+                 i_inherit_flags-kostl,
+                 i_inherit_flags-proid,
+                 i_inherit_flags-daufn,
+                 i_inherit_flags-aufnr,
+                 i_inherit_flags-iwerk,
+                 i_inherit_flags-ingrp,
+                 i_inherit_flags-gewrk,
+                 i_inherit_flags-rbnr,
+                 i_inherit_flags-vkorg,
+                 i_inherit_flags-vtweg,
+                 i_inherit_flags-spart,
+                 i_inherit_flags-adrnr,
+                 i_inherit_flags-vkbur,
+                 i_inherit_flags-vkgrp.
+
+    s_equi-equnr = gt_equi-equnr.
+    r_iflo-tplnr = p_tplnr.
+
+    CALL FUNCTION 'EQUIPMENT_INSTALL'
+      EXPORTING
+        read_sobj             = 'X'
+        read_robj             = 'X'
+        lock_sobj             = 'X'
+*             POSEQUI               =
+        i_date                = sy-datum
+        i_time                = sy-uzeit
+        i_inherit_flags       = i_inherit_flags
+*             OLD_SEQUI             =
+*             EXEC_MEAS             = ' '
+*             CALL_EXIT             = ' '
+*             CHECK_NEW             = 'X'
+         transmit_new          = 'X'
+         direct_new            = ' '
+         commit_new            = ' '
+      CHANGING
+        s_equi                = s_equi
+*             R_EQUI                =
+        r_iflo                = r_iflo
+      EXCEPTIONS
+        err_install           = 1
+        OTHERS                = 2.
+*     Begin of insertion MOD-003
+    CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+     EXPORTING
+       wait          = 'X'
+*         IMPORTING
+*           RETURN        =
+.
+*    End of insertion MOD-003
+
+    IF sy-subrc <> 0.
+*........ The equipment &1 could not be installed at the funct.loc. &2
+***   begin of insertion MOD-003
+*          MESSAGE e126 WITH gt_equi-equnr p_tplnr INTO gv_msg.
+      PERFORM add_message_to_log.
+****  end of insertion MOD-003
+    ELSE.
+      COMMIT WORK.
+      IF sy-subrc EQ 0.
+*.......... Equipment &1 has been successfully installed
+        MESSAGE s127 WITH gt_equi-equnr INTO gv_msg.
+        PERFORM add_message_to_log.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+*  End of Insertion MOD-003
+ENDFORM.                    " install_equipment
+
+*&---------------------------------------------------------------------*
+*&      Form  add_message_to_log
+*&---------------------------------------------------------------------*
+*       Add a generated message to the application log
+*----------------------------------------------------------------------*
+FORM add_message_to_log .
+* Local variables
+*begin of insertion mod-003
+  DATA: ls_msg TYPE bal_s_msg.
+  IF wa_equip-del NE c_x AND gv_equi = c_x.
+    MOVE: c_msgid        TO ls_msg-msgid,
+          c_msgno        TO ls_msg-msgno,
+          wa_equip-equnr TO ls_msg-msgv1.
+  ELSEIF wa_equip-del = c_x AND gv_equi = c_x.
+    MOVE: c_msgid        TO ls_msg-msgid,
+          c_msgno1       TO ls_msg-msgno,
+          wa_equip-equnr TO ls_msg-msgv1.
+  ELSE.
+*end of insertion mod-003
+    MOVE-CORRESPONDING syst TO ls_msg.
+  ENDIF.
+
+  CALL FUNCTION 'BAL_LOG_MSG_ADD'
+    EXPORTING
+*     I_LOG_HANDLE              =
+      i_s_msg                   = ls_msg
+*   IMPORTING
+*     E_S_MSG_HANDLE            =
+*     E_MSG_WAS_LOGGED          =
+*     E_MSG_WAS_DISPLAYED       =
+    EXCEPTIONS
+      log_not_found             = 1
+      msg_inconsistent          = 2
+      log_is_full               = 3
+      OTHERS                    = 4
+            .
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+* Flag log as having entries
+  IF gv_log IS INITIAL.
+    gv_log = 'X'.
+  ENDIF.
+
+ENDFORM.                    " add_message_to_log
+
+*eject
+*&---------------------------------------------------------------------*
+*&      Form  save_application_log
+*&---------------------------------------------------------------------*
+*       Save the current application log to database
+*----------------------------------------------------------------------*
+FORM save_application_log .
+
+* Local variables
+  DATA: lt_handle TYPE bal_t_logh.
+
+  APPEND gv_handle TO lt_handle.
+
+  CALL FUNCTION 'BAL_DB_SAVE'
+    EXPORTING
+*     I_CLIENT               = SY-MANDT
+      i_in_update_task       = 'X'
+      i_t_log_handle         = lt_handle
+*   IMPORTING
+*     E_NEW_LOGNUMBERS       =
+    EXCEPTIONS
+      log_not_found          = 1
+      save_not_allowed       = 2
+      numbering_error        = 3
+      OTHERS                 = 4
+            .
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+*  COMMIT WORK.                 " -MOD-003
+  COMMIT WORK AND WAIT.         " +MOD-003
+
+ENDFORM.                    " save_application_log
+
+*&---------------------------------------------------------------------*
+*&      Form  display_log
+*&---------------------------------------------------------------------*
+*       Display the already generated application log
+*----------------------------------------------------------------------*
+FORM display_log .
+
+* Local variables
+  DATA: ls_prof TYPE bal_s_prof.
+
+* Reset log indicator once displayed
+*  CLEAR gv_log.
+
+* Get a prepared profile
+  CALL FUNCTION 'BAL_DSP_PROFILE_POPUP_GET'
+    IMPORTING
+      e_s_display_profile = ls_prof
+    EXCEPTIONS
+      OTHERS              = 1.
+
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+             WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+* Use grid for display if wanted
+  ls_prof-use_grid = 'X'.
+  ls_prof-start_row = 1.
+*  ls_prof-end_row = 25."-mod-003
+  ls_prof-end_row = 500."+mod-003
+  CLEAR ls_prof-pop_adjst.
+
+* When you use also other ALV lists in your report,
+* please specify a handle to distinguish between the display
+* variants of these different lists, e.g:
+  ls_prof-disvariant-handle = 'LOG'.
+
+* Call display function module
+  CALL FUNCTION 'BAL_DSP_LOG_DISPLAY'
+    EXPORTING
+      i_s_display_profile = ls_prof
+    EXCEPTIONS
+      OTHERS              = 1.
+
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+             WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+ENDFORM.                    " display_log
+
+*&---------------------------------------------------------------------*
+*&      Form  PREP_CHANGE_EQUIPMENT
+*&---------------------------------------------------------------------*
+*       Prepare change of equipment
+*----------------------------------------------------------------------*
+FORM prep_change_equipment.
+
+  REFRESH i_bdcdata.
+  CLEAR gt_errmsg.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                      USING: 'SAPMIEQ0' '0100' 'X' ' ' ' '
+                      CHANGING struct_bdcdata.
+  APPEND struct_bdcdata TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                     USING: '' '' '' 'RM63E-EQUNR' gt_equi-equnr
+                     CHANGING struct_bdcdata.
+  APPEND struct_bdcdata TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                      USING: '' '0000' '' 'BDC_OKCODE' '/00'
+                      CHANGING struct_bdcdata.
+  APPEND struct_bdcdata TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+*
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                      USING: 'SAPMIEQ0' '0101' 'X' ' ' ' '
+                      CHANGING struct_bdcdata.
+  APPEND struct_bdcdata TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                      USING: '' '0000' '' 'BDC_OKCODE' '=T\02'
+                      CHANGING struct_bdcdata.
+  APPEND struct_bdcdata TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+*
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                      USING: 'SAPMIEQ0' '0101' 'X' ' ' ' '
+                      CHANGING struct_bdcdata.
+  APPEND struct_bdcdata TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                     USING: '' '' '' 'ITOB-SWERK' '!'
+                     CHANGING struct_bdcdata.
+  APPEND struct_bdcdata TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING  ''  ''  ''  'BDC_OKCODE'  '/00'
+          CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+*
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                      USING: 'SAPMIEQ0' '0101' 'X' ' ' ' '
+                      CHANGING struct_bdcdata.
+  APPEND struct_bdcdata TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING  ''  ''  ''  'BDC_OKCODE'  '/00'
+          CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+*
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                      USING: 'SAPMIEQ0' '0101' 'X' ' ' ' '
+                      CHANGING struct_bdcdata.
+  APPEND struct_bdcdata TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING  ''  ''  ''  'BDC_OKCODE'  '=T\03'
+          CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+*
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                      USING: 'SAPMIEQ0' '0101' 'X' ' ' ' '
+                      CHANGING struct_bdcdata.
+  APPEND struct_bdcdata TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                     USING: '' '' '' 'ITOB-BUKRS' '!'
+                     CHANGING struct_bdcdata.
+  APPEND struct_bdcdata TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                     USING: '' '' '' 'ITOB-IWERK' '!'
+                     CHANGING struct_bdcdata.
+  APPEND struct_bdcdata TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                     USING: '' '' '' 'ITOB-INGRP' '!'
+                     CHANGING struct_bdcdata.
+  APPEND struct_bdcdata TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                     USING: '' '' '' 'ITOBATTR-GEWRK' '!'
+                     CHANGING struct_bdcdata.
+  APPEND struct_bdcdata TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING  ''  ''  ''  'BDC_OKCODE'  '=T\06'
+          CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+*
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                      USING: 'SAPMIEQ0' '0101' 'X' ' ' ' '
+                      CHANGING struct_bdcdata.
+  APPEND struct_bdcdata TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                     USING: '' '' '' 'ITOB-VKORG' '!'
+                     CHANGING struct_bdcdata.
+  APPEND struct_bdcdata TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                     USING: '' '' '' 'ITOB-VTWEG' '!'
+                     CHANGING struct_bdcdata.
+  APPEND struct_bdcdata TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                     USING: '' '' '' 'ITOB-SPART' '!'
+                     CHANGING struct_bdcdata.
+  APPEND struct_bdcdata TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                     USING: '' '' '' 'ITOB-VKBUR' '!'
+                     CHANGING struct_bdcdata.
+  APPEND struct_bdcdata TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                     USING: '' '' '' 'ITOB-VKGRP' '!'
+                     CHANGING struct_bdcdata.
+  APPEND struct_bdcdata TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING  ''  ''  ''  'BDC_OKCODE'  '/00'
+          CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+*
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                      USING: 'SAPMIEQ0' '0101' 'X' ' ' ' '
+                      CHANGING struct_bdcdata.
+  APPEND struct_bdcdata TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING  ''  ''  ''  'BDC_OKCODE'  '/00'
+          CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+*
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                      USING: 'SAPMIEQ0' '0101' 'X' ' ' ' '
+                      CHANGING struct_bdcdata.
+  APPEND struct_bdcdata TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING  ''  ''  ''  'BDC_OKCODE'  '=BU'
+          CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+ENDFORM.                    " PREP_CHANGE_EQUIPMENT
+*&---------------------------------------------------------------------*
+*&      Form  CHK_COUNTRY_FOR_EQUIP_FL
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM chk_country_for_equip_fl .
+  TYPES:BEGIN OF ty_equi,
+        equnr TYPE equnr,
+        objnr	TYPE j_objnr,     "	Object number
+        bukrs TYPE bukrs,       " Company Code
+        END OF ty_equi.
+  TYPES:BEGIN OF ty_jcds,
+        objnr	TYPE j_objnr,     " Object number
+        stat  TYPE j_status,    " Object status
+        chgnr	TYPE j_chgnr,     " Change number
+        inact TYPE j_inact,     " Indicator: Status Is Inactive
+        END OF ty_jcds.
+
+  TYPES: BEGIN OF ty_t001,
+        bukrs TYPE bukrs,            "  Company Code
+        land1	TYPE land1,            " 	Country Key
+        END OF ty_t001.
+
+  DATA:lt_equi  TYPE STANDARD TABLE OF ty_equi,
+       lt_jcds  TYPE STANDARD TABLE OF ty_jcds,
+       lt_t001  TYPE STANDARD TABLE OF ty_t001,
+       ls_jcds  TYPE ty_jcds,
+       ls_equi  TYPE ty_equi,
+       ls_t001  TYPE ty_t001.
+  DATA:lv_iloan TYPE iloan,
+       lv_bukrs TYPE bukrs,
+       lv_land1 TYPE land1.
+  CONSTANTS: c_datbi TYPE datbi    VALUE '99991231',
+             c_stat  TYPE j_status VALUE 'I0076'.
+
+  IF NOT gv_tplma IS INITIAL AND
+     NOT s_equnr[] IS INITIAL.
+    SELECT SINGLE iloan
+                  FROM iflo
+                  INTO lv_iloan
+                  WHERE tplnr EQ p_tplnr.
+*                    AND spras EQ sy-langu.                          " -MOD-003
+    IF sy-subrc EQ 0.
+      SELECT SINGLE bukrs
+                    FROM iloa
+                    INTO lv_bukrs
+                    WHERE iloan EQ lv_iloan.
+    ENDIF.
+    SELECT equnr
+           objnr
+           bukrs
+           FROM v_equi
+           INTO TABLE lt_equi
+           WHERE equnr IN s_equnr
+             AND datbi EQ c_datbi.
+
+    IF NOT lt_equi[] IS INITIAL.                                        " +MOD-003
+      SORT lt_equi BY equnr objnr bukrs.
+      DELETE ADJACENT DUPLICATES FROM lt_equi COMPARING ALL FIELDS.
+      SELECT bukrs
+             land1
+             FROM t001
+             INTO TABLE lt_t001
+             FOR ALL ENTRIES IN lt_equi
+             WHERE ( bukrs = lt_equi-bukrs OR bukrs = lv_bukrs ).
+*    Begin of Insertion MOD-003
+      IF sy-subrc = 0.
+        SORT lt_t001 BY bukrs.
+      ENDIF.
+*    End of Insertion MOD-003
+*    IF NOT lt_equi[] IS INITIAL.                                        " -MOD-003
+      SELECT objnr
+             stat
+             chgnr
+             inact
+             FROM jcds
+             INTO TABLE lt_jcds
+             FOR ALL ENTRIES IN lt_equi
+             WHERE objnr EQ lt_equi-objnr
+             AND stat EQ c_stat.
+*   Begin of Insertion MOD-003
+      IF sy-subrc = 0.
+        SORT lt_jcds BY objnr chgnr DESCENDING.
+        DELETE ADJACENT DUPLICATES FROM lt_jcds COMPARING objnr.
+        SORT lt_jcds BY objnr.
+*   End of Insertion MOD-003
+      ENDIF.
+    ENDIF.
+*    SORT lt_jcds BY objnr chgnr DESCENDING.                            " -MOD-003
+*    DELETE ADJACENT DUPLICATES FROM lt_jcds COMPARING objnr.           " -MOD-003
+    CLEAR ls_t001.                                                      " +MOD-003
+    READ TABLE lt_t001 INTO ls_t001 WITH KEY bukrs = lv_bukrs
+                       BINARY SEARCH.                                   " +MOD-003
+    lv_land1 = ls_t001-land1.
+*    CLEAR ls_t001.                                                      " -MOD-003
+    LOOP AT lt_equi INTO ls_equi.
+*Logic for checking the Equipment marked as deletion or not.
+      CLEAR ls_jcds.                                                    " +MOD-003.
+      READ TABLE lt_jcds INTO ls_jcds WITH KEY objnr = ls_equi-objnr
+                                      BINARY SEARCH.                    " +MOD-003
+      IF sy-subrc = 0 AND ls_jcds-inact NE c_x.
+        MOVE:ls_equi-equnr TO wa_equip-equnr.
+        MOVE: c_x TO wa_equip-del.
+      ENDIF.
+
+*Logic for checking the equipment and functional location country is same or not.
+      CLEAR ls_t001.                                                    " +mod-003
+      READ TABLE lt_t001 INTO ls_t001 WITH KEY bukrs = ls_equi-bukrs
+                         BINARY SEARCH.                                 " +MOD-003
+      IF ls_t001-land1 NE lv_land1. "Check FL country VS Equipement Contry
+        MOVE:ls_equi-equnr TO wa_equip-equnr.
+      ENDIF.
+
+* Append if the equipment is failing in one of the above cases.
+      IF wa_equip IS NOT INITIAL.
+        APPEND wa_equip TO gt_equip.
+      ENDIF.
+
+*      CLEAR:wa_equip,ls_equi,ls_jcds,ls_t001.                          " -mod-003
+      CLEAR : wa_equip.                                                " +mod-003
+    ENDLOOP.
+    SORT gt_equip BY equnr.                                             " +mod-003
+  ENDIF.
+ENDFORM.                    " CHK_COUNTRY_FOR_EQUIP_FL
+
+*Text symbol text£º
+*B01:Selection
+*E01:Functional location is not country level
+*E02:Functional location does not exist
+*E03:No authorisation for plant :
+*E04:No equipments selected !
+*E05:At least one equipment/serialnr. is to be selected
+*P01:Install equipment?
+*P02:You are about to install the equipment. Are you sure you want to continue?
+
+*T01:Are you sure you want to process all the equipment's from the output list
+*Selection text£º
+*P_TPLNR:        Functional Location
+*S_EQUNR:        Equipment
+*S_SERNR:        Serial number

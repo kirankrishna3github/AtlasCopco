@@ -1,0 +1,296 @@
+*&---------------------------------------------------------------------*
+*& Report  Z_SCMA_DEL_DATA                                             *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+*&                                                                     *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+
+REPORT  Z_SCMA_DEL_DATA                         .
+
+************************************************************************
+parameters:     s_sdat like sy-datum,
+                s_edat like sy-datum.
+parameters:     p_step(3) default '7'.
+parameters:     ch_test as checkbox default 'X'.
+
+*****************
+
+DATA: LT_WHERE_sel(72) TYPE C     OCCURS 0 WITH HEADER LINE.
+DATA: LT_WHERE_apl(72) TYPE C     OCCURS 0 WITH HEADER LINE.
+DATA: LT_SMMAIN    LIKE SMMAIN    OCCURS 0 WITH HEADER LINE.
+DATA: LT_SMWF      LIKE SMWF      OCCURS 0 WITH HEADER LINE.
+data: lt_appl      like smappl    occurs 0 with header line.
+data: lt_scmatreed like scmatreed occurs 0 with header line.
+data: ls_items     like schedman_delete_wf.                 "S9CK001152
+data: ls_WIHEADER  like SWWWIHEAD.                          "S9CK001152
+data: ls_WFDKEY    like SWD_WFDKEY.                         "S9CK001152
+data: LT_SEL_TREED like MONI_IF_SELFIELDS occurs 0          "S9CK001152
+                                          with header line. "S9CK001152
+data: lt_sequences like scmasequences occurs 0              "S9CK001152
+                                      with header line.     "S9CK001152
+data: begin of lt_schedids occurs 0,
+        schedulerid like smscmaid-schedulerid,
+      end of lt_schedids.
+data: begin of lt_topnodes occurs 0,
+        wf_witem like schedman_delete_wf-scma_sequence,     "S9CK001152
+        top_node like smwf-top_node,
+      end of lt_topnodes.
+data: lt_topnodes1 like lt_topnodes occurs 0                "S9CK001152
+                                    with header line.       "S9CK001152
+data: lt_sel like moni_if_selfields occurs 0 with header line.
+data: ld_appl  like smappl-application value 'SAP'.
+data: ld_lines like sy-tabix.
+data: ld_wf_id like SWD_PRAPI-WI_ID.
+DATA: LD_SELECTION_DONE(1).
+DATA: LD_testrun(1).
+DATA: LD_delete_wf(1).
+data : c_sdat(72),
+       c_edat(72).
+data: gd_sdat like sy-datum.
+data: gd_edat like sy-datum.
+constants true type c value 'X'.
+
+**********************
+if ch_test = 'X'.
+  LD_testrun = true.
+endif.
+
+*.now do the deletion for a size defined in p_step. Otherwise it
+*.would dump if the amount of data is too huge to delete in one
+*.commit.
+
+gd_sdat = s_sdat.
+gd_edat = s_edat.
+
+do.
+  s_sdat = s_edat - p_step.
+  if s_sdat < gd_sdat.
+    s_sdat = gd_sdat.
+  endif.
+  if s_sdat > s_edat.
+    s_sdat = s_edat.
+  endif.
+  write: / 'Date from:', s_sdat.
+  write: / 'Date to  :', s_edat.
+
+**********************************************************************
+* transactions and notes have no record in smmain, but they have to be
+* deleted from scmatreed as well
+  refresh lt_scmatreed[].
+  select *
+      into corresponding fields of table lt_scmatreed
+      from scmatreed as sd join scmatree as s
+               on sd~profile = s~profile and sd~node_id = s~node_id
+      where sd~task_date between s_sdat and s_edat and
+            s~task_type in ('2','3').
+
+  delete scmatreed from table lt_scmatreed.
+
+**********************************************************************
+* now delete the jobs on the basis of SMMAIN records
+  clear lt_Sel.
+  refresh lt_sel.
+  lt_sel-fieldname = 'SDATE'.
+  lt_sel-low       = s_sdat.
+  lt_sel-high      = s_edat.
+  append lt_sel.
+  clear lt_where_sel.
+  refresh lt_where_sel.
+  perform create_selection_table tables lt_sel
+                                        lt_where_sel.
+
+*.now do select on database--------------------------------------------*
+  CALL FUNCTION 'MONI_SELECT_COMBINED'
+    TABLES
+      Lt_APPL      = lt_appl
+      LT_WHERE_SEL = lt_where_sel
+      LT_WHERE_APL = lt_where_apl
+      LT_SMMAIN    = lt_smmain.
+
+  DESCRIBE TABLE LT_SMMAIN LINES LD_LINES.
+  IF LD_LINES > 0.
+************************************************************************
+*.If User wants to delete the corresponding workflows with all dependent
+*.jobs as well, create workflow structures
+* if ld_delete_wf = true.                                   "S9CK001152
+*....First create whole workflow structures
+  CALL FUNCTION 'MONI_CHANGE_WF_JOBS'
+    TABLES
+      LT_SMMAIN = lt_smmain
+      et_smwf   = lt_smwf.
+
+*....Search for all jobs started by scheduler
+  select schedulerid from smscmaid
+         appending corresponding fields of table lt_schedids
+         for all entries in lt_smmain
+             where id = lt_smmain-id.
+
+*....Search for all workflow topnodes
+*....(Top_node is equal to SMMAIN-WF_WITEM)
+  loop at lt_smwf.
+    lt_topnodes-wf_witem = lt_smwf-wf_witem.                "S9CK001152
+    lt_topnodes-top_node = lt_smwf-top_node.
+    collect lt_topnodes.
+  endloop.
+
+*    build selection table for deletion interval            "S9CK001152
+  refresh lt_sel_treed.                                     "S9CK001152
+  lt_sel_treed-fieldname = 'TASK_DATE'.                     "S9CK001152
+  loop at lt_smmain.                                        "S9CK001152
+    check lt_smmain-sdate ne 0.                             "S9CK001152
+    if lt_sel_treed-low = 0 or                              "S9CK001152
+       lt_sel_treed-low gt lt_smmain-sdate.                 "S9CK001152
+      lt_sel_treed-low       = lt_smmain-sdate.             "S9CK001152
+    endif.                                                  "S9CK001152
+    if lt_sel_treed-high = 0 or                             "S9CK001152
+       lt_sel_treed-high lt lt_smmain-sdate.                "S9CK001152
+      lt_sel_treed-high      = lt_smmain-sdate.             "S9CK001152
+    endif.                                                  "S9CK001152
+  endloop.                                                  "S9CK001152
+  append lt_sel_treed.                                      "S9CK001152
+                                                            "S9CK001152
+* get workflow definition from runtime workitem             "S9CK001152
+  refresh: lt_sequences.                                    "S9CK001152
+  lt_topnodes1[] = lt_topnodes[].                           "S9CK001152
+  sort lt_topnodes1 by top_node.                            "S9CK001152
+  delete adjacent duplicates from lt_topnodes1              "S9CK001152
+                  comparing top_node.                       "S9CK001152
+  loop at lt_topnodes1.                                     "S9CK001152
+    ls_wiheader-wi_id  = lt_topnodes1-top_node.             "S9CK001152
+    CALL FUNCTION 'SWP_WF_DEFINITION_KEY_GET'               "S9CK001152
+      EXPORTING                                             "S9CK001152
+        WF_ID                    = ls_wiheader-wi_id        "S9CK001152
+      IMPORTING                                             "S9CK001152
+        WF_DEF_KEY               = ls_wfdkey                "S9CK001152
+      EXCEPTIONS                                            "S9CK001152
+        WORKFLOW_NOT_FOUND       = 1                        "S9CK001152
+        OTHERS                   = 2                        "S9CK001152
+            .                                               "S9CK001152
+    IF SY-SUBRC <> 0.                                       "S9CK001152
+*   MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO       "S9CK001152
+*           WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.       "S9CK001152
+    ENDIF.                                                  "S9CK001152
+                                                            "S9CK001152
+    if sy-subrc ne 0.                                       "S9CK001152
+      delete lt_topnodes                                    "addelete
+        where top_node = ls_wiheader-wi_id.                 "addelete
+    endif.                                                  "S9CK001152
+                                                            "S9CK001152
+*   get schedman name of workflow from workflow definition  "S9CK001152
+    select * from scmasequences appending table lt_sequences"S9CK001152
+       where wfid = ls_wfdkey-wfd_id.                       "S9CK001152
+  endloop.                                                  "S9CK001152
+* delete guids for runtime schedman variables later         "S9CK001152
+
+*....delete the workflow item
+  if ld_testrun <> true.
+    loop at lt_topnodes.
+      ld_wf_id = lt_topnodes-top_node.
+      CALL FUNCTION 'SWD_PROFILE_API_FI_DELETE'
+        EXPORTING
+          IN_WI_ID = ld_wf_id.
+*          perform delete_tvarv_container using ld_wf_id    "S9CK001152
+*                                               ld_testrun. "S9CK001152
+    endloop.
+
+    if not lt_schedids[] is initial.
+      select * from scmatreed appending table lt_scmatreed
+            for all entries in lt_schedids
+                 where sched_id = lt_schedids-schedulerid.
+    endif.
+    if not lt_topnodes[] is initial.
+      select * from scmatreed appending table lt_scmatreed
+            for all entries in lt_topnodes
+                 where wf_id = lt_topnodes-top_node.
+    endif.
+    delete scmatreed from table lt_scmatreed.
+    commit work.
+  endif.
+* endif.                                                    "S9CK001152
+************************************************************************
+*.Now delete the found entries
+  CALL FUNCTION 'KPEP_ARCHIVE_MONI_DATA'
+       EXPORTING
+*           I_DELETE_ALL = ' '
+            I_TESTRUN    = ld_testrun
+       TABLES
+            LT_SMMAIN    = lt_smmain.
+
+* delete guids for runtime schedman variables               "S9CK001152
+  read table lt_sequences.                                  "S9CK001152
+  if sy-tfill ne 0.                                         "S9CK001152
+    sort lt_sequences by sequence.                          "S9CK001152
+    delete adjacent duplicates from lt_sequences            "S9CK001152
+                    comparing sequence.                     "S9CK001152
+    perform delete_tvarv_container tables LT_SEL_TREED      "S9CK001152
+                                          lt_sequences      "S9CK001152
+                                   using  ld_testrun        "S9CK001152
+                                          ' '.
+  endif.                                                    "S9CK001152
+
+  endif.
+
+**********************************************************************
+* some flow definitions have no record in smmain, so that they had not
+* been deleted by previos coding, but they have to be
+* deleted from scmatreed as well - these are e.g. flow definitions which
+* were scheduled but not yet started or they have been already started,
+* but they remained "hang up" because of some reason without running
+* through the first step - this can e.g happend when the first step is
+* the program which is not adapted for schedman so that it does not
+* send the event "Finished" or "Error"
+  refresh lt_scmatreed[].
+  select *
+      into corresponding fields of table lt_scmatreed
+      from scmatreed as sd join scmatree as s
+               on sd~profile = s~profile and sd~node_id = s~node_id
+      where sd~task_date between s_sdat and s_edat and
+            s~task_type = '1'.
+
+  delete scmatreed from table lt_scmatreed.
+
+* do/don't commit                                           "S9CK001152
+  perform testrun using ld_testrun                          "S9CK001152
+                        ' '
+                        ' '.                                "note635291
+  s_edat = s_edat - p_step.
+  if s_edat <= gd_sdat.
+     exit.
+  endif.
+enddo.
+
+include LMOF7F01.
+include LMOF7F02.
+
+*Text symbol text£º
+*BTC:Dependant batch data found
+*DAY:SCMA_CONT_ELEMS
+*DEL:Data found:
+*LOA:Delete dependent Data
+*LOE:Delete task:
+*MES:Saved messages found
+*OTH:Found elsewhere:
+*RER:Update run, data was deleted!
+*TA0:Table
+*TA1:SMMAIN
+*TA2:SMBATCH
+*TA3:SMSELKRIT
+*TA4:SMPARAM
+*TA5:SMMESSAGE
+*TA6:SMCOOM
+*TA7:SMSTATUS
+*TA8:SMSPOOL
+*TA9:SMEXT
+*TAC:SMWF
+*TAD:SMSCMAID
+*TAE:SMRL
+*TAF:SCMA_CONT
+*TER:Test run, data was not deleted!
+
+*WLS:Dependent worklists found
+*Selection text£º
+*CH_TEST:        Test run
+*P_STEP:        Increment in days
+*S_EDAT:        Start date to
+*S_SDAT:        Start date from

@@ -1,0 +1,472 @@
+************************************************************************
+* Program ID           : YAM_UPDATE_CONTRACT_END_DATES                 *
+* Program Title        : Update Contract End date of contract line item*
+* Author               : Lakshmi Reddy                                 *
+* Date                 : 19/SEP/2010                                   *
+* Change Request Number: CD1K959288                                    *
+* Description          : This program updates the contract end date    *
+*                        of contract line item from the input file     *
+*======================================================================*
+* Copied From          : N/A                                           *
+* Title                : N/A                                           *
+* Other Related obj    : N/A                                           *
+*======================================================================*
+* Change History Log                                                   *
+*----------------------------------------------------------------------*
+* Mod. no.|Date      |Name        |Correction Number|Change Reference  *
+*----------------------------------------------------------------------*
+* MOD-001 |16/09/2010|LakshmiReddy|CD1K959288       |CR1045            *
+* Description: Initial Development                                     *
+*----------------------------------------------------------------------*
+
+REPORT  yam_update_contract_end_dates MESSAGE-ID yam_re.
+
+TYPE-POOLS: slis.
+
+************************************************************************
+*                  T Y P E S  S T R U C T U R E S
+************************************************************************
+TYPES: BEGIN OF ty_inputdata,
+        vbeln   TYPE vbeln_va,
+        vposn   TYPE posnr_va,
+        venddat TYPE char8,
+       END OF ty_inputdata.
+
+TYPES: BEGIN OF ty_report,
+        vbeln   TYPE vbeln_va,
+        vposn   TYPE posnr_va,
+        errtyp  TYPE char1,
+        errdes  TYPE string,
+       END OF ty_report.
+
+************************************************************************
+*                 I N T E R N A L  T A B L E S
+************************************************************************
+DATA: i_inputdata TYPE STANDARD TABLE OF ty_inputdata,
+      i_validdata TYPE STANDARD TABLE OF ty_inputdata,
+      i_report    TYPE STANDARD TABLE OF ty_report,
+      i_fieldcatalog TYPE slis_t_fieldcat_alv,
+      i_events       TYPE slis_t_event,
+      i_header       TYPE slis_t_listheader.
+
+************************************************************************
+*                 W O R K  A R E A S
+************************************************************************
+DATA: wa_inputdata TYPE ty_inputdata,
+      wa_report    TYPE ty_report.
+
+*----------------------------------------------------------------------*
+*                 S E L E C T I O N  S C R E E N                       *
+*----------------------------------------------------------------------*
+SELECTION-SCREEN BEGIN OF BLOCK s1 WITH FRAME TITLE text-001.
+PARAMETERS: p_file TYPE localfile OBLIGATORY.
+SELECTION-SCREEN END OF BLOCK s1.
+
+*----------------------------------------------------------------------*
+*                 A T  S E L E C T I O N  S C R E E N                  *
+*----------------------------------------------------------------------*
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_file.
+
+  PERFORM f100_select_input_file CHANGING p_file.
+
+************************************************************************
+*                 S T A R T - O F - S E L E C T I O N
+************************************************************************
+START-OF-SELECTION.
+
+  PERFORM f200_prepare_input_data.
+
+  IF NOT i_inputdata IS INITIAL.
+    PERFORM f300_prep_valid_and_err_record.
+
+    PERFORM f400_update_veda_table.
+
+    PERFORM f500_display_report.
+  ELSE.
+    MESSAGE s320 WITH
+           'The file does not contain any records'(008).
+  ENDIF.
+
+*&---------------------------------------------------------------------*
+*&      Form  F100_SELECT_INPUT_FILE
+*&---------------------------------------------------------------------*
+*       Select Input file from presentation server
+*----------------------------------------------------------------------*
+FORM f100_select_input_file CHANGING f_c_file TYPE localfile.
+
+  DATA:  lv_deffile   TYPE string,
+         i_file_table TYPE TABLE OF file_table,
+         wa_filetable TYPE file_table,
+         lv_rc        TYPE  i,
+         lv_usr_act   TYPE i.
+
+* For type compatibility
+  lv_deffile = f_c_file .
+
+  CALL METHOD cl_gui_frontend_services=>file_open_dialog
+    EXPORTING
+      default_filename        = lv_deffile
+      file_filter             = 'Text Files|*.txt'
+    CHANGING
+      file_table              = i_file_table
+      rc                      = lv_rc
+      user_action             = lv_usr_act
+    EXCEPTIONS
+      file_open_dialog_failed = 1
+      cntl_error              = 2
+      error_no_gui            = 3
+      not_supported_by_gui    = 4
+      OTHERS                  = 5.
+
+  IF sy-subrc = 0 AND lv_usr_act <> cl_gui_frontend_services=>action_cancel.
+    LOOP AT i_file_table  INTO wa_filetable.
+      lv_deffile = wa_filetable.
+      EXIT.
+    ENDLOOP.
+  ELSEIF lv_usr_act EQ cl_gui_frontend_services=>action_cancel.
+    lv_deffile = f_c_file.
+  ENDIF.
+
+  MOVE lv_deffile TO f_c_file.
+
+ENDFORM.                    " F100_SELECT_INPUT_FILE
+*&---------------------------------------------------------------------*
+*&      Form  F200_PREPARE_INPUT_DATA
+*&---------------------------------------------------------------------*
+*       Prepare input file data into an internal table
+*----------------------------------------------------------------------*
+FORM f200_prepare_input_data .
+  DATA: lv_file TYPE string.
+  MOVE p_file TO lv_file.
+
+  CALL FUNCTION 'GUI_UPLOAD'
+    EXPORTING
+      filename                = lv_file
+      filetype                = 'DAT'
+    TABLES
+      data_tab                = i_inputdata
+    EXCEPTIONS
+      file_open_error         = 1
+      file_read_error         = 2
+      no_batch                = 3
+      gui_refuse_filetransfer = 4
+      invalid_type            = 5
+      no_authority            = 6
+      unknown_error           = 7
+      bad_data_format         = 8
+      header_not_allowed      = 9
+      separator_not_allowed   = 10
+      header_too_long         = 11
+      unknown_dp_error        = 12
+      access_denied           = 13
+      dp_out_of_memory        = 14
+      disk_full               = 15
+      dp_timeout              = 16
+      OTHERS                  = 17.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+ENDFORM.                    " F200_PREPARE_INPUT_DATA
+
+*&---------------------------------------------------------------------*
+*&      Form  f300_prep_valid_and_err_record
+*&---------------------------------------------------------------------*
+*       Prepare error records
+*----------------------------------------------------------------------*
+FORM f300_prep_valid_and_err_record .
+
+  TYPES: BEGIN OF ty_vbap,
+          vbeln TYPE vbeln_va,
+          posnr TYPE posnr_va,
+         END OF ty_vbap.
+
+  DATA: i_vbap  TYPE STANDARD TABLE OF ty_vbap,
+        wa_vbap TYPE ty_vbap,
+        lv_date TYPE scal-date.
+
+  REFRESH:i_vbap.
+
+  DELETE ADJACENT DUPLICATES FROM i_inputdata COMPARING vbeln
+                                                        vposn.
+  IF NOT i_inputdata IS INITIAL.
+    SELECT vbeln
+           posnr
+    FROM   vbap
+    INTO   TABLE i_vbap
+    FOR    ALL ENTRIES IN i_inputdata
+    WHERE  vbeln EQ i_inputdata-vbeln
+    AND    posnr EQ i_inputdata-vposn.
+  ENDIF.
+
+*Consider only input file records if exists in VBAP table
+  REFRESH: i_validdata,
+           i_report.
+  CLEAR: wa_inputdata,
+         wa_vbap.
+  LOOP AT i_inputdata INTO wa_inputdata.
+    READ TABLE i_vbap INTO wa_vbap WITH KEY vbeln = wa_inputdata-vbeln
+                                            posnr = wa_inputdata-vposn.
+    IF sy-subrc EQ 0.
+*Check whether date mentioned in file is valid
+      CLEAR: lv_date.
+      lv_date = wa_inputdata-venddat.
+      CALL FUNCTION 'DATE_GET_WEEK'
+        EXPORTING
+          date         = lv_date
+        EXCEPTIONS
+          date_invalid = 1
+          OTHERS       = 2.
+      IF sy-subrc EQ 0.
+        APPEND wa_inputdata TO i_validdata.
+      ELSE.
+*If invalid date is mentioned
+        CLEAR: wa_report.
+        wa_report-vbeln = wa_inputdata-vbeln.
+        wa_report-vposn = wa_inputdata-vposn.
+        wa_report-errtyp = 'E'.
+        CONCATENATE 'Invalid Date'(011)
+                    lv_date
+                    INTO
+                    wa_report-errdes
+                    SEPARATED BY space.
+        APPEND wa_report TO i_report.
+      ENDIF.
+    ELSE.
+*If Record does not exist in VBAP table
+      CLEAR: wa_report.
+      wa_report-vbeln = wa_inputdata-vbeln.
+      wa_report-vposn = wa_inputdata-vposn.
+      wa_report-errtyp = 'E'.
+      wa_report-errdes = 'The record does not exist in SAP'(012).
+      APPEND wa_report TO i_report.
+    ENDIF.
+    CLEAR: wa_inputdata,
+           wa_vbap.
+  ENDLOOP.
+
+ENDFORM.                    " f300_prep_valid_and_err_record
+*&---------------------------------------------------------------------*
+*&      Form  F400_UPDATE_VEDA_TABLE
+*&---------------------------------------------------------------------*
+*       Update VEDA table
+*----------------------------------------------------------------------*
+FORM f400_update_veda_table .
+
+  DATA: i_veda  TYPE STANDARD TABLE OF veda,
+        wa_veda TYPE veda,
+        i_update_veda TYPE STANDARD TABLE OF veda.
+
+*Get records from VEDA table
+  REFRESH: i_veda.
+  IF NOT i_validdata IS INITIAL.
+    SELECT *
+    FROM   veda
+    INTO   TABLE i_veda
+    FOR    ALL ENTRIES IN i_validdata
+    WHERE  vbeln EQ i_validdata-vbeln.
+  ENDIF.
+
+  REFRESH: i_update_veda.
+  CLEAR:   wa_inputdata.
+  LOOP AT i_validdata INTO wa_inputdata.
+
+    CLEAR: wa_veda.
+    READ TABLE i_veda INTO wa_veda WITH KEY vbeln = wa_inputdata-vbeln
+                                            vposn = wa_inputdata-vposn.
+    IF sy-subrc EQ 0.
+      wa_veda-vendreg = ' '.
+      wa_veda-venddat = wa_inputdata-venddat.
+      APPEND wa_veda TO i_update_veda.
+    ELSE.
+      READ TABLE i_veda INTO wa_veda WITH KEY vbeln = wa_inputdata-vbeln
+                                              vposn = '000000'.
+      IF sy-subrc EQ 0.
+        wa_veda-vposn   = wa_inputdata-vposn.
+        wa_veda-vendreg = ' '.
+        wa_veda-venddat = wa_inputdata-venddat.
+        APPEND wa_veda TO i_update_veda.
+      ENDIF.
+    ENDIF.
+    CLEAR: wa_inputdata.
+  ENDLOOP.
+
+  IF NOT i_update_veda IS INITIAL.
+    MODIFY veda FROM TABLE i_update_veda.
+    IF sy-subrc EQ 0.
+      COMMIT WORK.
+      CLEAR wa_veda.
+      LOOP AT i_update_veda INTO wa_veda.
+        CLEAR: wa_report.
+        wa_report-vbeln = wa_veda-vbeln.
+        wa_report-vposn = wa_veda-vposn.
+        wa_report-errtyp = 'S'.
+        wa_report-errdes = 'The contract End date has been updated successfully'(009).
+        APPEND wa_report TO i_report.
+        CLEAR: wa_veda.
+      ENDLOOP.
+    ELSE.
+      ROLLBACK WORK.
+      CLEAR wa_veda.
+      LOOP AT i_update_veda INTO wa_veda.
+        CLEAR: wa_report.
+        wa_report-vbeln = wa_veda-vbeln.
+        wa_report-vposn = wa_veda-vposn.
+        wa_report-errtyp = 'E'.
+        wa_report-errdes = 'Contract End date not updated due to an error while updating database table'(010).
+        APPEND wa_report TO i_report.
+        CLEAR: wa_veda.
+      ENDLOOP.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    " F400_UPDATE_VEDA_TABLE
+*&---------------------------------------------------------------------*
+*&      Form  F500_DISPLAY_REPORT
+*&---------------------------------------------------------------------*
+*       Display ALV report
+*----------------------------------------------------------------------*
+FORM f500_display_report .
+
+  PERFORM f510_build_field_catalog.
+
+  PERFORM f520_build_events.
+
+  PERFORM f530_display_alv_report.
+
+ENDFORM.                    " F500_DISPLAY_REPORT
+*&---------------------------------------------------------------------*
+*&      Form  F510_BUILD_FIELD_CATALOG
+*&---------------------------------------------------------------------*
+*       Build field catalog
+*----------------------------------------------------------------------*
+FORM f510_build_field_catalog .
+
+  PERFORM f511_field_catalog USING 'VBELN'
+                                   'Contract Document'(002).
+
+  PERFORM f511_field_catalog USING 'VPOSN'
+                                   'Item Number'(004).
+
+  PERFORM f511_field_catalog USING 'ERRTYP'
+                                   'Error Type'(005).
+
+  PERFORM f511_field_catalog USING 'ERRDES'
+                                   'Error Description'(006).
+
+ENDFORM.                    " F510_BUILD_FIELD_CATALOG
+
+*&---------------------------------------------------------------------*
+*&      Form  F511_FIELD_CATALOG
+*&---------------------------------------------------------------------*
+*       Prepare field catalog with output fields
+*----------------------------------------------------------------------*
+FORM f511_field_catalog USING p_fname   TYPE any
+                              p_seltext TYPE any.
+
+  DATA: wa_fieldcatalog TYPE slis_fieldcat_alv.
+
+*appending parameters of a particular field of a fieldcatalog
+  wa_fieldcatalog-tabname   = 'I_REPORT'.
+  wa_fieldcatalog-fieldname = p_fname.
+  wa_fieldcatalog-seltext_m = p_seltext.
+
+*appending parameters of a particular field to fieldcatalog
+  APPEND wa_fieldcatalog TO i_fieldcatalog.
+
+ENDFORM.                    " f511_field_catalog
+
+*---------------------------------------------------------------------*
+*       FORM top_of_page                                              *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+FORM top_of_page.
+
+  DATA : wa_header TYPE slis_listheader.
+
+  CLEAR wa_header.
+  REFRESH i_header.
+
+  wa_header-typ = 'H'.
+  wa_header-info = 'List of Success and Error Records'(007).
+  APPEND wa_header TO i_header.
+
+  CALL FUNCTION 'REUSE_ALV_COMMENTARY_WRITE'
+    EXPORTING
+      it_list_commentary = i_header.
+
+ENDFORM.                    "top_of_page
+
+*&---------------------------------------------------------------------*
+*&      Form  f520_build_events
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM f520_build_events.
+
+  DATA : wa_events TYPE slis_alv_event.
+
+  CALL FUNCTION 'REUSE_ALV_EVENTS_GET'
+    EXPORTING
+      i_list_type = 0
+    IMPORTING
+      et_events   = i_events.
+
+  READ TABLE i_events WITH KEY name = 'TOP_OF_PAGE'
+                                      INTO wa_events.
+
+  wa_events-form = 'TOP_OF_PAGE'.
+
+  MODIFY i_events
+  FROM wa_events
+  TRANSPORTING form
+  WHERE name EQ wa_events-name.
+
+ENDFORM.                    " f520_build_events
+
+*&---------------------------------------------------------------------*
+*&      Form  f530_display_alv_report
+*&---------------------------------------------------------------------*
+*       Display ALV report
+*----------------------------------------------------------------------*
+FORM f530_display_alv_report .
+
+  DATA: l_repid TYPE sy-repid.
+
+  l_repid = sy-repid.
+  SORT i_report BY vbeln vposn.
+
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+    EXPORTING
+      i_callback_program = l_repid
+      it_fieldcat        = i_fieldcatalog
+      it_events          = i_events
+    TABLES
+      t_outtab           = i_report
+    EXCEPTIONS
+      program_error      = 1
+      OTHERS             = 2.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+ENDFORM.                    " f530_display_alv_report
+
+*Text symbol text£º
+*001:Input File Selection
+*002:Contract Document
+*004:Item Number
+*005:Error Type
+*006:Error Description
+*007:List of Success and Error Records
+*008:The file does not contain any records
+*009:The contract End date has been updated successfully
+*010:Contract End date not updated due to an error while updating database table
+*011:Invalid Date
+
+*012:The record does not exist in SAP
+*Selection text£º
+*P_FILE:        Input File

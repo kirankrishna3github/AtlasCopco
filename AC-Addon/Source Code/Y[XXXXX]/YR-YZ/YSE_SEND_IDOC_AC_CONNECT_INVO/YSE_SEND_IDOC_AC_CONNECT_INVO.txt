@@ -1,0 +1,672 @@
+*&---------------------------------------------------------------------*
+*& Report  YSE_SEND_IDOC_AC_CONNECT_INVO                               *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+*&                                                                     *
+*& AC Connect : Send Invoice Idocs                                     *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+*  Author                : Geert Rutten
+*  Date                  : 30.01.2011
+*  Change Request Number : CR2208
+*  Transport request Nr. : CD1K970061
+*----------------------------------------------------------------------*
+*                                                                      *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD.NR. | DATE       | NAME              | CORRECT.NR. | CHANGE REF. *
+*----------------------------------------------------------------------*
+* MOD-001
+*----------------------------------------------------------------------*
+************************************************************************
+
+REPORT  yse_send_idoc_ac_connect_invo  MESSAGE-ID yam_inf.
+
+TABLES: vbrk, yse_acc_invoice, komk, komp, yse_sd_acc_cust.
+
+DATA: BEGIN OF tkomvd OCCURS 50.
+        INCLUDE STRUCTURE komvd.
+DATA: END OF tkomvd.
+
+DATA: BEGIN OF tkomv OCCURS 50.
+        INCLUDE STRUCTURE komv.
+DATA: END OF tkomv.
+
+DATA: BEGIN OF it_acc_inv OCCURS 0,
+        vbeln TYPE vbeln,
+        vkorg TYPE vkorg,
+        vtweg TYPE vtweg,
+        kunag TYPE kunnr,
+        kunrg TYPE kunnr,
+        spart TYPE spart,
+        msgfn TYPE msgfn,
+        data(1000) TYPE c,
+      END OF it_acc_inv.
+
+DATA: lt_inv TYPE lbbil_outp_dbdata,
+      wa_inv_vbrk LIKE vbrk,
+      wa_inv_vbrp LIKE vbrp,
+      wa_inv_vbpa LIKE vbpa,
+      wa_inv_kna1 LIKE kna1.
+
+DATA: gv_kwert   TYPE kwert,
+      gv_knumv   TYPE knumv.
+
+DATA: l_riwol TYPE STANDARD TABLE OF riwol,
+      wa_riwol LIKE LINE OF l_riwol.
+
+DATA: lv_index TYPE sy-tabix,
+      lv_line TYPE i.
+
+DATA: wa_yse_acc_invoice TYPE yse_acc_invoice.
+
+DATA: ls_vbrk_i TYPE lbbil_invoice_key_t,
+      wa_vbrk_i TYPE LINE OF lbbil_invoice_key_t.
+
+DATA: ls_vbrk TYPE vbrk.
+
+DATA: lv_datum TYPE sy-datum.
+
+DATA: lv_tabix TYPE sy-tabix.
+
+DATA: i_edidc_control_comm LIKE edidc OCCURS 1 WITH HEADER LINE ,
+      i_edidd_data LIKE edidd OCCURS 0 WITH HEADER LINE .
+DATA: created_idocs LIKE sy-tabix.
+
+DATA: wa_edidc    LIKE edidc.
+
+TYPES: BEGIN OF t_head.
+        INCLUDE STRUCTURE yse_e1_acc_inv_head.
+TYPES: END OF t_head.
+
+DATA: wa_head TYPE t_head.
+
+TYPES: BEGIN OF t_detail.
+        INCLUDE STRUCTURE yse_e1_acc_inv_detail.
+TYPES: END OF t_detail.
+
+DATA: wa_detail TYPE t_detail.
+
+TYPES: BEGIN OF t_par_ag.
+        INCLUDE STRUCTURE yse_e1_acc_inv_par_ag.
+TYPES: END OF t_par_ag.
+
+DATA: wa_par_ag TYPE t_par_ag.
+
+TYPES: BEGIN OF t_par_rg.
+        INCLUDE STRUCTURE yse_e1_acc_inv_par_rg.
+TYPES: END OF t_par_rg.
+
+DATA: wa_par_rg TYPE t_par_rg,
+      lv_adrnr  TYPE adrnr.
+
+CONSTANTS:
+    c_input            TYPE c             VALUE '0',
+    c_ls(2)            TYPE c             VALUE 'LS',
+    c_sc1(3)           TYPE c             VALUE 'SC1',
+    c_mestyp_inv       LIKE edidc-mestyp  VALUE 'YSE_ACC_INV',
+    c_idoc_type_inv    LIKE edidc-idoctp  VALUE 'YSE_ACC_INV',
+    c_segment_head(20) TYPE c             VALUE 'YSE_E1_ACC_INV_HEAD',
+    c_segment_detail(21) TYPE c           VALUE 'YSE_E1_ACC_INV_DETAIL',
+    c_segment_par_ag(21) TYPE c           VALUE 'YSE_E1_ACC_INV_PAR_AG',
+    c_segment_par_re(21) TYPE c           VALUE 'YSE_E1_ACC_INV_PAR_RE',
+    c_segment_par_we(21) TYPE c           VALUE
+'YSE_E1_ACC_INV_PAR_WE',
+    c_segment_par_rg(21) TYPE c           VALUE
+'YSE_E1_ACC_INV_PAR_RG'.
+
+* Selection
+PARAMETERS: p_mess LIKE tbdme-mestyp OBLIGATORY DEFAULT 'YSE_ACC_INV'
+              MODIF ID sc1.
+
+DATA:  lv_bukrs TYPE bukrs,
+       lv_spras TYPE spras.
+DATA:  lv_erdat TYPE erdat,
+       lv_ord_typ TYPE auart.
+DATA:  lv_listpr TYPE netwr.
+DATA:  lv_kbetr TYPE kbetr,
+       lv_disc TYPE KBETR.
+
+SELECTION-SCREEN: BEGIN OF BLOCK block1 WITH FRAME TITLE text-001.
+*PARAMETERS: p_init TYPE xfeld,
+*            p_inorg  LIKE knvv-vkorg.    "S.O. to be initial loaded
+SELECT-OPTIONS: s_vbeln FOR vbrk-vbeln,
+                s_vkorg  FOR vbrk-vkorg OBLIGATORY NO INTERVALS,
+                s_vtweg  FOR vbrk-vtweg,
+                s_spart  FOR vbrk-spart,
+                s_fkart  FOR vbrk-fkart,
+                s_kunnr  FOR vbrk-kunag,
+                s_credat FOR sy-datum DEFAULT sy-datum.
+PARAMETERS: p_init  TYPE xfeld.
+SELECTION-SCREEN: END OF BLOCK block1.
+
+************************************************************************
+*    Disable Message Type Screen Field                                 *
+************************************************************************
+AT SELECTION-SCREEN OUTPUT.
+
+  LOOP AT SCREEN.
+    IF screen-group1 = c_sc1.
+      screen-input   = c_input.
+      MODIFY SCREEN.
+      CONTINUE.
+    ENDIF.
+  ENDLOOP.
+
+************************************************************************
+*       S T A R T - O F - S E L E C T I O N    E V E N T               *
+************************************************************************
+START-OF-SELECTION.
+
+
+* Delete data older than 7 days.
+
+  PERFORM del_invoice.
+
+* Get the information for selected plant(s)
+  LOOP AT s_vkorg.
+
+    PERFORM get_detail USING s_vkorg-low.
+
+  ENDLOOP.
+
+*&---------------------------------------------------------------------*
+*&      Form  get_detail
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_VKORG    text
+*----------------------------------------------------------------------*
+FORM get_detail USING p_vkorg.
+
+  CLEAR it_acc_inv.
+  REFRESH it_acc_inv.
+
+
+  IF p_init <> 'X'.
+* Select contract data based on Selection screen parameters
+    SELECT vbeln vkorg vtweg spart kunag kunrg
+           INTO CORRESPONDING FIELDS OF TABLE it_acc_inv
+           FROM vbrk
+           WHERE vbeln IN s_vbeln
+             AND vkorg = s_vkorg-low
+             AND vtweg IN s_vtweg
+             AND spart IN s_spart
+             AND fkart IN s_fkart
+             AND ( kunag IN s_kunnr OR kunrg IN s_kunnr )
+             AND erdat IN s_credat.
+  ELSE.
+* Select contract data based on Selection screen parameters
+    SELECT vbeln vkorg vtweg spart kunag kunrg
+           INTO CORRESPONDING FIELDS OF TABLE it_acc_inv
+           FROM vbrk
+           WHERE vbeln IN s_vbeln
+             AND vkorg = s_vkorg-low
+             AND vtweg IN s_vtweg
+             AND spart IN s_spart
+             AND ( kunag IN s_kunnr OR kunrg IN s_kunnr )
+             AND fkart IN s_fkart.
+  ENDIF.
+
+
+LOOP AT it_acc_inv.
+
+    lv_index = sy-tabix.
+
+    SELECT single *
+         FROM yse_sd_acc_cust
+         WHERE kunnr = it_acc_inv-kunag or
+               kunnr = it_acc_inv-kunrg.
+    IF sy-subrc <> 0.
+      DELETE it_acc_inv index lv_index.
+    ENDIF.
+
+
+ENDLOOP.
+
+DESCRIBE TABLE it_acc_inv lines lv_line.
+IF lv_line = 0.
+* Process Error - No data found for the Selected S.O.
+
+    WRITE: text-e01, p_vkorg.
+    EXIT.
+ENDIF.
+
+
+* check which invoices still need to be send to Ac Connect
+
+  LOOP AT it_acc_inv.
+    lv_tabix = sy-tabix.
+
+    SELECT SINGLE *
+      FROM yse_acc_invoice
+      WHERE vbeln = it_acc_inv-vbeln.
+
+    IF sy-subrc = 0.
+      DELETE it_acc_inv INDEX lv_tabix.
+    ENDIF.
+  ENDLOOP.
+
+* Process Error - No data found for the Selected S.O.
+  IF it_acc_inv[] IS INITIAL.
+    WRITE: text-e01, p_vkorg.
+    EXIT.
+  ENDIF.
+
+* fill table invoices to retrieve data from
+  LOOP AT it_acc_inv.
+
+    wa_vbrk_i-vbeln = it_acc_inv-vbeln.
+    APPEND wa_vbrk_i TO ls_vbrk_i.
+
+  ENDLOOP.
+
+  IF it_acc_inv[] IS NOT INITIAL.
+
+    CALL FUNCTION 'LB_BIL_INV_OUTP_READ_DBDATA'
+      EXPORTING
+        it_bil_number               = ls_vbrk_i
+*   IF_LANGUAGE                 =
+*   IS_DB_DATA_TO_READ          =
+*   IF_READ_MODE                = ' '
+*   IF_REFRESH_BUFFER           = ' '
+     IMPORTING
+        es_bil_outp_dbdata          = lt_inv
+* EXCEPTIONS
+*   RECORDS_NOT_FOUND           = 1
+*   RECORDS_NOT_REQUESTED       = 2
+*   OTHERS                      = 3
+              .
+    IF sy-subrc <> 0.
+* MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*         WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+    ENDIF.
+
+
+    IF lt_inv-vbrk[] IS INITIAL .
+      WRITE: / 'No Idocs created'.
+    ELSE.
+*   Generate Idoc's
+      PERFORM create_idocs_inv USING p_mess.
+      WRITE : /   created_idocs , ' Idocs created'.
+    ENDIF.
+    WRITE: / 'Job finished'.
+
+
+* Fill table YSE_ACC_INVOICE of the invoices send to Ac Connect.
+
+    LOOP AT it_acc_inv.
+      wa_yse_acc_invoice-vbeln = it_acc_inv-vbeln.
+      wa_yse_acc_invoice-erdat = sy-datum.
+      wa_yse_acc_invoice-vkorg = it_acc_inv-vkorg.
+      wa_yse_acc_invoice-vtweg = it_acc_inv-vtweg.
+      INSERT into yse_acc_invoice values  wa_yse_acc_invoice.
+    ENDLOOP.
+  ENDIF.
+
+
+ENDFORM.                    "get_detail
+
+*&---------------------------------------------------------------------*
+*&      Form  create_idocs_inv
+*&---------------------------------------------------------------------*
+*      -->MESSAGE_TYPE
+*----------------------------------------------------------------------*
+FORM create_idocs_inv  USING    message_type.
+
+
+  CLEAR: created_idocs.
+* FIND RECEIVING PARTNER
+  SELECT SINGLE rcvprn INTO wa_edidc-rcvprn
+         FROM edp13
+         WHERE mestyp = c_mestyp_inv.
+* Polulate Control Record
+  wa_edidc-mestyp =  c_mestyp_inv.
+  wa_edidc-idoctp =  c_idoc_type_inv.
+  wa_edidc-rcvprt =  c_ls.
+
+  LOOP AT it_acc_inv.
+    CLEAR i_edidd_data[].
+
+* retrieve prices/conditions
+
+    CLEAR: komp,
+           tkomv[].
+
+
+    SELECT single * FROM vbrk INTO CORRESPONDING FIELDS OF ls_vbrk
+      WHERE vbeln = it_acc_inv-vbeln.
+
+      IF sy-subrc = 0.
+        CLEAR komk.
+        komk-mandt = sy-mandt.
+        komk-kalsm = ls_vbrk-kalsm.
+        komk-fkart = ls_vbrk-fkart.
+        komk-kappl = 'V'.
+        IF ls_vbrk-kappl NE space.
+          komk-kappl = ls_vbrk-kappl.
+        ENDIF.
+        komk-waerk = ls_vbrk-waerk.
+        komk-knumv = ls_vbrk-knumv.
+        komk-vbtyp = ls_vbrk-vbtyp.
+      ENDIF.
+*      komp-kposn = vbdpr-posnr.
+
+      CALL FUNCTION 'RV_PRICE_PRINT_ITEM'
+        EXPORTING
+          comm_head_i = komk
+          comm_item_i = komp
+          language    = sy-langu
+        IMPORTING
+          comm_head_e = komk
+          comm_item_e = komp
+        TABLES
+          tkomv       = tkomv
+          tkomvd      = tkomvd.
+
+
+* Header
+
+    LOOP AT lt_inv-vbrk INTO wa_inv_vbrk WHERE vbeln = it_acc_inv-vbeln.
+      CLEAR wa_head.
+        SELECT SINGLE famback INTO wa_head-famback
+               FROM yse_sd_acc_fam
+               WHERE vkorg = it_acc_inv-vkorg
+                 AND vtweg = it_acc_inv-vtweg
+                 AND spart = it_acc_inv-spart.
+        wa_head-vbeln = wa_inv_vbrk-vbeln.
+        wa_head-fkdat = wa_inv_vbrk-fkdat.
+        wa_head-netwr = wa_inv_vbrk-netwr.
+        wa_head-mwsbk = wa_inv_vbrk-mwsbk.
+        wa_head-waerk = wa_inv_vbrk-waerk.
+        wa_head-bstnk = wa_inv_vbrk-bstnk_vf.
+        wa_head-vat_reg = wa_inv_vbrk-stceg.
+        READ TABLE tkomv WITH KEY kschl = 'ZD00'.
+        IF sy-subrc = 0.
+          wa_head-freight = tkomv-kbetr.
+        ELSE.
+          READ TABLE tkomv WITH KEY kschl = 'ZD01'.
+          IF sy-subrc = 0.
+            wa_head-freight = tkomv-kbetr.
+          ENDIF.
+        ENDIF.
+
+*   Company of the sales org
+        CLEAR lv_bukrs.
+        SELECT SINGLE bukrs INTO lv_bukrs
+               FROM tvko
+               WHERE vkorg = it_acc_inv-vkorg.
+*   Language of the company
+        SELECT SINGLE spras INTO lv_spras
+               FROM t001
+               WHERE bukrs = lv_bukrs.
+
+        SELECT SINGLE bezei FROM tinct INTO wa_head-inco
+          WHERE inco1 = wa_inv_vbrk-inco1 AND
+                spras = lv_spras.
+        IF sy-subrc <> 0.
+          SELECT SINGLE bezei FROM tinct INTO wa_head-inco
+            WHERE inco1 = wa_inv_vbrk-inco1 AND
+                   spras = 'EN'.
+        ENDIF.
+
+        SELECT SINGLE text1 FROM t052u INTO wa_head-terms
+          WHERE zterm = wa_inv_vbrk-zterm AND
+                spras = lv_spras.
+        IF sy-subrc <> 0.
+          SELECT SINGLE text1 FROM t052u INTO wa_head-terms
+            WHERE zterm = wa_inv_vbrk-zterm AND
+                  spras = 'EN'.
+        ENDIF.
+
+        wa_head-ernam = wa_inv_vbrk-ernam.
+
+        i_edidd_data-segnam  = c_segment_head.
+        i_edidd_data-sdata   = wa_head.
+        APPEND i_edidd_data.
+        CLEAR i_edidd_data.
+      ENDLOOP.
+
+* Detail
+    LOOP AT lt_inv-vbrp INTO wa_inv_vbrp WHERE vbeln = it_acc_inv-vbeln.
+      CLEAR wa_detail.
+      komp-kposn = wa_inv_vbrp-posnr.
+
+      CALL FUNCTION 'RV_PRICE_PRINT_ITEM'
+        EXPORTING
+
+          comm_head_i = komk
+          comm_item_i = komp
+          language    = sy-langu
+        IMPORTING
+          comm_head_e = komk
+          comm_item_e = komp
+        TABLES
+          tkomv       = tkomv
+          tkomvd      = tkomvd.
+
+* listprice
+* ZPNM ?
+        CLEAR gv_knumv.
+        SELECT SINGLE knumv from VBRK into gv_knumv
+          WHERE vbeln = wa_inv_vbrp-vbeln.
+
+        CLEAR gv_kwert.
+        SELECT SINGLE kbetr INTO gv_kwert
+               FROM konv
+               WHERE knumv = gv_knumv
+                 AND kposn = wa_inv_vbrp-posnr
+                 AND kschl = 'ZPBO'.
+        IF sy-subrc <> 0.
+        SELECT SINGLE kbetr INTO gv_kwert
+               FROM konv
+               WHERE knumv = gv_knumv
+                 AND kposn = wa_inv_vbrp-posnr
+                 AND kschl = 'ZPRO'.
+        ENDIF.
+
+        wa_detail-listpr = gv_kwert.
+* Discount
+        wa_inv_vbrp-netwr = wa_inv_vbrp-netwr / wa_inv_vbrp-fkimg.
+        CLEAR: lv_kbetr, lv_listpr, lv_disc.
+        lv_kbetr = gv_kwert - wa_inv_vbrp-netwr.
+        lv_listpr = wa_detail-listpr.
+        IF lv_listpr is not initial.
+         lv_disc = 100 * lv_kbetr / lv_listpr.
+        ENDIF.
+        wa_detail-kbetr = lv_disc.
+* discount
+
+
+        CALL FUNCTION 'IWOL_WV_READ_LIST'
+           EXPORTING
+             i_sdaufnr           = wa_inv_vbrp-aubel
+             i_sdposnr           = wa_inv_vbrp-posnr
+           TABLES
+*          t_ser02             = l_ser02
+             t_riwol             = l_riwol
+           EXCEPTIONS
+             objk_exists         = 1
+             no_object_list      = 2
+             status_not_allowed  = 3
+             equi_foreign_key    = 4
+             equi_system_failure = 5
+             customer_exit_error = 6
+             OTHERS              = 7.
+        IF sy-subrc <> 0.
+*        MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*                WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+        ELSE.
+          IF NOT l_riwol[] IS INITIAL.
+            LOOP AT l_riwol INTO wa_riwol.
+              MOVE wa_riwol-matnr  TO wa_detail-matnr_eq.
+              MOVE wa_riwol-sernr  TO wa_detail-sernr_eq.
+            ENDLOOP.
+          ENDIF.
+        ENDIF.
+        wa_detail-ordnr = wa_inv_vbrp-aubel.
+
+        SELECT SINGLE IHREZ INTO wa_detail-ihrez
+          FROM VBKD
+          WHERE vbeln eq wa_inv_vbrp-aubel
+          AND posnr eq '000000'.
+
+        CLEAR: lv_erdat, lv_ord_typ.
+        SELECT SINGLE erdat auart FROM vbak INTO (lv_erdat,
+                                                  lv_ord_typ)
+          WHERE vbeln = wa_inv_vbrp-aubel.
+
+        wa_detail-erdat = lv_erdat.
+        wa_detail-ord_typ = lv_ord_typ.
+        wa_detail-posnr = wa_inv_vbrp-posnr.
+        wa_detail-matnr = wa_inv_vbrp-matnr.
+        wa_detail-arktx = wa_inv_vbrp-arktx.
+        wa_detail-netwr = wa_inv_vbrp-netwr.
+        wa_detail-fkimg = wa_inv_vbrp-fkimg.
+        wa_detail-mwsbp = wa_inv_vbrp-mwsbp.
+        wa_detail-meins = wa_inv_vbrp-meins.
+        wa_detail-skfbp = wa_inv_vbrp-skfbp.
+
+        i_edidd_data-segnam  = c_segment_detail.
+        i_edidd_data-sdata   = wa_detail.
+        APPEND i_edidd_data.
+        CLEAR i_edidd_data.
+      ENDLOOP.
+
+
+* Partners - Sold to
+
+    LOOP AT lt_inv-vbpa INTO wa_inv_vbpa WHERE vbeln = it_acc_inv-vbeln
+                                         AND parvw = 'AG'.
+        CLEAR wa_par_ag.
+        CLEAR lv_adrnr.
+        wa_par_ag-parvw = wa_inv_vbpa-parvw.
+        wa_par_ag-partn = wa_inv_vbpa-kunnr.
+        wa_par_ag-land1 = wa_inv_vbpa-land1.
+        lv_adrnr        = wa_inv_vbpa-adrnr.
+        LOOP AT lt_inv-kna1 INTO wa_inv_kna1
+                               WHERE kunnr =  wa_inv_vbpa-kunnr.
+          MOVE-CORRESPONDING wa_inv_kna1 TO wa_par_ag.
+        ENDLOOP.
+        i_edidd_data-segnam  = c_segment_par_ag.
+        i_edidd_data-sdata   = wa_par_ag.
+        APPEND i_edidd_data.
+        CLEAR i_edidd_data.
+
+      ENDLOOP.
+
+* Partners - Ship to
+
+
+    LOOP AT lt_inv-vbpa INTO wa_inv_vbpa WHERE vbeln = it_acc_inv-vbeln
+                                         AND parvw = 'RG'.
+        CLEAR wa_par_rg.
+        CLEAR lv_adrnr.
+        wa_par_rg-parvw = wa_inv_vbpa-parvw.
+        wa_par_rg-partn = wa_inv_vbpa-kunnr.
+        wa_par_rg-land1 = wa_inv_vbpa-land1.
+        lv_adrnr        = wa_inv_vbpa-adrnr.
+        LOOP AT lt_inv-kna1 INTO wa_inv_kna1
+                               WHERE kunnr =  wa_inv_vbpa-kunnr.
+          MOVE-CORRESPONDING wa_inv_kna1 TO wa_par_rg.
+        ENDLOOP.
+        i_edidd_data-segnam  = c_segment_par_rg.
+        i_edidd_data-sdata   = wa_par_rg.
+        APPEND i_edidd_data.
+        CLEAR i_edidd_data.
+
+      ENDLOOP.
+
+*
+      IF NOT i_edidd_data[] IS INITIAL.
+        CALL FUNCTION 'MASTER_IDOC_DISTRIBUTE'
+          EXPORTING
+            master_idoc_control            = wa_edidc
+          TABLES
+            communication_idoc_control     = i_edidc_control_comm
+            master_idoc_data               = i_edidd_data
+          EXCEPTIONS
+            error_in_idoc_control          = 1
+            error_writing_idoc_status      = 2
+            error_in_idoc_data             = 3
+            sending_logical_system_unknown = 4
+            OTHERS                         = 5.
+
+        IF sy-subrc <> 0.
+
+        ELSE.
+          created_idocs = created_idocs + 1.
+        ENDIF.
+
+        CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'.
+
+        CALL FUNCTION 'EDI_DOCUMENT_DEQUEUE_LATER'
+          EXPORTING
+            docnum                 = i_edidc_control_comm-docnum
+          EXCEPTIONS
+            idoc_is_not_to_dequeue = 1
+            OTHERS                 = 2.
+      ENDIF.
+
+    ENDLOOP.
+
+  ENDFORM.                    " CREATE_IDOCS_Invoice
+**&---------------------------------------------------------------------
+*
+**&      Form  add_segments_to_it_acc
+**&---------------------------------------------------------------------
+*
+*FORM add_segments_to_it_acc.
+*
+*  DATA : gv_data(1000) TYPE c.
+*
+*  LOOP AT it_acc.
+*    CLEAR gv_data.
+*    LOOP AT it_mvke INTO wa_mvke
+*                    WHERE matnr = it_acc-matnr
+*                      AND vkorg = it_acc-vkorg
+*                      AND vtweg = it_acc-vtweg.
+*      gv_data = wa_mvke.
+*    ENDLOOP.
+*    LOOP AT it_maraa INTO wa_mara
+*                     WHERE matnr = it_acc-matnr.
+*      CONCATENATE gv_data wa_mara INTO gv_data.
+*    ENDLOOP.
+*    LOOP AT it_marc INTO wa_marc
+*                    WHERE matnr = it_acc-matnr
+*                      AND werks = it_acc-werks.
+*      CONCATENATE gv_data wa_marc INTO gv_data.
+*    ENDLOOP.
+*    LOOP AT it_makt INTO wa_makt
+*                    WHERE matnr = it_acc-matnr.
+*      CONCATENATE gv_data wa_makt INTO gv_data.
+*    ENDLOOP.
+*    MOVE gv_data TO it_acc-data.
+*    MODIFY it_acc.
+*  ENDLOOP.
+*
+*ENDFORM.                    "add_segments_to_it_acc
+
+FORM del_invoice.
+
+  lv_datum = sy-datum - 7.
+  DELETE FROM yse_acc_invoice
+       WHERE erdat < lv_datum.
+
+ENDFORM.                    "del_invoice
+
+*Text symbol text£º
+*001:Selection parameters
+
+*E01:No data found for the selected Sales Organization
+*Selection text£º
+*P_INIT:        Initial Load
+*P_MESS:        Message type
+*S_CREDAT:        Creation Date
+*S_FKART:        Billing Type
+*S_KUNNR:        Customer Number
+*S_SPART:        Division
+*S_VBELN:        Invoice Number
+*S_VKORG:        Sales Organisation
+*S_VTWEG:        Distribution Channel

@@ -1,0 +1,445 @@
+*----------------------------------------------------------------------*
+***INCLUDE YSE_OPCO_COLLECT_FORMS .
+*----------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  GET_OPEN_ORDERS
+*&---------------------------------------------------------------------*
+FORM GET_OPEN_ORDERS.
+
+  DATA:
+    LV_OBJNR TYPE J_OBJNR,
+    BEGIN OF IT_JEST OCCURS 0,
+      OBJNR TYPE J_OBJNR,
+    END OF IT_JEST.
+
+* Select obj numbers for which status "Closed" is active
+  SELECT      OBJNR
+         INTO TABLE IT_JEST
+         FROM JEST
+        WHERE OBJNR LIKE GC_OBJNR_AUFK
+          AND STAT  EQ   GC_STAT_BUSCMP
+          AND INACT EQ   SPACE.
+
+* Select all service order numbers
+  SELECT      AUFNR AUART BUKRS OBJNR BEMOT
+         INTO TABLE IT_AUFK
+         FROM AUFK
+        WHERE AUART IN SO_AUART
+          AND BUKRS IN SO_BUKRS.
+
+* Sort tables
+  SORT:
+    IT_AUFK BY OBJNR,
+    IT_JEST BY OBJNR.
+
+* Eliminate service order numbers for which "Closed" status is set
+  LOOP AT IT_JEST.
+    READ TABLE IT_AUFK WITH KEY OBJNR = IT_JEST-OBJNR BINARY SEARCH.
+    IF SY-SUBRC EQ 0.
+      DELETE IT_AUFK INDEX SY-TABIX.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    " GET_OPEN_ORDERS
+*&---------------------------------------------------------------------*
+*&      Form  GET_WIP_AB
+*&---------------------------------------------------------------------*
+FORM GET_WIP_AB.
+
+  SELECT *
+         INTO TABLE IT_WIP_AB
+         FROM YSE_WIPS_AGEING
+        WHERE BUKRS  IN SO_BUKRS
+          AND KEYDAT EQ SY-DATUM.
+
+ENDFORM.                    " GET_WIP_AB
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_LINK_SDI_AUFNR
+*&---------------------------------------------------------------------*
+FORM GET_LINK_SDI_AUFNR .
+
+  DATA:
+    LV_VBELN(10) TYPE C,
+    LV_POSNR(6)  TYPE C,
+    BEGIN OF IT_ZUONR OCCURS 0,
+      ZUONR      TYPE DZUONR,
+      VBELN      TYPE VBELN,
+      POSNR      TYPE POSNR,
+    END OF IT_ZUONR.
+
+* Check that any links have to be retrieved
+  CHECK NOT IT_WIP_AB[] IS INITIAL.
+
+* Get all SDI references in local table and split into S.Order and item
+  LOOP AT IT_WIP_AB.
+    CLEAR IT_ZUONR.
+    IT_ZUONR-ZUONR = IT_WIP_AB-ZUONR.
+    SPLIT    IT_ZUONR-ZUONR
+          AT GC_CHAR_FS
+        INTO LV_VBELN
+             LV_POSNR.
+    IF SY-SUBRC EQ 0.
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+        EXPORTING
+          INPUT         = LV_VBELN
+        IMPORTING
+          OUTPUT        = LV_VBELN.
+      IT_ZUONR-VBELN = LV_VBELN.
+      IT_ZUONR-POSNR = LV_POSNR.
+      APPEND IT_ZUONR.
+    ENDIF.
+  ENDLOOP.
+
+* Sort table and eliminate duplicate numbers
+  SORT IT_ZUONR BY ZUONR.
+  DELETE ADJACENT DUPLICATES FROM IT_ZUONR.
+
+* Read all VBEP lines
+  SELECT      AUFNR VBELN POSNR
+         INTO CORRESPONDING FIELDS OF TABLE IT_SDI_LINK
+         FROM VBEP
+          FOR ALL ENTRIES IN IT_ZUONR
+        WHERE VBELN EQ IT_ZUONR-VBELN
+          AND POSNR EQ IT_ZUONR-POSNR
+          AND AUFNR NE SPACE.
+
+* Add to the table IT_SDI_LINK the SDI "key"
+  LOOP AT IT_SDI_LINK.
+    LV_VBELN = IT_SDI_LINK-VBELN.
+    LV_POSNR = IT_SDI_LINK-POSNR.
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+      EXPORTING
+        INPUT         = LV_VBELN
+      IMPORTING
+        OUTPUT        = LV_VBELN.
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+      EXPORTING
+        INPUT         = LV_POSNR
+      IMPORTING
+        OUTPUT        = LV_POSNR.
+    CONCATENATE LV_VBELN GC_CHAR_FS LV_POSNR INTO IT_SDI_LINK-ZUONR.
+    MODIFY IT_SDI_LINK.
+  ENDLOOP.
+
+  SORT IT_SDI_LINK BY AUFNR.
+
+ENDFORM.                    " GET_LINK_SDI_AUFNR
+
+*&---------------------------------------------------------------------*
+*&      Form  FILL_OUTPUT
+*&---------------------------------------------------------------------*
+FORM FILL_OUTPUT .
+
+  DATA: LV_COLLECT TYPE C,
+        LV_OBJNR   TYPE CO_OBJNR,
+        LV_DAYS    TYPE I,
+        LV_KWERT   LIKE IT_COEP-WTGBTR.
+
+* Loop over the open service orders
+  LOOP AT IT_VAFILOA.
+
+    CLEAR:
+      IT_OPCO,
+      LV_COLLECT.
+
+*   Copy order details to output table
+    MOVE-CORRESPONDING IT_VAFILOA TO IT_OPCO.
+    IT_OPCO-INGRP  = IT_VAFILOA-INGPR.
+    IT_OPCO-KEYDAT = SY-DATUM.
+
+*   Read equipment details
+    READ TABLE IT_ILOA
+               WITH KEY EQUNR = IT_VAFILOA-EQUNR.
+    IF SY-SUBRC EQ 0.
+      MOVE-CORRESPONDING IT_ILOA TO IT_OPCO.
+    ENDIF.
+
+*   Read company code's currency
+    READ TABLE IT_T001
+               WITH KEY BUKRS = IT_VAFILOA-BUKRS.
+    IF SY-SUBRC EQ 0.
+      IT_OPCO-WAERS = IT_T001-WAERS.
+    ENDIF.
+
+*   " External Categories "
+*   ***********************
+*   Find the SDI
+    READ TABLE IT_SDI_LINK
+               WITH KEY AUFNR = IT_VAFILOA-AUFNR
+               BINARY SEARCH.
+
+*   If SDI found
+    IF SY-SUBRC EQ 0.
+
+*     Loop over the WIP Ageing balance table and summarize costs per SDI
+      LOOP AT IT_WIP_AB WHERE ZUONR = IT_SDI_LINK-ZUONR.
+
+*       Copy G/L account and corresponding numbers to output table
+        IT_OPCO-HKONT = IT_WIP_AB-HKONT.
+        IT_OPCO-RAST2 = IT_WIP_AB-RAST2.
+        IT_OPCO-RAST3 = IT_WIP_AB-RAST3.
+        IT_OPCO-RAST4 = IT_WIP_AB-RAST4.
+        IT_OPCO-RAST5 = IT_WIP_AB-RAST5.
+        LV_COLLECT = GC_CHAR_X.
+        COLLECT IT_OPCO.
+
+      ENDLOOP.
+
+    ENDIF.
+
+*   " Internal Categories "
+*   ***********************
+*   Loop over actual costs
+    CLEAR IT_OPCO-HKONT.
+    CONCATENATE GC_OBJNR_AUFK(2) IT_VAFILOA-AUFNR INTO LV_OBJNR.
+    LOOP AT IT_COEP WHERE OBJNR = LV_OBJNR.
+
+*     Find set name (eg. the key of SEED Labour Costs)
+      READ TABLE IT_SETLEAF WITH KEY VALFROM = IT_COEP-KSTAR.
+*     If set not found, try find in range
+      IF SY-SUBRC NE 0.
+        LOOP AT IT_SETLEAF WHERE VALFROM LE IT_COEP-KSTAR
+                             AND VALTO   GE IT_COEP-KSTAR.
+          EXIT.
+        ENDLOOP.
+      ENDIF.
+
+      IF SY-SUBRC EQ 0.
+*       Clear amounts in output area
+        CLEAR:
+          IT_OPCO-RAST2,
+          IT_OPCO-RAST3,
+          IT_OPCO-RAST4,
+          IT_OPCO-RAST5.
+*       Copy set name to output area
+        IT_OPCO-SETNAME = IT_SETLEAF-SETNAME.
+*       Convert amount if required
+        IF         IT_COEP-TWAER EQ IT_OPCO-WAERS.
+          LV_KWERT = IT_COEP-WTGBTR.
+        ELSEIF     IT_COEP-TWAER NE IT_OPCO-WAERS
+               AND IT_COEP-TWAER NE SPACE
+               AND IT_OPCO-WAERS NE SPACE.
+          CALL FUNCTION 'CONVERT_AMOUNT_TO_CURRENCY'
+            EXPORTING
+*             DATE                   = SY-DATUM
+              FOREIGN_CURRENCY       = IT_COEP-TWAER
+              FOREIGN_AMOUNT         = IT_COEP-WTGBTR
+              LOCAL_CURRENCY         = IT_OPCO-WAERS
+            IMPORTING
+              LOCAL_AMOUNT           = LV_KWERT.
+        ELSE.
+          LV_KWERT = 0.
+        ENDIF.
+
+*       Determine ageing category for this cost
+        LV_DAYS = SY-DATUM - IT_COEP-BUDAT.
+*       Put cost in appropr. ageing category amount of the output area
+        IF                       LV_DAYS LT 0.
+
+        ELSEIF LV_DAYS GE 0  AND LV_DAYS LT 31.
+          IT_OPCO-RAST2 = LV_KWERT.
+        ELSEIF LV_DAYS GE 31 AND LV_DAYS LT 61.
+          IT_OPCO-RAST3 = LV_KWERT.
+        ELSEIF LV_DAYS GE 61 AND LV_DAYS LT 91.
+          IT_OPCO-RAST4 = LV_KWERT.
+        ELSE.
+          IT_OPCO-RAST5 = LV_KWERT.
+        ENDIF.
+
+        LV_COLLECT = GC_CHAR_X.
+        COLLECT IT_OPCO.
+      ENDIF.
+
+    ENDLOOP.
+
+*   If no costs saved, still have to append the line
+    IF LV_COLLECT IS INITIAL.
+      APPEND IT_OPCO.
+    ENDIF.
+
+  ENDLOOP. " IT_VAFILOA
+
+ENDFORM.                    " FILL_OUTPUT
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_ORDER_DETAILS
+*&---------------------------------------------------------------------*
+FORM GET_ORDER_DETAILS.
+
+  DATA:
+    BEGIN OF IT_EQUNR OCCURS 0,
+      EQUNR TYPE EQUNR,
+    END OF IT_EQUNR.
+
+* Get order details
+  SELECT      AUFNR
+              EQUNR
+              BUKRS
+              VKORG
+              VTWEG
+              SPART
+              IWERK
+              INGPR
+              SWERK AS VAWRK
+              GEWRK
+              ARBPL AS VAPLZ
+         INTO TABLE IT_VAFILOA
+         FROM VAFILOA AS A
+         JOIN CRHD    AS B
+           ON A~GEWRK EQ B~OBJID
+          FOR ALL ENTRIES IN IT_AUFK
+        WHERE AUFNR   EQ IT_AUFK-AUFNR
+          AND OBJTY   EQ GC_OBJTY_ARBPL.
+
+* Fill local table with equipment numbers
+  LOOP AT IT_VAFILOA.
+    IT_EQUNR-EQUNR = IT_VAFILOA-EQUNR.
+    APPEND IT_EQUNR.
+  ENDLOOP.
+  SORT IT_EQUNR.
+  DELETE ADJACENT DUPLICATES FROM IT_EQUNR.
+  DELETE IT_EQUNR WHERE EQUNR EQ SPACE.
+
+* Get equipment details
+  SELECT      EQUNR A~ILOAN VKBUR VKGRP
+         INTO TABLE IT_ILOA
+         FROM EQUZ AS A
+         JOIN ILOA AS B
+           ON A~ILOAN EQ B~ILOAN
+          FOR ALL ENTRIES IN IT_EQUNR
+        WHERE A~EQUNR EQ IT_EQUNR-EQUNR
+          AND A~DATBI EQ GC_DATBI_EOT.
+
+ENDFORM.                    " GET_ORDER_DETAILS
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_BUKRS_WAERS
+*&---------------------------------------------------------------------*
+FORM GET_BUKRS_WAERS .
+
+  SELECT      BUKRS WAERS
+         INTO TABLE IT_T001
+         FROM T001
+        WHERE BUKRS IN SO_BUKRS.
+
+ENDFORM.                    " GET_BUKRS_WAERS
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_INT_COSTS
+*&---------------------------------------------------------------------*
+FORM GET_INT_COSTS.
+
+  DATA:
+    BEGIN OF IT_MAP OCCURS 0,
+      REFBN TYPE CO_REFBN, " CHAR 10
+      AWORG TYPE AWORG,    " CHAR 10
+      RUECK TYPE CO_RUECK, " NUMC 10
+      RMZHL TYPE CO_RMZHL, " NUMC  8
+    END OF IT_MAP,
+    BEGIN OF IT_MAP2 OCCURS 0,
+      REFBN TYPE CO_REFBN, " CHAR 10
+      REFGJ TYPE CO_REFGJ, " CHAR 10
+      MBLNR TYPE MBLNR,    " NUMC 10
+      MJAHR TYPE MJAHR,    " NUMC  2
+    END OF IT_MAP2.
+
+* Get posted CO items based on OBJNR and get those items' header posting
+* date (BUDAT) and reference to confirmation doc (so that external costs
+* can be eliminated)
+  SELECT       A~KOKRS A~BELNR BUZEI WTGBTR TWAER   KSTAR
+               OBJNR   BUDAT   REFBN REFGJ  AWORG  B~VRGNG
+         INTO TABLE IT_COEP
+         FROM COEP AS A
+         JOIN COBK AS B
+           ON A~KOKRS EQ B~KOKRS
+          AND A~BELNR EQ B~BELNR
+          FOR ALL ENTRIES IN IT_AUFK
+        WHERE OBJNR   EQ IT_AUFK-OBJNR
+*          AND B~VRGNG EQ GC_VRGNG_RKL.    " Actual act alloc
+          AND (    B~VRGNG EQ GC_VRGNG_RKL     " Actual act alloc
+             OR (    B~VRGNG EQ GC_VRGNG_COIN ) ).  " CO Thru-postings fr FI
+*                 AND A~WTGBTR GT 0 ) ).
+*Above correction by AIR22188, because negative values should be able to cancel positive values
+
+* To get settlements, repeat above select, but with VRGNG = KOAO
+
+* Get corresp conf's acct indicator (those with "E1" aren't of interest)
+  LOOP AT IT_COEP WHERE VRGNG EQ GC_VRGNG_RKL.
+    IT_MAP-REFBN = IT_COEP-REFBN.
+    IT_MAP-AWORG = IT_COEP-AWORG.
+    IT_MAP-RUECK = IT_COEP-REFBN.
+    IT_MAP-RMZHL = IT_COEP-AWORG.
+    APPEND IT_MAP.
+  ENDLOOP.
+  SORT IT_MAP BY RUECK RMZHL.
+  SELECT      RUECK RMZHL
+         INTO TABLE IT_AFRU
+         FROM AFRU
+          FOR ALL ENTRIES IN IT_MAP
+        WHERE RUECK EQ IT_MAP-RUECK
+          AND RMZHL EQ IT_MAP-RMZHL
+          AND BEMOT EQ GC_BEMOT_1E.
+  SORT IT_AFRU BY RUECK RMZHL.
+
+* Eliminate costs coming from a confirmation with ActInd 1E
+  SORT IT_COEP BY REFBN AWORG.
+  LOOP AT IT_AFRU.
+    READ TABLE IT_COEP WITH KEY REFBN = IT_AFRU-RUECK
+                                AWORG = IT_AFRU-RMZHL.
+    IF SY-SUBRC EQ 0.
+      DELETE IT_COEP INDEX SY-TABIX.
+    ENDIF.
+  ENDLOOP.
+
+* Get corr. CO Postings acct indic (those with "E1" aren't of interest)
+  LOOP AT IT_COEP WHERE VRGNG EQ GC_VRGNG_COIN.
+    IT_MAP2-REFBN = IT_COEP-REFBN.
+    IT_MAP2-REFGJ = IT_COEP-REFGJ.
+    IT_MAP2-MBLNR = IT_COEP-REFBN.
+    IT_MAP2-MJAHR = IT_COEP-REFGJ.
+    APPEND IT_MAP2.
+  ENDLOOP.
+  SORT IT_MAP2 BY MBLNR MJAHR.
+  SELECT      MBLNR MJAHR ZEILE
+         INTO TABLE IT_MSEG
+         FROM MSEG
+          FOR ALL ENTRIES IN IT_MAP2
+        WHERE MBLNR EQ IT_MAP2-MBLNR
+          AND MJAHR EQ IT_MAP2-MJAHR
+          AND BEMOT EQ GC_BEMOT_1E.
+  SORT IT_MSEG BY MBLNR MJAHR ZEILE.
+
+* Eliminate costs coming from a CO Posting with ActInd 1E
+  SORT IT_COEP BY REFBN REFGJ.
+  LOOP AT IT_MSEG.
+    READ TABLE IT_COEP WITH KEY REFBN = IT_MSEG-MBLNR
+                                REFGJ = IT_MSEG-MJAHR.
+    IF SY-SUBRC EQ 0.
+      DELETE IT_COEP INDEX SY-TABIX.
+    ENDIF.
+  ENDLOOP.
+
+* Get cost element link to sets
+  SELECT *
+         INTO TABLE IT_SETLEAF
+         FROM SETLEAF
+        WHERE SETNAME LIKE 'CE21%'.
+
+ENDFORM.                    " GET_INT_COSTS
+
+*&---------------------------------------------------------------------*
+*&      Form  SAVE_OUPUT
+*&---------------------------------------------------------------------*
+FORM SAVE_OUPUT .
+
+* Only proceed if any entries
+  CHECK NOT IT_OPCO[] IS INITIAL.
+
+* Delete other entries that are result of a run on the current date
+  DELETE FROM YSE_OPCO WHERE KEYDAT = SY-DATUM.
+
+* Insert the collected data into table
+  INSERT YSE_OPCO FROM TABLE IT_OPCO.
+
+ENDFORM.                    " SAVE_OUPUT

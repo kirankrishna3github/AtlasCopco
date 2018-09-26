@@ -1,0 +1,540 @@
+*&---------------------------------------------------------------------*
+*& Report  YSE_UPDATE_CUSTOMER_ST                                      *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+*& Update customer master - switch search terms                        *
+*&      - with BDC the kna1                                            *
+*&      - with BAPI the adrc
+*&---------------------------------------------------------------------*
+
+REPORT  YSE_UPDATE_CUSTOMER_ST
+       no standard page heading line-size 255..
+
+tables:  kna1, vbrk.
+
+TYPES: BEGIN OF xtyp_TABLE_TXT,
+          TEXT(2000) TYPE C,
+      END OF xtyp_TABLE_TXT.
+
+TYPES: BEGIN OF xtyp_kna1,
+        kunnr LIKE kna1-kunnr,
+        sortl LIKE kna1-sortl,
+        adrnr LIKE kna1-adrnr,
+        sort1 LIKE adrc-sort1,
+        sort2 LIKE adrc-sort2,
+        sort1_new LIKE adrc-sort1,
+        sort2_new LIKE adrc-sort2,
+        comment(30),
+      END OF xtyp_kna1,
+
+      BEGIN OF xtyp_error,
+        kunnr LIKE kna1-kunnr,
+        adrnr LIKE kna1-adrnr.
+        INCLUDE STRUCTURE BAPIRET2.
+        INCLUDE STRUCTURE BDCMSGCOLL.
+TYPES:
+      END OF xtyp_error.
+
+DATA: xt_kna1 TYPE TABLE OF xtyp_kna1,
+      xt_error TYPE TABLE OF xtyp_error,
+      xv_session(1) type c,
+*      p_test(1)  type c,
+      xv_noupdated TYPE i,
+      xv_error TYPE xtyp_error.
+
+* BDC variables
+* BDCRECX1
+DATA:   E_GROUP_OPENED,
+      xv_group(12) TYPE c VALUE 'VA02 upgrade',
+*       Batchinputdata of single transaction
+        BDCDATA LIKE BDCDATA    OCCURS 0 WITH HEADER LINE,
+        NODATA(1) VALUE '/',
+*       messages of call transaction
+        MESSTAB LIKE BDCMSGCOLL OCCURS 0 WITH HEADER LINE.
+*       error session opened (' ' or 'X')
+
+
+FIELD-SYMBOLS:  <x_kna1> TYPE xtyp_kna1.
+
+
+************************************************************************
+*       S E L E C T - O P T I O N S / P A R A M E T E R S              *
+************************************************************************
+
+SELECTION-SCREEN: BEGIN OF BLOCK B1 WITH FRAME TITLE text-t01.
+
+SELECT-OPTIONS:  s_kunnr  FOR kna1-kunnr,
+                 s_land1  FOR kna1-land1,
+
+                 s_famc   FOR vbrk-INCO1  OBLIGATORY NO INTERVALS,
+                 s_ktokd  FOR kna1-ktokd.
+*                 kna1~sortl LIKE ''' s_famc-low '%
+
+
+ PARAMETERS:      p_test  AS CHECKBOX DEFAULT 'X'.
+
+SELECTION-SCREEN END OF BLOCK B1.
+
+************************************************************************
+*       S T A R T - O F - S E L E C T I O N                            *
+************************************************************************
+START-OF-SELECTION.
+
+  PERFORM data_selection.
+  PERFORM data_process.
+  PERFORM output.
+
+END-OF-SELECTION.
+*&---------------------------------------------------------------------*
+*&      Form  data_selection
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM data_selection .
+  DATA: lv_like TYPE string.
+
+  clear lv_like.
+  LOOP AT s_famc.
+    IF NOT s_famc-low IS INITIAL.
+      CONCATENATE lv_like ' OR kna1~sortl LIKE ''' s_famc-low '%'' ' INTO lv_like.
+    ENDIF.
+  ENDLOOP.
+  IF NOT lv_like IS INITIAL.
+    SHIFT lv_like BY 3 PLACES IN CHARACTER MODE.        " delete ' OR'
+    CONCATENATE ' ( ' lv_like ' ) ' INTO lv_like.
+  ELSE.
+    lv_like = ' 1 '.
+  ENDIF.
+
+  SELECT  kna1~kunnr kna1~sortl kna1~adrnr adrc~sort1 adrc~sort2
+          FROM kna1
+          JOIN adrc ON adrc~addrnumber = kna1~adrnr
+          INTO TABLE xt_kna1
+          WHERE kna1~kunnr IN s_kunnr
+           AND  kna1~land1 IN s_land1
+           AND kna1~ktokd IN s_ktokd
+           AND (lv_like)
+           .
+ENDFORM.                    "data_selection
+*&---------------------------------------------------------------------*
+*&      Form  data_process
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM data_process .
+  FIELD-SYMBOLS:  <l_kna1> type xtyp_kna1,
+                  <l_ad1> TYPE BAPIAD1VL.
+
+  DATA: lt_AD1 TYPE TABLE OF BAPIAD1VL,
+        lv_AD1X TYPE BAPIAD1VLX,
+        lv_length TYPE i,
+        lv_sort LIKE BAPIAD1VL-sort1,
+
+        lt_RETURN TYPE TABLE OF BAPIRET2,
+        lv_messtab TYPE BDCMSGCOLL,
+        lv_return TYPE BAPIRET2.
+
+  DATA: lt_AD1X TYPE TABLE OF BAPIAD1VLX.
+
+  DATA: l_OBJ_ID TYPE BAPI4001_1-OBJKEY.
+
+
+* Do for all selected customers
+  clear xv_noupdated.
+  LOOP AT xt_kna1 ASSIGNING <l_kna1>.
+
+    IF <l_kna1>-sortL = <l_kna1>-sort2 .
+      xv_noupdated = xv_noupdated + 1.
+      <l_kna1>-sort1_new = <l_kna1>-sort1.
+      <l_kna1>-sort2_new = <l_kna1>-sort2.
+      <l_kna1>-comment = ' kna1-SORTL = adrc-sort2'.
+      CONTINUE.
+    ENDIF.
+
+*  if search term 2 is blank do nothing
+      IF <l_kna1>-sort2 IS INITIAL.
+        xv_noupdated = xv_noupdated + 1.
+        <l_kna1>-sort1_new = <l_kna1>-sort1.
+        <l_kna1>-sort2_new = <l_kna1>-sort2.
+        <l_kna1>-comment = 'ADRC-SORT2 is initial'.
+        CONTINUE.
+      ENDIF.
+
+*  if KNA1-SORTL <> ADRC-SORT1
+      IF <l_kna1>-sortL <> <l_kna1>-sort1.
+        xv_noupdated = xv_noupdated + 1.
+        <l_kna1>-sort1_new = <l_kna1>-sort1.
+        <l_kna1>-sort2_new = <l_kna1>-sort2.
+        <l_kna1>-comment = 'KNA1-SORTL <> ADRC-SORT1'.
+        CONTINUE.
+      ENDIF.
+
+* check 4th character
+      IF NOT <l_kna1>-sortL+3(1) CA '0123456789'.  " 4th character
+        xv_noupdated = xv_noupdated + 1.
+        <l_kna1>-sort1_new = <l_kna1>-sort1.
+        <l_kna1>-sort2_new = <l_kna1>-sort2.
+        <l_kna1>-comment = '4th character is not a digit'.
+        CONTINUE.
+      ENDIF.
+
+* FIRST get all addresses for the customer
+    MOVE <l_kna1>-kunnr TO l_obj_id.
+    CALL FUNCTION 'BAPI_ADDRESSORG_GETDETAIL'
+      EXPORTING
+        OBJ_TYPE   = 'KNA1'
+        OBJ_ID     = l_OBJ_ID
+        OBJ_ID_EXT = ' '
+        CONTEXT    = 1
+      TABLES
+        BAPIAD1VL  = lt_AD1.
+
+* SECOND update kna1-sortl - acutaly it updated adrc-sort1 as well !
+    IF p_test <> 'X'.
+      PERFORM bdc_vd02 USING <l_kna1>.
+
+* Analyse results:
+*      READ TABLE lt_RETURN INTO lv_RETURN WITH KEY TYPE = 'E'.
+      READ TABLE messtab INTO lv_messtab WITH KEY MSGTYP = 'E'.
+      IF SY-SUBRC = 0.
+*Save this line which did not succeed in the errortable
+        LOOP AT messtab INTO lv_messtab WHERE msgtyp = 'E'.
+          clear xv_error.
+          MOVE-CORRESPONDING lv_messtab to xv_error.
+          xv_error-kunnr = l_OBJ_ID.
+          APPEND xv_error TO xt_error.
+        ENDLOOP.
+
+        CONTINUE.   " skip bapi call
+      ENDIF.
+    ENDIF.
+* IF CALL TRANSACTION WAS SUCCESSFUL do BAPI to UPDATE ADRC
+
+* Update addresses
+    LOOP AT lt_ad1 ASSIGNING <l_ad1>.
+      clear lv_ad1X.
+* Here comes the change logic
+
+* switch sort terms
+
+    lv_length = strlen( <l_kna1>-sort2 ).
+    IF lv_length > 1 AND <l_kna1>-sort2(lv_length) = ' '.
+        SHIFT <l_kna1>-sort2 RIGHT DELETING TRAILING ' '.
+        SHIFT <l_kna1>-sort2 LEFT DELETING LEADING ' '.
+    ENDIF.
+
+    IF strlen( <l_kna1>-sort2 ) > 10.
+      <l_ad1>-sort1 = <l_ad1>-sort2(10).
+      lv_ad1x-sort1 = 'X'.
+    ELSE.
+      lv_sort = <l_ad1>-sort2.
+      <l_ad1>-sort2 = <l_ad1>-sort1.
+      <l_ad1>-sort1 = lv_sort.
+      lv_ad1x-sort1 = 'X'.
+      lv_ad1x-sort2 = 'X'.
+    ENDIF.
+
+
+      APPEND lv_ad1x TO lt_AD1X.
+
+    <l_kna1>-sort1_new = <l_ad1>-sort1.
+    <l_kna1>-sort2_new = <l_ad1>-sort2.
+
+    ENDLOOP.
+
+* Do change:
+    CALL FUNCTION 'BAPI_ADDRESSORG_CHANGE'
+      EXPORTING
+        OBJ_TYPE               = 'KNA1'
+        OBJ_ID                 = l_OBJ_ID
+       OBJ_ID_EXT             = ' '
+       CONTEXT                = '0001'
+       ACCEPT_ERROR           = 'X'
+       SAVE_ADDRESS           = 'X'
+       IV_CHECK_ADDRESS       = 'X'
+* IMPORTING
+*   ADDRESS_NUMBER         =
+     TABLES
+        BAPIAD1VL              = lt_AD1
+        BAPIAD1VL_X            = lt_AD1X
+        RETURN                 = lt_RETURN.
+
+    IF p_test = 'X'.
+      CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+      .
+    ELSE.
+      CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+        EXPORTING
+          WAIT = 'X'.
+    ENDIF.
+
+
+  ENDLOOP.
+
+ENDFORM.                    " data_process
+*&---------------------------------------------------------------------*
+*&      Form  output
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM output .
+  DATA: lv_i TYPE i,
+        lv_i2 TYPE i,
+        lv_str(5) TYPE c.
+  FIELD-SYMBOLS:  <l_kna1> type xtyp_kna1.
+
+  DESCRIBE TABLE xt_kna1 LINES lv_i.
+  DESCRIBE TABLE xt_error LINES lv_i2.
+
+  IF p_test = 'X'.
+    FORMAT INTENSIFIED.
+    WRITE 'Test run'.
+    FORMAT INTENSIFIED OFF.
+  ENDIF.
+
+  WRITE lv_i TO lv_str.
+  WRITE: 'Total ', 10 lv_str, ' customer matched the selection. '.
+  IF xv_noupdated > 0.
+    MOVE xv_noupdated TO lv_str.
+    WRITE: /10 lv_str, ' lines were not changed.'.
+  ENDIF.
+
+  IF lv_i2 > 0.
+    FORMAT INTENSIFIED.
+    WRITE lv_i2 TO lv_str.
+    WRITE: / lv_str, ' errors during the update.'.
+    FORMAT INTENSIFIED OFF.
+  ENDIF.
+
+  SORT xt_error BY kunnr.
+  LOOP AT xt_error INTO xv_error.
+    AT FIRST.
+      FORMAT INTENSIFIED.
+      WRITE: /5 'Kunnr', 20 'Adrnr', 30 'Msgno'.
+      FORMAT INTENSIFIED OFF.
+    ENDAT.
+    WRITE: /5 xv_error-kunnr, 20 xv_error-adrnr.
+
+    IF NOT xv_error-number IS INITIAL.      " BAPI ERROR
+        WRITE:  30 xv_error-number, 45 xv_error-message.
+    ELSE.    " BDC ERROR
+        WRITE: 30 xv_error-msgv1, xv_error-msgv2, xv_error-msgv3.
+    ENDIF.
+  ENDLOOP.
+
+  SKIP 2.
+  LOOP AT xt_kna1 ASSIGNING <l_kna1>.
+    AT FIRST.
+      FORMAT INTENSIFIED.
+      WRITE: /5 'OK-Kunnr', 20 'OK-Adrnr', 30 'SORT1 old. ', 41 'SORT2 old'.
+      WRITE: 60 ' ', 'SORT1 new' , 73 'Sort2 new'.
+      FORMAT INTENSIFIED OFF.
+    ENDAT.
+    READ TABLE xt_error INTO xv_error WITH KEY kunnr = <l_kna1>-kunnr
+                    BINARY SEARCH.
+    IF sy-subrc = 0.
+      CONTINUE.
+    ENDIF.
+    WRITE: /.
+    IF NOT <l_kna1>-comment IS INITIAL.
+        WRITE 2 '!!'.
+    ENDIF.
+    WRITE: 5  <l_kna1>-kunnr, 20  <l_kna1>-adrnr, 30  <l_kna1>-sort1, 41  <l_kna1>-sort2.
+    WRITE: 60 ' ', <l_kna1>-sort1_new, 73 <l_kna1>-sort2_new, 95 ' ', <l_kna1>-comment.
+  ENDLOOP.
+
+
+ENDFORM.                    " output
+
+
+*----------------------------------------------------------------------*
+*   create batchinput session                                          *
+*   (not for call transaction using...)                                *
+*----------------------------------------------------------------------*
+FORM OPEN_GROUP.
+
+  IF xv_SESSION = 'X'.
+    SKIP.
+    WRITE: /(20) 'Create group'(I01), xv_group.
+    SKIP.
+*   open batchinput group
+    CALL FUNCTION 'BDC_OPEN_GROUP'
+      EXPORTING
+        CLIENT   = SY-MANDT
+        GROUP    = xv_group
+        USER     = sy-uname
+        KEEP     = 'X'
+        HOLDDATE = SY-DATUM.
+    WRITE: /(30) 'BDC_OPEN_GROUP'(I02),
+            (12) 'returncode:'(I05),
+                 SY-SUBRC.
+  ENDIF.
+ENDFORM.                    "OPEN_GROUP
+
+*----------------------------------------------------------------------*
+*   end batchinput session                                             *
+*   (call transaction using...: error session)                         *
+*----------------------------------------------------------------------*
+FORM CLOSE_GROUP.
+  IF xv_SESSION = 'X'.
+*   close batchinput group
+    CALL FUNCTION 'BDC_CLOSE_GROUP'.
+    WRITE: /(30) 'BDC_CLOSE_GROUP'(I04),
+            (12) 'returncode:'(I05),
+                 SY-SUBRC.
+  ELSE.
+    IF E_GROUP_OPENED = 'X'.
+      CALL FUNCTION 'BDC_CLOSE_GROUP'.
+      WRITE: /.
+      WRITE: /(30) 'Fehlermappe wurde erzeugt'(I06).
+      E_GROUP_OPENED = ' '.
+    ENDIF.
+  ENDIF.
+ENDFORM.                    "CLOSE_GROUP
+
+*----------------------------------------------------------------------*
+*        Start new screen                                              *
+*----------------------------------------------------------------------*
+FORM BDC_DYNPRO USING PROGRAM DYNPRO.
+  CLEAR BDCDATA.
+  BDCDATA-PROGRAM  = PROGRAM.
+  BDCDATA-DYNPRO   = DYNPRO.
+  BDCDATA-DYNBEGIN = 'X'.
+  APPEND BDCDATA.
+ENDFORM.                    "BDC_DYNPRO
+
+*----------------------------------------------------------------------*
+*        Insert field                                                  *
+*----------------------------------------------------------------------*
+FORM BDC_FIELD USING FNAM FVAL.
+  IF FVAL <> NODATA.
+    CLEAR BDCDATA.
+    BDCDATA-FNAM = FNAM.
+    BDCDATA-FVAL = FVAL.
+    APPEND BDCDATA.
+  ENDIF.
+ENDFORM.                    "BDC_FIELD
+
+*----------------------------------------------------------------------*
+*        Start new transaction according to parameters                 *
+*----------------------------------------------------------------------*
+FORM BDC_TRANSACTION USING TCODE.
+  DATA: L_MSTRING(480),
+        lv_mode(1) type c VALUE 'N',
+        L_SUBRC LIKE SY-SUBRC.
+* batch input session
+  IF xv_SESSION = 'X'.
+    CALL FUNCTION 'BDC_INSERT'
+      EXPORTING
+        TCODE     = TCODE
+      TABLES
+        DYNPROTAB = BDCDATA.
+* call transaction using
+  ELSE.
+    REFRESH MESSTAB.
+    CALL TRANSACTION TCODE USING BDCDATA
+                     MODE   lv_mode
+                                      "A: show all dynpros
+                                      "E: show dynpro on error only
+                                      "N: do not display dynpro
+                     UPDATE 'A'
+                                      "S: synchronously
+                                      "A: asynchronously
+                                      "L: local
+                     MESSAGES INTO MESSTAB.
+    L_SUBRC = SY-SUBRC.
+** Erzeugen fehlermappe ************************************************
+    IF L_SUBRC <> 0 AND xv_GROUP <> SPACE.
+      IF E_GROUP_OPENED = ' '.
+        CALL FUNCTION 'BDC_OPEN_GROUP'
+          EXPORTING
+            CLIENT   = SY-MANDT
+            GROUP    = xv_GROUP
+            USER     = sy-uname
+            KEEP     = 'X'
+            HOLDDATE = sy-datum.
+        E_GROUP_OPENED = 'X'.
+      ENDIF.
+      CALL FUNCTION 'BDC_INSERT'
+        EXPORTING
+          TCODE     = TCODE
+        TABLES
+          DYNPROTAB = BDCDATA.
+    ENDIF.
+  ENDIF.
+  REFRESH BDCDATA.
+ENDFORM.                    "BDC_TRANSACTION
+
+
+*----------------------------------------------------------------------*
+*   Update kna1                                                        *
+*----------------------------------------------------------------------*
+
+FORM bdc_vd02 USING p_kna1 TYPE xtyp_kna1.
+
+  perform open_group.
+  perform bdc_dynpro      using 'SAPMF02D' '0108'.
+*  perform bdc_field       using 'BDC_CURSOR'
+*                                'RF02D-D0110'.
+*  perform bdc_field       using 'BDC_OKCODE'
+*                                '/00'.
+  perform bdc_field       using 'RF02D-KUNNR' p_kna1-kunnr.
+  perform bdc_field       using 'RF02D-D0110'   'X'.    " Address
+  perform bdc_dynpro      using 'SAPMF02D' '0110'.
+*  perform bdc_field       using 'BDC_CURSOR'
+*                                'KNA1-SORTL'.
+  perform bdc_field       using 'KNA1-SORTL' p_kna1-sort2(10).
+
+  IF p_test = 'X'.
+    perform bdc_field       using 'BDC_OKCODE'
+                                '=PF03'.
+  ELSE.
+    perform bdc_field       using 'BDC_OKCODE'
+                                '/00'.
+  ENDIF.
+*  perform bdc_field       using 'KNA1-ANRED'
+*                                record-ANRED_003.
+*  perform bdc_field       using 'KNA1-NAME1'
+*                                record-NAME1_004.
+*  perform bdc_field       using 'KNA1-SORTL'
+*                                record-SORTL_005.
+*  perform bdc_field       using 'KNA1-STRAS'
+*                                record-STRAS_006.
+*  perform bdc_field       using 'KNA1-ORT01'
+*                                record-ORT01_007.
+*  perform bdc_field       using 'KNA1-PSTLZ'
+*                                record-PSTLZ_008.
+*  perform bdc_field       using 'KNA1-LAND1'
+*                                record-LAND1_009.
+*  perform bdc_field       using 'KNA1-SPRAS'
+*                                record-SPRAS_010.
+
+  IF p_test = 'X'.
+    perform bdc_dynpro      using 'SAPLSP01' '0100'.
+    perform bdc_field       using 'BDC_OKCODE'
+                                '=NO'.
+  ENDIF.
+
+  perform bdc_transaction using 'VD02'.
+
+  perform close_group.
+ENDFORM.                                                    "bdc_vd02
+
+*Text symbol text£º
+
+*T01:Switch search term for customers
+*Selection text£º
+*P_TEST:        Test run
+*S_FAMC:        FAM code
+*S_KTOKD:D       .
+*S_KUNNR:D       .
+*S_LAND1:D       .

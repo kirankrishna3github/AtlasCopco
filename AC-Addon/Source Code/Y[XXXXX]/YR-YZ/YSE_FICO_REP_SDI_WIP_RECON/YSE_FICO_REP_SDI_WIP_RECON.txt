@@ -1,0 +1,663 @@
+*-----------------------------------------------------------------------
+* PROGRAM ID           : YSE_FICO_REP_SDI_WIP_RECON                    *
+* PROGRAM TITLE        : FICO-REP-SDI-WIP reconciliation               *
+* AUTHOR               : Marc Jacobs                                   *
+* DATE                 : 17/03/2008                                    *
+* DEVELOPMENT ID       : D406                                          *
+* CHANGE REQUEST NUMBER: CD1K927238                                    *
+* PROGRAM DESCRIPTION  : Reconciliation between COPA & PCA             *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME     |CORRECTION NUMBER| CHANGE REFERENCE # *
+*----------------------------------------------------------------------*
+*         |          |          |                 |                    *
+*----------------------------------------------------------------------*
+REPORT yse_fico_rep_sdi_wip_recon .
+************************************************************************
+*                   T A B L E S                                        *
+************************************************************************
+TABLES : glpca,
+         bsis,
+         bsas.
+************************************************************************
+*                   C O N S T A N T S                                  *
+************************************************************************
+CONSTANTS : c_x(1) TYPE c           VALUE 'X',
+            c_s(1) TYPE c           VALUE 'S' .
+
+TYPE-POOLS : fibs,stree.
+TYPE-POOLS: slis.
+
+************************************************************************
+*                   V A R I A B L E S                                  *
+************************************************************************
+
+DATA : BEGIN OF it_sdi_wip OCCURS 0,
+        rbukrs LIKE glpca-rbukrs,
+        zuonr LIKE bsis-zuonr,
+        refdocnr LIKE glpca-refdocnr,
+        dmbtr LIKE bsis-dmbtr,
+        hsl LIKE glpca-hsl,
+        diff LIKE bsis-dmbtr,
+        selected,
+END OF it_sdi_wip .
+*be defined
+DATA: v_events TYPE slis_t_event,
+     wa_event TYPE slis_alv_event.
+
+DATA: g_racct        TYPE glpca-racct,
+      g_rhoart       TYPE glpca-rhoart,
+      g_rscope       TYPE scope_cv,
+      g_hkont        TYPE bsis-hkont,
+      g_off          TYPE i,
+      g_len1         TYPE i,
+      g_off2         TYPE i,
+      g_len2         TYPE i,
+      g_order        TYPE dzuonr,
+      g_line         TYPE dzuonr,
+      g_dmbtr        TYPE bsis-dmbtr,
+      g_hsl          TYPE glpca-hsl,
+      g_diff         TYPE bsis-dmbtr,
+      g_refdocnr     TYPE glpca-refdocnr.
+
+DATA : gt_fieldcat     TYPE slis_t_fieldcat_alv,
+       g_events_tab    TYPE slis_t_event,
+       g_form_user_command TYPE slis_formname VALUE 'USER_COMMAND_L',
+       g_ic1           LIKE sy-ucomm VALUE '&IC1',
+       g_repid         LIKE sy-repid,
+       l_index         TYPE sy-tabix.
+
+************************************************************************
+*       S E L E C T - O P T I O N S / P A R A M E T E R S              *
+************************************************************************
+SELECTION-SCREEN : BEGIN OF BLOCK b1 WITH FRAME TITLE text-001.
+PARAMETERS :p_bukrs TYPE bukrs OBLIGATORY MEMORY ID buk  .
+SELECT-OPTIONS : s_ryear FOR glpca-ryear,
+                 s_poper FOR glpca-poper,
+                 s_budat FOR glpca-budat .
+SELECTION-SCREEN: END OF BLOCK b1.
+
+SELECTION-SCREEN : BEGIN OF BLOCK b2 WITH FRAME TITLE text-002.
+PARAMETERS :p_kokrs LIKE glpca-kokrs DEFAULT '1000' OBLIGATORY.
+SELECT-OPTIONS: s_racct FOR g_racct,
+                s_rhoart FOR g_rhoart,
+                s_rscope FOR g_rscope.
+SELECTION-SCREEN: END OF BLOCK b2.
+
+SELECTION-SCREEN : BEGIN OF BLOCK b3 WITH FRAME TITLE text-003.
+SELECT-OPTIONS: s_hkont FOR g_hkont.
+SELECTION-SCREEN SKIP.
+PARAMETERS: p_all  TYPE c RADIOBUTTON GROUP radi DEFAULT 'X',
+            p_dif  TYPE c RADIOBUTTON GROUP radi .
+SELECTION-SCREEN: END OF BLOCK b3.
+
+* authority check
+
+*&---------------------------------------------------------------------*
+INITIALIZATION.
+*&---------------------------------------------------------------------*
+
+************************************************************************
+*       S T A R T - O F - S E L E C T I O N    E V E N T               *
+************************************************************************
+START-OF-SELECTION.
+
+* select
+  REFRESH: it_sdi_wip.
+  PERFORM select_records.
+
+************************************************************************
+*       E N D - O F - S E L E C T I O N    E V E N T                   *
+************************************************************************
+END-OF-SELECTION .
+
+* equipments without service.
+  IF it_sdi_wip[] IS INITIAL.
+    WRITE: /.
+    WRITE: / 'No records selected'(i02).
+  ELSE.
+    PERFORM build_field_catlog CHANGING gt_fieldcat.
+    PERFORM fill_events_f14.
+    PERFORM display_alv.
+  ENDIF.
+*&---------------------------------------------------------------------*
+*&      Form  select_records
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM select_records.
+
+* from GLPCA
+  SELECT * FROM glpca
+    WHERE rldnr = '8A'
+      AND rrcty IN ('0', '2')
+      AND rvers = '000'
+      AND rbukrs = p_bukrs
+      AND kokrs = p_kokrs
+      AND ryear IN s_ryear
+      AND poper IN s_poper
+      AND racct IN s_racct
+      AND rhoart IN s_rhoart
+      AND rscope IN s_rscope
+      AND budat IN s_budat
+      AND hsl <> 0.
+    CLEAR it_sdi_wip.
+    it_sdi_wip-rbukrs = glpca-rbukrs.
+    IF NOT glpca-kdpos IS INITIAL.
+      WRITE glpca-kdauf TO g_order NO-ZERO.
+      WRITE glpca-kdpos TO g_line NO-ZERO.
+      CONCATENATE g_order g_line INTO
+      it_sdi_wip-zuonr SEPARATED BY '/'.
+      CONDENSE it_sdi_wip-zuonr NO-GAPS.
+    ELSE.
+      WRITE glpca-refdocnr TO g_refdocnr NO-ZERO.
+      CONCATENATE glpca-ryear '/' g_refdocnr INTO it_sdi_wip-refdocnr.
+    ENDIF.
+    it_sdi_wip-hsl = glpca-hsl.
+    COLLECT it_sdi_wip.
+  ENDSELECT.
+
+* data from BSIS
+
+  SELECT * FROM bsis
+       WHERE bukrs = p_bukrs
+         AND hkont IN s_hkont
+         AND gjahr IN s_ryear
+         AND monat IN s_poper
+         AND budat IN s_budat
+         AND dmbtr <> 0.
+
+    CLEAR it_sdi_wip.
+    it_sdi_wip-rbukrs = bsis-bukrs.
+    FIND '/' IN bsis-zuonr MATCH OFFSET g_off.
+    IF sy-subrc = '0'.
+      g_len1 = g_off.
+      g_off2 = g_off + 1.
+      g_len2 = 18 - ( g_off + 1 ) .
+      WRITE bsis-zuonr+0(g_len1) TO g_order NO-ZERO.
+      WRITE bsis-zuonr+g_off2(g_len2) TO g_line NO-ZERO.
+      CONCATENATE g_order g_line INTO
+      it_sdi_wip-zuonr SEPARATED BY '/'.
+      CONDENSE it_sdi_wip-zuonr NO-GAPS.
+    ELSE.
+      WRITE bsis-belnr TO g_refdocnr NO-ZERO.
+      CONCATENATE bsis-gjahr '/' g_refdocnr INTO it_sdi_wip-refdocnr.
+    ENDIF.
+    IF bsis-shkzg = 'H'.
+      it_sdi_wip-dmbtr = bsis-dmbtr * -1.
+    ELSE.
+      it_sdi_wip-dmbtr = bsis-dmbtr.
+    ENDIF.
+    COLLECT it_sdi_wip.
+  ENDSELECT.
+
+* data from BSAS
+
+  SELECT * FROM bsas
+       WHERE bukrs = p_bukrs
+         AND hkont IN s_hkont
+         AND gjahr IN s_ryear
+         AND monat IN s_poper
+         AND budat IN s_budat
+         AND dmbtr <> 0.
+
+    CLEAR it_sdi_wip.
+    it_sdi_wip-rbukrs = bsas-bukrs.
+    FIND '/' IN bsas-zuonr MATCH OFFSET g_off.
+    IF sy-subrc = '0'.
+      g_len1 = g_off.
+      g_off2 = g_off + 1.
+      g_len2 = 18 - ( g_off + 1 ) .
+      WRITE bsas-zuonr+0(g_len1) TO g_order NO-ZERO.
+      WRITE bsas-zuonr+g_off2(g_len2) TO g_line NO-ZERO.
+      CONCATENATE g_order g_line INTO
+      it_sdi_wip-zuonr SEPARATED BY '/'.
+      CONDENSE it_sdi_wip-zuonr NO-GAPS.
+    ELSE.
+      WRITE bsas-belnr TO g_refdocnr NO-ZERO.
+      CONCATENATE bsas-gjahr '/' g_refdocnr INTO it_sdi_wip-refdocnr.
+    ENDIF.
+    IF bsas-shkzg = 'H'.
+      it_sdi_wip-dmbtr = bsas-dmbtr * -1.
+    ELSE.
+      it_sdi_wip-dmbtr = bsas-dmbtr.
+    ENDIF.
+    COLLECT it_sdi_wip.
+  ENDSELECT.
+
+* calculate differences
+  LOOP AT it_sdi_wip.
+    IF it_sdi_wip-hsl = 0 AND it_sdi_wip-dmbtr = 0.
+      DELETE it_sdi_wip.
+    ELSE.
+      it_sdi_wip-diff = it_sdi_wip-hsl - it_sdi_wip-dmbtr.
+      MODIFY it_sdi_wip.
+    ENDIF.
+  ENDLOOP.
+
+* sort
+  SORT it_sdi_wip BY zuonr refdocnr.
+* totals
+  CLEAR : g_dmbtr ,
+          g_hsl ,
+          g_diff.
+  LOOP AT it_sdi_wip.
+    g_dmbtr = g_dmbtr + it_sdi_wip-dmbtr.
+    g_hsl = g_hsl + it_sdi_wip-hsl.
+    g_diff = g_diff + it_sdi_wip-diff.
+  ENDLOOP.
+
+  CLEAR it_sdi_wip.
+  it_sdi_wip-refdocnr = 'TOTAL'.
+  it_sdi_wip-dmbtr = g_dmbtr.
+  it_sdi_wip-hsl = g_hsl.
+  it_sdi_wip-diff = g_diff.
+  APPEND it_sdi_wip.
+
+* display only differences ?
+  IF p_dif = 'X'.
+    LOOP AT it_sdi_wip.
+      IF NOT it_sdi_wip-refdocnr = 'TOTAL'.
+        IF it_sdi_wip-diff = 0.
+          DELETE it_sdi_wip.
+        ENDIF.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+
+ENDFORM.                    "select_records_from_glpca
+*&---------------------------------------------------------------------*
+*&      Form  build_field_catlog
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->PT_FIELDCAT  text
+*----------------------------------------------------------------------*
+FORM build_field_catlog  CHANGING pt_fieldcat TYPE slis_t_fieldcat_alv.
+
+  DATA : ls_fcat TYPE slis_fieldcat_alv.
+
+*-------------Company ---------------*
+  ls_fcat-fieldname = 'RBUKRS'.
+  ls_fcat-seltext_l = 'Company'.
+  ls_fcat-outputlen = '8'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+*---------Sales Order --------*
+  ls_fcat-fieldname = 'ZUONR'.
+  ls_fcat-seltext_l = 'Sales Order/item'.
+  ls_fcat-outputlen = '18'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+*---------Document number --------*
+  ls_fcat-fieldname = 'REFDOCNR'.
+  ls_fcat-seltext_l = 'Document Number'.
+  ls_fcat-outputlen = '20'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+*---------FI amount--------*
+  ls_fcat-fieldname = 'DMBTR'.
+  ls_fcat-seltext_l = 'COPA Amount'.
+  ls_fcat-outputlen = '27'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+*---------PCA amount--------*
+  ls_fcat-fieldname = 'HSL'.
+  ls_fcat-seltext_l = 'PCA Amount'.
+  ls_fcat-outputlen = '25'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+*---------differnce --------*
+  ls_fcat-fieldname = 'DIFF'.
+  ls_fcat-seltext_l = 'Difference'.
+  ls_fcat-outputlen = '25'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+
+ENDFORM.                    " build_field_catlog
+
+*&---------------------------------------------------------------------*
+*&      Form  fill_events_f14
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM fill_events_f14 .
+
+  DATA h_event       TYPE slis_alv_event.
+
+  CALL FUNCTION 'REUSE_ALV_EVENTS_GET'
+    EXPORTING
+      i_list_type = 0
+    IMPORTING
+      et_events   = g_events_tab.
+
+*--- allocate form for user-command ---------------------------------*
+  READ TABLE g_events_tab WITH KEY name = slis_ev_user_command
+                        INTO h_event.
+  IF sy-subrc = 0.
+    MOVE g_form_user_command TO h_event-form.
+    MODIFY g_events_tab FROM h_event INDEX sy-tabix.
+  ENDIF.
+
+ENDFORM.                    " fill_events_f14
+
+*&--------------------------------------------------------------------*
+*&      Form  user_command_l
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+*      -->P_UCOMM    text
+*      -->P_SELFIELD text
+*---------------------------------------------------------------------*
+FORM user_command_l USING p_ucomm LIKE sy-ucomm
+                          p_selfield TYPE slis_selfield.
+
+  p_selfield-refresh = c_s.
+  PERFORM check_pf2_with_object_f16 USING p_ucomm.
+  PERFORM set_p_selfield_general_f16 USING p_selfield.
+
+*  CASE p_ucomm.
+*    WHEN 'ISEL'.
+*      p_ucomm = 'DISP'.
+*      PERFORM fcodes_with_mark_f16 USING p_ucomm p_selfield.
+*  ENDCASE.
+
+ENDFORM.                    "user_command_l
+
+*&---------------------------------------------------------------------*
+*&      Form  check_pf2_with_object_f16
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_P_UCOMM  text
+*----------------------------------------------------------------------*
+FORM check_pf2_with_object_f16  USING    p_ucomm.
+
+  CHECK p_ucomm = g_ic1.
+  p_ucomm = 'ISEL'.
+
+ENDFORM.                    " check_pf2_with_object_f16
+
+*&---------------------------------------------------------------------*
+*&      Form  set_p_selfield_general_f16
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_P_SELFIELD  text
+*----------------------------------------------------------------------*
+FORM set_p_selfield_general_f16  USING f_selfield TYPE slis_selfield.
+
+  f_selfield-col_stable = c_x.
+  f_selfield-row_stable = c_x.
+
+ENDFORM.                    " set_p_selfield_general_f16
+
+*&---------------------------------------------------------------------*
+*&      Form  fcodes_with_mark_f16
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_P_UCOMM  text
+*      -->P_P_SELFIELD  text
+*      -->P_ENDCASE  text
+*----------------------------------------------------------------------*
+FORM fcodes_with_mark_f16  USING p_ucomm LIKE sy-ucomm
+                                p_selfield TYPE slis_selfield.
+
+  PERFORM check_object_tab_marked_f14 USING p_ucomm p_selfield.
+
+  LOOP AT it_sdi_wip WHERE selected = c_x .
+    l_index = sy-tabix.
+    PERFORM fcodes_with_mark_l USING p_ucomm p_selfield.
+    it_sdi_wip-selected = ' '.
+    MODIFY it_sdi_wip INDEX l_index.
+  ENDLOOP.
+
+  CLEAR p_ucomm.
+
+ENDFORM.                    " fcodes_with_mark_f16
+
+*&---------------------------------------------------------------------*
+*&      Form  check_object_tab_marked_f14
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_P_UCOMM  text
+*      -->P_P_SELFIELD  text
+*----------------------------------------------------------------------*
+FORM check_object_tab_marked_f14  USING    p_ucomm LIKE sy-ucomm
+                                        p_selfield TYPE slis_selfield.
+
+  READ TABLE it_sdi_wip WITH KEY selected = c_x.
+
+  IF NOT sy-subrc IS INITIAL.
+    IF NOT p_selfield-tabindex IS INITIAL.
+      READ TABLE it_sdi_wip  INDEX p_selfield-tabindex.
+      it_sdi_wip-selected = c_x.
+      MODIFY it_sdi_wip INDEX p_selfield-tabindex.
+    ENDIF.
+  ELSE.
+*--- Checkbox markiert -----------------------------------------------*
+    p_selfield-sel_tab_field = 'G_MARK'.
+  ENDIF.
+
+ENDFORM.                    " check_object_tab_marked_f14
+
+*&---------------------------------------------------------------------*
+*&      Form  fcodes_with_mark_l
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_F_UCOMM  text
+*      -->P_F_SELFIELD  text
+*----------------------------------------------------------------------*
+FORM fcodes_with_mark_l  USING   p_ucomm LIKE sy-ucomm
+                              p_selfield TYPE slis_selfield.
+
+  DATA: h_ucomm LIKE sy-ucomm.
+
+  CASE p_ucomm.
+*   Display equipment
+    WHEN 'DISP'.
+*      SET PARAMETER ID 'EQN' FIELD  i_equi_no_serv-equnr.
+*      CALL TRANSACTION 'IE03' AND SKIP FIRST SCREEN.
+  ENDCASE.
+
+ENDFORM.                    " fcodes_with_mark_l
+
+*&---------------------------------------------------------------------*
+*&      Form  display_alv
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM display_alv .
+
+  g_repid = sy-repid.
+
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+     EXPORTING
+       i_callback_program                =  g_repid
+       i_save                            = 'A'
+       it_events                         =  g_events_tab[]
+       i_callback_top_of_page            = 'TOP_OF_PAGE'
+*      I_GRID_TITLE                      =
+*      I_GRID_SETTINGS                   =
+*      is_layout                         =  g_layout
+       it_fieldcat                       =  gt_fieldcat[]
+     TABLES
+        t_outtab                         =  it_sdi_wip.
+
+ENDFORM.                    "display_alv
+
+*&--------------------------------------------------------------------*
+*&      Form  POPULATE_EVENT
+*&--------------------------------------------------------------------*
+*      Events populated for TOP OF PAGE & USER COMAND
+*---------------------------------------------------------------------*
+FORM populate_event.
+  READ TABLE v_events INTO wa_event WITH KEY name = 'TOP_OF_PAGE'.
+  IF sy-subrc EQ 0.
+    wa_event-form = 'TOP_OF_PAGE'.
+
+    MODIFY v_events FROM wa_event TRANSPORTING form WHERE name =
+ wa_event-form.
+  ENDIF.
+
+ENDFORM.                    "POPULATE_EVENT
+*&---------------------------------------------------------------------*
+*&      Form  TOP_OF_PAGE
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM top_of_page.
+
+*ALV Header declarations
+  DATA: t_header TYPE slis_t_listheader,
+        wa_header TYPE slis_listheader,
+        t_line TYPE string,
+        ld_lines TYPE i,
+        ld_linesc(10) TYPE c.
+
+* Title
+  wa_header-typ  = 'H'.
+  wa_header-info = 'YSE : FICO_REP_SDI_WIP Reconciliation'.
+  APPEND wa_header TO t_header.
+  CLEAR wa_header.
+
+* Company
+  wa_header-typ  = 'S'.
+  wa_header-key = 'Company '.
+  CONCATENATE p_bukrs ' ' INTO wa_header-info.
+  APPEND wa_header TO t_header.
+  CLEAR: wa_header.
+
+* Fiscal Year
+  IF s_ryear[] IS NOT INITIAL.
+    LOOP AT s_ryear.
+      IF s_ryear-high <> 0.
+        CONCATENATE  s_ryear-low '..to..' s_ryear-high INTO t_line.
+      ELSE.
+        CONCATENATE  s_ryear-low ' ' INTO t_line.
+      ENDIF.
+      wa_header-key = 'Fiscal Year '.
+      wa_header-typ  = 'S'.
+      wa_header-info =  t_line.
+      APPEND wa_header TO t_header.
+      CLEAR: wa_header, t_line.
+    ENDLOOP.
+  ENDIF.
+
+* period
+  IF s_poper[] IS NOT INITIAL.
+    LOOP AT s_poper.
+      IF s_poper-high <> 0.
+        CONCATENATE  s_poper-low '..to..' s_poper-high INTO t_line.
+      ELSE.
+        CONCATENATE  s_poper-low  ' '   INTO t_line.
+      ENDIF.
+      wa_header-key = 'Period '.
+      wa_header-typ  = 'S'.
+      wa_header-info =  t_line.
+      APPEND wa_header TO t_header.
+      CLEAR: wa_header, t_line.
+    ENDLOOP.
+  ENDIF.
+
+* Posting date
+  IF s_budat[] IS NOT INITIAL.
+    LOOP AT s_budat.
+      CONCATENATE  s_budat-low '..to..' s_budat-high INTO t_line.
+      wa_header-key = 'Posting Date '.
+      wa_header-typ  = 'S'.
+      wa_header-info =  t_line.
+      APPEND wa_header TO t_header.
+      CLEAR: wa_header, t_line.
+    ENDLOOP.
+  ENDIF.
+
+* Controlling area
+  wa_header-typ  = 'S'.
+  wa_header-key = 'Controlling Area' .
+  CONCATENATE p_kokrs ' ' INTO wa_header-info.
+  APPEND wa_header TO t_header.
+  CLEAR: wa_header.
+
+* Account
+  IF s_racct[] IS NOT INITIAL.
+    LOOP AT s_racct.
+      CONCATENATE  s_racct-low '..to..' s_racct-high INTO t_line.
+      wa_header-key = 'Account '.
+      wa_header-typ  = 'S'.
+      wa_header-info =  t_line.
+      APPEND wa_header TO t_header.
+      CLEAR: wa_header, t_line.
+    ENDLOOP.
+  ENDIF.
+
+* Origin Object Type
+  IF s_rhoart[] IS NOT INITIAL.
+    LOOP AT s_rhoart  .
+      CONCATENATE  s_rhoart-low '..to..' s_rhoart-high INTO t_line.
+      wa_header-key = 'Origin Object Type '.
+      wa_header-typ  = 'S'.
+      wa_header-info =  t_line.
+      APPEND wa_header TO t_header.
+      CLEAR: wa_header, t_line.
+    ENDLOOP.
+  ENDIF.
+
+* Object Class
+  IF s_rscope[] IS NOT INITIAL.
+    LOOP AT s_rscope.
+      CONCATENATE  s_rscope-low '..to..' s_rscope-high INTO t_line.
+      wa_header-key = 'Object Class '.
+      wa_header-typ  = 'S'.
+      wa_header-info =  t_line.
+      APPEND wa_header TO t_header.
+      CLEAR: wa_header, t_line.
+    ENDLOOP.
+  ENDIF.
+
+* GL Account
+  IF s_hkont[] IS NOT INITIAL.
+    LOOP AT s_hkont.
+      CONCATENATE  s_hkont-low '..to..' s_hkont-high INTO t_line.
+      wa_header-key = 'GL Account '.
+      wa_header-typ  = 'S'.
+      wa_header-info =  t_line.
+      APPEND wa_header TO t_header.
+      CLEAR: wa_header, t_line.
+    ENDLOOP.
+  ENDIF.
+
+  CALL FUNCTION 'REUSE_ALV_COMMENTARY_WRITE'
+    EXPORTING
+      it_list_commentary = t_header.
+
+ENDFORM.                    "TOP_OF_PAGE
+
+*Text symbol text£º
+*001:General selections
+*002:PCA Selections
+*003:FI Selections
+*E01:You have no authorisation for sales organisation :
+*E02:Fill in Sales Office and Sales Group
+*I01:No equipments selected for One-2-One
+
+*I02:No records selected
+*Selection text£º
+*P_ALL:        Display All
+*P_BUKRS:        Company
+*P_DIF:        Display Differences Only
+*P_KOKRS:        Controlling Area
+*S_BUDAT:        Posting Date
+*S_HKONT:        GL Account
+*S_POPER:        Period
+*S_RACCT:        Account
+*S_RHOART:        Origin Object Type
+*S_RSCOPE:        Object Class
+*S_RYEAR:        Fiscal Year

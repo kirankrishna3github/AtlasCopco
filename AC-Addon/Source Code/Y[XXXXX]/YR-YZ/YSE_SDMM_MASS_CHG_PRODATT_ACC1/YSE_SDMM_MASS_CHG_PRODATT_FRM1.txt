@@ -1,0 +1,375 @@
+*&---------------------------------------------------------------------*
+*&  Include           YSE_SDMM_MASS_CHG_PRODATT_FRM
+*&---------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME     |CORRECTION NUMBER| CHANGE REFERENCE # *
+* MOD-001 |01/04/2013| Anda Wu  |CD1K975435       | #30383
+*----------------------------------------------------------------------*
+
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_AUTHORIZATION
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM CHECK_AUTHORIZATION .
+* Display the progress to the user in the status bar.
+  IF SY-BATCH <> C_X.
+    CALL FUNCTION 'SAPGUI_PROGRESS_INDICATOR'
+      EXPORTING
+        PERCENTAGE = '25'
+        TEXT       = TEXT-010.
+  ENDIF.
+
+
+* Check if the user has authorization for that sales org. / dist. channel or else display error.
+  AUTHORITY-CHECK OBJECT 'V_VBAK_VKO'
+         ID 'VKORG' FIELD P_VKORG
+         ID 'VTWEG' FIELD P_VTWEG
+         ID 'SPART' DUMMY
+         ID 'ACTVT' DUMMY.
+    IF SY-SUBRC = 4.
+*   No authorisation to change data in sales org. / dist. channel
+        MESSAGE ID 'YSE_GENERAL' TYPE 'E' NUMBER '006' WITH P_VKORG.
+        EXIT.
+    ELSEIF SY-SUBRC <> 0.
+*   Error checking authorization.
+        MESSAGE ID 'YSE_GENERAL' TYPE 'E' NUMBER '004'.
+        EXIT.
+    ENDIF.
+
+ENDFORM.                    " CHECK_AUTHORIZATION
+
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  UPLOAD_FILES
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM UPLOAD_FILES .
+* Display the progress to the user in the status bar.
+  IF SY-BATCH <> C_X.
+    CALL FUNCTION 'SAPGUI_PROGRESS_INDICATOR'
+      EXPORTING
+        PERCENTAGE = '25'
+        TEXT       = TEXT-011.
+  ENDIF.
+
+* Upload the Material data from the excel file
+  CALL FUNCTION 'TEXT_CONVERT_XLS_TO_SAP'
+     EXPORTING
+* I_FIELD_SEPERATOR          =
+* I_LINE_HEADER              =
+       I_TAB_RAW_DATA             = I_TAB_RAW_DATA
+       I_FILENAME                 = P_FILE1
+     TABLES
+       I_TAB_CONVERTED_DATA       = GT_UPLOAD_ACC
+   EXCEPTIONS
+    CONVERSION_FAILED          = 1
+    OTHERS                     = 2
+             .
+  IF SY-SUBRC <> 0.
+    MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+           WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+  ENDIF.
+
+
+* Check if the uploaded files have data in them.
+  IF GT_UPLOAD_ACC[] IS INITIAL.
+    MESSAGE TEXT-005 TYPE 'E'.
+  ENDIF.
+* Begin of MOD-001
+  DATA: lv_lines TYPE i.
+  DESCRIBE TABLE GT_UPLOAD_ACC LINES lv_lines.
+  IF lv_lines > gc_max_line.
+    MESSAGE S000(YSE_GENERAL)
+      WITH TEXT-030 gc_max_line TEXT-031
+      DISPLAY LIKE 'E'.
+    LEAVE LIST-PROCESSING.
+  ENDIF.
+* End of MOD-001
+ENDFORM.                    " UPLOAD_FILE
+
+
+
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  OPTIMIZE_FILES
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM OPTIMIZE_FILES .
+* Display the progress to the user in the status bar.
+  IF SY-BATCH <> C_X.
+    CALL FUNCTION 'SAPGUI_PROGRESS_INDICATOR'
+      EXPORTING
+        PERCENTAGE = '25'
+        TEXT       = TEXT-012.
+  ENDIF.
+
+* Sort the Materials and delete the duplicates from them.
+  SORT GT_UPLOAD_ACC.
+  DELETE ADJACENT DUPLICATES FROM GT_UPLOAD_ACC COMPARING MATNR.
+
+* Move the uploaded data into the final internal table
+  LOOP AT GT_UPLOAD_ACC.
+    GT_PRODUCT_ATT-MANDT = SY-MANDT.
+    GT_PRODUCT_ATT-MATNR = GT_UPLOAD_ACC-MATNR.
+    APPEND GT_PRODUCT_ATT.
+  ENDLOOP.
+
+
+* Clear the contents of the database table and insert these new records
+  DELETE FROM YSE_PRODATT_UPL.
+
+  IF NOT GT_PRODUCT_ATT[] IS INITIAL.
+    INSERT YSE_PRODATT_UPL FROM TABLE GT_PRODUCT_ATT.
+    IF SY-SUBRC = 0.
+      WRITE /: TEXT-013.
+    ELSE.
+      WRITE /: TEXT-014.
+    ENDIF.
+  ELSE.
+    WRITE /: TEXT-015.
+  ENDIF.
+
+
+
+ENDFORM.                    " OPTIMIZE_FILES
+
+
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_TABLES
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM CHECK_TABLES .
+* Select the product attribute data into the internal table
+  SELECT * FROM YSE_PRODATT_UPL INTO TABLE GT_PRODUCT_ATT.
+
+* Check the number of records in the table
+  DESCRIBE TABLE GT_PRODUCT_ATT  LINES GV_PRODATT_RECS.
+
+* If both product Attributes table is empty, don't proceed further.
+  IF  GV_PRODATT_RECS < 1.
+    MESSAGE TEXT-004 TYPE 'E'.
+  ENDIF.
+ENDFORM.                    " CHECK_TABLES
+
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  UPDATE_PRODATTS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM UPDATE_PRODATTS.
+
+* Display the progress to the user in the status bar.
+  IF SY-BATCH <> C_X.
+    CALL FUNCTION 'SAPGUI_PROGRESS_INDICATOR'
+      EXPORTING
+        PERCENTAGE = '25'
+        TEXT       = TEXT-016.
+  ENDIF.
+
+
+* Lets update the material product attributes in Sales view using the BAPI
+  LOOP AT GT_PRODUCT_ATT.
+
+* Add leading zeros to the material number incase it is not added in the file
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+      EXPORTING
+        INPUT         =   GT_PRODUCT_ATT-MATNR
+     IMPORTING
+       OUTPUT         =   WA_HEADDATA-MATERIAL
+              .
+
+    WA_HEADDATA-SALES_VIEW   =  C_X.
+
+    WA_SALESDATA-SALES_ORG   =  P_VKORG.
+    WA_SALESDATA-DISTR_CHAN  =  P_VTWEG.
+    WA_SALESDATA-PROD_ATT_2  =  C_X.
+
+    WA_SALESDATAX-SALES_ORG  =  P_VKORG.
+    WA_SALESDATAX-DISTR_CHAN =  P_VTWEG.
+    WA_SALESDATAX-PROD_ATT_2 =  C_X.
+
+
+    CALL FUNCTION 'BAPI_MATERIAL_SAVEDATA'
+      EXPORTING
+        HEADDATA   = WA_HEADDATA
+        SALESDATA  = WA_SALESDATA
+        SALESDATAX = WA_SALESDATAX
+      IMPORTING
+        RETURN     = WA_RETURN.
+
+*       Check if the update was successful.
+    IF WA_RETURN-TYPE = 'S'.
+      CLEAR GT_PRODATT_SUCC.
+      GT_PRODATT_SUCC-MATNR     = GT_PRODUCT_ATT-MATNR.
+      GT_PRODATT_SUCC-VKORG     = P_VKORG.
+      GT_PRODATT_SUCC-VTWEG     = P_VTWEG.
+      APPEND GT_PRODATT_SUCC.
+
+*        Lets save the record into the database.
+      CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+        EXPORTING
+          WAIT = 'X'.
+
+
+    ELSE.
+      CLEAR GT_PRODATT_FAIL.
+      GT_PRODATT_FAIL-MATNR      = GT_PRODUCT_ATT-MATNR.
+      GT_PRODATT_FAIL-VKORG      = P_VKORG.
+      GT_PRODATT_FAIL-VTWEG      = P_VTWEG.
+      GT_PRODATT_FAIL-MESSAGE    = WA_RETURN-MESSAGE.
+      APPEND GT_PRODATT_FAIL.
+    ENDIF.
+
+
+    CLEAR : WA_HEADDATA,
+            WA_SALESDATA,
+            WA_SALESDATAX,
+            WA_RETURN.
+
+  ENDLOOP.
+
+ENDFORM.                    " UPDATE_SALESVIEW
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  DISPLAY_STATUS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM DISPLAY_STATUS .
+
+* Display the progress to the user in the status bar.
+  IF SY-BATCH <> C_X.
+    CALL FUNCTION 'SAPGUI_PROGRESS_INDICATOR'
+      EXPORTING
+        PERCENTAGE = '25'
+        TEXT       = TEXT-017.
+  ENDIF.
+
+
+* Lets update the status
+  DESCRIBE TABLE GT_PRODUCT_ATT   LINES GV_PRODATT_TOTAL.
+  DESCRIBE TABLE GT_PRODATT_SUCC  LINES GV_PRODATT_SUCC.
+  DESCRIBE TABLE GT_PRODATT_FAIL  LINES GV_PRODATT_FAIL.
+
+
+  WRITE : /'*********************************************************************************************************************************'.
+  WRITE /35 TEXT-018.
+  WRITE : /'*********************************************************************************************************************************'.
+  FORMAT COLOR COL_HEADING INTENSIFIED.
+  WRITE :/25 TEXT-019 ,   GV_PRODATT_TOTAL.
+  FORMAT RESET.
+*  WRITE : /'**********************************************************************'.
+
+  IF GV_PRODATT_SUCC  > 0.
+    SKIP 2.
+    WRITE : /'**********************************************************************'.
+    FORMAT COLOR COL_POSITIVE INTENSIFIED.
+    WRITE : / TEXT-020.
+    SKIP 1.
+    FORMAT RESET.
+    LOOP AT GT_PRODATT_SUCC.
+      WRITE :/2  GT_PRODATT_SUCC-MATNR, 21 TEXT-021, 36 GT_PRODATT_SUCC-VKORG , 42 TEXT-022, 61 GT_PRODATT_SUCC-VTWEG.
+    ENDLOOP.
+    WRITE : /'**********************************************************************'.
+  ENDIF.
+
+  IF GV_PRODATT_FAIL > 0.
+    SKIP 2.
+    WRITE : /'**********************************************************************'.
+    FORMAT COLOR COL_GROUP INTENSIFIED.
+    WRITE : / TEXT-023.
+    SKIP 1.
+    FORMAT RESET.
+    LOOP AT GT_PRODATT_FAIL.
+      WRITE :/2 GT_PRODATT_FAIL-MATNR, 21 TEXT-021, 36 GT_PRODATT_FAIL-VKORG, 42 TEXT-022, 61 GT_PRODATT_FAIL-VTWEG.
+      WRITE /: GT_PRODATT_FAIL-MESSAGE.
+    ENDLOOP.
+    WRITE : /'**********************************************************************'.
+  ENDIF.
+
+
+  IF GV_PRODATT_SUCC > 0 OR GV_PRODATT_FAIL > 0.
+    SKIP 2.
+    WRITE : /'**********************************************************************'.
+    IF GV_PRODATT_SUCC > 0.
+      FORMAT COLOR COL_POSITIVE INTENSIFIED.
+      WRITE :  / TEXT-024,  GV_PRODATT_SUCC.
+      FORMAT RESET.
+    ENDIF.
+    IF GV_PRODATT_FAIL > 0.
+      FORMAT COLOR COL_NEGATIVE INTENSIFIED.
+      WRITE : / TEXT-025,  GV_PRODATT_FAIL.
+      FORMAT RESET.
+    ENDIF.
+    WRITE : /'**********************************************************************'.
+  ENDIF.
+
+
+ENDFORM.                    " DISPLAY_STATUS
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  DELETE_ENTRIES
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM DELETE_ENTRIES .
+  DELETE FROM YSE_PRODATT_UPL.
+ENDFORM.                    " DELETE_ENTRIES
+
+* Begin of MOD-001
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_DATE
+*&---------------------------------------------------------------------*
+*       Change if the date in valid perild
+*----------------------------------------------------------------------*
+form CHECK_DATE .
+  DATA: lv_today(8) TYPE n.
+  lv_today = sy-datum.
+  IF   lv_today+6(2) < gc_date_low
+    OR lv_today+6(2) > gc_date_high.
+    MESSAGE  e000(YSE_GENERAL)
+      WITH text-035
+            gc_date_low
+            text-036
+            gc_date_high.
+  ENDIF.
+endform.                    " CHECK_DATE
+* End of MOD-001

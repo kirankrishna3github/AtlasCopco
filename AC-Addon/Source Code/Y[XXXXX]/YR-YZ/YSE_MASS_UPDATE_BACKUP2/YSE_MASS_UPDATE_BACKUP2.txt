@@ -1,0 +1,305 @@
+*----------------------------------------------------------------------*
+* PROGRAM ID    : YSE_MASS_UPDATE                                      *
+* PROGRAM TITLE : Mass update via uploading local file                 *
+* AUTHOR        : Anda Wu                                              *
+* DATE          : 05/02/2013                                           *
+* DEVELOPMENT ID:                                                      *
+*                                                                      *
+* CHANGE REQUEST NUMBER:                                               *
+*                                                                      *
+* Program Description: Upload local file to DB                         *
+*                                                                      *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+*  DATE    | NAME     |TRANSPORT  | CR# and short Description          *
+*----------------------------------------------------------------------*
+*05/02/2013|Anda Wu   |CD1K975043 |CR2814: Initial version             *
+*----------------------------------------------------------------------*
+
+REPORT  yse_mass_update_backup2 NO STANDARD PAGE HEADING LINE-SIZE 255.
+DATA: gt_lfile TYPE yse_t_lfile,                      "Local file name
+      gt_message TYPE scr_strings.                    "Message table
+CONSTANTS: c_on TYPE c VALUE 'X'.                     "Switch On
+
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE text-t01.
+PARAMETERS: cb_upld TYPE c AS CHECKBOX DEFAULT c_on,  "Do upload
+            cb_updt TYPE c AS CHECKBOX DEFAULT c_on.  "Do update
+SELECTION-SCREEN END OF BLOCK b1.
+
+SELECTION-SCREEN BEGIN OF BLOCK b2 WITH FRAME TITLE text-t02.
+PARAMETERS:
+          p_appl TYPE yse_up_appl-appl OBLIGATORY,    "Application Type
+          p_file(1024) TYPE c LOWER CASE.             "Local File Path
+SELECTION-SCREEN END OF BLOCK b2.
+
+AT SELECTION-SCREEN.
+* Check selection screen
+  PERFORM check_selscreen.
+
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_file.
+* Get local file path
+  PERFORM select_file.
+
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_appl.
+* F4-help Function Implementation
+  PERFORM f4_appl.
+
+START-OF-SELECTION.
+* If the function of  'UPLOAD' is choosed
+  IF cb_upld = c_on.
+*   Read local file into a internal table
+    PERFORM read_file.
+*   Write entry to datebase table
+    PERFORM write_db.
+  ENDIF.
+
+* If the function of  'UPDATE' is choosed
+  IF cb_updt = c_on.
+*   Mass data updata according to upload data
+    PERFORM mass_update.
+  ENDIF.
+
+END-OF-SELECTION.
+* WRITE process result message
+  PERFORM write_message.
+*&---------------------------------------------------------------------*
+*&      Form  select_file
+*&---------------------------------------------------------------------*
+*       Get local file path
+*----------------------------------------------------------------------*
+FORM select_file .
+  DATA: lv_title  TYPE string,     "Referrence title
+        lt_file   TYPE filetable,  "Internal table of dialog filenames
+        ls_file   TYPE file_table, "Working area for IT_FILE,
+        lv_rc     TYPE i.          "Return Code
+
+  lv_title = text-001.
+  CLEAR: lt_file[],
+         ls_file.
+
+  CALL METHOD cl_gui_frontend_services=>file_open_dialog
+    EXPORTING
+      window_title            = lv_title
+    CHANGING
+      file_table              = lt_file
+      rc                      = lv_rc
+    EXCEPTIONS
+      file_open_dialog_failed = 1
+      cntl_error              = 2
+      error_no_gui            = 3
+      not_supported_by_gui    = 4
+      OTHERS                  = 5.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+              WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+  IF lv_rc = 1.
+    READ TABLE lt_file INDEX 1 INTO ls_file.
+    IF sy-subrc EQ 0.
+      p_file = ls_file-filename.
+    ENDIF.
+  ENDIF.
+ENDFORM.                    " select_file
+*&---------------------------------------------------------------------*
+*&      Form  READ_FILE
+*&---------------------------------------------------------------------*
+*       Read local file into a internal table
+*----------------------------------------------------------------------*
+FORM read_file .
+  DATA: lv_filename TYPE string.
+
+  lv_filename = p_file.
+
+
+  CALL FUNCTION 'GUI_UPLOAD'
+    EXPORTING
+      filename            = lv_filename
+      filetype            = ycl_se_utility=>c_ft_asc
+      has_field_separator = ' '
+    TABLES
+      data_tab            = gt_lfile
+    EXCEPTIONS
+      OTHERS              = 17.
+  IF sy-subrc <> 0.
+    MESSAGE e010(yam_dc).        "DATA UPLOAD FAILED
+  ENDIF.
+
+  IF gt_lfile IS NOT INITIAL.
+    DELETE gt_lfile INDEX 1.
+  ENDIF.
+
+ENDFORM.                    " READ_FILE
+*&---------------------------------------------------------------------*
+*&      Form  WRITE_DB
+*&---------------------------------------------------------------------*
+*       Write entry to datebase table
+*----------------------------------------------------------------------*
+FORM write_db .
+
+  DATA: lv_xml TYPE string,
+        ls_up_file TYPE yse_up_file.
+
+  IF gt_lfile IS INITIAL.
+    MESSAGE w000(yse_sales_log) WITH 'No Input Data'(002).
+  ELSE.
+    CALL TRANSFORMATION yse_trans_file SOURCE lfile = gt_lfile RESULT XML lv_xml.
+  ENDIF.
+*
+*  CLEAR: gt_lfile[].
+*  CALL TRANSFORMATION yse_trans_file SOURCE XML lv_xml RESULT lfile = gt_lfile.
+  CALL FUNCTION 'SYSTEM_UUID_CREATE'
+    IMPORTING
+      uuid = ls_up_file-guid.
+* Prepare entry for insert
+  ls_up_file-appl = p_appl.
+  ls_up_file-create_date = sy-datum.
+  ls_up_file-create_time = sy-uzeit.
+  ls_up_file-create_by   = sy-uname.
+  ls_up_file-xml = lv_xml.
+  INSERT yse_up_file FROM ls_up_file.
+
+  IF sy-subrc = 0.
+    MESSAGE s000(yse_sales_log) WITH 'File uploaded successfully'(003)
+                                     'for applicaiton'(004)
+                                     p_appl.
+  ENDIF.
+
+ENDFORM.                    " WRITE_DB
+
+*&---------------------------------------------------------------------*
+*&      Form  f4_appl
+*&---------------------------------------------------------------------*
+*       F4-help Function Implementation
+*----------------------------------------------------------------------*
+FORM f4_appl .
+
+  DATA: lt_appl TYPE TABLE OF yse_up_appl.
+  DATA: lt_return TYPE TABLE OF ddshretval,
+        ls_return TYPE ddshretval.
+
+  SELECT * FROM yse_up_appl INTO TABLE lt_appl.       "#EC CI_SGLSELECT
+
+  CALL FUNCTION 'F4IF_INT_TABLE_VALUE_REQUEST'
+    EXPORTING
+      retfield        = 'APPL'
+      dynpprog        = sy-repid
+      dynprofield     = 'P_APPL'
+      value_org       = 'S'
+    TABLES
+      value_tab       = lt_appl
+      return_tab      = lt_return
+    EXCEPTIONS
+      parameter_error = 1
+      no_values_found = 2
+      OTHERS          = 3.
+  IF sy-subrc = 0.
+    READ TABLE lt_return INTO ls_return INDEX 1.
+    p_appl = ls_return-fieldval.
+  ENDIF.
+ENDFORM.                    "f4_appl
+
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_APPL
+*&---------------------------------------------------------------------*
+*       Applicatin Type Check
+*----------------------------------------------------------------------*
+FORM check_appl .
+  DATA: lt_up_appl TYPE TABLE OF yse_up_appl.
+
+  SELECT * FROM yse_up_appl INTO TABLE lt_up_appl
+    WHERE appl = p_appl.                              "#EC CI_SGLSELECT
+
+  IF sy-subrc <> 0 .
+    MESSAGE e000(yse_sales_log)
+      WITH 'for applicaiton'(004) p_appl
+           ' does not exist!'(005).
+  ENDIF.
+ENDFORM.                    " CHECK_APPL
+*&---------------------------------------------------------------------*
+*&      Form  MASS_UPDATE
+*&---------------------------------------------------------------------*
+*       Mass data updata according to upload data
+*----------------------------------------------------------------------*
+FORM mass_update .
+  DATA: lo_mass_update TYPE REF TO yse_cl_mass_update_backup.
+
+  CREATE OBJECT lo_mass_update
+    EXPORTING
+      iv_appl = p_appl.
+
+  CALL METHOD lo_mass_update->update
+    IMPORTING
+      et_message = gt_message.
+ENDFORM.                    " MASS_UPDATE
+*&---------------------------------------------------------------------*
+*&      Form  WRITE_MESSAGE
+*&---------------------------------------------------------------------*
+*       WRITE process result message
+*----------------------------------------------------------------------*
+FORM write_message .
+  DATA: lv_text TYPE string.
+  WRITE: 'Application:'(006), p_appl.
+  LOOP AT gt_message INTO lv_text.
+    WRITE: / lv_text.
+  ENDLOOP.
+ENDFORM.                    " WRITE_MESSAGE
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_FILENAME
+*&---------------------------------------------------------------------*
+*       CHECK filename
+*----------------------------------------------------------------------*
+FORM check_filename .
+  IF    p_file IS INITIAL
+    AND cb_upld = c_on.
+    SET CURSOR FIELD  'P_FILE'.
+    MESSAGE  e000(yse_sales_log)
+      WITH 'Filename should not be empty'(007)
+           'when UPLOAD is selected'(009).
+
+  ENDIF.
+ENDFORM.                    " CHECK_FILENAME
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_SELSCREEN
+*&---------------------------------------------------------------------*
+*       Check selection screen
+*----------------------------------------------------------------------*
+FORM check_selscreen .
+* Applicatin Type Check
+  PERFORM check_appl.
+* CHECK filename
+  PERFORM check_filename.
+* Check Others
+  PERFORM check_others.
+ENDFORM.                    " CHECK_SELSCREEN
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_OTHERS
+*&---------------------------------------------------------------------*
+*       Check Others
+*----------------------------------------------------------------------*
+FORM check_others .
+  IF    cb_upld IS INITIAL
+    AND cb_updt IS INITIAL.
+    MESSAGE  e000(yse_sales_log)
+      WITH 'Please choose a function at least.'(008).
+  ENDIF.
+ENDFORM.                    " CHECK_OTHERS
+
+*Text symbol text£º
+*001:Select a file for upload
+*002:No Input Data
+*003:File uploaded successfully
+*004:for applicaiton
+*005: does not exist!
+*006:Application:
+*007:Filename should not be empty
+*008:Please choose a function at least.
+*009:when UPLOAD is selected
+*T01:Functions
+
+*T02:Select Criterial
+*Selection text£º
+*CB_UPDT:        Update
+*CB_UPLD:        Upload
+*P_APPL:D       .
+*P_FILE:        Local File

@@ -1,0 +1,254 @@
+*&---------------------------------------------------------------------*
+*&  Include           YSE_EM_EXC_MGT_RUN_F02                           *
+*&---------------------------------------------------------------------*
+
+*&---------------------------------------------------------------------*
+*&      Form  fill_exception_central
+*&---------------------------------------------------------------------*
+*       DETERMINE EXCEPTION CODE FOR CENTRAL WAREHOUSE
+*----------------------------------------------------------------------*
+FORM fill_exception_central .
+
+* loop over materials => determine parameters for materials
+  LOOP AT i_marc.
+*   PERFORM get_distr_mode.
+    CLEAR i_log.
+    PERFORM get_order_lines_central.
+* set current values in the exception management log table
+    MOVE-CORRESPONDING i_marc TO i_log.
+*   Get mat description (was initially read from internal tab, but selecting descr with a
+*   a range of mat's, was limited to x thousand)
+*    READ TABLE I_MAKT WITH KEY MATNR = I_MARC-MATNR BINARY SEARCH.
+*    IF SY-SUBRC EQ 0.
+*      I_LOG-MAKTX = I_MAKT-MAKTX.
+*    ENDIF.
+    SELECT SINGLE MAKTX
+             FROM MAKT
+             INTO I_LOG-MAKTX
+           WHERE MATNR EQ I_MARC-MATNR
+             AND SPRAS EQ SY-LANGU.
+    IF SY-SUBRC NE 0.
+      CLEAR I_LOG-MAKTX.
+    ENDIF.
+    i_log-hist = v_history.
+    i_log-nrlines = v_so12.
+    i_log-custopo = i_marc-dismm.
+*   Get MATPLANT
+    CLEAR YSE_EM_MATPLANT.
+    SELECT SINGLE *
+             FROM yse_em_matplant
+            WHERE matnr EQ i_marc-matnr
+              AND werks EQ p_werks.
+    I_LOG-CULSFL  = YSE_EM_MATPLANT-LOTSIZE_IND.
+
+*   START
+    PERFORM GET_MAT_STCOST.
+    PERFORM MATERIAL_FORECAST.
+
+*** 0. Only for not "stock on request"
+    IF I_MARC-MAXLZ EQ 0.
+
+*** * 1. Distribution Mode = DTC
+      IF I_MARC-CUDIMO EQ C_DTC.
+
+***   * IF  Order lines (12 mth) >= Max lines
+*       AND Order lines (4mth) * factor (4 mth) >= DTC lines
+        IF      V_SO12 GE YSE_EM_WHSTYPAR-MAXLINES
+            AND V_SOF4 GE YSE_EM_WHSTYPAR-DTCLINES.
+*         Set exception D01
+          PERFORM SET_EM_MSG USING 'D01'.
+*         Calculate SS, ROP, lot size, DMSV
+          PERFORM CALCULATE_PARAMETERS.
+***   * If  Order lines (12 mth) >= DTC lines
+*       AND Stock policy = Non-stocked
+*       AND Order lines (4 mth) * factor (4mth) >= DTC lines
+        ELSEIF  V_SO12 GE YSE_EM_WHSTYPAR-DTCLINES
+            AND I_MARC-DISMM EQ C_CNS
+            AND V_SOF4 GE YSE_EM_WHSTYPAR-DTCLINES.
+*         Set exception A01
+          PERFORM SET_EM_MSG USING 'A01'.
+*         Calculate SS, ROP, lot size, DMSV
+          PERFORM CALCULATE_PARAMETERS.
+        ELSE.
+***     * If Order lines (12 mth) < DTC lines
+          IF      V_SO12 LT YSE_EM_WHSTYPAR-DTCLINES.
+***       * If Stock policy = Stocked
+            IF I_MARC-DISMM EQ C_ST.
+***         * If Order lines (6 mth) * factor (6 mth) < DTC lines
+              IF V_SOF6 LT YSE_EM_WHSTYPAR-DTCLINES.
+                PERFORM SET_EM_MSG USING 'A02'.
+                PERFORM CALCULATE_PARS_LIGHT.
+              ELSE.
+*               Calculate SS, ROP, lot size, DMSV
+                PERFORM CALCULATE_PARAMETERS.
+              ENDIF.
+            ENDIF.
+          ELSE.
+***       * If Stock policy = Stocked
+            IF I_MARC-DISMM EQ C_ST.
+*             Calculate SS, ROP, lot size, DMSV
+              PERFORM CALCULATE_PARAMETERS.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+
+*** * 2. Distribution Mode = DTC
+      ELSEIF I_MARC-CUDIMO EQ C_NDTC.
+***   * If  Order lines (12 mth) < Min lines
+*       AND Not 0 months (12 mth) < # 0 months (12 mth)
+*       AND Order lines (2 mth) < # lines last 2 mth
+        IF      V_SO12 LT YSE_EM_WHSTYPAR-MINLINES
+            AND V_012  LT YSE_EM_WHSTYPAR-NUM0M12
+            AND V_SO2  LT YSE_EM_WHSTYPAR-LINES2M.
+*         Set exception D02
+          PERFORM SET_EM_MSG USING 'D02'.
+          PERFORM CALCULATE_PARS_LIGHT.
+
+***   * Please mind that the rest of this IF clause, is drawn differently
+***   * on the flow chart in the spec (in the spec there is an
+***   * "ELSEIF Distr mode = NDTC or LCL", but that doesn't work in ABAP logic
+***   * after the above statement ...
+
+***   * If  Order lines (12 mth) >= NDTC lines
+*       AND Stock policy NOT stocked
+*       AND Not 0 months (12 mth) >= # 0 months (12 mth)
+*       AND Not 0 months (6 mth) >= # 0 months (6 mth)
+        ELSEIF  V_SO12 GE YSE_EM_WHSTYPAR-NDTCLINES
+            AND I_MARC-DISMM NE C_ST
+            AND V_012 GE YSE_EM_WHSTYPAR-NUM0M12
+            AND V_006 GE YSE_EM_WHSTYPAR-NUM0M6.
+*         Set exception A03
+          PERFORM SET_EM_MSG USING 'A03'.
+*         Calculate SS, ROP, lot size, DMSV
+          PERFORM CALCULATE_PARAMETERS.
+
+***   * Elseif Order lines (12 mth) < NDTC lines
+*       AND    Stock policy = Stocked
+        ELSEIF     V_SO12 LT YSE_EM_WHSTYPAR-NDTCLINES
+               AND I_MARC-DISMM EQ C_ST.
+***     * If  Not 0 months (12 mth) < # 0 months (12 mth)
+*         AND Order lines (2 mth) < # lines last 2 months
+          IF      V_012 LT YSE_EM_WHSTYPAR-NUM0M12
+              AND V_SO2 LT YSE_EM_WHSTYPAR-LINES2M.
+*           Set exception A04
+            PERFORM SET_EM_MSG USING 'A04'.
+            PERFORM CALCULATE_PARS_LIGHT.
+          ELSE.
+*           Calculate SS, ROP, lot size, DMSV
+            PERFORM CALCULATE_PARAMETERS.
+          ENDIF.
+***   * Elseif Stock policy = Stocked
+        ELSEIF I_MARC-DISMM EQ C_ST.
+*         Calculate SS, ROP, lot size, DMSV
+          PERFORM CALCULATE_PARAMETERS.
+
+        ENDIF.
+
+*** * 3. Distribution Mode = LCL
+      ELSEIF I_MARC-CUDIMO EQ C_LCL.
+***   * If  Order lines (12 mth) >= LCL lines
+*       AND Stock policy NOT stocked
+*       AND Not 0 months (12 mth) >= # 0 months (12 mth)
+*       AND Not 0 months (6 mth) >= # 0 months (6 mth)
+        IF      V_SO12 GE YSE_EM_WHSTYPAR-LCLLINES
+            AND I_MARC-DISMM NE C_ST
+            AND V_012 GE YSE_EM_WHSTYPAR-NUM0M12
+            AND V_006 GE YSE_EM_WHSTYPAR-NUM0M6.
+*         Set exception A03
+          PERFORM SET_EM_MSG USING 'A03'.
+*         Calculate SS, ROP, lot size, DMSV
+          PERFORM CALCULATE_PARAMETERS.
+
+***   * Elseif Order lines (12 mth) < LCL lines
+*       AND    Stock policy = Stocked
+        ELSEIF     V_SO12 LT YSE_EM_WHSTYPAR-LCLLINES
+               AND I_MARC-DISMM EQ C_ST.
+***     * If  Not 0 months (12 mth) < # 0 months (12 mth)
+*         AND Order lines (2 mth) < # lines last 2 months
+          IF      V_012 LT YSE_EM_WHSTYPAR-NUM0M12
+              AND V_SO2 LT YSE_EM_WHSTYPAR-LINES2M.
+*           Set exception A04
+            PERFORM SET_EM_MSG USING 'A04'.
+            PERFORM CALCULATE_PARS_LIGHT.
+          ELSE.
+*           Calculate SS, ROP, lot size, DMSV
+            PERFORM CALCULATE_PARAMETERS.
+          ENDIF.
+***   * Elseif Stock policy = Stocked
+        ELSEIF I_MARC-DISMM EQ C_ST.
+*         Calculate SS, ROP, lot size, DMSV
+          PERFORM CALCULATE_PARAMETERS.
+        ENDIF.
+      ENDIF.  " DTC / NDTC
+    ENDIF.  " Not "stock on request"
+
+*   Check if exception raised
+    IF NOT I_LOG-EXTYPNR IS INITIAL.
+      APPEND I_LOG.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    " fill_exception_central
+
+*&---------------------------------------------------------------------*
+*&      Form  get_order_lines_central
+*&---------------------------------------------------------------------*
+*       get parameters for order lines for central warehouse
+*----------------------------------------------------------------------*
+FORM get_order_lines_central.
+
+* V_SO12 = sum of all sales lines over the last 12 months from temp file
+*        = number of sales lines over the last 12 months
+* V_SO6 = sum of all sales lines over the last 6 months from temp file
+* V_SO4 = sum of all sales lines over the last 4 months from temp file
+* V_SO2 = sum of all sales lines over the last 2 months from temp file
+
+* V_012 = number of months over the last 12 months in temp file where
+*         sales quantity ne 0
+* V_006 = number of months over the last 6 months in temp file where
+*         sales quantity ne 0
+* v_history = total sales qty over 12 months
+
+  CLEAR: v_so12, v_so6, v_so4, v_so2, v_012, v_006, v_history.
+
+  LOOP AT i_temp WHERE matnr EQ i_marc-matnr.
+    v_history = v_history + i_temp-zmeng.
+    v_so12 = v_so12 + i_temp-zline.
+    IF i_temp-zmeng NE 0.
+      v_012 = v_012 + 1.
+    ENDIF.
+    IF i_temp-period GE v_period2.
+      v_so6 = v_so6 + i_temp-zline.
+      v_so4 = v_so4 + i_temp-zline.
+      v_so2 = v_so2 + i_temp-zline.
+      IF i_temp-zmeng NE 0.
+        v_006 = v_006 + 1.
+      ENDIF.
+
+    ELSEIF i_temp-period GE v_period4.
+      v_so6 = v_so6 + i_temp-zline.
+      v_so4 = v_so4 + i_temp-zline.
+      IF i_temp-zmeng NE 0.
+        v_006 = v_006 + 1.
+      ENDIF.
+
+    ELSEIF i_temp-period GE v_period6.
+      v_so6 = v_so6 + i_temp-zline.
+      IF i_temp-zmeng NE 0.
+        v_006 = v_006 + 1.
+      ENDIF.
+    ENDIF.
+
+
+  ENDLOOP.
+
+* v_sof4 = order lines(4 mth) * factor(4mth)
+  CLEAR v_sof4.
+  v_sof4 = v_so4 * yse_em_whstypar-mulfac4.
+
+* v_sof6 = order lines(6 mth) * factor(6mth)
+  CLEAR v_sof6.
+  v_sof6 = v_so6 * yse_em_whstypar-mulfac6.
+
+
+ENDFORM.                    " get_order_lines_central

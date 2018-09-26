@@ -1,0 +1,171 @@
+*&---------------------------------------------------------------------*
+*& Report  RALM_ME_MEASP_FULL_DOWNLOAD_SD                              *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+
+REPORT  zralm_me_measp_full_downloadsd .
+
+* Pass all relevant measurement point keys to the
+* server-driven SyncBOs on the middleware
+* for an initial download.
+
+* Selection screen
+PARAMETERS p_full  TYPE char01 AS CHECKBOX.
+SELECTION-SCREEN SKIP.
+PARAMETERS p_rfcd  TYPE rfcdest . "DEFAULT 'MAM_MI'. " no need to default, increases the loop
+PARAMETERS p_mamver type ALM_ME_MAMVERSION. "MAM Version." 1034868
+PARAMETERS p_fdest AS CHECKBOX.
+SELECTION-SCREEN SKIP.
+PARAMETERS p_datum   TYPE sy-datum.
+SELECTION-SCREEN SKIP.
+PARAMETERS variant TYPE alm_me_c030prf-meas_sel_variant.
+
+* Data definition
+* Measurement list
+DATA: BEGIN OF ls_meas_list,
+  point TYPE imptt-point,
+END OF ls_meas_list.
+
+DATA lt_meas_list LIKE TABLE OF ls_meas_list.
+
+DATA lt_meas_full_list LIKE TABLE OF ls_meas_list.
+* Table for keys to pass to middleware
+DATA ls_meas_keys TYPE          alm_me_r3keys_sd.
+DATA lt_meas_keys TYPE TABLE OF alm_me_r3keys_sd.
+* Table for middleware systems to call
+DATA lt_rfchosts TYPE TABLE OF ALM_ME_DEST_SD.
+DATA ls_rfchost LIKE LINE OF lt_rfchosts.
+* General settings for master data
+DATA ls_master_data TYPE alm_me_c030prf.
+* Constants
+CONSTANTS gc_mam_041 TYPE char100 VALUE 'MAM_041'.
+CONSTANTS lc_action_update  TYPE msgfn VALUE '018'.
+CONSTANTS lc_action_delete  TYPE msgfn VALUE '003'.
+
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR variant.
+  CONSTANTS lc_mp_m_report  TYPE rsvar-report
+    VALUE 'RALM_ME_MEASURMENT_POINT_LIST'.
+  CONSTANTS lc_mp_dynnr     TYPE sy-dynnr
+    VALUE '1000'.
+
+  CALL FUNCTION 'RS_VARIANT_CATALOG'
+    EXPORTING
+      report      = lc_mp_m_report
+      dynnr       = lc_mp_dynnr
+    IMPORTING
+      sel_variant = variant
+    EXCEPTIONS
+      OTHERS      = 7.
+  IF sy-subrc NE 0.
+    CLEAR variant.
+  ENDIF.
+
+START-OF-SELECTION.
+* When a variant is given on the selection-screen, this variant
+* is used to do a (partial) update without change of customizing
+  IF NOT variant IS INITIAL.
+    MOVE variant TO ls_master_data-meas_sel_v_mass. "N1053984
+  ELSE.
+* Otherwise get the variant from MAM customizing
+    CALL FUNCTION 'ALM_ME_CMASTER_DATA_GETDETAIL'
+      IMPORTING
+        master_data_selection = ls_master_data
+      EXCEPTIONS
+        entry_not_found       = 1
+        OTHERS                = 2.
+    IF sy-subrc NE 0.
+* Directly show an error message if entry does not exist
+      MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+              WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+    ENDIF.
+  ENDIF.
+
+* Call the selection report
+  SUBMIT ralm_me_measurment_point_list
+    USING SELECTION-SET ls_master_data-meas_sel_v_mass  "N1053984
+    WITH p_datum EQ p_datum
+    WITH dy_selm EQ 'D'
+    AND RETURN.
+
+* Get the result from the report
+  IMPORT sel_tab TO lt_meas_list
+    FROM MEMORY ID 'RALM_ME_MEASURMENT_POINT_LIST'.
+
+  IF p_full NE space.
+* When full update is desired, also select all funclocs.
+    SUBMIT ralm_me_measurment_point_list
+      WITH p_datum EQ p_datum
+      WITH dy_selm EQ 'D'
+      AND RETURN.
+    IMPORT sel_tab TO lt_meas_full_list
+      FROM MEMORY ID 'RALM_ME_MEASURMENT_POINT_LIST'.
+
+    LOOP AT lt_meas_full_list INTO ls_meas_list.
+      MOVE ls_meas_list-point TO ls_meas_keys-r3key.
+* check the action
+* Table from report is read sorted from database
+      READ TABLE lt_meas_list
+        WITH KEY  point = ls_meas_list-point
+        BINARY SEARCH
+        TRANSPORTING NO FIELDS.
+      IF sy-subrc EQ 0.
+        MOVE lc_action_update TO ls_meas_keys-msgfn.
+      ELSE.
+* Not in customer selection
+        MOVE lc_action_delete TO ls_meas_keys-msgfn.
+      ENDIF.
+      APPEND ls_meas_keys TO lt_meas_keys.
+    ENDLOOP. "lt_meas_full_list
+
+  ELSE.
+    LOOP AT lt_meas_list INTO ls_meas_list.
+      MOVE ls_meas_list-point TO ls_meas_keys-r3key.
+      MOVE lc_action_update TO ls_meas_keys-msgfn.
+      APPEND ls_meas_keys TO lt_meas_keys.
+    ENDLOOP. "lt_meas_list
+  ENDIF. "p_full
+
+
+  IF p_fdest EQ space.
+* Get the RFC destination from the customizing
+    CALL FUNCTION 'ALM_ME_GET_SERVERDRIVEN_CUST'
+      TABLES
+        serverdriven = lt_rfchosts.
+  ENDIF.
+* Set the RFC destination from the selection screen
+  IF NOT p_rfcd IS INITIAL.
+    ls_rfchost-rfcdest = p_rfcd.
+    if NOT p_mamver is INITIAL.
+*     use the version provided by user
+      ls_rfchost-MAMVERSION = p_mamver.
+    endif.
+* when no version is provided then object type will be
+* version independent. do not expect version depebdet key entry in MEREP_DELTABO
+
+    APPEND ls_rfchost TO lt_rfchosts.
+  ENDIF.
+
+* Call the middleware system and pass all the keys
+
+*replace by Y function for allowing to take correct syncbo
+*  CALL FUNCTION 'ALM_ME_SERVER_DRIVEN_TRIGGER'
+  CALL FUNCTION 'YALM_ME_SERVER_DRIVEN_TRIGGER'
+    EXPORTING
+      objtyp       = gc_mam_041
+    TABLES
+      keys         = lt_meas_keys
+      destinations = lt_rfchosts.
+*          return       = return.
+
+* Execute the trigger (in background task)
+  CALL FUNCTION 'ALM_ME_UPDATE_DUMMY' IN UPDATE TASK.
+
+  COMMIT WORK.
+
+*Selection text£º
+*P_DATUM:        Changed/Created Since
+*P_FDEST:        Only Specified RFC Destination
+*P_FULL:        Full Update with Deletion
+*P_MAMVER:D       .
+*P_RFCD:D       .
+*VARIANT:D       .

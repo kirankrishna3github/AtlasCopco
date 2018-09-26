@@ -1,0 +1,1781 @@
+*----------------------------------------------------------------------*
+***INCLUDE YSE_OPCO2_F01 .
+*----------------------------------------------------------------------*
+* MOD-008 | 18/03/2014 | Shireesha          | CD1K981174  | CR3209     *
+*************************************************************************
+*&---------------------------------------------------------------------*
+*&      Form  EXTERNAL_WIP
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM external_wip .
+  PERFORM:   calc_period,
+             load_company_code_currency,
+             load_postings,
+             calc_wip,
+             get_seo,
+             fill_output.
+
+ENDFORM.                    " EXTERNAL_WIP
+*&---------------------------------------------------------------------*
+*&      Form  CALC_PERIOD
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM calc_period .
+  DATA:
+    lv_periv     LIKE t001-periv,         " Fiscal year variant
+    lv_period    LIKE t009b-poper.        " Posting period
+
+  SELECT SINGLE periv
+      INTO lv_periv
+      FROM t001
+     WHERE bukrs = p_bukrs.
+
+  CALL FUNCTION 'G_PERIOD_GET'
+    EXPORTING
+      company                        = p_bukrs
+      date                           = p_keydat
+      variant                        = lv_periv
+    IMPORTING
+      period                         = lv_period
+      year                           = gv_gjahr
+    EXCEPTIONS
+      ledger_not_assigned_to_company = 1
+      period_not_defined             = 2
+      variant_not_defined            = 3
+      OTHERS                         = 4.
+
+  IF sy-subrc <> 0.
+*   MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*           WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+  ELSE.
+    gv_monat = lv_period.
+  ENDIF.
+ENDFORM.                    " CALC_PERIOD
+*&---------------------------------------------------------------------*
+*&      Form  LOAD_COMPANY_CODE_CURRENCY
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM load_company_code_currency .
+  SELECT SINGLE waers
+       INTO gv_waers
+       FROM t001
+      WHERE bukrs EQ p_bukrs.
+ENDFORM.                    " LOAD_COMPANY_CODE_CURRENCY
+*&---------------------------------------------------------------------*
+*&      Form  LOAD_POSTINGS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM load_postings .
+
+  DATA: lv_kmntend TYPE dats.
+
+* Calculate end of keydate's month
+  lv_kmntend = p_keydat.
+  lv_kmntend+4(2) = lv_kmntend+4(2) + 1.    " add 1 month
+  lv_kmntend = lv_kmntend - 1.              " substract 1 day
+
+* Select all WIP entries
+  SELECT belnr buzei bukrs hkont zuonr gjahr
+         "bldat"CR2924--
+         budat                                              "CR2924++
+         waers
+         shkzg
+         dmbtr
+         INTO TABLE gt_bsis
+         FROM bsis               " -> Postings table
+         WHERE   bukrs EQ p_bukrs             " Company Code
+           AND   hkont IN so_hkont            " General Ledger Account
+           AND   budat LE p_keydat.           " Posting date >= key date  " MOD-004
+*       AND ZUONR IN SO_ZUONR.
+
+  SELECT belnr buzei bukrs hkont zuonr gjahr
+         "bldat"CR2924--
+         budat                                              "CR2924++
+         waers
+         shkzg
+         dmbtr
+         APPENDING TABLE gt_bsis
+         FROM bsas               " -> Postings table
+         WHERE bukrs EQ p_bukrs             " Company Code
+           AND hkont IN so_hkont            " General Ledger Account
+*       AND   ZUONR EQ GT_BSIS-ZUONR.
+           AND budat LE p_keydat               " Posting date <= Key date
+           AND augdt GT p_keydat.              " Clearing date > key date
+
+  SORT gt_bsis BY belnr buzei.
+ENDFORM.                    " LOAD_POSTINGS
+*&---------------------------------------------------------------------*
+*&      Form  CALC_WIP
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM calc_wip .
+
+  FIELD-SYMBOLS: <fs_clearing> TYPE gty_bsis.
+
+  LOOP AT gt_bsis ASSIGNING <fs_bsis> WHERE shkzg = 'S'.  "Loop at all the debit items
+    LOOP AT gt_bsis ASSIGNING <fs_clearing> "Try to find a credit item
+      WHERE bukrs EQ <fs_bsis>-bukrs  "Same company code
+        AND hkont EQ <fs_bsis>-hkont  "Same account
+        AND zuonr EQ <fs_bsis>-zuonr  "Same assignment
+        AND waers EQ <fs_bsis>-waers  "Same currency
+        AND dmbtr EQ <fs_bsis>-dmbtr  "Same amount
+* begin of insert air21099 18/12/2008
+*        AND bldat EQ <fs_bsis>-bldat  "Same document date
+* end of insert air21099 18/12/2008
+        AND budat EQ <fs_bsis>-budat  "Same document date
+        AND shkzg EQ 'H'.         "And credit
+      "If an entry was found we can delete both items from the table
+      DELETE gt_bsis WHERE belnr = <fs_bsis>-belnr AND buzei = <fs_bsis>-buzei.
+      DELETE gt_bsis WHERE belnr = <fs_clearing>-belnr AND buzei = <fs_clearing>-buzei.
+      EXIT. "This clearing is processed so continue with the next amount
+    ENDLOOP.  "Try to find a credit item
+  ENDLOOP.  "Loop at all the debit items
+
+  LOOP AT gt_bsis ASSIGNING <fs_bsis> WHERE shkzg = 'H'.
+    MULTIPLY <fs_bsis>-dmbtr BY -1.
+  ENDLOOP.
+
+ENDFORM.                    " CALC_WIP
+*&---------------------------------------------------------------------*
+*&      Form  INTERNAL_WIP
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM internal_wip .
+
+* First select all relevant service orders
+  CLEAR: gt_aufnrs[], gt_mvke[], gt_pmsdo[].
+
+  SELECT aufk~objnr aufk~aufnr aufk~bukrs aufk~vaplz
+         afih~iwerk afih~equnr afih~serialnr afih~sermat
+         aufk~kdauf aufk~kdpos
+          FROM aufk
+          INNER JOIN afih
+          ON aufk~aufnr = afih~aufnr
+          INTO TABLE gt_aufnrs
+          WHERE aufk~bukrs EQ p_bukrs
+            AND aufk~phas3 = ' '
+            AND aufk~loekz = ' '                            "MOD-003
+            AND afih~iwerk IN so_iwerk
+*            AND AUFK~AUFNR IN SO_AUFNR
+*            AND AUFK~VAPLZ EQ p_wc
+*            AND aufk~vaplz IN so_wc
+          ORDER BY aufk~aufnr.
+
+* Next get details
+  PERFORM seo_details.
+
+  IF NOT gt_aufnrs[] IS INITIAL.
+    SORT gt_aufnrs BY bukrs aufnr.
+    PERFORM get_int_wip.
+  ENDIF.
+*  ENDIF.
+ENDFORM.                    " INTERNAL_WIP
+*&---------------------------------------------------------------------*
+*&      Form  GET_INT_WIP
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM get_int_wip .
+  DATA:wa_bkpf LIKE LINE OF gt_bkpf.
+  gr_wrttp-sign = 'I'.
+  gr_wrttp-option = 'EQ'.
+  gr_wrttp-low = '04'.
+  APPEND gr_wrttp.
+  gr_wrttp-low = '11'.
+  APPEND gr_wrttp.
+
+
+  SELECT covp~kokrs
+         covp~belnr
+         covp~buzei
+         covp~objnr
+         covp~bukrs
+         covp~kstar
+         covp~hrkft
+*        covp~bldat"++CR2924
+         covp~budat                                         "++CR2924
+         covp~wtgbtr
+         covp~twaer
+         covp~perio
+         covp~gjahr
+         cokey~bemot
+         FROM covp INNER JOIN cokey
+         ON covp~hrkft = cokey~hrkft
+         INTO TABLE gt_coep
+         FOR ALL ENTRIES IN gt_aufnrs
+         WHERE lednr = '00'
+*        and covp~bukrs = gt_aufnrs-bukrs
+         AND covp~objnr = gt_aufnrs-objnr
+         AND covp~versn = '000'
+         AND covp~wrttp IN gr_wrttp
+         AND covp~kstar IN so_kstar
+         AND covp~budat LE p_keydat
+*        and covp~budat ge p_keydat
+*        and budat between '20000101' and '20071130'
+         AND cokey~bemot NE '1E'.
+
+  SORT gt_coep BY objnr bemot kstar.
+
+  DATA: lv_old_objnr TYPE j_objnr,
+        lv_old_bemot TYPE bemot,
+        lv_old_kstar TYPE kstar.
+  DATA: gt_coep_tmp TYPE gtty_coep.
+  SORT gt_arbpl BY equnr.
+* Begin of Insert MOD-008++
+  TYPES:BEGIN OF ty_tbmotx,
+        spras TYPE spras,
+        bemot TYPE bemot,
+        bemot_txt TYPE bemot_txt,
+        END OF ty_tbmotx.
+  DATA:lt_tbmotx TYPE STANDARD TABLE OF ty_tbmotx,
+       ls_tbmotx TYPE ty_tbmotx,
+       c_e TYPE char1 VALUE 'E'.
+*Begin of changes ++CR2924
+  LOOP AT gt_coep ASSIGNING <fs_coep>.
+    CLEAR: <fs_coep>-belnr,<fs_coep>-buzei,<fs_coep>-hrkft.
+    COLLECT <fs_coep> INTO gt_coep_tmp.
+  ENDLOOP.
+  REFRESH:gt_coep.
+  gt_coep[] = gt_coep_tmp[].
+  REFRESH:gt_coep_tmp.
+  DELETE gt_coep WHERE wtgbtr = '0.00'.
+*End of changes ++CR2924
+* Begin of Insert MOD-008++
+  IF NOT gt_coep[] IS INITIAL.
+    SELECT spras
+           bemot
+           bemot_txt
+           FROM tbmotx
+           INTO TABLE lt_tbmotx
+           FOR ALL ENTRIES IN gt_coep
+           WHERE spras EQ c_e
+           AND   bemot EQ gt_coep-bemot.
+  ENDIF.
+* End of Insert MOD-008++
+*For found service orders, get detail data
+  LOOP AT gt_coep ASSIGNING <fs_coep>.
+    READ TABLE gt_aufnrs ASSIGNING <fs_aufnrs>
+      WITH KEY objnr = <fs_coep>-objnr.
+    IF sy-subrc = 0.  "EXTUVE Incident 7463
+*** MOD-003 * begin **
+*      READ TABLE gt_pmsdo ASSIGNING <fs_pmsdo>
+*          WITH KEY objnr = <fs_aufnrs>-objnr
+*          BINARY SEARCH.
+*      IF sy-subrc EQ 0.
+*        MOVE: <fs_pmsdo>-vkorg TO <fs_aufnrs>-vkorg,
+*              <fs_pmsdo>-vtweg TO <fs_aufnrs>-vtweg,
+*              <fs_pmsdo>-spart TO <fs_aufnrs>-spart,
+*              <fs_pmsdo>-servp TO <fs_aufnrs>-servp.
+** begin of insertion MOD-002
+*        MOVE: <fs_pmsdo>-vkbur TO <fs_aufnrs>-vkbur,
+*              <fs_pmsdo>-vkgrp TO <fs_aufnrs>-vkgrp.
+** end of insertion MOD-002
+*      ELSE.
+*        DELETE gt_aufnrs WHERE objnr = <fs_aufnrs>-objnr.
+*        CONTINUE.
+*      ENDIF.
+*** MOD-003 * end **
+
+      CLEAR gs_output.                                      "MOD-003
+      MOVE-CORRESPONDING <fs_coep> TO gs_output-coep.
+
+      MOVE: <fs_aufnrs>-aufnr TO gs_output-aufnr,
+            <fs_aufnrs>-vkorg TO gs_output-vkorg,
+            <fs_aufnrs>-vtweg TO gs_output-vtweg,
+            <fs_aufnrs>-spart TO gs_output-spart,
+            <fs_aufnrs>-iwerk TO gs_output-iwerk,
+            <fs_aufnrs>-equnr TO gs_output-equnr,
+            <fs_aufnrs>-serialnr TO gs_output-sernr,
+            <fs_aufnrs>-sermat TO gs_output-matnr,
+            <fs_aufnrs>-kdauf TO gs_output-kdauf,
+            <fs_aufnrs>-kdpos TO gs_output-kdpos,
+            <fs_aufnrs>-servp TO gs_output-servp,
+            <fs_aufnrs>-vaplz TO gs_output-vaplz.           "MOD-004
+* begin of insertion MOD-002
+      MOVE: <fs_aufnrs>-vkbur TO gs_output-vkbur,
+            <fs_aufnrs>-vkgrp TO gs_output-vkgrp.
+* end of insertion MOD-002
+
+*** MOD-003 * begin ***
+      PERFORM calculate_aging USING <fs_coep>-budat
+                                    <fs_coep>-wtgbtr
+                                    gs_output-rast1
+                                    gs_output-rast2
+                                    gs_output-rast3
+                                    gs_output-rast4
+                                    gs_output-rast5.
+      CLEAR gs_output-coep-wtgbtr.
+*** MOD-003 * end ***
+
+      IF gs_output-vaplz IS INITIAL.                        "MOD-004
+        READ TABLE gt_arbpl ASSIGNING <fs_arbpl>
+          WITH KEY equnr = gs_output-equnr
+          BINARY SEARCH.
+        IF sy-subrc EQ 0.
+          MOVE <fs_arbpl>-arbpl TO gs_output-vaplz.
+        ENDIF.
+      ENDIF.                                                "MOD-004
+
+      READ TABLE gt_mvke ASSIGNING <fs_mvke>
+        WITH KEY matnr = <fs_aufnrs>-sermat
+                 vkorg = <fs_aufnrs>-vkorg
+                 vtweg = <fs_aufnrs>-vtweg.
+
+      IF sy-subrc EQ 0.
+        MOVE: <fs_mvke>-prodh       TO gs_output-prodh,
+              <fs_mvke>-prodh(4)    TO gs_output-gac,
+              <fs_mvke>-prodh+4(4)  TO gs_output-pgc.
+      ENDIF.
+* Begin of Insert MOD-008++
+      READ TABLE lt_tbmotx INTO ls_tbmotx
+               WITH KEY bemot = <fs_coep>-bemot.
+      IF sy-subrc = 0.
+        MOVE ls_tbmotx-bemot_txt TO gs_output-bemot_txt.
+      ENDIF.
+* End of Insert MOD-008++
+
+*Begin of --CR2924
+*      IF lv_old_objnr = <fs_coep>-objnr
+*       AND lv_old_bemot = <fs_coep>-bemot
+*       AND lv_old_kstar = <fs_coep>-kstar.
+*        READ TABLE gt_output ASSIGNING <fs_output>
+*          WITH KEY coep-objnr = <fs_coep>-objnr
+*                   coep-bemot = <fs_coep>-bemot
+*                   coep-kstar = <fs_coep>-kstar.
+*
+*        IF sy-subrc EQ 0.
+**** MOD-003 * begin ***
+**          ADD gs_output-coep-wtgbtr TO <fs_output>-coep-wtgbtr.
+*          ADD gs_output-rast1 TO <fs_output>-rast1.
+*          ADD gs_output-rast2 TO <fs_output>-rast2.
+*          ADD gs_output-rast3 TO <fs_output>-rast3.
+*          ADD gs_output-rast4 TO <fs_output>-rast4.
+*          ADD gs_output-rast5 TO <fs_output>-rast5.
+**** MOD-003 * end ***
+*        ENDIF.
+*      ELSE.
+*End of --CR2924
+*      """"""""""""""""""""""""""""
+*      IF P_BEMOT EQ '='.  "If financial wip we need to check if the found fin wip amount
+*        " is the same as the actual costs, if not we display the found fin wip
+*        READ TABLE GT_SDI ASSIGNING <FS_SDI>
+*          WITH KEY KDAUF = <FS_AUFNRS>-KDAUF
+*                   KDPOS = <FS_AUFNRS>-KDPOS
+*                   BINARY SEARCH.
+*        IF SY-SUBRC EQ 0.
+*          READ TABLE GT_WIP ASSIGNING <FS_WIP>
+*            WITH KEY OBJNR = <FS_SDI>-OBJNR.
+*          IF SY-SUBRC EQ 0 AND ( GS_OUTPUT-COEP-WTGBTR <> <FS_WIP>-WOG ).
+*            MOVE <FS_WIP>-WOG TO GS_OUTPUT-COEP-WTGBTR.
+*            GS_OUTPUT-COEP-WTGBTR = GS_OUTPUT-COEP-WTGBTR * -1.
+*          ENDIF.
+*        ENDIF.
+*      ENDIF.
+*      """"""""""""""""""""""""""""""""
+*Begin of --CR2924
+*      MOVE: <fs_coep>-objnr TO lv_old_objnr,
+*            <fs_coep>-bemot TO lv_old_bemot,
+*            <fs_coep>-kstar TO lv_old_kstar.
+*End of --CR2924
+      APPEND gs_output TO gt_output.
+*      ENDIF.
+    ENDIF.
+
+  ENDLOOP.
+
+ENDFORM.                    " GET_INT_WIP
+*&---------------------------------------------------------------------*
+*&      Form  SEO_DETAILS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM seo_details .
+  DATA: lt_aufmat TYPE gtty_aufnrs.
+
+  IF NOT gt_aufnrs[] IS INITIAL.
+
+    lt_aufmat[] = gt_aufnrs.
+    DELETE ADJACENT DUPLICATES FROM lt_aufmat COMPARING sermat vkorg vtweg.
+
+***Get the prodh for all SEO's
+* begin of change MOD-002
+*    SELECT OBJNR VKORG VTWEG SPART MATNR FROM PMSDO
+    SELECT objnr vkorg vtweg spart matnr vkgrp vkbur FROM pmsdo
+* end of change MOD-002
+         INTO TABLE gt_pmsdo
+         FOR ALL ENTRIES IN gt_aufnrs
+         WHERE objnr = gt_aufnrs-objnr
+           AND vkorg IN so_vkorg
+* begin of insertion MOD-002
+           AND vkgrp IN so_vkgrp
+           AND vkbur IN so_vkbur.
+* end of insertion MOD-002
+*        AND VTWEG IN SO_VTWEG
+*        AND SPART IN SO_SPART.
+    SORT gt_pmsdo BY objnr.
+
+    LOOP AT gt_aufnrs ASSIGNING <fs_aufnrs>.
+      READ TABLE gt_pmsdo ASSIGNING <fs_pmsdo>
+        WITH KEY objnr = <fs_aufnrs>-objnr
+        BINARY SEARCH.
+      IF sy-subrc EQ 0.
+        MOVE: <fs_pmsdo>-vkorg TO <fs_aufnrs>-vkorg,
+              <fs_pmsdo>-vtweg TO <fs_aufnrs>-vtweg,
+              <fs_pmsdo>-spart TO <fs_aufnrs>-spart,
+              <fs_pmsdo>-servp TO <fs_aufnrs>-servp.
+* begin of insertion MOD-002
+        MOVE: <fs_pmsdo>-vkbur TO <fs_aufnrs>-vkbur,
+              <fs_pmsdo>-vkgrp TO <fs_aufnrs>-vkgrp.
+* end of insertion MOD-002
+      ELSE.
+        DELETE gt_aufnrs WHERE objnr = <fs_aufnrs>-objnr.
+        CONTINUE.
+      ENDIF.
+*** MOD-003 * begin **
+*     Check status 'Closed'
+      CALL FUNCTION 'STATUS_CHECK'
+        EXPORTING
+          objnr             = <fs_aufnrs>-objnr
+          status            = 'I0046'
+        EXCEPTIONS
+          object_not_found  = 1
+          status_not_active = 2
+          OTHERS            = 3.
+      IF sy-subrc EQ 0.
+        DELETE gt_aufnrs WHERE objnr = <fs_aufnrs>-objnr.
+        CONTINUE.
+      ENDIF.
+*** MOD-003 * end **
+    ENDLOOP.
+
+    SELECT matnr vkorg vtweg prodh
+     FROM mvke
+     INTO TABLE gt_mvke
+     FOR ALL ENTRIES IN gt_aufnrs
+     WHERE matnr = gt_aufnrs-sermat
+       AND vkorg = gt_aufnrs-vkorg
+       AND vtweg = gt_aufnrs-vtweg.
+
+    MOVE gt_aufnrs[] TO gt_equnrs[].
+
+    DELETE ADJACENT DUPLICATES FROM gt_equnrs COMPARING equnr.
+
+    SELECT equz~equnr
+           crhd~arbpl
+      FROM equz INNER JOIN crhd
+      ON equz~gewrk = crhd~objid
+      AND equz~pm_objty = crhd~objty
+      INTO TABLE gt_arbpl
+      FOR ALL ENTRIES IN gt_equnrs
+      WHERE equz~equnr = gt_equnrs-equnr
+       AND equz~datbi > sy-datum.
+
+  ENDIF.
+
+ENDFORM.                    " SEO_DETAILS
+*&---------------------------------------------------------------------*
+*&      Form  GET_SEO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM get_seo .
+
+  FIELD-SYMBOLS: <fs_multi> TYPE gty_bsis.
+
+*Move all sdi's to internal table to select seo's
+  LOOP AT gt_bsis ASSIGNING <fs_bsis>.
+    SPLIT <fs_bsis>-zuonr AT '/' INTO gs_sdi-kdauf gs_sdi-kdpos.
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+      EXPORTING
+        input  = gs_sdi-kdauf
+      IMPORTING
+        output = gs_sdi-kdauf.
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+      EXPORTING
+        input  = gs_sdi-kdpos
+      IMPORTING
+        output = gs_sdi-kdpos.
+
+    MOVE: <fs_bsis>-hkont TO gs_sdi-hkont,
+          <fs_bsis>-gjahr TO gs_sdi-gjahr,
+*          <fs_bsis>-bldat TO gs_sdi-bldat,"CR2924--
+          <fs_bsis>-budat TO gs_sdi-budat,                  "CR2924++
+          <fs_bsis>-waers TO gs_sdi-waers,
+          <fs_bsis>-shkzg TO gs_sdi-shkzg,
+          <fs_bsis>-dmbtr TO gs_sdi-dmbtr,
+          <fs_bsis>-bukrs TO gs_sdi-bukrs,
+          <fs_bsis>-waers TO gs_sdi-waers.
+*    "First check if multiple entries for the same sdi/cost cat exist
+    LOOP AT gt_bsis ASSIGNING <fs_multi>
+      WHERE zuonr = <fs_bsis>-zuonr
+        AND hkont = <fs_bsis>-hkont
+* begin of insert air21099 2008/12/17
+*        AND bldat = <fs_bsis>-bldat
+* end of insert air21099 2008/12/17
+        AND budat = <fs_bsis>-budat                         "CR2924++
+        AND belnr <> <fs_bsis>-belnr.
+      ADD <fs_multi>-dmbtr TO gs_sdi-dmbtr.
+      DELETE gt_bsis WHERE belnr EQ <fs_multi>-belnr AND buzei EQ <fs_multi>-buzei.
+    ENDLOOP.
+    APPEND gs_sdi TO gt_sdi.
+  ENDLOOP.
+
+
+  DELETE ADJACENT DUPLICATES FROM gt_sdi.
+*First select all relevant service orders
+
+  SELECT aufk~objnr aufk~aufnr aufk~bukrs aufk~vaplz
+         afih~iwerk afih~equnr afih~serialnr afih~sermat aufk~kdauf aufk~kdpos
+          FROM aufk
+          INNER JOIN afih
+          ON aufk~aufnr = afih~aufnr
+          INNER JOIN afko
+          ON aufk~aufnr = afko~aufnr
+          INTO TABLE gt_aufnrs
+          FOR ALL ENTRIES IN gt_sdi
+          WHERE aufk~kdauf EQ gt_sdi-kdauf
+            AND aufk~kdpos EQ gt_sdi-kdpos
+            AND afko~maufnr = ' '
+            AND afih~iwerk IN so_iwerk
+            AND aufk~phas3 = ' '              "EXTUVE Incident 7463
+            AND aufk~loekz = ' '.                           "MOD-003
+*            AND AUFK~AUFNR IN SO_AUFNR
+*           ORDER BY AUFK~AUFNR.              "EXTUVE Incident 7463
+
+  IF sy-subrc EQ 0.
+* begin of insert air21099 2008/12/11
+    SORT gt_aufnrs BY kdauf kdpos.
+    DELETE ADJACENT DUPLICATES FROM gt_aufnrs COMPARING kdauf kdpos.
+* end of insert air21099 2008/12/11
+    SORT gt_aufnrs BY aufnr.
+    PERFORM seo_details.
+  ENDIF.
+
+ENDFORM.                    " GET_SEO
+
+*&---------------------------------------------------------------------*
+*&      Form  FILL_OUTPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM fill_output .
+
+  SORT gt_arbpl BY equnr.
+* Begin of Insert MOD-008++
+  constants: c_external TYPE char8 value 'External'.
+* End of Insert MOD-008++
+
+  LOOP AT gt_aufnrs ASSIGNING <fs_aufnrs>.
+
+*** MOD-003 * begin ***
+*    READ TABLE gt_pmsdo ASSIGNING <fs_pmsdo>
+*        WITH KEY objnr = <fs_aufnrs>-objnr
+*        BINARY SEARCH.
+*    IF sy-subrc EQ 0.
+*      MOVE: <fs_pmsdo>-vkorg TO <fs_aufnrs>-vkorg,
+*            <fs_pmsdo>-vtweg TO <fs_aufnrs>-vtweg,
+*            <fs_pmsdo>-spart TO <fs_aufnrs>-spart,
+*            <fs_pmsdo>-servp TO <fs_aufnrs>-servp.
+** begin of insertion MOD-002
+*      MOVE: <fs_pmsdo>-vkbur TO <fs_aufnrs>-vkbur,
+*            <fs_pmsdo>-vkgrp TO <fs_aufnrs>-vkgrp.
+** end of insertion MOD-002
+*    ELSE.
+*      DELETE gt_aufnrs WHERE objnr = <fs_aufnrs>-objnr.
+*      CONTINUE.
+*    ENDIF.
+*** MOD-003 * begin ***
+
+    CLEAR gs_output.                                        "MOD-003
+
+    MOVE: <fs_aufnrs>-aufnr TO gs_output-aufnr,
+          <fs_aufnrs>-vkorg TO gs_output-vkorg,
+          <fs_aufnrs>-vtweg TO gs_output-vtweg,
+          <fs_aufnrs>-spart TO gs_output-spart,
+          <fs_aufnrs>-iwerk TO gs_output-iwerk,
+          <fs_aufnrs>-equnr TO gs_output-equnr,
+          <fs_aufnrs>-serialnr TO gs_output-sernr,
+          <fs_aufnrs>-sermat TO gs_output-matnr,
+          <fs_aufnrs>-kdauf TO gs_output-kdauf,
+          <fs_aufnrs>-kdpos TO gs_output-kdpos,
+          <fs_aufnrs>-servp TO gs_output-servp.
+* begin of insertion MOD-002
+    MOVE: <fs_aufnrs>-vkbur TO gs_output-vkbur,
+          <fs_aufnrs>-vkgrp TO gs_output-vkgrp,
+* end of insertion MOD-002
+          <fs_aufnrs>-vaplz TO gs_output-vaplz.             "MOD-004
+
+    IF gs_output-vaplz IS INITIAL.                          "MOD-004
+      READ TABLE gt_arbpl ASSIGNING <fs_arbpl>
+        WITH KEY equnr = gs_output-equnr
+        BINARY SEARCH.
+      IF sy-subrc EQ 0.
+        MOVE <fs_arbpl>-arbpl TO gs_output-vaplz.
+      ENDIF.
+    ENDIF.                                                  "MOD-004
+
+    READ TABLE gt_mvke ASSIGNING <fs_mvke>
+      WITH KEY matnr = <fs_aufnrs>-sermat
+               vkorg = <fs_aufnrs>-vkorg
+               vtweg = <fs_aufnrs>-vtweg.
+
+    IF sy-subrc EQ 0.
+      MOVE: <fs_mvke>-prodh       TO gs_output-prodh,
+            <fs_mvke>-prodh(4)    TO gs_output-gac,
+            <fs_mvke>-prodh+4(4)  TO gs_output-pgc.
+    ENDIF.
+
+    LOOP AT gt_sdi ASSIGNING <fs_sdi>
+      WHERE kdauf EQ <fs_aufnrs>-kdauf
+        AND kdpos EQ <fs_aufnrs>-kdpos.
+
+      MOVE: <fs_sdi>-bukrs TO gs_output-coep-bukrs,
+            <fs_sdi>-budat TO gs_output-coep-budat,
+            <fs_sdi>-dmbtr TO gs_output-coep-wtgbtr,
+            <fs_sdi>-gjahr TO gs_output-coep-gjahr,
+            <fs_sdi>-waers TO gs_output-coep-twaer,
+            '1E'           TO gs_output-coep-bemot,
+* Begin of Insert MOD-008++
+            c_external     TO gs_output-bemot_txt.
+* End of Insert MOD-008++
+*** MOD-003 * begin ***
+      MOVE sy-datum        TO gs_output-erdat.
+      PERFORM calculate_aging USING <fs_sdi>-budat
+                                    <fs_sdi>-dmbtr
+                                    gs_output-rast1
+                                    gs_output-rast2
+                                    gs_output-rast3
+                                    gs_output-rast4
+                                    gs_output-rast5.
+      CLEAR gs_output-coep-wtgbtr.
+*** MOD-003 * end ***
+
+      CASE <fs_sdi>-hkont.
+        WHEN '0001441901'.
+          gs_output-coep-kstar = '0009971001'.
+        WHEN '0001441902'.
+          gs_output-coep-kstar = '0004210901'.
+        WHEN '0001441903'.
+          gs_output-coep-kstar = '0009971005'.
+        WHEN OTHERS.
+          "nothing
+      ENDCASE.
+
+      PERFORM get_period.
+      APPEND gs_output TO gt_output.
+
+****** Begin of MOD-005 ******
+      CLEAR : gs_output-rast1,
+              gs_output-rast2,
+              gs_output-rast3,
+              gs_output-rast4,
+              gs_output-rast5.
+****** End of MOD-005 ******
+
+    ENDLOOP.
+
+  ENDLOOP.
+
+ENDFORM.                    " FILL_OUTPUT
+
+*&---------------------------------------------------------------------*
+*&      Form  CALCULATE_AGING                     "MOD-003
+*&---------------------------------------------------------------------*
+FORM calculate_aging  USING    p_bldat
+                               p_wtgbtr
+                               p_rast1
+                               p_rast2
+                               p_rast3
+                               p_rast4
+                               p_rast5.
+
+  DATA: lv_days_overdue  TYPE i.
+
+  lv_days_overdue = p_keydat - p_bldat.
+
+* Insert amounts in correct interval
+  IF lv_days_overdue <= gv_last_2.
+    p_rast2 = p_wtgbtr.
+  ELSEIF lv_days_overdue <= gv_last_3.
+    p_rast3 = p_wtgbtr.
+  ELSEIF lv_days_overdue <= gv_last_4.
+    p_rast4 = p_wtgbtr.
+  ELSE.
+    p_rast5 = p_wtgbtr.
+  ENDIF.
+
+ENDFORM.                    " CALCULATE_AGING
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_DUE_DATES
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM get_due_dates .
+  SEARCH rastbis2 FOR '-'.
+  MOVE rastbis2+sy-fdpos TO gv_last_2.
+
+  SEARCH rastbis3 FOR '-'.
+  MOVE rastbis3+sy-fdpos TO gv_last_3.
+
+  SEARCH rastbis4 FOR '-'.
+  MOVE rastbis4+sy-fdpos TO gv_last_4.
+ENDFORM.                    " GET_DUE_DATES
+*&---------------------------------------------------------------------*
+*&      Form  ADD_DESCR
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM add_descr .
+  DATA: lt_kstar TYPE STANDARD TABLE OF gty_kstar.
+  FIELD-SYMBOLS: <fs_kstar> TYPE gty_kstar.
+
+  DATA: lt_sp TYPE gtty_output.
+* begin of insertion MOD-002
+  DATA : gv_bezei TYPE bezei20,
+         gv_objnr TYPE j_objnr,
+         gv_parnr TYPE i_parnr,
+         gv_name1 TYPE name1.
+* end of insertion MOD-002
+  TYPES: BEGIN OF lty_sp_descr,
+          matnr TYPE matnr,
+          maktx TYPE maktx,
+         END OF lty_sp_descr,
+
+         BEGIN OF lty_sp_matkl,
+           matnr TYPE matnr,
+           matkl TYPE matkl,
+         END OF lty_sp_matkl,
+
+         BEGIN OF lty_sp_mvke,
+           matnr TYPE matnr,
+           vkorg TYPE vkorg,
+           vtweg TYPE vtweg,
+           prodh TYPE prodh_d,
+         END OF lty_sp_mvke.
+
+
+  DATA: lt_sp_descr TYPE STANDARD TABLE OF lty_sp_descr,
+        lt_sp_matkl TYPE STANDARD TABLE OF lty_sp_matkl,
+        lt_sp_mvke  TYPE STANDARD TABLE OF lty_sp_mvke.
+
+  FIELD-SYMBOLS: <fs_sp_descr> TYPE lty_sp_descr,
+                 <fs_sp_matkl> TYPE lty_sp_matkl,
+                 <fs_sp_mvke>  TYPE lty_sp_mvke.
+
+  SELECT kstar ktext
+    FROM csku
+    INTO TABLE lt_kstar
+    WHERE spras = 'EN'
+      AND ktopl = 'SCOA'
+      AND kstar IN so_kstar.
+
+*Also add SP description
+*First select description for all sp in output
+  MOVE gt_output[] TO lt_sp[].
+
+  DELETE ADJACENT DUPLICATES FROM lt_sp[] COMPARING servp.
+
+  SELECT matnr maktx FROM makt
+    INTO TABLE lt_sp_descr
+    FOR ALL ENTRIES IN lt_sp
+    WHERE matnr = lt_sp-servp
+      AND spras = 'E'.
+
+  SORT lt_sp_descr BY matnr.
+
+*Also get the material group of the sp
+  SELECT matnr matkl FROM mara
+    INTO TABLE lt_sp_matkl
+    FOR ALL ENTRIES IN lt_sp
+    WHERE matnr = lt_sp-servp.
+
+*Get prodh for gac and pgc of sp
+  SELECT matnr vkorg vtweg prodh
+    FROM mvke
+    INTO TABLE lt_sp_mvke
+    FOR ALL ENTRIES IN gt_output
+    WHERE matnr = gt_output-servp
+      AND vkorg = gt_output-vkorg
+      AND vtweg = gt_output-vtweg.
+
+  SORT: lt_sp_descr[] BY matnr,
+        lt_sp_matkl[] BY matnr,
+        lt_sp_mvke[] BY matnr vkorg vtweg.
+
+  LOOP AT gt_output ASSIGNING <fs_output>.
+
+*** MOD-003 * begin ***
+    <fs_output>-rasts = <fs_output>-rast1 +
+                        <fs_output>-rast2 +
+                        <fs_output>-rast3 +
+                        <fs_output>-rast4 +
+                        <fs_output>-rast5.
+*** MOD-003 * end ***
+
+    READ TABLE lt_kstar
+      ASSIGNING <fs_kstar>
+      WITH KEY kstar = <fs_output>-coep-kstar.
+* begin of inserton MOD-002
+    IF sy-subrc = 0.
+* end of insertion MOD-002
+      MOVE: <fs_kstar>-ktext TO <fs_output>-ktext.
+* begin of insertion MOD-002
+    ENDIF.
+* end of insertion MOD-002
+
+    READ TABLE lt_sp_descr
+      ASSIGNING <fs_sp_descr>
+      WITH KEY matnr = <fs_output>-servp
+       BINARY SEARCH.
+* begin of inserton MOD-002
+    IF sy-subrc = 0.
+* end of insertion MOD-002
+      MOVE: <fs_sp_descr>-maktx TO <fs_output>-maktx.
+* begin of insertion MOD-002
+    ENDIF.
+* end of insertion MOD-002
+
+    READ TABLE lt_sp_matkl
+      ASSIGNING <fs_sp_matkl>
+      WITH KEY matnr = <fs_output>-servp
+       BINARY SEARCH.
+* begin of inserton MOD-002
+    IF sy-subrc = 0.
+* end of insertion MOD-002
+      MOVE <fs_sp_matkl>-matkl TO <fs_output>-matkl.
+* begin of insertion MOD-002
+    ENDIF.
+* end of insertion MOD-002
+
+    READ TABLE lt_sp_mvke
+      ASSIGNING <fs_sp_mvke>
+      WITH KEY matnr = <fs_output>-servp
+               vkorg = <fs_output>-vkorg
+               vtweg = <fs_output>-vtweg
+        BINARY SEARCH.
+* begin of inserton MOD-002
+    IF sy-subrc = 0.
+* end of insertion MOD-002
+      MOVE: <fs_sp_mvke>-prodh(4) TO <fs_output>-sp_gac,
+            <fs_sp_mvke>-prodh+4(4) TO <fs_output>-sp_pgc.
+* begin of insertion MOD-002
+    ENDIF.
+* to fill sales office / sales group
+    CLEAR gv_bezei.
+    SELECT SINGLE bezei INTO gv_bezei
+      FROM tvkbt WHERE vkbur = <fs_output>-vkbur.
+    IF sy-subrc = 0.
+      MOVE gv_bezei TO <fs_output>-vkburd.
+    ENDIF.
+    CLEAR gv_bezei.
+    SELECT SINGLE bezei INTO gv_bezei
+    FROM tvgrt WHERE vkgrp = <fs_output>-vkgrp.
+    IF sy-subrc = 0.
+      MOVE gv_bezei TO <fs_output>-vkgrpd.
+    ENDIF.
+* to fill sold-to
+    IF NOT <fs_output>-aufnr IS INITIAL.
+      CONCATENATE 'OR' <fs_output>-aufnr INTO gv_objnr.
+      SELECT SINGLE parnr INTO gv_parnr FROM ihpa
+        WHERE objnr = gv_objnr
+          AND parvw = 'AG'.
+      IF sy-subrc = 0.
+        MOVE gv_parnr TO <fs_output>-soldtonr.
+        SELECT SINGLE name1 INTO gv_name1
+          FROM kna1 WHERE kunnr = gv_parnr.
+        IF sy-subrc = 0.
+          MOVE gv_name1 TO <fs_output>-soldtoname.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+* end of insertion MOD-002
+
+  ENDLOOP.
+ENDFORM.                    " ADD_DESCR
+*&---------------------------------------------------------------------*
+*&      Form  CALC_DUE_ITEMS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM calc_due_items .
+  DATA: lv_days_overdue  TYPE i.
+
+
+  LOOP AT gt_output ASSIGNING <fs_output>.
+    <fs_output>-erdat = sy-datum.
+    lv_days_overdue = p_keydat - <fs_output>-coep-budat.
+*   Insert amounts in correct interval
+    IF lv_days_overdue <= gv_last_2.
+      <fs_output>-rast2 = <fs_output>-coep-wtgbtr.
+    ELSEIF lv_days_overdue <= gv_last_3.
+      <fs_output>-rast3 = <fs_output>-coep-wtgbtr.
+    ELSEIF lv_days_overdue <= gv_last_4.
+      <fs_output>-rast4 = <fs_output>-coep-wtgbtr.
+    ELSE.
+      <fs_output>-rast5 = <fs_output>-coep-wtgbtr.
+    ENDIF.
+    CLEAR <fs_output>-coep-wtgbtr.
+
+    MOVE-CORRESPONDING <fs_output> TO gs_save_data.
+    MOVE-CORRESPONDING <fs_output>-coep TO gs_save_data.
+    MOVE <fs_output>-servp TO gs_save_data-serp.
+    APPEND gs_save_data TO gt_save_data.
+  ENDLOOP.
+ENDFORM.                    " CALC_DUE_ITEMS
+*&---------------------------------------------------------------------*
+*&      Form  CREATE_FIELDCAT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM create_fieldcat .
+  REFRESH lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'AUFNR'.
+  ls_fieldcat-outputlen = 14.
+  ls_fieldcat-coltext   = 'Service order'(004).
+*  ls_fieldcat-no_zero = 'X'.                               "MOD-003
+  ls_fieldcat-edit_mask = '==ALPHA'.                        "MOD-003
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'COEP-BEMOT'.
+  ls_fieldcat-outputlen = 4.
+  ls_fieldcat-coltext   = 'Acc. Ind'(005).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'COEP-KSTAR'.
+  ls_fieldcat-outputlen = 12.
+  ls_fieldcat-coltext   = 'Cost element'(006).
+*  ls_fieldcat-no_zero = 'X'.                               "MOD-003
+  ls_fieldcat-edit_mask = '==ALPHA'.                        "MOD-003
+  APPEND ls_fieldcat TO lt_fieldcat.                        "CR-2924
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'KTEXT'.
+  ls_fieldcat-outputlen = 20.
+  ls_fieldcat-coltext   = 'Cost element text'(017).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'COEP-BUKRS'.
+  ls_fieldcat-outputlen = 8.
+  ls_fieldcat-coltext   = 'Comp. Code'(007).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'VKORG'.
+  ls_fieldcat-outputlen = 8.
+  ls_fieldcat-coltext   = 'Sales Org.'(021).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'VTWEG'.
+  ls_fieldcat-outputlen = 8.
+  ls_fieldcat-coltext   = 'Distr. Ch.'(022).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'SPART'.
+  ls_fieldcat-outputlen = 6.
+  ls_fieldcat-coltext   = 'Division'(023).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'IWERK'.
+  ls_fieldcat-outputlen = 8.
+  ls_fieldcat-coltext   = 'Maint. Plant'(025).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'COEP-BUDAT'.
+  ls_fieldcat-outputlen = 10.
+  ls_fieldcat-coltext   = 'Pstng date'(035).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'COEP-TWAER'.
+  ls_fieldcat-outputlen = 8.
+  ls_fieldcat-coltext   = 'Currency'(008).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'COEP-PERIO'.
+  ls_fieldcat-outputlen = 5.
+  ls_fieldcat-coltext   = 'Period'(009).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'COEP-GJAHR'.
+  ls_fieldcat-outputlen = 6.
+  ls_fieldcat-coltext   = 'Year'(010).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'EQUNR'.
+  ls_fieldcat-outputlen = 14.
+  ls_fieldcat-coltext   = 'Equipment'(011).
+*  ls_fieldcat-no_zero = 'X'.                               "MOD-003
+  ls_fieldcat-edit_mask = '==ALPHA'.                        "MOD-003
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'MATNR'.
+  ls_fieldcat-outputlen = 14.
+  ls_fieldcat-coltext   = 'Material'(012).
+*  ls_fieldcat-no_zero = 'X'.                               "MOD-003
+  ls_fieldcat-edit_mask = '==MATN1'.                        "MOD-003
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'SERNR'.
+  ls_fieldcat-outputlen = 16.
+  ls_fieldcat-coltext   = 'Serial number'(013).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'PRODH'.
+  ls_fieldcat-outputlen = 10.
+  ls_fieldcat-coltext   = 'Prod. Hier.'(014).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'GAC'.
+  ls_fieldcat-outputlen = 4.
+  ls_fieldcat-coltext   = 'GAC'(015).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'PGC'.
+  ls_fieldcat-outputlen = 4.
+  ls_fieldcat-coltext   = 'PGC'(016).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'RAST2'.
+  ls_fieldcat-outputlen = 15.
+*  ls_fieldcat-coltext = 'Overdue 1'(017).
+  ls_fieldcat-coltext   = rastbis2.
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'RAST3'.
+  ls_fieldcat-outputlen = 15.
+*  ls_fieldcat-coltext = 'Overdue 2'(018).
+  ls_fieldcat-coltext   = rastbis3.
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'RAST4'.
+  ls_fieldcat-outputlen = 15.
+*  ls_fieldcat-coltext = 'Overdue 3'(019).
+  ls_fieldcat-coltext   = rastbis4.
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  DATA: lv_rast5(20) TYPE c,
+        lv_rast5a(5) TYPE c,
+        lv_rast5b(5) TYPE c.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'RAST5'.
+  ls_fieldcat-outputlen = 15.
+*  ls_fieldcat-coltext = 'Overdue 4'(020).
+  SPLIT rastbis4 AT '-' INTO lv_rast5a lv_rast5b.
+  CONCATENATE '>' lv_rast5b INTO lv_rast5 SEPARATED BY space.
+  ls_fieldcat-coltext   = lv_rast5.
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'RASTS'.
+  ls_fieldcat-outputlen = 15.
+  ls_fieldcat-coltext   = 'Total'(042).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'KDAUF'.
+  ls_fieldcat-outputlen = 12.
+  ls_fieldcat-coltext   = 'Sales order'(027).
+*  ls_fieldcat-no_zero = 'X'.                               "MOD-003
+  ls_fieldcat-edit_mask = '==ALPHA'.                        "MOD-003
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'KDPOS'.
+  ls_fieldcat-outputlen = 6.
+  ls_fieldcat-coltext   = 'SO item'(028).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'SERVP'.
+  ls_fieldcat-outputlen = 14.
+  ls_fieldcat-coltext   = 'Service product'(029).
+*  ls_fieldcat-no_zero = 'X'.                               "MOD-003
+  ls_fieldcat-edit_mask = '==MATN1'.                        "MOD-003
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'MAKTX'.
+  ls_fieldcat-outputlen = 25.
+  ls_fieldcat-coltext   = 'Service product description'(030).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'SP_GAC'.
+  ls_fieldcat-outputlen = 6.
+  ls_fieldcat-coltext   = 'SP GAC'(031).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'SP_PGC'.
+  ls_fieldcat-outputlen = 6.
+  ls_fieldcat-coltext   = 'SP PGC'(032).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'VAPLZ'.
+* begin of change air21099 18/12/08
+*  LS_FIELDCAT-OUTPUTLEN = 6.
+  ls_fieldcat-outputlen = 8.
+* end of change air21099 18/12/08
+  ls_fieldcat-coltext   = 'Workcenter'(033).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+* begin of insertion MOD-002
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'SOLDTONR'.
+  ls_fieldcat-outputlen = 12.
+  ls_fieldcat-coltext   = 'Partner'(036).
+*  ls_fieldcat-no_zero = 'X'.                               "MOD-003
+  ls_fieldcat-edit_mask = '==ALPHA'.                        "MOD-003
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'SOLDTONAME'.
+  ls_fieldcat-outputlen = 40.
+  ls_fieldcat-coltext = 'Name'(037).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'VKBUR'.
+  ls_fieldcat-outputlen = 12.
+  ls_fieldcat-coltext = 'Sales Office'(038).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'VKBURD'.
+  ls_fieldcat-outputlen = 20.
+  ls_fieldcat-coltext   = 'Name'(039).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'VKGRP'.
+  ls_fieldcat-outputlen = 11.
+  ls_fieldcat-coltext   = 'Sales Group'(040).
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'VKGRPD'.
+  ls_fieldcat-outputlen = 20.
+  ls_fieldcat-coltext   = 'Name'(041).
+  APPEND ls_fieldcat TO lt_fieldcat.
+* end of insertion MOD-002
+* Begin of insertion MOD-007++
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = text-053."'PRCTR'.
+  ls_fieldcat-outputlen = 20.
+  ls_fieldcat-coltext   = text-050.
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = text-054."'SEGMENT'.
+  ls_fieldcat-outputlen = 20.
+  ls_fieldcat-coltext   = text-051.
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = text-055."'NAME'.
+  ls_fieldcat-outputlen = 50.
+  ls_fieldcat-coltext   = text-052.
+  APPEND ls_fieldcat TO lt_fieldcat.
+* End of insertion MOD-007++
+* Begin of Insert MOD-008++
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'INGPR'."'Planner Group'.
+  ls_fieldcat-outputlen = 10.
+  ls_fieldcat-coltext   = text-056.
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'INNAM'." 'Planner grp name'.
+  ls_fieldcat-outputlen = 20.
+  ls_fieldcat-coltext   = text-057.
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'BEMOT_TXT'. "Accounting ind name'.
+  ls_fieldcat-outputlen = 20.
+  ls_fieldcat-coltext   = text-058.
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'KTEXT_1'."'Work Center Name'.
+  ls_fieldcat-outputlen = 20.
+  ls_fieldcat-coltext   = text-059.
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'USNAM_C'."'Created by'.
+  ls_fieldcat-outputlen = 30.
+  ls_fieldcat-coltext   = text-060.
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'UDATE_C'."'Date of order created'.
+  ls_fieldcat-outputlen = 20.
+  ls_fieldcat-coltext   = text-061.
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'USNAM_R'. "Released by'.
+  ls_fieldcat-outputlen = 30.
+  ls_fieldcat-coltext   = text-062.
+  APPEND ls_fieldcat TO lt_fieldcat.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-fieldname = 'UDATE_R'."'Date of order released'.
+  ls_fieldcat-outputlen = 20.
+  ls_fieldcat-coltext   = text-063.
+  APPEND ls_fieldcat TO lt_fieldcat.
+* End of Insert MOD-008++
+ENDFORM.                    " CREATE_FIELDCAT
+*&---------------------------------------------------------------------*
+*&      Form  GET_PERIOD
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM get_period .
+  DATA:
+      lv_periv     LIKE t001-periv,         " Fiscal year variant
+      lv_period    LIKE t009b-poper,        " Posting period
+      lv_gjahr     TYPE gjahr.
+
+  SELECT SINGLE periv
+      INTO lv_periv
+      FROM t001
+     WHERE bukrs = p_bukrs.
+
+  CALL FUNCTION 'G_PERIOD_GET'
+    EXPORTING
+      company                        = gs_output-coep-bukrs
+      date                           = gs_output-coep-budat
+      variant                        = lv_periv
+    IMPORTING
+      period                         = gs_output-coep-perio
+      year                           = lv_gjahr
+    EXCEPTIONS
+      ledger_not_assigned_to_company = 1
+      period_not_defined             = 2
+      variant_not_defined            = 3
+      OTHERS                         = 4.
+ENDFORM.                    " GET_PERIOD
+*&---------------------------------------------------------------------*
+*&      Form  EXTRACT_DATA_TO_TABLE
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM extract_data_to_table .
+
+*** MOD-003 * begin ***
+  LOOP AT gt_output ASSIGNING <fs_output>.
+    MOVE-CORRESPONDING <fs_output> TO gs_save_data.
+    MOVE-CORRESPONDING <fs_output>-coep TO gs_save_data.
+    MOVE <fs_output>-servp TO gs_save_data-serp.
+    APPEND gs_save_data TO gt_save_data.
+  ENDLOOP.
+*** MOD-003 * end ***
+
+  DELETE FROM yse_opco02 WHERE erdat = sy-datum.
+*         AND AUFNR IN SO_AUFNR.
+*         AND BUKRS IN SO_BUKRS
+*         AND VKORG IN SO_VKORG
+*         AND VTWEG IN SO_VTWEG
+*         AND SPART IN SO_SPART
+*         AND IWERK IN SO_IWERK.
+
+  MODIFY yse_opco02 FROM TABLE gt_save_data.
+  IF sy-subrc EQ 0.
+    COMMIT WORK AND WAIT.
+  ENDIF.
+ENDFORM.                    " EXTRACT_DATA_TO_TABLE
+*&---------------------------------------------------------------------*
+*&      Form  AUTHORIZATIONS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM authorizations .
+
+  AUTHORITY-CHECK OBJECT 'F_SKA1_BUK'
+                      ID 'BUKRS' FIELD p_bukrs
+                      ID 'ACTVT' DUMMY.
+  IF sy-subrc = 4.
+*   No authorisation to display the data
+    MESSAGE ID 'YSE_GENERAL' TYPE 'E' NUMBER '008' WITH p_bukrs.
+  ELSEIF sy-subrc <> 0.
+*   Error checking authorization.
+    MESSAGE ID 'YSE_GENERAL' TYPE 'E' NUMBER '004'.
+  ENDIF.
+
+ENDFORM.                    " AUTHORIZATIONS
+*&---------------------------------------------------------------------*
+*&      Form  FILT_DATA_PRCTR_SEGMENTS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM filt_data_prctr_segments .
+  TYPES:BEGIN OF ty_vbap,
+        vbeln   TYPE vbeln,
+        posnr   TYPE posnr,
+        paobjnr TYPE rkeobjnr,
+        END OF ty_vbap.
+  TYPES:BEGIN OF ty_ce41000_acct,
+        paobjnr  TYPE rkeobjnr,
+        prctr    TYPE prctr,
+        END OF ty_ce41000_acct.
+  TYPES:BEGIN OF ty_prctr,
+        prctr    TYPE prctr,
+        segment  TYPE fb_segment,
+        END OF ty_prctr  .
+  TYPES:BEGIN OF ty_fagl,
+        segment  TYPE fb_segment,
+        name     TYPE text50,
+        END OF ty_fagl.
+  DATA:lt_vbap      TYPE STANDARD TABLE OF ty_vbap,
+       lt_ce41000   TYPE STANDARD TABLE OF ty_ce41000_acct,
+       lt_prctr_seg TYPE STANDARD TABLE OF ty_prctr,
+       lt_fagl      TYPE STANDARD TABLE OF ty_fagl,
+       ls_vbap      TYPE ty_vbap,
+       ls_ce41000   TYPE ty_ce41000_acct,
+       ls_prctr_seg TYPE ty_prctr,
+       ls_fagl      TYPE ty_fagl,
+       lv_idx       TYPE sy-tabix.
+  CONSTANTS:c_x     TYPE char1 VALUE 'X',
+            c_subnr TYPE char4 VALUE '0001'.
+  IF NOT gt_output[] IS INITIAL.
+    SELECT vbeln
+           posnr
+           paobjnr
+           FROM vbap
+           INTO TABLE lt_vbap
+           FOR ALL ENTRIES IN gt_output
+           WHERE vbeln EQ gt_output-kdauf
+             AND posnr EQ gt_output-kdpos.
+  ENDIF.
+  IF NOT lt_vbap[] IS INITIAL.
+    SELECT paobjnr
+           prctr
+           FROM ce41000_acct
+           INTO TABLE lt_ce41000
+           FOR ALL ENTRIES IN lt_vbap
+           WHERE paobjnr EQ lt_vbap-paobjnr
+             AND aktbo   EQ c_x
+             AND pasubnr EQ c_subnr
+             AND prctr   IN so_prctr.
+  ENDIF.
+  IF NOT lt_ce41000[] IS INITIAL.
+    SELECT prctr
+           segment
+           FROM yse_prctr_bl
+           INTO TABLE lt_prctr_seg
+           FOR ALL ENTRIES IN lt_ce41000
+           WHERE prctr EQ lt_ce41000-prctr
+             AND segment IN so_segme.
+  ENDIF.
+  IF NOT lt_prctr_seg[] IS INITIAL.
+    SELECT segment
+           name
+           FROM fagl_segmt
+           INTO TABLE lt_fagl
+           FOR ALL ENTRIES IN lt_prctr_seg
+           WHERE segment EQ lt_prctr_seg-segment.
+  ENDIF.
+  SORT lt_prctr_seg BY prctr.
+  DELETE ADJACENT DUPLICATES FROM lt_prctr_seg COMPARING ALL FIELDS.
+  LOOP AT gt_output INTO gs_output.
+    lv_idx = sy-tabix.
+    READ TABLE lt_vbap INTO ls_vbap WITH KEY vbeln = gs_output-kdauf
+                                             posnr = gs_output-kdpos.
+    IF sy-subrc EQ 0.
+      READ TABLE lt_ce41000 INTO ls_ce41000 WITH KEY paobjnr = ls_vbap-paobjnr.
+      IF sy-subrc EQ 0.
+        READ TABLE lt_prctr_seg INTO ls_prctr_seg WITH KEY prctr = ls_ce41000-prctr.
+        IF sy-subrc EQ 0.
+          READ TABLE lt_fagl INTO ls_fagl WITH KEY segment = ls_prctr_seg-segment.
+          MOVE:ls_prctr_seg-prctr   TO gs_output-prctr,
+               ls_prctr_seg-segment TO gs_output-segment,
+               ls_fagl-name         TO gs_output-name.
+          MODIFY gt_output INDEX lv_idx FROM gs_output TRANSPORTING prctr segment name.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+    CLEAR:ls_vbap,ls_ce41000,ls_prctr_seg,ls_fagl,gs_output,lv_idx.
+  ENDLOOP.
+  DELETE gt_output WHERE prctr = space.
+ENDFORM.                    " FILT_DATA_PRCTR_SEGMENTS
+*&---------------------------------------------------------------------*
+*&      Form  NEW_FIELDS_ADDITION
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM new_fields_addition .
+* Structures Declarations
+  TYPES: BEGIN OF ty_afih,
+         aufnr TYPE aufnr,
+         iwerk TYPE iwerk,
+         ingpr TYPE ingrp,
+         END OF ty_afih.
+  TYPES: BEGIN OF ty_t024i,
+         iwerk TYPE iwerk,
+         ingrp TYPE ingrp,
+         innam TYPE innam,
+         END OF ty_t024i.
+  TYPES: BEGIN OF ty_aufk,
+         aufnr TYPE aufnr,
+         werks TYPE werks_d,
+         bemot TYPE bemot,
+         vaplz TYPE gewrk,
+         END OF ty_aufk.
+  TYPES: BEGIN OF ty_crhd,
+         objty TYPE cr_objty,
+         objid TYPE cr_objid,
+         arbpl TYPE arbpl,
+         werks TYPE werks_d,
+         END OF ty_crhd.
+  TYPES: BEGIN OF ty_crtx,
+         objty TYPE cr_objty,
+         objid TYPE cr_objid,
+         spras TYPE spras,
+         aenam_text TYPE usrname,
+         ktext TYPE cr_ktext,
+         ktext_up TYPE cr_ktextup,
+         END OF ty_crtx.
+  TYPES: BEGIN OF ty_tj02t,
+         istat TYPE j_istat,
+         spras TYPE spras,
+         txt04 TYPE j_txt04,
+         txt30 TYPE j_txt30,
+         END OF ty_tj02t.
+  TYPES: BEGIN OF ty_jcds,
+         objnr TYPE j_objnr,
+         stat  TYPE j_status,
+         usnam TYPE cdusername,
+         udate TYPE cddatum,
+         utime TYPE cduzeit,
+         END OF ty_jcds.
+  TYPES: BEGIN OF ty_usr21,
+         bname TYPE xubname,
+         persnumber TYPE ad_persnum,
+         END OF ty_usr21.
+  TYPES: BEGIN OF ty_adrp,
+         persnumber TYPE ad_persnum,
+         name_first TYPE ad_namefir,
+         name_last TYPE ad_namelas,
+         END OF ty_adrp.
+  TYPES: BEGIN OF ty_aufnr,
+         aufnr TYPE j_objnr,
+         END OF ty_aufnr.
+
+* Internal table declarations
+  DATA: lt_afih   TYPE STANDARD TABLE OF ty_afih,
+        lt_t024i  TYPE STANDARD TABLE OF ty_t024i,
+        lt_aufk   TYPE STANDARD TABLE OF ty_aufk,
+        lt_aufk1  TYPE STANDARD TABLE OF ty_aufk,
+        lt_crhd   TYPE STANDARD TABLE OF ty_crhd,
+        lt_crtx   TYPE STANDARD TABLE OF ty_crtx,
+        lt_tj02t1 TYPE STANDARD TABLE OF ty_tj02t,
+        lt_tj02t2 TYPE STANDARD TABLE OF ty_tj02t,
+        lt_jcds1  TYPE STANDARD TABLE OF ty_jcds,
+        lt_jcds2  TYPE STANDARD TABLE OF ty_jcds,
+        lt_usr21  TYPE STANDARD TABLE OF ty_usr21,
+        lt_usr21_1 TYPE STANDARD TABLE OF ty_usr21,
+        lt_adrp   TYPE STANDARD TABLE OF ty_adrp,
+        lt_aufnr  TYPE STANDARD TABLE OF ty_aufnr,
+        lv_idx    TYPE sy-tabix.
+
+* Local work area declarations
+  DATA: ls_afih    TYPE ty_afih,
+        ls_t024i   TYPE ty_t024i,
+        ls_aufk    TYPE ty_aufk,
+        ls_aufk1   TYPE ty_aufk,
+        ls_crhd    TYPE ty_crhd,
+        ls_crtx    TYPE ty_crtx,
+        ls_tj02t1  TYPE ty_tj02t,
+        ls_tj02t2  TYPE ty_tj02t,
+        ls_jcds1   TYPE ty_jcds,
+        ls_jcds2   TYPE ty_jcds,
+        ls_usr21   TYPE ty_usr21,
+        ls_usr21_1 TYPE ty_usr21,
+        ls_adrp    TYPE ty_adrp,
+        ls_aufnr   TYPE ty_aufnr.
+
+* Constants declarations
+  CONSTANTS: c_e TYPE char1 VALUE 'E',
+             c_i0001 TYPE char5 VALUE 'I0001',
+             c_i0002 TYPE char5 VALUE 'I0002',
+             c_or TYPE char2 VALUE 'OR'.
+
+*  Variable declarations
+  DATA:lv_final_created  TYPE char120,
+       lv_final_released TYPE char120,
+       lv_temp_aufnr TYPE j_objnr.
+
+* Get data from required tables
+* Fetch data from AFIH
+  IF NOT gt_output[] IS INITIAL.
+    SELECT aufnr
+           iwerk
+           ingpr
+           FROM afih
+           INTO TABLE lt_afih
+           FOR ALL ENTRIES IN gt_output
+           WHERE aufnr EQ gt_output-aufnr
+           AND   ingpr IN so_ingpr.
+  ENDIF.
+* Fetch data from AUFK
+  IF NOT lt_afih[] IS INITIAL.
+    SELECT aufnr
+           werks
+           bemot
+           vaplz
+           FROM aufk
+           INTO TABLE lt_aufk
+           FOR ALL ENTRIES IN lt_afih
+           WHERE aufnr EQ lt_afih-aufnr.
+* Concatenate Order with OR value
+    MOVE lt_aufk[] TO lt_aufk1[].
+    LOOP AT lt_aufk INTO ls_aufk.
+      READ TABLE lt_aufk1 INTO ls_aufk1 WITH KEY aufnr = ls_aufk-aufnr.
+      CONCATENATE c_or ls_aufk-aufnr INTO ls_aufnr.
+      APPEND ls_aufnr TO lt_aufnr.
+      CLEAR: ls_aufk, ls_aufk1, ls_aufnr.
+    ENDLOOP.
+    SORT lt_aufnr BY aufnr.
+  ENDIF.
+* Fetch data from T024I
+  IF NOT lt_afih[] IS INITIAL.
+    SELECT iwerk
+           ingrp
+           innam
+           FROM t024i
+           INTO TABLE lt_t024i
+           FOR ALL ENTRIES IN lt_afih
+           WHERE iwerk EQ lt_afih-iwerk
+           AND   ingrp EQ lt_afih-ingpr.
+  ENDIF.
+* Fecth data from CRHD
+  IF NOT lt_aufk[] IS INITIAL.
+    SELECT objty
+           objid
+           arbpl
+           werks
+           FROM crhd
+           INTO TABLE lt_crhd
+           FOR ALL ENTRIES IN lt_aufk
+           WHERE arbpl EQ lt_aufk-vaplz
+           AND   werks EQ lt_aufk-werks.
+  ENDIF.
+*  Fecth data from CRTX
+  IF NOT lt_crhd[] IS INITIAL.
+    SELECT objty
+           objid
+           spras
+           aenam_text
+           ktext
+           ktext_up
+           FROM crtx
+           INTO TABLE lt_crtx
+           FOR ALL ENTRIES IN lt_crhd
+           WHERE objty EQ lt_crhd-objty
+           AND   objid EQ lt_crhd-objid
+           AND   spras EQ c_e.
+  ENDIF.
+*  Fetch data from TJ02T
+  IF sy-subrc = 0.
+    SELECT istat
+           spras
+           txt04
+           txt30
+           FROM tj02t
+           INTO TABLE lt_tj02t1
+           WHERE ( istat EQ c_i0001 OR istat EQ c_i0002 )
+           AND   spras EQ c_e.
+    MOVE lt_tj02t1[] TO lt_tj02t2[].
+  ENDIF.
+*  Fetch data from JCDS
+  IF NOT lt_aufnr[] IS INITIAL.
+    SELECT objnr
+           stat
+           usnam
+           udate
+           utime
+           FROM jcds
+           INTO TABLE lt_jcds1
+           FOR ALL ENTRIES IN lt_aufnr
+           WHERE objnr EQ lt_aufnr-aufnr
+           AND   ( stat  EQ c_i0001 OR stat EQ c_i0002 ).
+    SORT lt_jcds1[] BY objnr.
+    DELETE ADJACENT DUPLICATES FROM lt_jcds1 COMPARING objnr stat.
+    MOVE lt_jcds1[] TO lt_jcds2[].
+  ENDIF.
+* Fetch data from USR21
+  IF NOT lt_jcds1 IS INITIAL.
+    SELECT bname
+           persnumber
+           FROM usr21
+           INTO TABLE lt_usr21
+           FOR ALL ENTRIES IN lt_jcds1
+           WHERE bname EQ lt_jcds1-usnam.
+    MOVE lt_usr21 TO lt_usr21_1.
+  ENDIF.
+*  Fetch data from ADRP
+  IF NOT lt_usr21 IS INITIAL.
+    SELECT persnumber
+           name_first
+           name_last
+           FROM adrp
+           INTO TABLE lt_adrp
+           FOR ALL ENTRIES IN lt_usr21
+           WHERE persnumber EQ lt_usr21-persnumber.
+  ENDIF.
+*  Fill the Output structure with required additional fields
+  LOOP AT gt_output INTO gs_output.
+    lv_idx = sy-tabix.
+    READ TABLE lt_afih INTO ls_afih WITH KEY aufnr = gs_output-aufnr.
+    IF sy-subrc = 0.
+      READ TABLE lt_aufk INTO ls_aufk WITH KEY aufnr = ls_afih-aufnr.
+      IF sy-subrc = 0.
+        READ TABLE lt_t024i INTO ls_t024i WITH KEY iwerk = ls_afih-iwerk
+                                                   ingrp = ls_afih-ingpr.
+        IF sy-subrc = 0.
+          READ TABLE lt_crhd INTO ls_crhd WITH KEY arbpl = ls_aufk-vaplz
+                                                   werks = ls_aufk-werks.
+          IF sy-subrc = 0.
+            READ TABLE lt_crtx INTO ls_crtx WITH KEY objty = ls_crhd-objty
+                                                     objid = ls_crhd-objid
+                                                     spras = c_e.
+            READ TABLE lt_tj02t1 INTO ls_tj02t1 WITH KEY istat = c_i0001
+                                                        spras = c_e.
+            READ TABLE lt_tj02t2 INTO ls_tj02t2 WITH KEY istat = c_i0002
+                                                        spras = c_e.
+            CONCATENATE c_or ls_aufk-aufnr INTO lv_temp_aufnr.
+            IF sy-subrc = 0.
+              READ TABLE lt_aufnr INTO ls_aufnr WITH KEY aufnr = lv_temp_aufnr.
+              IF sy-subrc = 0.
+                READ TABLE lt_jcds1 INTO ls_jcds1 WITH KEY objnr = ls_aufnr-aufnr
+                                                       stat  = ls_tj02t1-istat.
+                READ TABLE lt_jcds2 INTO ls_jcds2 WITH KEY objnr = ls_aufnr-aufnr
+                                                       stat  = ls_tj02t2-istat.
+                IF sy-subrc = 0.
+                  READ TABLE lt_usr21 INTO ls_usr21 WITH KEY bname = ls_jcds1-usnam.
+                  READ TABLE lt_usr21_1 INTO ls_usr21_1 WITH KEY bname = ls_jcds2-usnam.
+                  IF sy-subrc = 0.
+                    READ TABLE lt_adrp INTO ls_adrp WITH KEY persnumber = ls_usr21-persnumber.
+                    IF sy-subrc = 0.
+                      CONCATENATE ls_adrp-name_first ls_adrp-name_last
+                                                  INTO lv_final_created SEPARATED BY space.
+                      CLEAR: ls_adrp.
+                      READ TABLE lt_adrp INTO ls_adrp WITH KEY persnumber = ls_usr21_1-persnumber.
+                      IF sy-subrc = 0.
+                        CONCATENATE ls_adrp-name_first ls_adrp-name_last
+                                                     INTO lv_final_released SEPARATED BY space.
+                        MOVE:ls_afih-ingpr       TO gs_output-ingpr,
+                             ls_t024i-innam      TO gs_output-innam,
+                             ls_crtx-ktext       TO gs_output-ktext_1,
+                             lv_final_created    TO gs_output-usnam_c,
+                             ls_jcds1-udate      TO gs_output-udate_c,
+                             lv_final_released   TO gs_output-usnam_r,
+                             ls_jcds2-udate      TO gs_output-udate_r.
+                        MODIFY gt_output INDEX lv_idx FROM gs_output
+                                     TRANSPORTING ingpr innam ktext_1 usnam_c
+                                                  udate_c usnam_r udate_r.
+                      ENDIF.
+                    ENDIF.
+                  ENDIF.
+                ENDIF.
+              ENDIF.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+* Clear local work areas
+    CLEAR:ls_afih,ls_t024i,ls_aufk,ls_crhd,ls_crtx,
+          ls_tj02t1,ls_tj02t2,ls_jcds1,ls_jcds2,ls_usr21,ls_usr21_1,
+          ls_adrp,ls_aufnr,lv_final_created,lv_final_released,gs_output,lv_idx.
+  ENDLOOP.
+  DELETE gt_output WHERE ingpr = space.
+ENDFORM.                    " NEW_FIELDS_ADDITION

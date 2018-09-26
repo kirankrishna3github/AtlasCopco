@@ -1,0 +1,1235 @@
+*&---------------------------------------------------------------------*
+*& Report  YSE_SEND_IDOC_AC_CONNECT_ORD                                *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+*&                                                                     *
+*& AC Connect : Send Sales Order Idocs                                 *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+*  Author                : Jules Smets
+*  Date                  : 06.04.2009
+*  Change Request Number : CR0101
+*  Transport request Nr. : CD1K947466
+*----------------------------------------------------------------------*
+*                                                                      *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD.NR. | DATE       | NAME              | CORRECT.NR. | CHANGE REF. *
+*----------------------------------------------------------------------*
+* MOD-001 | 15.12.2010 | Geert Rutten      | CD1K961942  | CR1827      *
+*         | Add VAT and total price to ACC order update                *
+*----------------------------------------------------------------------*
+* MOD-002 | 08.03.2011 | Jules Smets       | CD1K963529  | CR1789      *
+*         | Select only open orders                                    *
+*----------------------------------------------------------------------*
+* MOD-003 | 24.06.2011 | Jules Smets       | CD1K965976  | CR1789      *
+*         | Process freight                  CD1K966207                *
+*----------------------------------------------------------------------*
+* MOD-004 | 12.09.2011 | W. Deplancke      | CD1K965976  | ZPRO issue  *
+*         | ZPRO direct read from table (not via internal table        *
+*----------------------------------------------------------------------*
+*         | 10.24.2011 | Johnny Wu         | CD1K968518  | CR2230      *
+*         | Bug Fix                                                    *
+*----------------------------------------------------------------------*
+* MOD-006 | 07.05.2012 | G. Rutten         | CD1K971696  | Solve Bugs  *
+*         | + select all orders Ac Connect instead of pur type = 'ACC' *
+*         | orders                                                     *
+*----------------------------------------------------------------------*
+************************************************************************
+
+REPORT  yse_send_idoc_ac_connect_ord  MESSAGE-ID yam_inf    .
+
+TABLES : yse_acc_files,
+         yse_sd_acc_cust,
+         yse_sd_acc_fam,
+         yse_sd_acc_auart,
+         yse_sd_gds_kvgr4,
+         vbak,
+         vbkd,
+         vbap,
+         vbep,
+         vbpa,
+         vbfa,
+         konv,
+         tvgrt.
+
+DATA : g_retcd         LIKE sy-subrc,
+       g_pfile         LIKE /sapdmc/lsoinp-filename,
+       g_ofile         LIKE /sapdmc/lsoinp-filename,
+       g_ersda(12)     TYPE c,                      "YYYYMMDDHHMM
+       g_date          LIKE sy-datum,
+       gv_adrnr        TYPE adrnr,
+       g_directory(25) TYPE c VALUE '/var/load/xxx/UK/convert/',
+       p_logsys        LIKE tbdlst-logsys.
+DATA: wa_edidc    LIKE edidc.
+DATA: wa_adrc TYPE adrc.
+
+DATA: i_edidc_control_comm LIKE edidc OCCURS 1 WITH HEADER LINE ,
+      i_edidd_data LIKE edidd OCCURS 0 WITH HEADER LINE .
+DATA: created_idocs LIKE sy-tabix.
+
+DATA: BEGIN OF it_sel OCCURS 0,
+        kunnr TYPE kunnr,
+        vkorg TYPE vkorg,
+        vtweg TYPE vtweg,
+        spart TYPE spart,
+      END OF it_sel.
+
+DATA: BEGIN OF it_acc OCCURS 0,
+        vbeln TYPE vbeln_va,
+        msgfn TYPE msgfn,
+        data(1000) TYPE c,
+      END OF it_acc.
+
+DATA: BEGIN OF it_acc_delta OCCURS 0,
+        vbeln TYPE vbeln_va,
+        msgfn TYPE msgfn,
+        data(1000) TYPE c,
+ END OF it_acc_delta.
+
+DATA: BEGIN OF i_prev OCCURS 0,
+        vbeln TYPE vbeln_va,
+        msgfn TYPE msgfn,
+        data(1000) TYPE c,
+END OF i_prev.
+
+TYPES: BEGIN OF t_hdr.
+        INCLUDE STRUCTURE yse_e1_acc_ord_hdr.
+TYPES: END OF t_hdr.
+DATA: it_hdr TYPE SORTED TABLE OF t_hdr
+                  WITH NON-UNIQUE KEY vbeln
+                  WITH HEADER LINE.
+DATA: wa_hdr  TYPE t_hdr.
+
+TYPES: BEGIN OF t_par.
+        INCLUDE STRUCTURE yse_e1_acc_ord_par.
+TYPES: END OF t_par.
+DATA: it_par  TYPE SORTED TABLE OF t_par
+                   WITH NON-UNIQUE KEY vbeln
+                   WITH HEADER LINE.
+DATA: wa_par  TYPE t_par.
+
+TYPES: BEGIN OF t_itm.
+        INCLUDE STRUCTURE yse_e1_acc_ord_itm.
+TYPES: END OF t_itm.
+DATA: it_itm   TYPE STANDARD TABLE OF t_itm
+                    WITH HEADER LINE.
+DATA: it_itms  TYPE SORTED TABLE OF t_itm
+                    WITH NON-UNIQUE KEY vbeln posnr
+                    WITH HEADER LINE.
+DATA: wa_itm  TYPE t_itm.
+
+TYPES: BEGIN OF t_fam.
+        INCLUDE STRUCTURE yse_sd_acc_fam.
+TYPES: END OF t_fam.
+DATA: it_fam  TYPE TABLE OF t_fam WITH HEADER LINE.
+DATA: wa_fam  TYPE t_fam.
+
+TYPES: BEGIN OF t_vbak,
+         vbeln   TYPE vbeln_va,
+         vkorg   TYPE vkorg,
+         vtweg   TYPE vtweg,
+         spart   TYPE spart,
+         auart   TYPE auart,
+         vkgrp   TYPE vkgrp,
+         vdatu   TYPE edatu_vbak,
+         waerk   TYPE waerk,
+         kvgr4   TYPE kvgr4,
+         netwr   TYPE netwr_ak,
+         kunnr   TYPE kunnr,
+         knumv   TYPE knumv,
+      END OF t_vbak.
+DATA: it_vbak  TYPE HASHED TABLE OF t_vbak
+                    WITH UNIQUE KEY vbeln
+                    WITH HEADER LINE.
+DATA: wa_vbak  TYPE t_vbak.
+
+TYPES: BEGIN OF t_vbkd,
+         vbeln   TYPE vbeln_va,
+         ihrez   TYPE ihrez,
+         bstkd   TYPE bstkd,
+         bstdk   TYPE bstdk,
+         zterm   TYPE dzterm,
+         sdabw   TYPE sdabw,
+      END OF t_vbkd.
+DATA: it_vbkd  TYPE HASHED TABLE OF t_vbkd
+                    WITH UNIQUE KEY vbeln
+                    WITH HEADER LINE.
+DATA: wa_vbkd  TYPE t_vbkd.
+
+TYPES: BEGIN OF t_vbpa,
+         vbeln   TYPE vbeln_va,
+         parvw   TYPE parvw,
+         kunnr   TYPE kunnr,
+         adrnr   TYPE adrnr,
+      END OF t_vbpa.
+DATA: it_vbpai  TYPE TABLE OF t_vbpa WITH HEADER LINE.
+DATA: it_vbpa  TYPE HASHED TABLE OF t_vbpa
+                    WITH UNIQUE KEY vbeln parvw
+                    WITH HEADER LINE.
+DATA: wa_vbpa  TYPE t_vbpa.
+
+TYPES: BEGIN OF t_vbap,
+         vbeln   TYPE vbeln_va,
+         posnr   TYPE posnr_va,
+         posex   TYPE posex,
+         matnr   TYPE matnr,
+         pstyv   TYPE pstyv,
+         arktx   TYPE arktx,
+         kwmeng  TYPE kwmeng,
+         netwr   TYPE netwr_ap,
+         route   TYPE route,
+         abgru   TYPE abgru,
+      END OF t_vbap.
+DATA: it_vbap  TYPE TABLE OF t_vbap WITH HEADER LINE.
+DATA: wa_vbap  TYPE t_vbap.
+
+TYPES: BEGIN OF t_vbep,
+         vbeln   TYPE vbeln_va,
+         posnr   TYPE posnr_va,
+         etenr   TYPE etenr,
+         edatu   TYPE edatu,
+         bmeng   TYPE bmeng,
+      END OF t_vbep.
+DATA: it_vbep  TYPE SORTED TABLE OF t_vbep
+                    WITH NON-UNIQUE KEY vbeln posnr
+                    WITH HEADER LINE.
+DATA: wa_vbep  TYPE t_vbep.
+
+TYPES: BEGIN OF t_vbfa,
+         vbelv    TYPE vbeln_von,
+         posnv    TYPE posnr_von,
+         vbtyp_n  TYPE vbtyp_n,
+         vbeln    TYPE vbeln_nach,
+         posnn    TYPE posnr_nach,
+         rfmng    TYPE rfmng,
+      END OF t_vbfa.
+DATA: it_vbfa  TYPE SORTED TABLE OF t_vbfa
+                    WITH NON-UNIQUE KEY vbelv posnv vbtyp_n
+                    WITH HEADER LINE.
+DATA: wa_vbfa  TYPE t_vbpa.
+
+TYPES: BEGIN OF t_mara,
+         matnr    TYPE matnr,
+         bismt    TYPE bismt,
+      END OF t_mara.
+DATA: it_marai  TYPE TABLE OF t_mara WITH HEADER LINE.
+DATA: it_mara  TYPE HASHED TABLE OF t_mara
+               WITH UNIQUE KEY matnr
+               WITH HEADER LINE.
+DATA: wa_mara  TYPE t_mara.
+
+TYPES: BEGIN OF t_tvgrt.
+        INCLUDE STRUCTURE tvgrt.
+TYPES: END OF t_tvgrt.
+DATA: it_tvgrti  TYPE TABLE OF t_tvgrt WITH HEADER LINE.
+DATA: it_tvgrt  TYPE HASHED TABLE OF t_tvgrt
+                     WITH UNIQUE KEY spras vkgrp
+                     WITH HEADER LINE.
+DATA: wa_tvgrt  TYPE t_tvgrt.
+
+TYPES: BEGIN OF t_cusadd,
+         kvgr4    TYPE kvgr4,
+         cusadd   TYPE ycusadd,
+      END OF t_cusadd.
+DATA: it_cusadd  TYPE TABLE OF t_cusadd WITH HEADER LINE.
+DATA: wa_cusadd  TYPE t_cusadd.
+
+*** MOD-003 * begin ***
+TYPES: BEGIN OF t_konv,
+         knumv    TYPE knumv,
+         kposn    TYPE kposn,
+         kschl    TYPE kschl,
+         kwert    TYPE kwert,
+      END OF t_konv.
+DATA: it_konv TYPE SORTED TABLE OF t_konv
+                   WITH NON-UNIQUE KEY knumv kposn kschl
+                   WITH HEADER LINE.
+DATA: wa_konv TYPE t_konv.
+
+DATA: BEGIN OF it_frstat  OCCURS 0,
+        vbeln   TYPE vbeln_va,
+      END OF it_frstat.
+*** MOD-003 * end ***
+
+DATA : BEGIN OF wa_yse_acc_files,
+         mandt LIKE yse_acc_files-mandt,
+         msgtyp LIKE yse_acc_files-msgtyp,
+         vkorg LIKE yse_acc_files-vkorg,
+         ersda LIKE yse_acc_files-ersda,
+       END OF wa_yse_acc_files.
+
+DATA : BEGIN OF i_delfiles OCCURS 0,
+         mandt LIKE yse_acc_files-mandt,
+         msgtyp LIKE yse_acc_files-msgtyp,
+         vkorg LIKE yse_acc_files-vkorg,
+         ersda LIKE yse_acc_files-ersda,
+       END OF i_delfiles.
+
+DATA: gv_kwert   TYPE kwert,
+      gv_bmeng   TYPE bmeng,
+      gv_rfmng   TYPE rfmng.
+
+CONSTANTS : c_input           TYPE c     VALUE '0',
+            c_ls(2)           TYPE c     VALUE 'LS',
+            c_mestyp_ord      LIKE edidc-mestyp VALUE 'YSE_ACC_ORD',
+            c_idoc_type_ord   LIKE edidc-idoctp VALUE 'YSE_ACC_ORD',
+            c_segment_hdr(20) TYPE c     VALUE 'YSE_E1_ACC_ORD_HDR',
+            c_segment_par(20) TYPE c     VALUE 'YSE_E1_ACC_ORD_PAR',
+            c_segment_itm(20) TYPE c     VALUE 'YSE_E1_ACC_ORD_ITM',
+            c_menge_1         TYPE bmeng VALUE 1,     "MOD-003
+            c_a(1)            TYPE c     VALUE 'A',
+            c_c(1)            TYPE c     VALUE 'C',    " Change
+            c_d(1)            TYPE c     VALUE 'D',    " Delete
+            c_x(1)            TYPE c     VALUE 'X',
+            c_004(3)          TYPE c     VALUE '004',
+            c_acc(3)          TYPE c     VALUE 'ACC',
+            c_0000(4)         TYPE c     VALUE '0000',
+            c_underscore(1)   TYPE c     VALUE '_',    " Underscore
+            c_sc1(3)          TYPE c     VALUE 'SC1'.
+
+* Selection
+PARAMETERS: p_mess LIKE tbdme-mestyp OBLIGATORY DEFAULT 'YSE_ACC_ORD'
+                   MODIF ID sc1.
+SELECTION-SCREEN: BEGIN OF BLOCK block1 WITH FRAME TITLE text-001.
+PARAMETERS: p_init TYPE xfeld,
+            p_inorg  LIKE knvv-vkorg.    "S.O. to be initial loaded
+SELECT-OPTIONS: s_kunnr FOR yse_sd_acc_cust-kunnr,
+                s_vkorg FOR yse_sd_acc_cust-vkorg
+                            OBLIGATORY NO INTERVALS,
+                s_vtweg FOR yse_sd_acc_cust-vtweg,
+                s_spart FOR yse_sd_acc_cust-spart,
+                s_vbeln FOR vbak-vbeln,
+                s_erdat FOR vbak-erdat.
+SELECTION-SCREEN: END OF BLOCK block1.
+
+PARAMETERS: p_no_out  TYPE xfeld  NO-DISPLAY.
+
+************************************************************************
+*    Disable Message Type Screen Field                                 *
+************************************************************************
+AT SELECTION-SCREEN OUTPUT.
+
+  LOOP AT SCREEN.
+    IF screen-group1 = c_sc1.
+      screen-input   = c_input.
+      MODIFY SCREEN.
+      CONTINUE.
+    ENDIF.
+  ENDLOOP.
+
+************************************************************************
+*       I N I T I A L I Z A T I O N    E V E N T                       *
+************************************************************************
+INITIALIZATION.
+
+  CALL FUNCTION 'OWN_LOGICAL_SYSTEM_GET'
+    IMPORTING
+      own_logical_system             = p_logsys
+    EXCEPTIONS
+      own_logical_system_not_defined = 1
+      OTHERS                         = 2.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+         WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+************************************************************************
+*       S T A R T - O F - S E L E C T I O N    E V E N T               *
+************************************************************************
+START-OF-SELECTION.
+
+  CLEAR it_frstat[].                                        "MOD-003
+
+* Get the information for selected plant(s)
+  LOOP AT s_vkorg.
+
+    PERFORM get_detail USING s_vkorg-low.
+
+*   Create delta with new creations/updates by comparing the selected
+*   data with this from the previous run. When a new sales organization
+*   has to be loaded, no comparison has to take place.
+    IF NOT it_acc[] IS INITIAL.
+      PERFORM add_segments_to_it_acc.
+      IF p_init IS INITIAL.
+        IF s_vkorg-low NE p_inorg.
+          CLEAR: g_retcd.
+          PERFORM get_previous_file USING p_mess s_vkorg-low
+                                 CHANGING g_retcd.
+          IF g_retcd = 0.
+            PERFORM create_delta.
+          ELSE.
+            CONTINUE.                      " Pass to next S.O.
+          ENDIF.
+        ENDIF.
+      ELSE.
+        IF NOT p_inorg IS INITIAL.
+          LOOP AT it_acc.
+            MOVE-CORRESPONDING it_acc TO it_acc_delta.
+            MOVE c_a TO it_acc_delta-msgfn.
+            APPEND it_acc_delta.
+            CLEAR it_acc_delta.
+          ENDLOOP.
+        ELSE.
+          CLEAR it_acc.
+          REFRESH it_acc.
+        ENDIF.
+      ENDIF.
+
+*     Write outputfile to application server
+      CLEAR g_retcd.
+
+      CONCATENATE sy-datum sy-uzeit(4) INTO g_ersda.
+      CONCATENATE p_mess s_vkorg-low g_ersda
+                INTO g_ofile SEPARATED BY c_underscore.
+
+      REPLACE 'xxx' IN g_directory WITH p_logsys(3).
+      CONCATENATE g_directory g_ofile INTO g_ofile.
+
+      IF NOT it_acc[] IS INITIAL.
+* Begin of insert MOD-006
+        IF p_no_out IS INITIAL.
+* End of insert MOD-006
+         PERFORM write_outputfile.
+* Begin of insert MOD-006
+        ENDIF.
+* End of insert MOD-006
+        IF g_retcd IS INITIAL.
+* Begin of insert MOD-006
+        IF p_no_out IS INITIAL.
+* End of insert MOD-006
+*         Update custom table YSE_ACC_FILES
+          PERFORM update_custom_table USING s_vkorg-low.
+* Begin of insert MOD-006
+        ENDIF.
+* End of insert MOD-006
+*         Delete older entries in custom table YSE_ACC_FILES
+          PERFORM delete_old_table_entries USING s_vkorg-low.
+*         Delete older files on appl.server
+          IF NOT i_delfiles[] IS INITIAL.
+            PERFORM delete_old_files.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+  ENDLOOP.
+
+************************************************************************
+*       E N D - O F - S E L E C T I O N    E V E N T                   *
+************************************************************************
+END-OF-SELECTION .
+
+  IF NOT p_no_out IS INITIAL.
+*   NO output
+    IF NOT it_acc_delta[] IS INITIAL .
+*     Generate Idoc's
+      PERFORM create_idocs_ord USING p_mess.
+    ENDIF.
+  ELSE.
+    IF it_acc_delta[] IS INITIAL .
+      WRITE: / 'No Idocs created'.
+    ELSE.
+*     Generate Idoc's
+      PERFORM create_idocs_ord USING p_mess.
+      WRITE : /   created_idocs , ' Idocs created'.
+    ENDIF.
+    WRITE: / 'Job finished'.
+  ENDIF.
+
+*** MOD-003 * begin ***
+* Send status updates for freight
+  IF NOT it_frstat[] IS INITIAL.
+    PERFORM send_status_freight.
+  ENDIF.
+*** MOD-003 * end ***
+
+
+************************************************************************
+*--- S U B R O U T I N E S --------------------------------------------*
+************************************************************************
+*&---------------------------------------------------------------------*
+*&      Form  Validate_ALE_Configuration
+*&---------------------------------------------------------------------*
+FORM validate_ale_configuration .
+
+  DATA: l_create_idoc     TYPE     c .
+
+* CHECK IF IDOC CONFIGURATION IS READY AND IDOC CAN BE PROCESSED.
+  CALL FUNCTION 'ALE_MODEL_DETERMINE_IF_TO_SEND'
+    EXPORTING
+      message_type           = p_mess
+    IMPORTING
+      idoc_must_be_sent      = l_create_idoc
+    EXCEPTIONS
+      own_system_not_defined = 1
+      OTHERS                 = 2.
+
+  IF sy-subrc <> 0.
+    MESSAGE e029 WITH p_mess.
+    EXIT.
+  ENDIF.
+
+ENDFORM.                    " Validate_ALE_Configuration
+
+*&---------------------------------------------------------------------*
+*&      Form  Get_Detail
+*&---------------------------------------------------------------------*
+*       To get the information for selected sales organizations
+*----------------------------------------------------------------------*
+FORM get_detail USING p_vkorg.
+
+* Begin of insert MOD-001
+  DATA: lv_sum_vat TYPE mwsbp,
+        lv_sum_tot TYPE netwr_ak.
+* End of insert MOD-001
+
+data: lv_kwert_ZPRF type konv-kwert."CD1K968518
+
+  CLEAR: it_acc, it_sel.
+  REFRESH: it_acc, it_sel.
+
+* Select contract data based on Selection screen parameters
+  SELECT kunnr vkorg vtweg spart FROM
+     yse_sd_acc_cust INTO TABLE it_sel
+                 WHERE kunnr IN s_kunnr
+                   AND vkorg = s_vkorg-low
+                   AND vtweg IN s_vtweg
+                   AND spart IN s_spart.
+* Process Error - No data found for the Selected S.O.
+  IF sy-subrc NE 0 .
+    IF p_no_out IS INITIAL.
+      WRITE: text-e01, p_vkorg.
+      EXIT.
+    ENDIF.
+  ENDIF .
+*Take out the doubles
+  SORT it_sel.
+  DELETE ADJACENT DUPLICATES FROM it_sel.
+
+* Get orders
+  IF NOT it_sel[] IS INITIAL.
+    LOOP AT it_sel.
+      SELECT vbak~vbeln INTO it_acc-vbeln
+             FROM vbak
+             INNER JOIN yse_sd_acc_auart AS a
+                       ON vbak~vkorg = a~vkorg  AND
+                          vbak~auart = a~auart
+             INNER JOIN vbuk AS s                           "MOD-002
+                       ON vbak~vbeln = s~vbeln              "MOD-002
+             WHERE vbak~vkorg = it_sel-vkorg
+               AND vbak~kunnr = it_sel-kunnr
+               AND vbak~vtweg = it_sel-vtweg
+               AND vbak~spart = it_sel-spart
+               AND s~gbstk    NE c_c                        "MOD-002
+               AND a~auart    NE space
+               AND vbak~vbeln IN s_vbeln
+               AND erdat      IN s_erdat.
+* Begin of delete MOD-006
+*              AND bsark = c_acc.
+* End of delete MOD-006
+        APPEND it_acc.
+      ENDSELECT.
+    ENDLOOP.
+  ENDIF.
+
+  SORT it_acc.
+
+  IF NOT it_acc[] IS INITIAL.
+*   FAM codes
+    SELECT * INTO TABLE it_fam
+             FROM yse_sd_acc_fam.
+    SORT it_fam.
+*   Header
+    SELECT vbeln vkorg vtweg spart auart vkgrp
+           vdatu waerk netwr kunnr knumv  kvgr4
+           FROM vbak INTO CORRESPONDING FIELDS OF TABLE it_vbak
+             FOR ALL ENTRIES IN it_acc
+             WHERE vbeln = it_acc-vbeln.
+    SORT it_vbak.
+*   Sales Document: Business Data
+    SELECT vbeln ihrez bstkd bstdk zterm sdabw
+           FROM vbkd INTO CORRESPONDING FIELDS OF TABLE it_vbkd
+           FOR ALL ENTRIES IN it_vbak
+           WHERE vbeln = it_vbak-vbeln
+             AND posnr = 0.
+    SORT it_vbkd.
+*   Sales group (description)
+    SELECT * INTO TABLE it_tvgrti
+           FROM tvgrt
+           FOR ALL ENTRIES IN it_vbak
+           WHERE vkgrp = it_vbak-vkgrp
+             AND spras = 'E'.
+    SORT it_tvgrti BY spras vkgrp.
+    DELETE ADJACENT DUPLICATES FROM it_tvgrti
+           COMPARING spras vkgrp.
+    it_tvgrt[] = it_tvgrti[].
+    FREE it_tvgrti.
+*   Max. deliveries
+    SELECT kvgr4 cusadd INTO TABLE it_cusadd
+           FROM yse_sd_gds_kvgr4
+           WHERE cusadd NE ' '.
+    SORT it_cusadd.
+    DELETE ADJACENT DUPLICATES FROM it_cusadd.
+*** MOD-003 * begin ***
+*   Freight values
+    SELECT knumv kposn kschl kwert INTO TABLE it_konv
+           FROM konv
+           FOR ALL ENTRIES IN it_vbak
+           WHERE knumv =  it_vbak-knumv
+*** MOD-004 * Begin remove ZPRO here -> use it on line item level
+*             AND kschl IN ('ZD00', 'ZD01', 'ZPRO')
+*** MOD-004 * end
+             AND kschl IN ('ZD00', 'ZD01')
+             AND kinak =  ' '.
+*** MOD-003 * end ***
+
+    LOOP AT it_vbak.
+      CLEAR it_hdr.
+      MOVE-CORRESPONDING it_vbak TO it_hdr.
+*     Sales organisation (back-end FAM)
+      READ TABLE it_fam WITH KEY vkorg = it_vbak-vkorg
+                                 vtweg = it_vbak-vtweg
+                                 spart = it_vbak-spart
+                        BINARY SEARCH.
+      IF sy-subrc = 0.
+        it_hdr-orgid = it_fam-famback.
+      ENDIF.
+*     Fields from VBKD
+      CLEAR it_vbkd.
+      READ TABLE it_vbkd WITH TABLE KEY vbeln = it_vbak-vbeln.
+      MOVE-CORRESPONDING it_vbkd TO it_hdr.
+*     Sales group (description)
+      READ TABLE it_tvgrt WITH TABLE KEY spras = 'E'
+                                         vkgrp = it_vbak-vkgrp.
+      IF sy-subrc = 0.
+        it_hdr-vkgrpt = it_tvgrt-bezei.
+      ENDIF.
+*     Max. deliveries
+      READ TABLE it_cusadd WITH KEY kvgr4  = it_vbak-kvgr4
+                           BINARY SEARCH.
+      IF sy-subrc = 0.
+        it_hdr-maxdl = it_cusadd-cusadd.
+      ENDIF.
+*     Freight value
+      CLEAR gv_kwert.
+      IF it_vbak-netwr > 0.
+*** MOD-003 * begin ***
+*        SELECT SINGLE kbetr INTO gv_kwert
+*               FROM konv
+*               WHERE knumv = it_vbak-knumv
+*                 AND kposn = 0
+*                 AND kschl = 'ZD00'.
+*        IF sy-subrc = 0.
+        LOOP AT it_konv WHERE knumv = it_vbak-knumv
+                          AND kposn = '000000'
+                          AND ( kschl = 'ZD00' OR kschl = 'ZD01' ).
+          gv_kwert = gv_kwert + it_konv-kwert.
+        ENDLOOP.
+        IF gv_kwert <> 0.
+*** MOD-003 * end ***
+          it_hdr-freig = gv_kwert.
+          it_vbak-netwr = it_vbak-netwr - gv_kwert.
+          IF it_vbak-netwr < 0.
+            it_vbak-netwr = 0.
+          ENDIF.
+          it_hdr-netwr = it_vbak-netwr.
+*** MOD-003 * begin ***
+*         Add item for freight
+          CLEAR it_itm.
+          it_itm-vbeln  = it_vbak-vbeln.
+          it_itm-posnr  = '999999'.
+          it_itm-posex  = '999999'.
+          it_itm-bismt  = 'FREIGHT'.
+          it_itm-kwmeng = c_menge_1.
+          it_itm-qtyco  = c_menge_1.
+          it_itm-netwr  = gv_kwert.
+          APPEND it_itm.
+*         Send status '998'
+          it_frstat-vbeln = it_vbak-vbeln.
+          APPEND it_frstat.
+*** MOD-003 * end ***
+        ENDIF.
+
+* Begin of insert MOD-001
+        CLEAR lv_sum_vat.
+        CLEAR lv_sum_tot.
+        SELECT SUM( mwsbp ) FROM vbap INTO lv_sum_vat
+          WHERE vbeln = it_vbak-vbeln AND
+                abgru = ' '.
+        it_hdr-mwsbp = lv_sum_vat.
+*        lv_sum_tot = it_vbak-netwr + lv_sum_vat.           "MOD-003
+        lv_sum_tot = it_vbak-netwr + gv_kwert + lv_sum_vat. "MOD-003
+        it_hdr-totpr = lv_sum_tot.
+* End of insert MOD-001
+      ENDIF.
+      APPEND it_hdr.
+    ENDLOOP.
+
+*   Partners
+    SELECT vbeln parvw kunnr adrnr INTO TABLE it_vbpai
+           FROM vbpa
+           FOR ALL ENTRIES IN it_acc
+           WHERE vbeln = it_acc-vbeln
+             AND posnr = 0
+             AND ( parvw = 'WE' OR parvw = 'ZP' ).
+    SORT it_vbpai BY vbeln parvw.
+    DELETE ADJACENT DUPLICATES FROM it_vbpai
+           COMPARING vbeln parvw.
+    it_vbpa[] = it_vbpai[].
+    FREE it_vbpai.
+
+    LOOP AT it_vbak.
+      CLEAR it_par.
+      it_par-vbeln = it_vbak-vbeln.
+*     Soldto
+      it_par-soldto = it_vbak-kunnr.
+*     Shipto
+      READ TABLE it_vbpa
+                 WITH TABLE KEY vbeln = it_vbak-vbeln
+                                parvw = 'WE'.
+      IF sy-subrc = 0.
+        it_par-shipto = it_vbpa-kunnr.
+        SELECT SINGLE name1 name2 street city1 post_code1 region country
+               INTO (it_par-shname1, it_par-shname2, it_par-shstras,
+                     it_par-short01, it_par-shpstlz, it_par-shregio,
+                     it_par-shland1)
+               FROM adrc
+               WHERE addrnumber = it_vbpa-adrnr.
+      ENDIF.
+*     Contact person
+      CLEAR it_vbpa.
+      READ TABLE it_vbpa
+                 WITH TABLE KEY vbeln = it_vbak-vbeln
+                                parvw = 'ZP'.
+      IF sy-subrc = 0.
+        SELECT SINGLE name1 INTO it_par-contp
+               FROM adrc
+               WHERE addrnumber = it_vbpa-adrnr.
+      ENDIF.
+      APPEND it_par.
+    ENDLOOP.
+
+*   Items
+    SELECT vbeln posnr posex matnr pstyv
+           arktx kwmeng netwr route abgru
+           FROM vbap INTO CORRESPONDING FIELDS OF TABLE it_vbap
+           FOR ALL ENTRIES IN it_acc
+           WHERE vbeln = it_acc-vbeln
+             AND pstyv NE 'ZP1'.
+    IF not it_vbap[] IS INITIAL.
+    SORT it_vbap.
+    SELECT vbeln posnr etenr edatu bmeng
+           FROM vbep INTO CORRESPONDING FIELDS OF TABLE it_vbep
+           FOR ALL ENTRIES IN it_vbap
+           WHERE vbeln = it_vbap-vbeln
+             AND posnr = it_vbap-posnr.
+*    SORT it_vbep.
+    SELECT vbelv posnv vbeln posnn vbtyp_n rfmng
+           FROM vbfa INTO CORRESPONDING FIELDS OF TABLE it_vbfa
+           FOR ALL ENTRIES IN it_vbap
+           WHERE vbelv = it_vbap-vbeln
+             AND posnv = it_vbap-posnr
+             AND ( vbtyp_n = 'V'   OR
+                   vbtyp_n = 'J' ).
+*    SORT it_vbfa.
+    SELECT matnr bismt
+           FROM mara INTO CORRESPONDING FIELDS OF TABLE it_marai
+           FOR ALL ENTRIES IN it_vbap
+           WHERE matnr = it_vbap-matnr.
+    SORT it_marai BY matnr.
+    DELETE ADJACENT DUPLICATES FROM it_marai
+           COMPARING matnr.
+    it_mara[] = it_marai[].
+    FREE it_marai.
+
+    LOOP AT it_vbap.
+*     Prevent dump (divide by 0)
+      IF it_vbap-kwmeng = 0.
+        it_vbap-kwmeng = 1.
+      ENDIF.
+      CLEAR it_itm.
+      MOVE-CORRESPONDING it_vbap TO it_itm.
+*     Old material number
+      CLEAR it_mara.
+      READ TABLE it_mara WITH TABLE KEY matnr = it_vbap-matnr.
+      IF sy-subrc = 0.
+        it_itm-bismt = it_mara-bismt.
+      ENDIF.
+*     Schedule lines
+      CLEAR gv_bmeng.
+      LOOP AT it_vbep WHERE vbeln = it_vbap-vbeln
+                        AND posnr = it_vbap-posnr.
+        gv_bmeng = gv_bmeng + it_vbep-bmeng.
+        IF it_itm-datre IS INITIAL.
+          it_itm-datre = it_vbep-edatu.
+        ENDIF.
+        IF it_itm-datco IS INITIAL  AND
+           it_vbep-bmeng NE 0.
+          it_itm-datco = it_vbep-edatu.
+        ENDIF.
+      ENDLOOP.
+      it_itm-qtyco = gv_bmeng.
+*     Purchase order
+      CLEAR it_vbfa.
+      READ TABLE it_vbfa WITH KEY vbelv = it_vbap-vbeln
+                                  posnv = it_vbap-posnr
+                                  vbtyp_n = 'V'
+                         BINARY SEARCH.
+      IF sy-subrc = 0.
+        it_itm-purord = it_vbfa-vbeln.
+        it_itm-puritm = it_vbfa-posnn.
+      ENDIF.
+*     Delivered quantity
+      CLEAR it_vbfa.
+      CLEAR gv_rfmng.
+      LOOP AT it_vbfa WHERE vbelv = it_vbap-vbeln
+                        AND posnv = it_vbap-posnr
+                        AND vbtyp_n = 'J'.
+        gv_rfmng = gv_rfmng + it_vbfa-rfmng.
+      ENDLOOP.
+      it_itm-qtydl = gv_rfmng.
+*     Item list price
+      CLEAR gv_kwert.
+      CLEAR it_vbak.
+      READ TABLE it_vbak WITH TABLE KEY vbeln = it_vbap-vbeln.
+      IF sy-subrc = 0.
+
+*** MOD-004 * Begin Restore ZPRO on item level reading
+*** MOD-003 * begin ***
+        SELECT SINGLE kwert INTO gv_kwert
+               FROM konv
+               WHERE knumv = it_vbak-knumv
+                 AND kposn = it_vbap-posnr
+                 AND kschl = 'ZPRO'.
+
+*        READ TABLE it_konv WITH TABLE KEY knumv = it_vbak-knumv "MOD-004
+*                                          kposn = it_vbap-posnr "MOD-004
+*                                          kschl = 'ZPRO'.       "MOD-004
+*** MOD-003 * end ***
+*** MOD-004 * End ***
+"CD1K968518 begin
+        clear: lv_kwert_ZPRF.
+        select single kwert into lv_kwert_ZPRF
+          from konv
+          where knumv = it_vbak-knumv
+                 AND kposn = it_vbap-posnr
+                 AND kschl = 'ZPRF'.
+        gv_kwert = gv_kwert + lv_kwert_ZPRF.
+"CD1K968518  end
+*        IF sy-subrc = 0.
+          gv_kwert = gv_kwert / it_vbap-kwmeng.            "MOD-004
+*          gv_kwert = it_konv-kwert / it_vbap-kwmeng.        "MOD-003
+*        ENDIF.
+      ENDIF.
+      it_itm-zpro = gv_kwert.
+*     Freight value ?
+      CLEAR gv_kwert.
+*** MOD-003 * begin ***
+*      SELECT SINGLE kwert INTO gv_kwert
+*             FROM konv
+*             WHERE knumv = it_vbak-knumv
+*               AND kposn = it_vbap-posnr
+*               AND kschl = 'ZD00'.
+*      IF sy-subrc = 0.
+      LOOP AT it_konv WHERE knumv = it_vbak-knumv
+                        AND kposn = it_vbap-posnr
+                        AND ( kschl = 'ZD00' OR kschl = 'ZD01' ).
+        gv_kwert = gv_kwert + it_konv-kwert.
+      ENDLOOP.
+      IF gv_kwert <> 0.
+*** MOD-003 * end ***
+        gv_kwert = ( it_vbap-netwr - gv_kwert ) / it_vbap-kwmeng.
+      ELSE.
+        gv_kwert = it_vbap-netwr / it_vbap-kwmeng.
+      ENDIF.
+      it_itm-netwr = gv_kwert.
+      APPEND it_itm.
+    ENDLOOP.
+    ENDIF.
+  ENDIF.
+
+*** MOD-003 * begin ***
+  SORT it_itm BY vbeln posnr.
+  it_itms[] = it_itm[].
+  FREE: it_itm,
+        it_konv.
+*** MOD-003 * end ***
+
+ENDFORM.                    " Get_Detail
+
+*&---------------------------------------------------------------------*
+*&      Form  Create_delta
+*&---------------------------------------------------------------------*
+*       Create internal table with creates/updates/deletes
+*----------------------------------------------------------------------*
+FORM create_delta.
+
+* Creates/Updates
+  LOOP AT it_acc.
+
+    READ TABLE i_prev WITH KEY vbeln = it_acc-vbeln
+                    BINARY SEARCH.
+
+    IF sy-subrc = 0.
+      IF it_acc(1000) <> i_prev(1000).
+        MOVE-CORRESPONDING it_acc TO it_acc_delta.
+        MOVE c_c TO it_acc_delta-msgfn.
+        APPEND it_acc_delta.
+        CLEAR it_acc_delta.
+      ENDIF.
+    ELSE.
+      MOVE-CORRESPONDING it_acc TO it_acc_delta.
+      MOVE c_a TO it_acc_delta-msgfn.
+      APPEND it_acc_delta.
+      CLEAR it_acc_delta.
+    ENDIF.
+
+  ENDLOOP.
+
+* Deletes
+  IF NOT it_acc[] IS INITIAL.
+    CLEAR i_prev.
+    LOOP AT i_prev.
+      READ TABLE it_acc WITH KEY vbeln = i_prev-vbeln
+                      BINARY SEARCH.
+      IF sy-subrc <> 0.
+        MOVE-CORRESPONDING i_prev TO it_acc_delta.
+        MOVE c_d TO it_acc_delta-msgfn.
+        APPEND it_acc_delta.
+        CLEAR it_acc_delta.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+
+ENDFORM.                    " Create_delta
+
+*&---------------------------------------------------------------------*
+*&      Form  Get_previous_file
+*&---------------------------------------------------------------------*
+*       Get file from previous run
+*----------------------------------------------------------------------*
+FORM get_previous_file USING p_mess p_vkorg
+                    CHANGING p_retcd.
+
+* Prepare filename of previous run
+  CLEAR g_ersda.
+  SELECT ersda INTO g_ersda
+               FROM yse_acc_files
+               WHERE msgtyp = p_mess
+                 AND vkorg = p_vkorg.
+  ENDSELECT.
+
+  IF sy-subrc <> 0.
+    IF p_no_out IS INITIAL.
+      WRITE: / text-e02, p_vkorg.    "No filename of previous run
+*                                   available in custom table YSE_ACC_FILES
+      p_retcd = 4.
+      EXIT.
+    ENDIF.
+  ENDIF.
+
+  CONCATENATE p_mess p_vkorg g_ersda
+              INTO g_pfile SEPARATED BY c_underscore.
+  REPLACE 'xxx' IN g_directory WITH p_logsys(3).
+  CONCATENATE g_directory g_pfile INTO g_pfile.
+
+* FILE READ FROM APPLICATION SERVER
+  PERFORM get_from_appl TABLES  i_prev
+                        USING   g_pfile
+                                p_retcd.
+
+  SORT i_prev.
+
+ENDFORM.                    " Get_previous_file
+
+*&---------------------------------------------------------------------*
+*&      Form  Get_from_appl
+*&---------------------------------------------------------------------*
+*       Get the file from application server into internal table
+*----------------------------------------------------------------------*
+FORM get_from_appl TABLES i_infile STRUCTURE i_prev
+                   USING p_infile p_subrc.
+
+  OPEN DATASET p_infile FOR INPUT IN TEXT MODE ENCODING DEFAULT.
+  IF sy-subrc <> 0.
+    IF p_no_out IS INITIAL.
+      WRITE: / text-e03, p_infile.
+      p_subrc = 4.
+      EXIT.
+    ENDIF.
+  ENDIF.
+
+  REFRESH i_infile.
+
+  DO.
+    READ DATASET p_infile INTO i_infile.
+    IF sy-subrc <> 0.
+      EXIT.
+    ENDIF.
+    APPEND i_infile.
+  ENDDO.
+  CLOSE DATASET p_infile.
+
+ENDFORM.                    " GET_FROM_APPL
+
+*&---------------------------------------------------------------------*
+*&      Form  Write_outputfile
+*&---------------------------------------------------------------------*
+*       Write outputfile
+*----------------------------------------------------------------------*
+FORM write_outputfile.
+
+  OPEN DATASET g_ofile FOR OUTPUT IN TEXT MODE ENCODING DEFAULT.
+  IF sy-subrc <> 0.
+    IF p_no_out IS INITIAL.
+      WRITE: / text-e04, g_ofile.
+      g_retcd = 4.
+      EXIT.
+    ENDIF.
+  ENDIF.
+
+  LOOP AT it_acc.
+    TRANSFER it_acc(1000) TO g_ofile.
+  ENDLOOP.
+
+ENDFORM.                    " Write_outputfile
+
+*&---------------------------------------------------------------------*
+*&      Form  Update_custom_table
+*&---------------------------------------------------------------------*
+*       Update custom table YSE_ACC_FILES
+*----------------------------------------------------------------------*
+FORM update_custom_table USING p_vkorg.
+
+  wa_yse_acc_files-mandt = sy-mandt.
+  wa_yse_acc_files-msgtyp = p_mess.
+  wa_yse_acc_files-vkorg = p_vkorg.
+  wa_yse_acc_files-ersda = g_ersda.
+
+  INSERT yse_acc_files FROM wa_yse_acc_files.
+
+ENDFORM.                    " Update_custom_table
+
+*&---------------------------------------------------------------------*
+*&      Form  Delete_old_files
+*&---------------------------------------------------------------------*
+*       Delete files from former runs on application server
+*----------------------------------------------------------------------*
+FORM delete_old_files.
+
+  DATA: g_dir_name LIKE epsf-epsdirnam,
+        g_dfile    LIKE epsf-epsfilnam.
+
+  LOOP AT i_delfiles.
+
+    CONCATENATE p_mess i_delfiles-vkorg i_delfiles-ersda
+                INTO g_dfile SEPARATED BY c_underscore.
+
+    MOVE g_directory TO g_dir_name.
+    REPLACE 'xxx' IN g_dir_name WITH p_logsys(3).
+    TRANSLATE g_dir_name(10) TO LOWER CASE.
+    TRANSLATE g_dir_name+17(8) TO LOWER CASE.
+
+    CALL FUNCTION 'EPS_DELETE_FILE'
+      EXPORTING
+        file_name              = g_dfile
+        dir_name               = g_dir_name
+      EXCEPTIONS
+        invalid_eps_subdir
+        sapgparam_failed
+        build_directory_failed
+        no_authorization
+        build_path_failed
+        delete_failed.
+
+    IF sy-subrc <> 0.
+      IF p_no_out IS INITIAL.
+        WRITE: / text-e05, g_dfile.      "Could not delete file
+      ENDIF.
+    ENDIF.
+
+  ENDLOOP.
+
+ENDFORM.                    "delete_old_files
+
+*&---------------------------------------------------------------------*
+*&      Form  Delete_old_table_entries
+*&---------------------------------------------------------------------*
+*       Delete entries from former runs in custom table YSE_ACC_FILES
+*----------------------------------------------------------------------*
+FORM delete_old_table_entries USING p_vkorg.
+
+  g_date = sy-datum - 7.
+  CONCATENATE g_date c_0000 INTO g_ersda.
+
+  REFRESH i_delfiles.
+
+  SELECT * FROM yse_acc_files
+           WHERE msgtyp EQ p_mess
+             AND vkorg EQ p_vkorg
+             AND ersda LT g_ersda.
+    MOVE yse_acc_files TO i_delfiles.
+    APPEND i_delfiles.
+    CLEAR i_delfiles.
+  ENDSELECT.
+
+  IF sy-subrc = 0.
+    DELETE FROM yse_acc_files WHERE msgtyp EQ p_mess
+                                AND vkorg EQ p_vkorg
+                                AND ersda LT g_ersda.
+
+    IF sy-subrc <> 0.
+      IF p_no_out IS INITIAL.
+        WRITE: / text-e06, p_vkorg.        "Could not delete entrie(s)
+*                                           in table YSE_ACC_FILES
+      ENDIF.
+    ENDIF.
+
+  ENDIF.
+
+ENDFORM.                    "delete_old_table_entries
+
+*&---------------------------------------------------------------------*
+*&      Form  create_idocs_ord
+*&---------------------------------------------------------------------*
+*      -->MESSAGE_TYPE
+*----------------------------------------------------------------------*
+FORM create_idocs_ord  USING    message_type.
+
+  CLEAR: created_idocs.
+
+* FIND RECEIVING PARTNER
+  SELECT SINGLE rcvprn INTO wa_edidc-rcvprn
+  FROM edp13
+  WHERE mestyp = c_mestyp_ord.
+* Control Record
+  wa_edidc-mestyp =  c_mestyp_ord.
+  wa_edidc-idoctp =  c_idoc_type_ord.
+  wa_edidc-rcvprt =  c_ls.
+
+  LOOP AT it_acc_delta.
+    IF NOT it_acc_delta-vbeln IS INITIAL.
+      CLEAR i_edidd_data[].
+
+      LOOP AT it_hdr INTO wa_hdr WHERE vbeln = it_acc_delta-vbeln.
+        i_edidd_data-segnam  = c_segment_hdr.
+        i_edidd_data-sdata   = wa_hdr.
+        APPEND i_edidd_data.
+        CLEAR i_edidd_data.
+      ENDLOOP.
+
+      IF sy-subrc = 0.
+        LOOP AT it_par INTO wa_par WHERE vbeln = it_acc_delta-vbeln.
+          i_edidd_data-segnam  = c_segment_par.
+          i_edidd_data-sdata   = wa_par.
+          APPEND i_edidd_data.
+          CLEAR i_edidd_data.
+        ENDLOOP.
+
+        LOOP AT it_itms INTO wa_itm WHERE vbeln = it_acc_delta-vbeln.
+          i_edidd_data-segnam  = c_segment_itm.
+          i_edidd_data-sdata   = wa_itm.
+          APPEND i_edidd_data.
+          CLEAR i_edidd_data.
+        ENDLOOP.
+
+        IF NOT i_edidd_data[] IS INITIAL.
+          CALL FUNCTION 'MASTER_IDOC_DISTRIBUTE'
+            EXPORTING
+              master_idoc_control            = wa_edidc
+            TABLES
+              communication_idoc_control     = i_edidc_control_comm
+              master_idoc_data               = i_edidd_data
+            EXCEPTIONS
+              error_in_idoc_control          = 1
+              error_writing_idoc_status      = 2
+              error_in_idoc_data             = 3
+              sending_logical_system_unknown = 4
+              OTHERS                         = 5.
+
+          IF sy-subrc = 0.
+            created_idocs = created_idocs + 1.
+          ENDIF.
+
+          CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'.
+
+          CALL FUNCTION 'EDI_DOCUMENT_DEQUEUE_LATER'
+            EXPORTING
+              docnum                 = i_edidc_control_comm-docnum
+            EXCEPTIONS
+              idoc_is_not_to_dequeue = 1
+              OTHERS                 = 2.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    " CREATE_IDOCS_ORD
+
+*&---------------------------------------------------------------------*
+*&      Form  add_segments_to_it_acc
+*&---------------------------------------------------------------------*
+FORM add_segments_to_it_acc.
+
+  DATA : gv_data(1000) TYPE c.
+
+  LOOP AT it_acc.
+    CLEAR gv_data.
+    LOOP AT it_hdr INTO wa_hdr WHERE vbeln = it_acc-vbeln.
+      gv_data = wa_hdr.
+    ENDLOOP.
+    LOOP AT it_par INTO wa_par WHERE vbeln = it_acc-vbeln.
+      CONCATENATE gv_data wa_par INTO gv_data.
+    ENDLOOP.
+    LOOP AT it_itms INTO wa_itm WHERE vbeln = it_acc-vbeln.
+      CONCATENATE gv_data wa_itm INTO gv_data.
+    ENDLOOP.
+    MOVE gv_data TO it_acc-data.
+    MODIFY it_acc.
+  ENDLOOP.
+
+ENDFORM.                    "add_segments_to_it_acc
+
+*&---------------------------------------------------------------------*
+*&      Form  SEND_STATUS_FREIGHT                           "MOD-003
+*&---------------------------------------------------------------------*
+*       Send status updates for freight
+*----------------------------------------------------------------------*
+FORM send_status_freight .
+
+  WAIT UP TO 5 SECONDS.
+
+  LOOP AT it_frstat.
+
+    CALL FUNCTION 'YSE_ACC_SD_STATUS_UPDATE'
+      EXPORTING
+        im_vbeln  = it_frstat-vbeln
+        im_posnr  = '999999'
+        im_status = '998'
+        im_quan   = 1.
+
+  ENDLOOP.
+
+ENDFORM.                    " SEND_STATUS_FREIGHT
+
+*Text symbol text£º
+*001:Initial load parameters
+*E01:No data found for the selected Sales Organization
+*E02:No filename of previous run for Sales Organization
+*E03:Could not open input file
+*E04:Could not open output file
+*E05:Could not delete file
+
+*E06:Could not delete entries in table YSE_ACC_FILES
+*Selection text£º
+*P_INIT:        Initial load
+*P_INORG:        Sales Org.to be initial loaded
+*P_MESS:        Message type
+*S_ERDAT:        Created on
+*S_KUNNR:        Customer
+*S_SPART:        Division
+*S_VBELN:        Sales Order
+*S_VKORG:        Sales Organization
+*S_VTWEG:        Distribution Channel

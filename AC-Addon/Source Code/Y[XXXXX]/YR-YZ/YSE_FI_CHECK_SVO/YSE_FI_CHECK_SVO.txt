@@ -1,0 +1,369 @@
+*----------------------------------------------------------------------*
+* PROGRAM ID           : YSE_FI_CHECK_SVO                              *
+* PROGRAM TITLE        : Check settlement SVO (report for NEWGL)       *
+* AUTHOR               : Marc Jacobs                                   *
+* DATE                 : 20/03/2009                                    *
+*                                                                      *
+* CHANGE REQUEST NUMBER: CD1K947144                                    *
+*                                                                      *
+*  Check settlements Service orders                                    *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME                 |CORRNUMBER|CHANGE REF.    *
+*----------------------------------------------------------------------*
+* MOD-001 |          |                      |          |               *
+*                                                                      *
+************************************************************************
+
+REPORT  yse_fi_check_svo MESSAGE-ID yam_re.
+
+*.................. Tables definitions................................ *
+TABLES: coep.
+
+TYPE-POOLS: slis.
+
+DATA: BEGIN OF it_coeps OCCURS 0,
+       objnr LIKE coep-objnr,
+       wogbtr LIKE coep-wogbtr.
+DATA: END   OF it_coeps.
+
+DATA: BEGIN OF it_coept OCCURS 0,
+       objnr LIKE coep-objnr,
+       segment LIKE coep-segment.
+DATA: END   OF it_coept.
+
+DATA: BEGIN OF gt_coep OCCURS 0,
+       objnr LIKE coep-objnr,
+       ktext LIKE caufv-ktext,
+       segment LIKE coep-segment,
+       wogbtr LIKE coep-wogbtr,
+       selkz(1) TYPE c.
+DATA: END   OF gt_coep.
+
+DATA: gt_errmsg  TYPE TABLE OF bdcmsgcoll,
+      wa_errmsg  LIKE LINE OF gt_errmsg.
+DATA: i_bapiret2             TYPE STANDARD TABLE OF bapiret2.
+
+DATA: lt_fieldcat TYPE slis_t_fieldcat_alv.
+
+DATA:   BEGIN OF stat_tab OCCURS 0.    " Internal status setting table
+        INCLUDE STRUCTURE jstat.                            "
+DATA:   END   OF stat_tab.
+DATA:   gv_objnr  LIKE coep-objnr.
+
+DATA: BEGIN OF arbid_tab_c OCCURS 0,
+        arbid LIKE crhd-objid,
+        arbpl LIKE crhd-arbpl.
+DATA: END OF arbid_tab_c.
+
+*.. Global constants
+CONSTANTS: c_04(2)     TYPE c            VALUE '04',
+           c_charx(1)      TYPE c            VALUE 'X'.
+
+*.................. Layout selection screen........................... *
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE text-b01.
+
+PARAMETERS:
+  p_kokrs LIKE coep-kokrs OBLIGATORY,
+  p_bukrs LIKE coep-bukrs OBLIGATORY,
+  p_gjahr LIKE coep-gjahr OBLIGATORY,
+  p_perio LIKE coep-perio OBLIGATORY.
+
+SELECTION-SCREEN END   OF BLOCK b1.
+
+*.................. Main program...................................... *
+INITIALIZATION.
+
+*...................Transaction counter...............................*
+
+**.. Prepare field catalog
+  PERFORM build_field_catlog CHANGING lt_fieldcat.
+
+
+START-OF-SELECTION.
+
+*.. Select the relevant service order
+  PERFORM select_service_orders .
+
+*.. Output the ALV list with selected maintenance plans
+  PERFORM output_list_coep.
+
+*&---------------------------------------------------------------------*
+*&      Form  select_service_orders
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM select_service_orders .
+
+  REFRESH: gt_coep.
+  CONCATENATE 'OR' '%' INTO gv_objnr.
+* for the amounts
+  SELECT objnr SUM( wogbtr ) INTO TABLE it_coeps
+    FROM coep
+    WHERE kokrs EQ p_kokrs
+      AND   bukrs EQ p_bukrs
+      AND   gjahr EQ p_gjahr
+      AND   perio EQ p_perio
+      AND   wrttp EQ c_04
+      AND   objnr LIKE gv_objnr
+      GROUP BY objnr HAVING SUM( wogbtr ) <> 0.
+
+* for the text
+  IF NOT it_coeps[] IS INITIAL.
+    SELECT objnr segment INTO CORRESPONDING FIELDS OF TABLE it_coept
+       FROM coep
+       WHERE kokrs EQ p_kokrs
+       AND   bukrs EQ p_bukrs
+       AND   gjahr EQ p_gjahr
+       AND   perio EQ p_perio
+       AND   wrttp EQ c_04
+       AND   objnr LIKE gv_objnr
+       AND   segment <> ' '.
+  ENDIF.
+  SORT it_coept BY objnr.
+* join it_coeps and it_coept
+  LOOP AT it_coeps.
+    gt_coep-objnr = it_coeps-objnr.
+    gt_coep-wogbtr = it_coeps-wogbtr.
+    READ TABLE it_coept WITH KEY objnr = it_coeps-objnr
+     BINARY SEARCH.
+    IF sy-subrc = 0.
+      gt_coep-segment = it_coept-segment.
+    ENDIF.
+    gt_coep-objnr = gt_coep-objnr+2(12).
+    SELECT SINGLE ktext INTO gt_coep-ktext FROM
+      caufv WHERE aufnr = gt_coep-objnr.
+    WRITE gt_coep-objnr TO gt_coep-objnr NO-ZERO.
+    APPEND gt_coep.
+    CLEAR gt_coep.
+  ENDLOOP.
+* sorting output-table
+  SORT gt_coep BY objnr.
+
+ENDFORM.                    "select_service_orders
+
+*&---------------------------------------------------------------------*
+*&      Form  output_list_serv
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM output_list_coep.
+
+*.. Local variables
+  DATA: ls_layout TYPE slis_layout_alv,
+        ls_grid   TYPE lvc_s_glay,
+        ls_events TYPE slis_alv_event.
+
+  DATA: lt_events TYPE slis_t_event,
+        lt_event_exits TYPE slis_t_event_exit.
+
+*.. Fill events
+  REFRESH lt_events.
+  ls_events-name = 'USER_COMMAND'.
+  ls_events-form = 'USER_COMMAND_COEP'.
+  APPEND ls_events TO lt_events.
+  ls_events-name = 'PF_STATUS_SET'.
+  ls_events-form = 'PF_STATUS_SET_COEP'.
+  APPEND ls_events TO lt_events.
+  ls_events-name = 'TOP_OF_PAGE'.
+  ls_events-form = 'TOP_OF_PAGE_COEP'.
+  APPEND ls_events TO lt_events.
+*  ls_events-form = ls_events-name = 'END_OF_LIST'.
+*  APPEND ls_events TO lt_events.
+
+*.. Define layout
+  CLEAR ls_layout.
+  ls_layout-get_selinfos      = c_charx.
+  ls_layout-colwidth_optimize = c_charx.
+  ls_layout-detail_popup      = c_charx.
+  ls_layout-box_fieldname     = 'SELKZ'.
+  ls_layout-no_keyfix         = c_charx.
+  ls_layout-info_fieldname    = 'ZZCOL'.
+
+*.. Define grid settings
+  ls_grid-coll_end_l = c_charx.
+
+**.. Prepare field catalog
+*  PERFORM build_field_catlog CHANGING lt_fieldcat.
+
+*.. Call ALV grid output
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+    EXPORTING
+      i_callback_program = 'YSE_FI_CHECK_SVO'
+      i_save             = 'A'
+      it_fieldcat        = lt_fieldcat
+      it_events          = lt_events
+    TABLES
+      t_outtab           = gt_coep
+    EXCEPTIONS
+      program_error      = 1
+      OTHERS             = 2.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+ENDFORM.                    "output_list_cont_mplans
+*&---------------------------------------------------------------------*
+*&      Form  build_field_catlog
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->PT_FIELDCAT  text
+*----------------------------------------------------------------------*
+FORM build_field_catlog  CHANGING lt_fieldcat TYPE slis_t_fieldcat_alv.
+
+  DATA : ls_fcat TYPE slis_fieldcat_alv.
+*------------ Service Order--------------*
+  ls_fcat-fieldname = 'OBJNR'.
+  ls_fcat-seltext_l = 'Service Order'.
+  ls_fcat-outputlen = '12'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*--------Order description----------*
+  ls_fcat-fieldname = 'KTEXT'.
+  ls_fcat-seltext_l = 'SO Description'.
+  ls_fcat-outputlen = '50'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*------------ Segment--------------*
+  ls_fcat-fieldname = 'SEGMENT'.
+  ls_fcat-seltext_l = 'Segment'.
+  ls_fcat-outputlen = '10'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*------------ Amount--------------*
+  ls_fcat-fieldname = 'WOGBTR'.
+  ls_fcat-seltext_l = 'Value Object'.
+  ls_fcat-outputlen = '20'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*
+ENDFORM.                    " build_field_catlog
+
+
+*&---------------------------------------------------------------------*
+*&      Form  user_command_coep
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->R_UCOMM      text
+*      -->RS_SELFIELD  text
+*----------------------------------------------------------------------*
+FORM user_command_coep USING r_ucomm LIKE sy-ucomm
+                        rs_selfield TYPE slis_selfield.
+
+  CASE r_ucomm.
+
+* display service order
+    WHEN 'ORDE'.
+      READ TABLE gt_coep INDEX rs_selfield-tabindex.
+      IF sy-subrc = 0.
+        gt_coep-selkz = c_charx.
+        MODIFY gt_coep INDEX rs_selfield-tabindex.
+      ENDIF.
+      PERFORM display_service_order.
+
+  ENDCASE.
+
+ENDFORM.                    "user_command_serv
+
+
+*&---------------------------------------------------------------------*
+*&      Form  pf_status_set_coep
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->RT_EXTAB   text
+*----------------------------------------------------------------------*
+FORM pf_status_set_coep USING rt_extab TYPE slis_t_extab.
+
+  SET PF-STATUS 'YAM_COEP'.
+
+ENDFORM.                    "pf_status_set_serv
+
+
+*&---------------------------------------------------------------------*
+*&      Form  top_of_page_coep
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM top_of_page_coep.
+
+*.. Local variables
+  DATA: lt_comment TYPE slis_t_listheader,
+        ls_comment TYPE slis_listheader.
+
+*.. Header
+  ls_comment-typ  = 'H'.
+  ls_comment-info = text-h00.
+  APPEND ls_comment TO lt_comment.
+  CLEAR ls_comment.
+
+*.. Selection
+
+  IF NOT p_kokrs IS INITIAL.
+    ls_comment-typ  = 'S'.
+    ls_comment-key = text-h01.
+    ls_comment-info = p_kokrs.
+    APPEND ls_comment TO lt_comment.
+    CLEAR ls_comment.
+  ENDIF.
+  IF NOT p_bukrs IS INITIAL.
+    ls_comment-typ  = 'S'.
+    ls_comment-key = text-h02.
+    ls_comment-info = p_bukrs.
+    APPEND ls_comment TO lt_comment.
+    CLEAR ls_comment.
+  ENDIF.
+  IF NOT p_gjahr IS INITIAL.
+    ls_comment-typ  = 'S'.
+    ls_comment-key = text-h03.
+    ls_comment-info = p_gjahr.
+    APPEND ls_comment TO lt_comment.
+    CLEAR ls_comment.
+  ENDIF.
+  IF NOT p_perio    IS INITIAL.
+    ls_comment-typ  = 'S'.
+    ls_comment-key = text-h04.
+    ls_comment-info = p_perio.
+    APPEND ls_comment TO lt_comment.
+    CLEAR ls_comment.
+  ENDIF.
+
+  CALL FUNCTION 'REUSE_ALV_COMMENTARY_WRITE'
+    EXPORTING
+      it_list_commentary = lt_comment.
+
+ENDFORM.                    "top_of_page_serv
+
+*&---------------------------------------------------------------------*
+*&      Form  display_service_order
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM display_service_order.
+
+  LOOP AT gt_coep WHERE selkz EQ c_charx.
+    SET PARAMETER ID 'ANR' FIELD gt_coep-objnr.
+    CALL TRANSACTION 'IW33' AND SKIP FIRST SCREEN.
+    CLEAR gt_coep-selkz.
+    MODIFY gt_coep TRANSPORTING selkz.
+    EXIT.
+  ENDLOOP.
+ENDFORM.                    "display_service_order
+
+*Text symbol text£º
+*B01:Selection Screen Input
+*H00:Check Settlement Service Orders
+*H01:Controlling Area :
+*H02:Company :
+*H03:Year :
+
+*H04:Month :
+*Selection text£º
+*P_BUKRS:        Company
+*P_GJAHR:        Year
+*P_KOKRS:        Controlling Area
+*P_PERIO:        Period

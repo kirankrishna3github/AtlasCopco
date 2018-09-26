@@ -1,0 +1,698 @@
+*----------------------------------------------------------------------
+* PROGRAM ID           : YAM_INVOICE_RECONCILIATION_PRO                *
+* PROGRAM TITLE        : SAP invoice reconciliation report profitab.   *
+* AUTHOR               : Luc Mertens                                   *
+* DATE                 : 15/12/2005                                    *
+* DEVELOPMENT ID       : CR224                                         *
+* CHANGE REQUEST NUMBER: CD1K904247                                    *
+* PROGRAM DESCRIPTION  : List of all invoices billed within a given    *
+*                        period in order - ALV-GRID                    *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME     |CORRECTION NUMBER| CHANGE REFERENCE # *
+*----------------------------------------------------------------------*
+* MOD-001 |2006.01.31|Luc Mertens      |CD1K904611|                    *
+*            - for non-contractinvoices the actual cost must come from *
+*              service order in CO/PA (FP: check quotation)            *
+* MOD-002 |2006.12.21|Marc Jacobs      |CD1K908879|                    *
+*            - add fields sales office and created by                  *
+* MOD-003 |2009.05.29|Marc Jacobs      |CD1K948500| NEWGL              *
+*----------------------------------------------------------------------*
+REPORT YAM_INVOICE_RECONCILIATION_PRO no standard page heading
+                                      line-count 65
+                                      line-size 120.
+TYPE-POOLS: SLIS.
+
+TABLES: VBRK,                          "Billing Document: Header Data
+        VBRP,                          "Billing Document: Item Data
+        KNA1.                          "General Customer data
+
+SELECT-OPTIONS: s_vbeln for vbrk-vbeln,
+                s_fkart for vbrk-fkart,
+                s_erdat for vbrk-erdat obligatory.
+
+PARAMETERS: p_bukrs type bukrs obligatory memory id BUK.
+
+DATA: begin of gt_head occurs 0,
+        vbeln like vbrk-vbeln,
+        fkart like vbrk-fkart,
+        fkdat like vbrk-fkdat,
+* begin of insert MOD-004
+        belnr type vbrk-belnr,
+* end of insert MOD-004
+        erdat like vbrk-erdat,
+        kunrg like vbrk-kunrg,
+        waerk like vbrk-waerk,
+* begin of insert MOD-002
+        ernam like vbrk-ernam,
+* end of insert MOD-002
+      end of gt_head.
+
+DATA: begin of gt_item occurs 0,
+        vbeln like vbrp-vbeln,
+        posnr like vbrp-posnr,
+        netwr like vbrp-netwr,
+        wavwr like vbrp-wavwr,
+        prctr like vbrp-prctr,
+* begin of insert MOD-002
+        vkbur like vbrp-vkbur,
+* end of insert MOD-002
+* begin of insert MOD-002
+        prodh like vbrp-prodh,
+* end of insert MOD-002
+      end of gt_item.
+
+DATA: begin of gt_sortl occurs 0,
+        kunnr like kna1-kunnr,
+        sortl like kna1-sortl,
+      end of gt_sortl.
+
+* begin of insert MOD-004
+*DATA: begin of gt_item1 occurs 0,
+*        belnr type ce11000-belnr,
+*        rbeln type ce11000-rbeln,
+*      end of gt_item1.
+* end of insert MOD-004
+
+DATA: begin of gt_out occurs 0,
+        vbeln like vbrp-vbeln,
+        kunrg like vbrk-kunrg,
+        sortl like kna1-sortl,
+        fkart like vbrk-fkart,
+        fkdat like vbrk-fkdat,
+        erdat like vbrk-erdat,
+        prctr like vbrp-prctr,
+        plc(3) type c,
+        gac(4) type c,
+        pgc(4) type c,
+        netwr like vbrp-netwr,
+        wavwr like vbrp-wavwr,
+        profit(7) type c,
+* begin of insert MOD-002
+        ernam like vbrk-ernam,
+        vkbur like vbrp-vkbur,
+* end of insert MOD-002
+        selected,
+      end of gt_out.
+
+DATA: g_sortl         like kna1-sortl,
+      g_fkart         like vbrk-fkart,
+      g_profit(4)     type p decimals 3,
+      p_logsys        LIKE tbdlst-logsys,
+      gt_fieldcat     TYPE slis_t_fieldcat_alv,
+      g_events_tab    TYPE slis_t_event,
+      g_form_user_command TYPE slis_formname VALUE 'USER_COMMAND_L',
+      g_ic1           LIKE sy-ucomm VALUE '&IC1',
+      g_repid         like sy-repid,
+      l_index         TYPE sy-tabix,
+* begin of insert MOD-001
+      g_aufnr         like vbak-aufnr,
+      g_vgbel         type vgbel,
+      g_vv200         type RKE2_VV200,
+      g_vv300         type RKE2_VV300,
+      g_vv400         type RKE2_VV400,
+      g_vv500         type RKE2_VV500,
+      g_vv600         type RKE2_VV600,
+      g_act_cost      type RKE2_VV600,
+* end of insert MOD-001
+      g_vbelv         like vbfa-vbelv.
+
+* begin of insertion MOD-003
+data : IT_PLC         TYPE K9RCD11000010    OCCURS 0 WITH HEADER LINE.
+* end of insertion MOD-003
+
+CONSTANTS: c_fv like vbrk-fkart value 'FV',     "Contract Invoice
+           c_x(1) type c        value 'X',
+           c_s(1) type c        VALUE 'S',
+* begin of insert MOD-001
+           c_l(1) type c        value 'L',
+           c_b(1) type c        value 'B',      "Quotation
+           c_0(1) type c        value '0',
+           c_02(2) type c       value '02',
+           c_l2 like vbrk-fkart value 'L2',     "Debit memo
+           c_s2 like vbrk-fkart value 'S2',     "Credit memo cancell.
+* end of insert MOD-001
+           c_9999999(4) type p decimals 3 value '9999.999',
+           c_s1 like vbrk-fkart value 'S1',     "Invoice Cancellation
+           c_g2 like vbrk-fkart value 'G2'.     "Credit memo
+
+*-----------------------------------------------------------------------
+INITIALIZATION.
+
+  CALL FUNCTION 'OWN_LOGICAL_SYSTEM_GET'
+    IMPORTING
+      own_logical_system             = p_logsys
+    EXCEPTIONS
+      own_logical_system_not_defined = 1
+      OTHERS                         = 2.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+         WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+*-----------------------------------------------------------------------
+AT SELECTION-SCREEN.
+
+
+*-----------------------------------------------------------------------
+START-OF-SELECTION.
+
+* begin of insertion MOD-003
+* Get PLC Data
+  SELECT * FROM k9rcd11000010 INTO TABLE it_plc.
+*end of insertion MOD-003
+
+* select invoices: header data
+  SELECT vbeln fkart fkdat erdat kunrg waerk belnr
+* begin of insert MOD-002
+         ernam
+* end of insert MOD-002
+        INTO corresponding fields of table gt_head
+        FROM VBRK
+        WHERE vbeln in s_vbeln
+          AND fkart in s_fkart
+          AND erdat in s_erdat
+          AND bukrs eq p_bukrs.
+
+* select invoice items
+  if not gt_head[] is initial.
+    SELECT vbeln posnr netwr wavwr prctr
+* begin of insert MOD-002
+          vkbur
+* end of insert MOD-002
+* begin of insertion MOD-003
+          prodh
+* end of insertion MOD-003
+          INTO corresponding fields of table gt_item
+          FROM VBRP
+          FOR all entries in gt_head
+          WHERE vbeln eq gt_head-vbeln.
+  endif.
+
+* begin of insert MOD-004
+*select belnr rbeln
+*  into table gt_item1
+*  from ce11000 for ALL ENTRIES IN gt_head
+*  where belnr eq gt_head-vbeln.
+* end of insert MOD-004
+
+
+
+
+select kunnr sortl
+        INTO corresponding fields of table gt_sortl
+        FROM KNA1
+        FOR ALL entries in gt_head
+        WHERE kunnr = gt_head-kunrg.
+
+  delete adjacent duplicates from gt_sortl comparing kunnr.
+
+*-----------------------------------------------------------------------
+END-OF-SELECTION.
+
+  if gt_item[] is initial.
+    skip 3.
+    write: /15 'No Invoices selected'(015).
+    stop.
+  endif.
+
+  sort gt_item.
+  sort gt_head.
+  sort gt_sortl.
+*  sort gt_item1.
+
+
+* test on type of contract
+  loop at gt_item.
+
+    clear gt_head.
+    read table gt_head with key vbeln = gt_item-vbeln
+                         binary search.
+
+*   if invoice contract --> cost = 0
+    if gt_head-fkart = c_fv.
+
+      clear gt_item-wavwr.
+
+* begin of change MOD-001
+*   elseif gt_head-fkart = c_s1.
+    elseif gt_head-fkart = c_s1 or
+           gt_head-fkart = c_s2.
+* end of change MOD-001
+
+*     read document flow to check type of invoice
+      select vbelv into g_vbelv
+          from vbfa up to 1 rows
+          where vbeln   = gt_item-vbeln
+          and   vbtyp_n in ('N', 'S')       "Inv/Cr.memo cancellation
+          and   vbtyp_v in ('M', 'P', 'K'). "Inv/Debmemo/Cr.memo request
+      endselect.
+
+      if sy-subrc = 0.
+        select single fkart into g_fkart
+            from vbrk
+            where vbeln = g_vbelv.
+
+        if g_fkart = c_fv.
+          clear gt_item-wavwr.
+        else.
+          gt_item-wavwr = gt_item-wavwr * -1.
+        endif.
+
+* begin of change MOD-001
+*       gt_item-netwr = gt_item-netwr * -1.
+        if gt_head-fkart = c_s1.
+          gt_item-netwr = gt_item-netwr * -1.
+        endif.
+* end of change MOD-001
+      endif.
+    elseif gt_head-fkart = c_g2.
+
+      gt_item-wavwr = gt_item-wavwr * -1.
+      gt_item-netwr = gt_item-netwr * -1.
+
+* begin of insert MOD-001
+    elseif gt_head-fkart = c_l2.
+
+*.... for Fixed Price orders: take actual cost from S.O. in CO/PA via
+*.... document flow
+      select vbelv into g_vbelv
+          from vbfa
+          where vbeln   = gt_item-vbeln
+          and   posnn   = gt_item-posnr
+          and   vbtyp_v = c_b.                   "Quotation
+      endselect.
+
+      if sy-subrc = 0.
+
+*...... read sales document to get service ordernr.
+        select single aufnr into g_aufnr
+              from vbak
+              where vbeln = g_vbelv.
+
+          if sy-subrc = 0.
+            clear g_act_cost.
+            select vv200 vv300 vv400 vv500 vv600
+                 into (g_vv200, g_vv300, g_vv400, g_vv500, g_vv600)
+                 from ce11000
+                 where paledger = c_02
+                   and vrgar    = c_0
+                   and rkaufnr  = g_aufnr.
+
+              g_act_cost = g_act_cost + g_vv200 + g_vv300 + g_vv400
+                         + g_vv500 + g_vv600.
+            endselect.
+
+            if sy-subrc = 0.
+              gt_item-wavwr = g_act_cost.
+            endif.
+          endif.
+
+      endif.
+* end of insert MOD-001
+    endif.
+
+    clear g_sortl.
+    read table gt_sortl with key kunnr = gt_head-kunrg
+                          binary search.
+
+*   fill structure output
+    move-corresponding gt_item to gt_out.
+    move-corresponding gt_head to gt_out.
+    move-corresponding gt_sortl to gt_out.
+*    move-corresponding gt_item1 to gt_out.
+
+    clear gt_out-plc.
+* begin of deletion MOD-003
+*    case gt_item-prctr+1(1).
+*      when 1.
+*        move 'AIF'  to gt_out-plc.
+*      when 2.
+*        move 'AII'  to gt_out-plc.
+*      when 3.
+*        move 'AIP'  to gt_out-plc.
+*      when 4.
+*        move 'GAP'  to gt_out-plc.
+*    endcase.
+* end of deletion MOD-003
+* begin of insertion MOD-003
+CALL FUNCTION 'YSE_CONVERT_PRCTR_BL'
+  EXPORTING
+    prctr_in          = gt_out-prctr
+    bukrs             = p_bukrs
+ IMPORTING
+   SEGMENT_OUT       = gt_out-prctr .
+
+   LOOP AT it_plc WHERE sour1_from LE gt_item-prctr
+                   AND sour1_to   GE gt_item-prctr
+                   AND valid_from LE sy-datum.
+    gt_out-plc = it_plc-target1.
+    EXIT.
+  ENDLOOP.
+  write gt_out-prctr to gt_out-prctr no-ZERO.
+
+* end of insertion MOD-003
+* begin of change MOD-003
+*    write gt_item-prctr+2(4)  to gt_out-gac no-zero.
+*    write gt_item-prctr+6(4)  to gt_out-pgc no-zero.
+
+*    write gt_item-prodh+0(4)  to gt_out-gac no-zero.
+*    write gt_item-prodh+4(4)  to gt_out-pgc no-zero.
+* end of change MOD-003
+
+Select Single Ww006 Ww007
+    Into (Gt_out-gac, Gt_out-pgc)
+      From Ce11000
+      Where Rbeln Eq Gt_item-vbeln
+      And   Rposn Eq Gt_item-posnr.
+
+* begin of change MOD-004
+*    write gt_item1-rbeln+0(4) to gt_out-gac no-zero.
+*    write gt_item1-rbeln+4(4) to gt_out-pgc no-zero.
+* end of change MOD-004
+
+*   calculate profit margin %
+    clear g_profit.
+    CATCH SYSTEM-EXCEPTIONS ARITHMETIC_ERRORS = 1.
+      if not ( gt_item-netwr is initial or
+               gt_item-wavwr is initial ).
+        g_profit = ( gt_item-netwr - gt_item-wavwr )
+                         / gt_item-netwr * 100.
+      endif.
+    ENDCATCH.
+
+    if sy-subrc = 1.
+      g_profit = c_9999999.
+    endif.
+
+    write g_profit to gt_out-profit no-zero.
+    append gt_out.
+    clear gt_out.
+
+  endloop.
+
+* create ALV-GRID
+  PERFORM build_field_catlog CHANGING gt_fieldcat.
+  PERFORM fill_events_f14.
+  PERFORM alv_display.
+
+*-----------------------------------------------------------------------
+TOP-OF-PAGE.
+
+
+*&---------------------------------------------------------------------*
+*&      Form  build_field_catlog
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_GT_FIELDCAT  text
+*----------------------------------------------------------------------*
+FORM build_field_catlog  CHANGING pt_fieldcat TYPE slis_t_fieldcat_alv.
+
+  DATA : ls_fcat TYPE slis_fieldcat_alv.
+*--------------------------Invoice Nr-----------------------*
+  ls_fcat-fieldname = 'VBELN'.
+  ls_fcat-rollname = 'VBELN_VF'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+*--------------------------SAP Customer Nr------------------*
+  ls_fcat-fieldname = 'KUNRG'.
+  ls_fcat-outputlen = '15'.
+  ls_fcat-seltext_l = 'SAP Customer Nr'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+*--------------------------BPCS Customer Nr-----------------*
+  ls_fcat-fieldname = 'SORTL'.
+  ls_fcat-outputlen = '16'.
+  ls_fcat-seltext_l = 'BPCS Customer Nr'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+*--------------------------Billing Type---------------------*
+  ls_fcat-fieldname = 'FKART'.
+  ls_fcat-rollname = 'FKART'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+*--------------------------Billing Date---------------------*
+  ls_fcat-fieldname = 'FKDAT'.
+  ls_fcat-rollname = 'FKDAT'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+*--------------------------Creation Date---------------------*
+  ls_fcat-fieldname = 'ERDAT'.
+  ls_fcat-rollname = 'ERDAT'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+*-------------------Profitcenter------------------------------*
+  ls_fcat-fieldname = 'PRCTR'.
+  ls_fcat-rollname = 'PRCTR'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+*--------------------------PLC--------------------------------*
+  ls_fcat-fieldname = 'PLC'.
+  ls_fcat-rollname = 'RKEG_WW002'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+*--------------------------GAC--------------------------------*
+  ls_fcat-fieldname = 'GAC'.
+  ls_fcat-rollname = 'RKEG_WW006'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+*--------------------------PGC--------------------------------*
+  ls_fcat-fieldname = 'PGC'.
+  ls_fcat-rollname = 'RKEG_WW007'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+*--------------------------SALES Value------------------------*
+  ls_fcat-fieldname = 'NETWR'.
+  ls_fcat-rollname = 'NETWR_FP'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+*--------------------------COST Value-------------------------*
+  ls_fcat-fieldname = 'WAVWR'.
+  ls_fcat-rollname = 'WAVWR'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+*--------------------------Profit Margin %-------------------*
+  ls_fcat-fieldname = 'PROFIT'.
+  ls_fcat-outputlen = '15'.
+  ls_fcat-seltext_l = 'Profit Margin %'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+* begin of insert MOD-002
+*--------------------------Created by ----------------------*
+  ls_fcat-fieldname = 'ERNAM'.
+  ls_fcat-rollname = 'ERNAM'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+*--------------------------Sales Office ----------------------*
+  ls_fcat-fieldname = 'VKBUR'.
+  ls_fcat-rollname = 'VKBUR'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+* end of insert MOD-002
+
+ENDFORM.                    " build_field_catlog
+
+*&---------------------------------------------------------------------*
+*&      Form  fill_events_f14
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM fill_events_f14 .
+
+  DATA h_event       TYPE slis_alv_event.
+
+  CALL FUNCTION 'REUSE_ALV_EVENTS_GET'
+    EXPORTING
+      i_list_type = 0
+    IMPORTING
+      et_events   = g_events_tab.
+
+*--- allocate form for user-command ---------------------------------*
+  READ TABLE g_events_tab WITH KEY name = slis_ev_user_command
+                        INTO h_event.
+  IF sy-subrc = 0.
+    MOVE g_form_user_command TO h_event-form.
+    MODIFY g_events_tab FROM h_event INDEX sy-tabix.
+  ENDIF.
+
+ENDFORM.                    " fill_events_f14
+
+*&--------------------------------------------------------------------*
+*&      Form  user_command_l
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+*      -->P_UCOMM    text
+*      -->P_SELFIELD text
+*---------------------------------------------------------------------*
+FORM user_command_l USING p_ucomm LIKE sy-ucomm
+                          p_selfield TYPE slis_selfield.
+
+  p_selfield-refresh = c_s.
+  PERFORM check_pf2_with_object_f16 USING p_ucomm.
+  PERFORM set_p_selfield_general_f16 USING p_selfield.
+
+  CASE p_ucomm.
+    WHEN 'ISEL'.
+      p_ucomm = 'DISP'.
+      PERFORM fcodes_with_mark_f16 USING p_ucomm p_selfield.
+  ENDCASE.
+
+ENDFORM.                    "user_command_l
+
+*&---------------------------------------------------------------------*
+*&      Form  check_pf2_with_object_f16
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_P_UCOMM  text
+*----------------------------------------------------------------------*
+FORM check_pf2_with_object_f16  USING    p_ucomm.
+
+  CHECK p_ucomm = g_ic1.
+  p_ucomm = 'ISEL'.
+
+ENDFORM.                    " check_pf2_with_object_f16
+
+*&---------------------------------------------------------------------*
+*&      Form  set_p_selfield_general_f16
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_P_SELFIELD  text
+*----------------------------------------------------------------------*
+FORM set_p_selfield_general_f16  USING f_selfield TYPE slis_selfield.
+
+  f_selfield-col_stable = c_x.
+  f_selfield-row_stable = c_x.
+
+ENDFORM.                    " set_p_selfield_general_f16
+
+*&---------------------------------------------------------------------*
+*&      Form  fcodes_with_mark_f16
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_P_UCOMM  text
+*      -->P_P_SELFIELD  text
+*      -->P_ENDCASE  text
+*----------------------------------------------------------------------*
+FORM fcodes_with_mark_f16  USING p_ucomm LIKE sy-ucomm
+                                p_selfield TYPE slis_selfield.
+
+  PERFORM check_object_tab_marked_f14 USING p_ucomm p_selfield.
+
+  LOOP AT gt_out WHERE selected = c_x .
+    l_index = sy-tabix.
+    PERFORM fcodes_with_mark_l USING p_ucomm p_selfield.
+    gt_out-selected = ' '.
+    MODIFY gt_out INDEX l_index.
+  ENDLOOP.
+
+  CLEAR p_ucomm.
+
+ENDFORM.                    " fcodes_with_mark_f16
+
+*&---------------------------------------------------------------------*
+*&      Form  check_object_tab_marked_f14
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_P_UCOMM  text
+*      -->P_P_SELFIELD  text
+*----------------------------------------------------------------------*
+FORM check_object_tab_marked_f14  USING    p_ucomm LIKE sy-ucomm
+                                        p_selfield TYPE slis_selfield.
+
+  READ TABLE gt_out WITH KEY selected = c_x.
+
+  IF NOT sy-subrc IS INITIAL.
+    IF NOT p_selfield-tabindex IS INITIAL.
+      READ TABLE gt_out  INDEX p_selfield-tabindex.
+      gt_out-selected = c_x.
+      MODIFY gt_out  INDEX p_selfield-tabindex.
+    ENDIF.
+  ELSE.
+*--- Checkbox markiert -----------------------------------------------*
+    p_selfield-sel_tab_field = 'G_MARK'.
+  ENDIF.
+
+ENDFORM.                    " check_object_tab_marked_f14
+
+*&---------------------------------------------------------------------*
+*&      Form  fcodes_with_mark_l
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_F_UCOMM  text
+*      -->P_F_SELFIELD  text
+*----------------------------------------------------------------------*
+FORM fcodes_with_mark_l  USING   p_ucomm LIKE sy-ucomm
+                              p_selfield TYPE slis_selfield.
+
+  DATA: h_ucomm LIKE sy-ucomm.
+
+  CASE p_ucomm.
+*   Display billing document
+    WHEN 'DISP'.
+      SET PARAMETER ID 'VF ' FIELD  gt_out-vbeln.
+      CALL TRANSACTION 'VF03' AND SKIP FIRST SCREEN.
+  ENDCASE.
+
+ENDFORM.                    " fcodes_with_mark_l
+
+*&---------------------------------------------------------------------*
+*&      Form  alv_display
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM alv_display .
+
+  g_repid = sy-repid.
+
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+     EXPORTING
+       i_callback_program                =  g_repid
+       i_save                            = 'A'
+       it_events                         =  g_events_tab[]
+*      I_GRID_TITLE                      =
+*      I_GRID_SETTINGS                   =
+*      is_layout                         =  g_layout
+       it_fieldcat                       =  gt_fieldcat[]
+     TABLES
+        t_outtab                         =  gt_out.
+
+ENDFORM.                    " alv_display
+
+*Text symbol text£º
+*001:Invoice_No
+*002:SAP_Customer_No
+*003:Inv_Date
+*004:Sales_Val_excl_VAT
+*005:Cost_Value
+*006:User:
+*007:BPCS_Customer_No
+*008:Created_on
+*010:From :
+*011:To
+*012:'X' = LIST w/o titles+totals, '  ' = NORMAL LIST
+*015:No Invoices selected
+*030:Order Number Total
+*040:Acc.ind. Total
+*050:Grand Total
+*E01:Period/year From must be less than or equal To
+
+*E03:Open dataset failed for :
+*Selection text£º
+*P_BUKRS:D       Company Code
+*S_ERDAT:D       Created on
+*S_FKART:D       Billing Type
+*S_VBELN:D       Billing Document

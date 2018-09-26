@@ -1,0 +1,795 @@
+*----------------------------------------------------------------------
+* PROGRAM ID           : YAM_COST_PROVISION                            *
+* PROGRAM TITLE        : Cost provision                                *
+* AUTHOR               : Luc Mertens                                   *
+* DATE                 : 11/03/2005                                    *
+* DEVELOPMENT ID       : ALL-CR 226                                    *
+* CHANGE REQUEST NUMBER: CD1K904557                                    *
+* PROGRAM DESCRIPTION  : Create list of open contracts with several    *
+*                        values from CO/PA in order to calculate       *
+*                        def.revenues and cost provision.              *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME     |CORRECTION NUMBER| CHANGE REFERENCE # *
+*----------------------------------------------------------------------*
+* MOD-001 |2006.02.09|Luc Mertens      |CD1K904718| ALL-CR226          *
+*      - select only revenue recognition relevant contractitems        *
+*      - add column with unbilled revenues                             *
+* MOD-002 |2006.02.17|Luc Mertens      |CD1K904   | ALL-CR226          *
+*      - do display revenue-columns when tcode = SA38 or SE38          *
+* MOD-003 |2006.10.17|Marc Jacobs      |CD1K907067| ALL-CR226          *
+*      - display negative values                                       *
+*      - profit center (gac/pgc) from COPA                             *
+* MOD-004 |2008.09.22|Marc Jacobs      |CD1K943493| ALL-CR296+001      *
+*      - also count in planned costs + historical planned costs        *
+* MOD-005 |2008.11.26|Marc Jacobs |CD1K944803| partly cancel MOD-004   *
+*----------------------------------------------------------------------*
+
+REPORT yam_cost_provision NO STANDARD PAGE HEADING
+                            LINE-SIZE 200.
+
+TYPE-POOLS: slis.
+
+TABLES: vbak.                          "Sales Document: Header Data
+
+
+*- SELECTION SCREEN---------------------------------------------------
+SELECTION-SCREEN : BEGIN OF BLOCK b1 WITH FRAME TITLE text-001.
+PARAMETERS:     p_idate TYPE datum OBLIGATORY DEFAULT sy-datum.
+PARAMETERS:     p_vkorg    LIKE vbak-vkorg OBLIGATORY MEMORY ID vko.
+SELECT-OPTIONS: s_vkbur     FOR vbak-vkbur.
+SELECTION-SCREEN: END OF BLOCK b1.
+
+*- VARIABLES----------------------------------------------------------
+DATA: BEGIN OF gt_vbak OCCURS 0,
+        vbeln LIKE vbak-vbeln,
+        vkbur LIKE vbak-vkbur,
+        auart LIKE vbak-auart,
+        kunnr LIKE vbak-kunnr,
+      END OF gt_vbak.
+
+DATA: BEGIN OF gt_vbap OCCURS 0,
+        vbeln LIKE vbap-vbeln,
+        posnr LIKE vbap-posnr,
+* begin of deletion mod-003
+*       prctr like vbap-prctr,
+* end of deletion mod-003
+      END OF gt_vbap.
+
+* begin of insert MOD-001
+DATA: BEGIN OF gt_vbkd OCCURS 0,
+        vbeln LIKE vbkd-vbeln,
+        posnr LIKE vbkd-posnr,
+      END OF gt_vbkd.
+* end of insert MOD-001
+
+DATA: BEGIN OF gt_copa OCCURS 0,
+        ww004   TYPE rkeg_ww004,
+        prctr   TYPE prctr,
+        gjahr   TYPE gjahr,
+        perde   TYPE periode,
+        vrgar   TYPE rke_vrgar,
+        vv100   TYPE rke2_vv100,
+        vv110   TYPE rke2_vv110,
+        vv200   TYPE rke2_vv200,
+        vv300   TYPE rke2_vv300,
+        vv400   TYPE rke2_vv400,
+        vv500   TYPE rke2_vv500,
+        vv600   TYPE rke2_vv600,
+        vv120   TYPE rke2_vv120,
+        vv101   TYPE rke2_vv101,
+        vv199   TYPE rke2_vv199,
+        vv111   TYPE rke2_vv111,
+      END OF gt_copa.
+
+DATA: BEGIN OF gt_final OCCURS 0,
+        ww004         TYPE rkeg_ww004,
+        gac           TYPE rkeg_ww006,
+        pgc           TYPE rkeg_ww007,
+        vkbur         TYPE vkbur,
+        auart         TYPE auart,
+        kunnr         TYPE kunag,
+        act_rev(15)   TYPE p DECIMALS 2,
+        rec_rev(15)   TYPE p DECIMALS 2,
+        def_rev(15)   TYPE p DECIMALS 2,
+* begin of insert MOD-001
+        unbilled_rev(15) TYPE p DECIMALS 2,
+* end of insert MOD-001
+        act_cost(15)  TYPE p DECIMALS 2,
+* begin of insertion MOD-004
+        plan_cost(15) TYPE p DECIMALS 2,
+* end of insertion MOD-004
+        rec_cost(15)  TYPE p DECIMALS 2,
+        cost_prov(15) TYPE p DECIMALS 2,
+        selected,
+      END OF gt_final.
+
+DATA: g_tabname       LIKE tketr-tabname   VALUE 'CE1xxxx',
+      g_repid         LIKE ceddb-program,
+      gt_seltab       LIKE ceddbsel OCCURS 1 WITH HEADER LINE,
+      g_timestmp      LIKE tketrlg-timestmp,
+      g_trcatnr       LIKE tketrlt-trcatnr,
+      l_index         TYPE sy-tabix,
+      g_exist(1)      TYPE c,
+      g_ic1           LIKE sy-ucomm VALUE '&IC1',
+      gt_fieldcat     TYPE slis_t_fieldcat_alv,
+      g_events_tab    TYPE slis_t_event,
+      g_form_user_command TYPE slis_formname VALUE 'USER_COMMAND_L',
+      wa_copa         LIKE LINE OF gt_copa,
+      g_ww004_10(10)  TYPE c,
+      g_period(6)     TYPE c,
+      g_bukrs         TYPE bukrs,
+      g_kokrs         TYPE kokrs,
+      g_erkrs         TYPE erkrs.
+* begin of insertion MOD-004
+DATA: gv_planhist     LIKE ce11000-vv300.
+* end of insertion MOD-004
+* begin of insertion MOD-005
+DATA: gv_golive       LIKE yam_ctam_golive-golive,
+      gv_goliveper    like ce21000-perbl.
+* end of insertion MOD-005
+*- Constants------------------------------------------------------------
+CONSTANTS: c_g(1)          TYPE c VALUE 'G',               "Contracts
+           c_x(1)          TYPE c VALUE 'X',
+           c_s(1)          TYPE c VALUE 'S',
+           c_00(2)         TYPE c VALUE '00',
+           c_applclass     LIKE tketr-applclass VALUE 'KE',
+           c_subclass      LIKE tketr-subclass  VALUE '01'.
+
+*...................Transaction counter...............................*
+
+CALL METHOD ycl_statistics=>record_transaction
+  .
+
+*-START OF SELECTION----------------------------------------------------
+START-OF-SELECTION.
+
+* get company code
+  SELECT SINGLE bukrs INTO g_bukrs
+      FROM tvko WHERE vkorg = p_vkorg.
+
+  IF sy-subrc NE 0.
+    WRITE:/ text-e01, p_vkorg.                       "SO does not exist
+    EXIT.
+  ENDIF.
+
+* get controlling area
+  CALL FUNCTION 'COPA_ERKRS_FIND'
+    EXPORTING
+      bukrs              = g_bukrs
+      gsber              = ' '
+      kokrs              = ' '
+    IMPORTING
+      erkrs              = g_erkrs
+      kokrs              = g_kokrs
+    EXCEPTIONS
+      error_kokrs_find   = 1
+      kokrs_wrong        = 2
+      no_erkrs_defined   = 3
+      no_erkrs_for_kokrs = 4
+      OTHERS             = 5.
+
+  IF sy-subrc <> 0.
+    WRITE: / text-e02, sy-subrc.
+    EXIT.
+  ENDIF.
+
+* get summarization level from custom table
+  SELECT SINGLE trcatnr INTO g_trcatnr
+      FROM yam_summ_levels
+      WHERE bukrs = g_bukrs.
+
+  IF sy-subrc NE 0.
+    WRITE:/ text-e04, 'YAM_SUMM_LEVELS'.
+    EXIT.
+  ENDIF.
+
+* select all open contracts
+  SELECT vbeln vkbur auart kunnr
+        INTO CORRESPONDING FIELDS OF TABLE gt_vbak
+        FROM vbak
+        WHERE vkorg EQ p_vkorg
+          AND vkbur IN s_vkbur
+          AND vbtyp EQ c_g
+          AND guebg LE p_idate
+          AND gueen GE p_idate.
+
+  IF gt_vbak[] IS INITIAL.
+    WRITE: / text-i01.              "No contracts selected
+    EXIT.
+  ENDIF.
+
+* begin of change mod-003*
+*  select vbeln posnr prctr
+  SELECT vbeln posnr
+* end of change mod-003
+        INTO CORRESPONDING FIELDS OF TABLE gt_vbap
+        FROM vbap
+        FOR ALL ENTRIES IN gt_vbak
+        WHERE vbeln = gt_vbak-vbeln.
+
+* begin of insert MOD-001
+* preselect not 'revenue recognition relevant' items
+  SELECT vbeln posnr
+        INTO CORRESPONDING FIELDS OF TABLE gt_vbkd
+        FROM vbkd
+        FOR ALL ENTRIES IN gt_vbap
+        WHERE vbeln EQ gt_vbap-vbeln
+          AND posnr EQ gt_vbap-posnr
+          AND rrrel EQ ' '.
+* end of insert MOD-001
+
+* begin of insertion MOD-005
+* get go_live date of the company
+ clear gv_golive.
+ select single golive into gv_golive
+     from yam_ctam_golive where bukrs = g_bukrs.
+if sy-subrc <> 0.
+  gv_golive = '20061001'.
+endif.
+  gv_goliveper = ( gv_golive+0(4) * 1000 ) + gv_golive+4(2).
+* end of insertion MOD-005
+*-----------------------------------------------------------------------
+END-OF-SELECTION.
+
+* begin of change mod-003
+*  sort gt_vbap by vbeln prctr.
+*  delete adjacent duplicates from gt_vbap comparing vbeln prctr.
+  SORT gt_vbap BY vbeln.
+  DELETE ADJACENT DUPLICATES FROM gt_vbap COMPARING vbeln.
+* end of change mod-003
+
+* begin of insert MOD-001
+  SORT gt_vbak BY vbeln.
+  SORT gt_vbkd BY vbeln posnr.
+
+  LOOP AT gt_vbap.
+
+    READ TABLE gt_vbkd WITH KEY vbeln = gt_vbap-vbeln
+                   BINARY SEARCH TRANSPORTING NO FIELDS.
+
+    IF sy-subrc EQ 0.
+      DELETE gt_vbap.
+    ENDIF.
+
+  ENDLOOP.
+* end of insert MOD-001
+
+  LOOP AT gt_vbap.
+
+*   Build SELTAB
+    REFRESH gt_seltab.
+
+    CLEAR gt_seltab.
+    gt_seltab-fnam = 'GJAHR'.
+    gt_seltab-sign = 'I'.
+    gt_seltab-option = 'LE'.
+    gt_seltab-low = p_idate(4).
+    APPEND gt_seltab.
+
+    CLEAR gt_seltab.
+    gt_seltab-fnam = 'WW004'.
+    gt_seltab-sign = 'I'.
+    gt_seltab-option = 'EQ'.
+    gt_seltab-low = gt_vbap-vbeln+2(8).
+    APPEND gt_seltab.
+
+* begin of deletion mod-003
+*    CLEAR gt_SELTAB.
+*    gt_SELTAB-FNAM = 'PRCTR'.
+*    gt_seltab-sign = 'I'.
+*    gt_seltab-option = 'EQ'.
+*    gt_seltab-low = gt_vbap-prctr.
+*    APPEND gt_SELTAB.
+* end of deletion mod-003
+
+    CLEAR gt_seltab.
+    gt_seltab-fnam = 'VRGAR'.
+    gt_seltab-sign = 'I'.
+    gt_seltab-option = 'EQ'.
+    gt_seltab-low = '0'.
+    APPEND gt_seltab.
+
+    CLEAR gt_seltab.
+    gt_seltab-fnam = 'VRGAR'.
+    gt_seltab-sign = 'I'.
+    gt_seltab-option = 'EQ'.
+    gt_seltab-low = 'F'.
+    APPEND gt_seltab.
+
+* begin of insertion MOD-004
+* planned cost
+    CLEAR gt_seltab.
+    gt_seltab-fnam = 'VRGAR'.
+    gt_seltab-sign = 'I'.
+    gt_seltab-option = 'EQ'.
+    gt_seltab-low = '1'.
+    APPEND gt_seltab.
+* historic cost
+    CLEAR gt_seltab.
+    gt_seltab-fnam = 'VRGAR'.
+    gt_seltab-sign = 'I'.
+    gt_seltab-option = 'EQ'.
+    gt_seltab-low = '9'.
+    APPEND gt_seltab.
+* end of insertion MOD-004
+    g_tabname+3(4) = g_erkrs.
+    g_repid = sy-repid.
+
+    CLEAR g_exist.
+
+    CALL FUNCTION 'RKD_TR_LEVEL_READ'
+      EXPORTING
+        applclass         = c_applclass
+        subclass          = c_subclass
+        tabname           = g_tabname
+        trcatnr           = g_trcatnr
+        s_form_name       = 'GET_DATA'
+        s_program_name    = g_repid
+        read_dirty        = ' '
+      IMPORTING
+        timestmp          = g_timestmp
+      TABLES
+        selection_table   = gt_seltab
+      EXCEPTIONS
+        catalog_not_found = 1
+        trcatnr_not_found = 2.
+
+    IF sy-subrc <> 0.
+      WRITE: /(79) 'Summarization level does not exist.'(e03)
+             COLOR COL_NEGATIVE.
+      STOP.
+    ENDIF.
+
+*.. show contract also when no summarization data was found
+    IF g_exist IS INITIAL.
+      MOVE gt_vbap-vbeln+2(8) TO gt_copa-ww004.
+* begin of deletion mod-003
+*     move gt_vbap-prctr to gt_copa-prctr.
+* end of deletion mod-003
+      APPEND gt_copa.
+      CLEAR gt_copa.
+    ENDIF.
+
+  ENDLOOP.
+
+  SORT gt_copa BY ww004.
+
+* calculate actual/recognized costs and revenues
+  LOOP AT gt_copa INTO wa_copa.
+
+    AT NEW ww004.
+      CONCATENATE c_00 wa_copa-ww004 INTO g_ww004_10.
+      READ TABLE gt_vbak WITH KEY vbeln = g_ww004_10
+                   BINARY SEARCH.
+    ENDAT.
+
+    IF NOT wa_copa-gjahr IS INITIAL.     "summ. data was found
+      CONCATENATE wa_copa-gjahr wa_copa-perde+1(2) INTO g_period.
+      IF g_period > p_idate(6).
+        MOVE g_ww004_10 TO gt_final-ww004.
+        WRITE wa_copa-prctr+3(3) TO gt_final-gac NO-ZERO.
+        WRITE wa_copa-prctr+6(4) TO gt_final-pgc NO-ZERO.
+        MOVE-CORRESPONDING gt_vbak TO gt_final.
+        COLLECT gt_final.
+        CLEAR gt_final.
+        CONTINUE.
+      ENDIF.
+    ENDIF.
+
+    MOVE g_ww004_10 TO gt_final-ww004.
+    WRITE wa_copa-prctr+3(3) TO gt_final-gac NO-ZERO.
+    WRITE wa_copa-prctr+6(4) TO gt_final-pgc NO-ZERO.
+    MOVE-CORRESPONDING gt_vbak TO gt_final.
+
+    CASE wa_copa-vrgar.
+      WHEN '0'.
+        gt_final-act_cost = wa_copa-vv200 + wa_copa-vv300 +
+               wa_copa-vv400 + wa_copa-vv500 + wa_copa-vv600.
+      WHEN 'F'.
+        gt_final-act_rev  = wa_copa-vv100 + wa_copa-vv120 +
+               wa_copa-vv110.
+        gt_final-rec_cost = wa_copa-vv199.
+        gt_final-rec_rev  = wa_copa-vv101 - wa_copa-vv111.
+* begin of insertion MOD-004
+      WHEN '9'.
+        gt_final-act_cost = wa_copa-vv200 + wa_copa-vv300 +
+               wa_copa-vv400 + wa_copa-vv500 + wa_copa-vv600.
+      WHEN '1'.
+        gt_final-plan_cost = wa_copa-vv300.
+* end of insertion MOD-004
+      WHEN OTHERS.
+*       no action
+    ENDCASE.
+
+    COLLECT gt_final.
+    CLEAR gt_final.
+
+  ENDLOOP.
+* begin of deletion MOD-005
+* begin of insertion MOD-004
+* add historical planned cost (wrongly booked in CE11000)
+**loop at gt_final.
+**   if gt_final-gac = ' _D ' and gt_final-pgc = 'UMMY'.
+**     clear gv_planhist.
+**     select sum( vv300 ) into gv_planhist from ce11000
+**         where paledger EQ '02'
+**           AND vrgar    eq '1'
+**           AND bukrs    EQ g_bukrs
+**           AND kaufn    EQ gt_final-ww004.
+**     gt_final-plan_cost = 0.
+**     gt_final-rec_cost = gt_final-rec_cost + gv_planhist.
+**     modify gt_final.
+**   endif.
+**endloop.
+* end of insertion MOD-004
+* end of deletion MOD-005
+* begin of insertion MOD-005
+* get the planned cost history from CE21000
+  LOOP AT gt_final.
+    IF gt_final-gac = ' _D ' AND gt_final-pgc = 'UMMY'.
+      CLEAR gv_planhist.
+      SELECT SUM( vv300001 ) INTO gv_planhist FROM ce21000
+          WHERE paledger EQ '02'
+            AND vrgar    EQ '1'
+            AND bukrs    EQ g_bukrs
+            AND kaufn    EQ gt_final-ww004
+            AND perbl    LT gv_goliveper.
+      gt_final-plan_cost = 0.
+      gt_final-rec_cost = gt_final-rec_cost + gv_planhist.
+      MODIFY gt_final.
+    ENDIF.
+  ENDLOOP.
+* end of insertion MOD-005
+
+* calculate deferred revenues and cost provision
+  LOOP AT gt_final.
+
+* begin of deletion mod-003
+*   gt_final-def_rev   = gt_final-act_rev - gt_final-rec_rev.
+*   if gt_final-def_rev < 0.
+*     gt_final-def_rev = 0.
+*   endif.
+* end of deletion mod-003
+
+    gt_final-cost_prov = gt_final-rec_cost - gt_final-act_cost.
+* begin of deletion mod-003
+*   if gt_final-cost_prov < 0.
+*    gt_final-cost_prov = 0.
+*   endif.
+* end of deletion mod-003
+
+* begin of deletion mod-003
+* begin of insert MOD-001
+*   gt_final-unbilled_rev = gt_final-rec_rev - gt_final-act_rev.
+*    if gt_final-unbilled_rev < 0.
+*     gt_final-unbilled_rev = 0.
+*   endif.
+* end of insert MOD-001
+* end of deletion mod-003
+
+* begin of change MOD-001
+*   modify gt_final transporting def_rev cost_prov.
+    MODIFY gt_final TRANSPORTING def_rev cost_prov unbilled_rev.
+* end of change MOD-001
+
+  ENDLOOP.
+
+* create ALV-GRID
+  PERFORM build_field_catlog CHANGING gt_fieldcat.
+  PERFORM fill_events_f14.
+  PERFORM alv_display.
+
+
+*- SUBROUTINES---------------------------------------------------------
+*----------------------------------------------------------------------
+*       FORM GET_DATA
+*----------------------------------------------------------------------
+*       routine which processes the read data called by
+*       RKD_TR_LEVEL_READ.
+*----------------------------------------------------------------------
+*  -->  CE1_TAB   line item table with structure CE1xxxx
+*  <->  p2        flag, cancel selection
+*----------------------------------------------------------------------
+FORM get_data
+     TABLES ce1_tab
+     USING  exit_flag LIKE ceddb-flag.
+
+  LOOP AT ce1_tab.
+    MOVE-CORRESPONDING ce1_tab TO gt_copa.
+* begin of deletion mod-003
+*    move gt_vbap-prctr to gt_copa-prctr.
+* end of deletion mod-003
+    APPEND gt_copa.
+    CLEAR gt_copa.
+    g_exist = c_x.
+  ENDLOOP.
+
+ENDFORM.                    "GET_DATA
+
+*&---------------------------------------------------------------------*
+*&      Form  build_field_catlog
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_GT_FIELDCAT  text
+*----------------------------------------------------------------------*
+FORM build_field_catlog  CHANGING pt_fieldcat TYPE slis_t_fieldcat_alv.
+
+  DATA : ls_fcat TYPE slis_fieldcat_alv.
+
+*--------------------------Contract-------------------------*
+  ls_fcat-fieldname = 'WW004'.
+  ls_fcat-rollname = 'RKEG_WW004'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+*--------------------------Contract type-----------------------*
+  ls_fcat-fieldname = 'AUART'.
+  ls_fcat-rollname = 'AUART'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+*--------------------------Sales office-----------------------*
+  ls_fcat-fieldname = 'VKBUR'.
+  ls_fcat-rollname = 'VKBUR'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+*--------------------------Sold-to party---------------------*
+  ls_fcat-fieldname = 'KUNNR'.
+  ls_fcat-rollname = 'KUNAG'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+*--------------------------GAC------------------------------*
+  ls_fcat-fieldname = 'GAC'.
+  ls_fcat-rollname = 'RKEG_WW006'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+*--------------------------PGC------------------------------*
+  ls_fcat-fieldname = 'PGC'.
+  ls_fcat-rollname = 'RKEG_WW007'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+* begin of insert MOD-002
+  IF sy-tcode = 'SE38' OR
+     sy-tcode = 'SA38'.
+* end of insert MOD-002
+*--------------------------Actual Revenues------------------*
+    ls_fcat-fieldname = 'ACT_REV'.
+    ls_fcat-outputlen = '15'.
+    ls_fcat-seltext_l = 'Actual Revenues'.
+    APPEND ls_fcat TO pt_fieldcat.
+    CLEAR ls_fcat.
+*--------------------------Recognized Revenues---------------------*
+    ls_fcat-fieldname = 'REC_REV'.
+    ls_fcat-rollname = 'RKE2_VV101'.
+    APPEND ls_fcat TO pt_fieldcat.
+    CLEAR ls_fcat.
+*--------------------------Deferred Revenues-----------------*
+    ls_fcat-fieldname = 'DEF_REV'.
+    ls_fcat-outputlen = '17'.
+    ls_fcat-seltext_l = 'Deferred Revenues'.
+    APPEND ls_fcat TO pt_fieldcat.
+    CLEAR ls_fcat.
+* begin of insert MOD-001
+*--------------------------Unbilled Revenues-----------------*
+    ls_fcat-fieldname = 'UNBILLED_REV'.
+    ls_fcat-outputlen = '17'.
+    ls_fcat-seltext_l = 'Unbilled Revenues'.
+    APPEND ls_fcat TO pt_fieldcat.
+    CLEAR ls_fcat.
+* end of insert MOD-001
+* begin of insert MOD-002
+  ENDIF.
+* end of insert MOD-002
+*--------------------------Actual cost------------------------*
+  ls_fcat-fieldname = 'ACT_COST'.
+  ls_fcat-outputlen = '15'.
+  ls_fcat-seltext_l = 'Actual Cost'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+* begin of insertion MOD-004
+*--------------------------Planned cost------------------------*
+  ls_fcat-fieldname = 'PLAN_COST'.
+  ls_fcat-outputlen = '15'.
+  ls_fcat-seltext_l = 'Planned Cost'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+* end of insertion MOD-004
+*--------------------------Recognized cost--------------------*
+  ls_fcat-fieldname = 'REC_COST'.
+  ls_fcat-rollname = 'RKE2_VV199'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+*--------------------------Cost provision--------------------*
+  ls_fcat-fieldname = 'COST_PROV'.
+  ls_fcat-outputlen = '15'.
+  ls_fcat-seltext_l = 'Cost provision'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+
+ENDFORM.                    " build_field_catlog
+
+*&---------------------------------------------------------------------*
+*&      Form  fill_events_f14
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM fill_events_f14 .
+
+  DATA h_event       TYPE slis_alv_event.
+
+  CALL FUNCTION 'REUSE_ALV_EVENTS_GET'
+    EXPORTING
+      i_list_type = 0
+    IMPORTING
+      et_events   = g_events_tab.
+
+*--- allocate form for user-command ---------------------------------*
+  READ TABLE g_events_tab WITH KEY name = slis_ev_user_command
+                        INTO h_event.
+  IF sy-subrc = 0.
+    MOVE g_form_user_command TO h_event-form.
+    MODIFY g_events_tab FROM h_event INDEX sy-tabix.
+  ENDIF.
+
+ENDFORM.                    " fill_events_f14
+
+*&--------------------------------------------------------------------*
+*&      Form  user_command_l
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+*      -->P_UCOMM    text
+*      -->P_SELFIELD text
+*---------------------------------------------------------------------*
+FORM user_command_l USING p_ucomm LIKE sy-ucomm
+                          p_selfield TYPE slis_selfield.
+
+  p_selfield-refresh = c_s.
+  PERFORM check_pf2_with_object_f16 USING p_ucomm.
+  PERFORM set_p_selfield_general_f16 USING p_selfield.
+
+  CASE p_ucomm.
+    WHEN 'ISEL'.
+      p_ucomm = 'DISP'.
+      PERFORM fcodes_with_mark_f16 USING p_ucomm p_selfield.
+  ENDCASE.
+
+ENDFORM.                    "user_command_l
+
+*&---------------------------------------------------------------------*
+*&      Form  check_pf2_with_object_f16
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_P_UCOMM  text
+*----------------------------------------------------------------------*
+FORM check_pf2_with_object_f16  USING    p_ucomm.
+
+  CHECK p_ucomm = g_ic1.
+  p_ucomm = 'ISEL'.
+
+ENDFORM.                    " check_pf2_with_object_f16
+
+*&---------------------------------------------------------------------*
+*&      Form  set_p_selfield_general_f16
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_P_SELFIELD  text
+*----------------------------------------------------------------------*
+FORM set_p_selfield_general_f16  USING f_selfield TYPE slis_selfield.
+
+  f_selfield-col_stable = c_x.
+  f_selfield-row_stable = c_x.
+
+ENDFORM.                    " set_p_selfield_general_f16
+
+*&---------------------------------------------------------------------*
+*&      Form  fcodes_with_mark_f16
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_P_UCOMM  text
+*      -->P_P_SELFIELD  text
+*      -->P_ENDCASE  text
+*----------------------------------------------------------------------*
+FORM fcodes_with_mark_f16  USING p_ucomm LIKE sy-ucomm
+                                p_selfield TYPE slis_selfield.
+
+  PERFORM check_object_tab_marked_f14 USING p_ucomm p_selfield.
+
+  LOOP AT gt_final WHERE selected = c_x .
+    l_index = sy-tabix.
+    PERFORM fcodes_with_mark_l USING p_ucomm p_selfield.
+    gt_final-selected = ' '.
+    MODIFY gt_final INDEX l_index.
+  ENDLOOP.
+
+  CLEAR p_ucomm.
+
+ENDFORM.                    " fcodes_with_mark_f16
+
+*&---------------------------------------------------------------------*
+*&      Form  check_object_tab_marked_f14
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_P_UCOMM  text
+*      -->P_P_SELFIELD  text
+*----------------------------------------------------------------------*
+FORM check_object_tab_marked_f14  USING    p_ucomm LIKE sy-ucomm
+                                        p_selfield TYPE slis_selfield.
+
+  READ TABLE gt_final WITH KEY selected = c_x.
+
+  IF NOT sy-subrc IS INITIAL.
+    IF NOT p_selfield-tabindex IS INITIAL.
+      READ TABLE gt_final INDEX p_selfield-tabindex.
+      gt_final-selected = c_x.
+      MODIFY gt_final INDEX p_selfield-tabindex.
+    ENDIF.
+  ELSE.
+*--- Checkbox markiert -----------------------------------------------*
+    p_selfield-sel_tab_field = 'G_MARK'.
+  ENDIF.
+
+ENDFORM.                    " check_object_tab_marked_f14
+
+*&---------------------------------------------------------------------*
+*&      Form  fcodes_with_mark_l
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_F_UCOMM  text
+*      -->P_F_SELFIELD  text
+*----------------------------------------------------------------------*
+FORM fcodes_with_mark_l  USING   p_ucomm LIKE sy-ucomm
+                              p_selfield TYPE slis_selfield.
+
+  DATA: h_ucomm LIKE sy-ucomm.
+
+  CASE p_ucomm.
+*   Display contract document
+    WHEN 'DISP'.
+      SET PARAMETER ID 'KTN' FIELD  gt_final-ww004.
+      CALL TRANSACTION 'VA43' AND SKIP FIRST SCREEN.
+  ENDCASE.
+
+ENDFORM.                    " fcodes_with_mark_l
+
+*&---------------------------------------------------------------------*
+*&      Form  alv_display
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM alv_display .
+
+  g_repid = sy-repid.
+
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+     EXPORTING
+       i_callback_program                =  g_repid
+       i_save                            = 'A'
+       it_events                         =  g_events_tab[]
+*      I_GRID_TITLE                      =
+*      I_GRID_SETTINGS                   =
+*      is_layout                         =  g_layout
+       it_fieldcat                       =  gt_fieldcat[]
+     TABLES
+        t_outtab                         =  gt_final.
+
+ENDFORM.                    " alv_display
+
+*Text symbol text£º
+*001:Selection screen input
+*E01:No company code found for Sales Organization
+*E02:Controlling area could not be derived, returncode
+*E03:Summarization level does not exist.
+*E04:Summarization level not found in custom table
+
+*I01:No contracts selected !
+*Selection text£º
+*P_IDATE:        Date
+*P_VKORG:D       Sales Organization
+*S_VKBUR:D       Sales office

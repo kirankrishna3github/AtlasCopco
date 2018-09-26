@@ -1,0 +1,905 @@
+************************************************************************
+*            Copyright(c) 2003 Deutsche Bank AG
+* All rights reserved. This Software is proprietary to Deutsche Bank AG
+* and is protected by copyright law and international treaties. Under no
+* circumstances are you permitted to make any attempt to alter, decrypt
+* or reverse engineer this software, and any unauthorised reproduction
+* of this software or any portion thereof may result in severe civil and
+* criminal penalties, and will be prosecuted to the maximum extent
+* possible under the law.
+*
+************************************************************************
+REPORT YHFDBI87 MESSAGE-ID 00.
+************************************************************************
+*  Author       :  Deutsche Bank AG
+*  Date         :  Apr/2003
+*  Description  :  This program extracts payment records generated
+*                  by Auto Payment Run.
+************************************************************************
+* DDIC-Objects ********************************************************
+TABLES: REGUH, YHFFMTXR, T001, YHFPARMI, WITH_ITEM, YHFAUDTR.
+TABLES: YHFFMTDT, YHFFMTOW, BKPF.
+
+************************* User Selection *******************************
+* Selection parameters ************************************************
+PARAMETERS: P_EMID LIKE REGUH-SRTF2.
+SELECT-OPTIONS: W_LAUFI FOR REGUH-LAUFI NO INTERVALS.
+SELECTION-SCREEN SKIP 1.
+SELECTION-SCREEN BEGIN OF BLOCK CRITERIA WITH FRAME TITLE TEXT-001.
+PARAMETERS:
+   CO_CODE    LIKE  REGUH-ZBUKR OBLIGATORY.
+SELECT-OPTIONS:
+   HBK_KEY    FOR  REGUH-HBKID OBLIGATORY,
+   ACCT_ID    FOR  REGUH-HKTID NO-EXTENSION,
+   PAY_METH   FOR  REGUH-RZAWE OBLIGATORY.
+PARAMETERS:
+   DBD_PAY LIKE YHFHELP-YHDBDPY OBLIGATORY
+           VISIBLE LENGTH 35.
+PARAMETERS: FALLBACK LIKE RFPDO1-F170XCRE.
+PARAMETERS: KATAKANA LIKE RFPDO1-F170XCRE.
+SELECTION-SCREEN END OF BLOCK CRITERIA.
+SELECTION-SCREEN BEGIN OF BLOCK RUNMODE WITH FRAME TITLE TEXT-007.
+SELECTION-SCREEN BEGIN OF LINE.
+PARAMETERS:
+   YHTEST LIKE YHFHELP-YHTEST RADIOBUTTON GROUP 1.
+SELECTION-SCREEN:
+  COMMENT 03(50) TEXT-005 FOR FIELD YHTEST,
+  END OF LINE.
+SELECTION-SCREEN BEGIN OF LINE.
+PARAMETERS:
+  YHLIVE LIKE YHFHELP-YHLIVE RADIOBUTTON GROUP 1.
+SELECTION-SCREEN:
+  COMMENT 03(50) TEXT-006 FOR FIELD YHLIVE,
+  END OF LINE.
+SELECTION-SCREEN END OF BLOCK RUNMODE.
+
+SELECTION-SCREEN BEGIN OF BLOCK CHEQUE WITH FRAME TITLE TEXT-003.
+PARAMETERS:
+   PAYPROG(50) TYPE C DEFAULT 'YHFDBIPY'.
+
+SELECTION-SCREEN BEGIN OF LINE.
+PARAMETERS: REF1 RADIOBUTTON GROUP RAD.
+SELECTION-SCREEN COMMENT 4(50) TEXT-010 .
+SELECTION-SCREEN END OF LINE.
+
+SELECTION-SCREEN BEGIN OF LINE.
+PARAMETERS: REF2 RADIOBUTTON GROUP RAD.
+SELECTION-SCREEN COMMENT 4(50) TEXT-011 .
+SELECTION-SCREEN END OF LINE.
+
+SELECTION-SCREEN BEGIN OF LINE.
+PARAMETERS: REF3 RADIOBUTTON GROUP RAD.
+SELECTION-SCREEN COMMENT 4(50) TEXT-009 .
+SELECTION-SCREEN END OF LINE.
+SELECTION-SCREEN END OF BLOCK CHEQUE.
+
+SELECTION-SCREEN BEGIN OF BLOCK WTXRUN WITH FRAME TITLE TEXT-004.
+PARAMETERS: WTXPROG(50) TYPE C DEFAULT 'YHFDBITX'.
+SELECT-OPTIONS: S_WITHT FOR WITH_ITEM-WITHT NO INTERVALS.
+SELECTION-SCREEN END OF BLOCK WTXRUN.
+************************* Data Declaration *****************************
+** Global arrays and internal tables ***********************************
+DATA: BEGIN OF SELTAB OCCURS 5.
+        INCLUDE STRUCTURE RSPARAMS.
+DATA: END OF SELTAB.
+DATA: BEGIN OF PMETHOD_ITAB OCCURS 100,
+        RZAWE        LIKE REGUH-RZAWE,
+        YHFNO         LIKE YHFFMTXR-YHFNO,
+      END OF PMETHOD_ITAB.
+DATA: BEGIN OF FORMNO_ITAB OCCURS 100,
+        YHFNO         LIKE YHFFMTXR-YHFNO,
+      END OF FORMNO_ITAB.
+************************* Data Declaration *****************************
+* Global fields *******************************************************
+DATA: PROG_NAME LIKE SY-REPID.
+DATA: TEST_PATH(270), V_PAYFILE(270), V_CHECK_FILE(270).
+DATA: W_LINES TYPE I,  WS_PC_DOWNLOAD(1).
+DATA: V_PAYFILE1(270).
+DATA: DBD_PAY1  LIKE YHFHELP-YHDBDPY.
+DATA: BEGIN OF ITAB OCCURS 10,
+        PAY_MODE(3) TYPE C,
+        YHFFMTXR LIKE YHFFMTXR,
+        REGUH LIKE REGUH,
+      END OF ITAB.
+DATA: ITAB_YHFAUDTR LIKE YHFAUDTR OCCURS 0 WITH HEADER LINE.
+DATA: T_YHFAUDTR LIKE YHFAUDTR OCCURS 0 WITH HEADER LINE.
+DATA: extractFlag(1).
+DATA: V_EXTRACTMSG(100), V_EXTRACTDATE(10), V_EXTRACTTIME(10).
+DATA: TO_PROCEED_FLAG(1).
+DATA: V_SKIP_PARM LIKE YHFPARMI-PARM_VAL.
+DATA: C_Y(1) TYPE C VALUE 'Y'.
+************************* Main Program *********************************
+START-OF-SELECTION.
+  PERFORM VALIDATE_IN.
+  PERFORM ASSIGN_OUTPUT.
+  PERFORM UPDATE_PMETHOD.
+
+  IF YHLIVE <> SPACE.
+    PERFORM REXTRACT_ERROR.
+    PERFORM REXTRACT_WARNING.
+
+   IF W_LAUFI EQ SPACE.
+      SELECT LAUFI LAUFD MAX( YSYSDATE ) AS YSYSDATE
+      INTO CORRESPONDING FIELDS OF TABLE T_YHFAUDTR
+      FROM YHFAUDTR
+      WHERE LAUFD = ZW_LAUFD
+      AND     LAUFI = ZW_LAUFI
+      GROUP BY LAUFI LAUFD.
+    ELSE.
+      SELECT LAUFI LAUFD MAX( YSYSDATE ) AS YSYSDATE
+      INTO CORRESPONDING FIELDS OF TABLE T_YHFAUDTR
+      FROM YHFAUDTR
+      WHERE LAUFD = ZW_LAUFD
+      AND   ( LAUFI = ZW_LAUFI OR LAUFI IN W_LAUFI )
+      GROUP BY LAUFI LAUFD.
+    ENDIF.
+
+    Clear extractFlag.
+    LOOP AT T_YHFAUDTR.
+      extractFlag = 'Y'.
+    ENDLOOP.
+
+    IF extractFlag = 'Y'.
+      PERFORM REXTRACT_DAYS.
+    ELSE.
+      PERFORM EXTRACT_DAYS.
+    ENDIF.
+
+    IF WS_PC_DOWNLOAD EQ 'Y'.
+      CONCATENATE DBD_PAY1 'dbtest.txt' INTO TEST_PATH.
+    ELSE.
+      CONCATENATE DBD_PAY 'dbtest.txt' INTO TEST_PATH.
+    ENDIF.
+    PERFORM CHECK_PATH USING TEST_PATH.
+    PERFORM CHECK_FILE USING V_PAYFILE.
+  ENDIF.
+
+  MOVE SY-REPID TO PROG_NAME.
+  CALL FUNCTION 'RS_REFRESH_FROM_SELECTOPTIONS'
+       EXPORTING
+            CURR_REPORT     = PROG_NAME
+       TABLES
+            SELECTION_TABLE = SELTAB
+       EXCEPTIONS
+            NOT_FOUND       = 1
+            NO_REPORT       = 2
+            OTHERS          = 3.
+*****************************************************************PP01
+* Changed by : Purna Chandra
+* Date       : 08\06\2007
+* To skip the spool pop-up box
+ PERFORM SKIP_SPOOL.
+.
+*  SUBMIT YHFDBI88 TO SAP-SPOOL
+*               AND RETURN
+*               WITH SELECTION-TABLE SELTAB
+*               IMMEDIATELY ' '
+*               SAP COVER PAGE ' '
+*               COVER TEXT 'Deutsche Bank AG - Auto Payment Summary'
+*               WITHOUT SPOOL DYNPRO.
+
+************************* Sub-routines *********************************
+FORM VALIDATE_IN.
+  DATA: N TYPE I.
+
+  CLEAR: PMETHOD_ITAB.
+  IF W_LAUFI NE SPACE.
+    SELECT * FROM REGUH WHERE LAUFD = ZW_LAUFD
+                        AND ( LAUFI = ZW_LAUFI OR LAUFI IN W_LAUFI )
+                        AND ZBUKR = CO_CODE
+                        AND HBKID IN HBK_KEY
+                        AND HKTID IN ACCT_ID
+                        AND RZAWE IN PAY_METH
+                        AND XVORL = ' '.
+*                       ORDER BY RZAWE HBKID HKTID.
+      PERFORM CO_AUTH_CHECK.
+      PMETHOD_ITAB-RZAWE = REGUH-RZAWE.
+      COLLECT PMETHOD_ITAB.
+      PERFORM GET_SORT_KEY.
+    ENDSELECT.
+  ELSE.
+    SELECT * FROM REGUH WHERE LAUFD = ZW_LAUFD
+                        AND LAUFI = ZW_LAUFI
+                        AND ZBUKR = CO_CODE
+                        AND HBKID IN HBK_KEY
+                        AND HKTID IN ACCT_ID
+                        AND RZAWE IN PAY_METH
+                        AND XVORL = ' '.
+*                       ORDER BY RZAWE HBKID HKTID.
+      PERFORM CO_AUTH_CHECK.
+      PMETHOD_ITAB-RZAWE = REGUH-RZAWE.
+      COLLECT PMETHOD_ITAB.
+      PERFORM GET_SORT_KEY.
+    ENDSELECT.
+  ENDIF.
+  DESCRIBE TABLE ITAB LINES N.
+
+
+  IF N >  0.
+
+***29.01.2007
+***changes by yupinto
+***format change when threshold is breached
+    data: wa_reguh   like reguh.
+    data: wa_txr     like yhffmtxr.
+    data: wa_amt     like reguh-rbetr.
+    data: thr_limit  like reguh-rbetr,
+          thr_format like yhffmtxr-yhfno,
+          thr_paym(100),
+          thr_uli.
+
+    select single * from yhfparmi where
+                    ( bukrs = co_code or bukrs = space )
+                    and parm1 = 'THR'
+                    and parm2 = 'LMT'.
+    if sy-subrc eq 0.
+
+      move yhfparmi-parm_val to thr_limit.
+
+    select single parm_val into thr_format from yhfparmi where
+                    ( bukrs = co_code or bukrs = space )
+                    and parm1 = 'THR'
+                    and parm2 = 'NFT'.
+    select single parm_val into thr_paym from yhfparmi where
+                    ( bukrs = co_code or bukrs = space )
+                    and parm1 = 'THR'
+                    and parm2 = 'PMT'.
+    select single parm_val into thr_uli from yhfparmi where
+                    ( bukrs = co_code or bukrs = space )
+                    and parm1 = 'THR'
+                    and parm2 = 'ULI'.
+
+
+      loop at itab.
+        clear: wa_reguh, wa_txr, wa_amt.
+        wa_txr   = itab-yhffmtxr.
+        wa_reguh = itab-reguh.
+        wa_amt   = abs( wa_reguh-rbetr ).
+
+
+        search thr_paym for wa_txr-ypaymthod.
+        if sy-subrc = 0.
+          if thr_uli eq 'L'.
+            if wa_amt lt thr_limit.
+              wa_txr-yhfno = thr_format.
+              itab-yhffmtxr = wa_txr.
+              modify itab.
+            endif.
+          else.
+            if wa_amt gt thr_limit.
+              wa_txr-yhfno = thr_format.
+              itab-yhffmtxr = wa_txr.
+              modify itab.
+            endif.
+          endif.
+        endif.
+      endloop.
+
+    endif.
+***end 29.01.2007
+    EXPORT ITAB TO MEMORY ID 'ITAB'.
+  ELSE.
+    MESSAGE E368 WITH 'No payment records selected.'.
+  ENDIF.
+ENDFORM.
+
+*---------------------------------------------------------------------*
+*       FORM GET_SORT_KEY                                             *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+FORM GET_SORT_KEY.
+
+  SELECT SINGLE * FROM T001
+         WHERE BUKRS = REGUH-ZBUKR.
+  SELECT SINGLE * FROM YHFFMTXR
+         WHERE LAND1 = T001-LAND1
+         AND YPAYMTHOD = REGUH-RZAWE.
+
+  IF SY-SUBRC EQ 0.
+    MOVE-CORRESPONDING YHFFMTXR TO ITAB-YHFFMTXR.
+
+    SELECT SINGLE * FROM YHFFMTDT
+       WHERE FORMAT_NO = YHFFMTXR-YHFNO
+         AND COLUMN_NO = 50.
+    ITAB-PAY_MODE = YHFFMTDT-SOURCE_VAL.
+    SELECT SINGLE * FROM YHFFMTOW
+           WHERE CO_CODE   = REGUH-ZBUKR
+           AND   FORMAT_NO = YHFFMTXR-YHFNO
+           AND   COLUMN_NO = 50
+           AND   PAY_METHOD = REGUH-RZAWE.
+    IF SY-SUBRC EQ 0.
+      ITAB-PAY_MODE = YHFFMTOW-SOURCE_VAL.
+    ELSE.
+      SELECT SINGLE * FROM YHFFMTOW
+             WHERE CO_CODE   = REGUH-ZBUKR
+             AND   FORMAT_NO = YHFFMTXR-YHFNO
+             AND   COLUMN_NO = 50
+             AND   PAY_METHOD = SPACE.
+      IF SY-SUBRC EQ 0.
+        ITAB-PAY_MODE = YHFFMTOW-SOURCE_VAL.
+      ENDIF.
+    ENDIF.
+
+* calculate value date for payroll records
+    IF REGUH-VALUT IS INITIAL.
+      PERFORM DETERMINE_VALUE_DATE.
+    ENDIF.
+*****code change for SIA as on 08.02.2006
+*
+*DATA:  W_FYR LIKE BKPF-GJAHR.
+* W_FYR =  REGUH-LAUFD+0(4).
+*    SELECT SINGLE * FROM BKPF WHERE BUKRS = REGUH-ZBUKR
+*                                AND   BELNR = REGUH-VBLNR
+*                                AND   GJAHR = W_FYR.
+*IF SY-SUBRC EQ 0.
+*****
+    MOVE-CORRESPONDING REGUH TO ITAB-REGUH.
+    APPEND ITAB.
+*  ENDIF.
+  ELSE.
+    MESSAGE E368 WITH 'No payment method setup in table YHFFMTXR.'.
+  ENDIF.
+ENDFORM.
+
+*---------------------------------------------------------------------*
+*       FORM CO_AUTH_CHECK                                            *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+FORM CO_AUTH_CHECK.
+  DATA: W_MSG(80) TYPE C.
+
+  AUTHORITY-CHECK OBJECT 'F_BKPF_BUK'
+    ID 'BUKRS' FIELD REGUH-ZBUKR
+    ID 'ACTVT' FIELD '03'.
+  IF SY-SUBRC <> 0.
+    CONCATENATE 'Not authorized to view Co Code - ' REGUH-ZBUKR
+      INTO W_MSG SEPARATED BY SPACE.
+    MESSAGE E368 WITH W_MSG.
+  ENDIF.
+
+ENDFORM.
+
+*---------------------------------------------------------------------*
+*       FORM UPDATE_PMETHOD                                           *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+FORM UPDATE_PMETHOD.
+  SELECT SINGLE * FROM T001 WHERE BUKRS = REGUH-ZBUKR.  "get ctry code
+  LOOP AT PMETHOD_ITAB.
+    SELECT SINGLE * FROM YHFFMTXR WHERE LAND1 = T001-LAND1
+                             AND YPAYMTHOD = PMETHOD_ITAB-RZAWE.
+    IF SY-SUBRC = 0.
+      PMETHOD_ITAB-YHFNO = YHFFMTXR-YHFNO.
+      MODIFY PMETHOD_ITAB.
+    ELSE.
+      DELETE PMETHOD_ITAB.
+    ENDIF.
+  ENDLOOP.
+
+* collect unique format no
+  LOOP AT PMETHOD_ITAB.
+    FORMNO_ITAB-YHFNO = PMETHOD_ITAB-YHFNO.
+    COLLECT FORMNO_ITAB.
+  ENDLOOP.
+  IF SY-SUBRC = 4.                     "empty pmethod_itab
+    MESSAGE E368 WITH
+           'No records match the file format in table : YHFFMTXR_i'.
+  ENDIF.
+
+ENDFORM.
+
+*---------------------------------------------------------------------*
+*       FORM CHECK_FILE                                               *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  PAYFILE                                                       *
+*---------------------------------------------------------------------*
+FORM CHECK_FILE USING PAYFILE.
+
+*FOR 4.6
+*  OPEN DATASET PAYFILE.
+*END 4.6
+
+*FOR 4.7
+   OPEN DATASET PAYFILE for input IN TEXT MODE encoding DEFAULT.
+*END 4.7
+  IF SY-SUBRC = 0.
+    CALL FUNCTION 'POPUP_TO_CONFIRM_STEP'
+         EXPORTING
+              TITEL     = 'dbi File Creation'
+              TEXTLINE1 = PAYFILE
+              TEXTLINE2 = 'already exist, Overwrite ?'
+         IMPORTING
+              ANSWER    = TO_PROCEED_FLAG.
+    IF TO_PROCEED_FLAG <> 'J'. "'J'-yes, 'N'-No, 'A'-Cancel
+      STOP.
+    ENDIF.
+  ENDIF.
+  CLOSE DATASET PAYFILE.
+ENDFORM.
+
+*---------------------------------------------------------------------*
+*       FORM CHECK_PATH                                               *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  PATH                                                          *
+*---------------------------------------------------------------------*
+FORM CHECK_PATH USING PATH.
+  DATA: PC_FILE LIKE RLGRAP-FILENAME.
+  DATA: BEGIN OF I_TEST OCCURS 10,
+          LINE(80),
+        END OF I_TEST.
+
+*FOR 4.6
+*  OPEN DATASET PATH FOR OUTPUT IN TEXT MODE.
+*END 4.6
+
+*FOR 4.7
+   OPEN DATASET PATH FOR OUTPUT IN TEXT MODE ENCODING DEFAULT.
+*END 4.7
+
+  IF SY-SUBRC <> 0.
+    WRITE:/ PATH.
+    WRITE:/ 'Cannot create a test file with the above path.'.
+    WRITE:/ 'Export path has to be terminated with a \.'.
+    WRITE:/01 'Contact the system administrator for access right'.
+    WRITE: 51 'if necessary.'.
+    STOP.
+  ELSE.
+    CLOSE DATASET PATH.
+    DELETE DATASET PATH.
+  ENDIF.
+ENDFORM.
+
+*---------------------------------------------------------------------*
+*       FORM ASSIGN_OUTPUT                                            *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+FORM ASSIGN_OUTPUT.
+  DATA: V_FILE_FLAG(1).
+  SELECT SINGLE * FROM YHFPARMI WHERE BUKRS = SPACE
+                    AND PARM1 = 'WDN'
+                    AND PARM2 = 'EAP'.
+  IF SY-SUBRC EQ 0.
+    MOVE YHFPARMI-PARM_VAL TO WS_PC_DOWNLOAD.
+  ELSE.
+    SELECT SINGLE * FROM YHFPARMI WHERE BUKRS = CO_CODE
+                      AND PARM1 = 'WDN'
+                      AND PARM2 = 'EAP'.
+    IF SY-SUBRC EQ 0.
+      MOVE YHFPARMI-PARM_VAL TO WS_PC_DOWNLOAD.
+    ENDIF.
+  ENDIF.
+
+  IF WS_PC_DOWNLOAD EQ 'Y'.
+    SELECT SINGLE * FROM YHFPARMI WHERE BUKRS = SPACE
+                      AND PARM1 = 'WDN'
+                      AND PARM2 = 'EXP'.
+    IF SY-SUBRC EQ 0.
+      MOVE YHFPARMI-PARM_VAL TO DBD_PAY1.
+    ELSE.
+      SELECT SINGLE * FROM YHFPARMI WHERE BUKRS = CO_CODE
+                        AND PARM1 = 'WDN'
+                        AND PARM2 = 'EXP'.
+      IF SY-SUBRC EQ 0.
+        MOVE YHFPARMI-PARM_VAL TO DBD_PAY1.
+      ENDIF.
+    ENDIF.
+    IF DBD_PAY1 NE SPACE.
+     CONCATENATE DBD_PAY1 'DBI' ZW_LAUFI ZW_LAUFD '.TXT' INTO V_PAYFILE.
+      CONCATENATE DBD_PAY1 'DBI' ZW_LAUFI ZW_LAUFD '.CHK'
+                  INTO V_CHECK_FILE.
+      CONCATENATE  'DBI' ZW_LAUFI ZW_LAUFD '.TXT' INTO V_PAYFILE1.
+    ENDIF.
+  ELSE.
+*-- normal & checkksum file
+    SELECT SINGLE PARM_VAL INTO V_FILE_FLAG FROM YHFPARMI
+           WHERE BUKRS = CO_CODE
+             AND PARM1  = 'FIX'
+             AND PARM2   = 'NME'.
+    IF V_FILE_FLAG EQ 'Y'.
+      CONCATENATE DBD_PAY 'DBI.TXT' INTO V_PAYFILE.
+      CONCATENATE DBD_PAY 'DBI.CHK' INTO V_CHECK_FILE.
+    ELSE.
+      CONCATENATE DBD_PAY 'DBI' ZW_LAUFI ZW_LAUFD '.TXT' INTO V_PAYFILE.
+      CONCATENATE DBD_PAY 'DBI' ZW_LAUFI ZW_LAUFD '.CHK'
+                  INTO V_CHECK_FILE.
+    ENDIF.
+  ENDIF.
+  EXPORT V_PAYFILE TO MEMORY ID 'PAYFILE'.
+  EXPORT V_CHECK_FILE TO MEMORY ID 'CHECKFILE'.
+  EXPORT DBD_PAY TO MEMORY ID 'DBD_PAY'.
+  EXPORT DBD_PAY1 TO MEMORY ID 'DBD_PAY1'.
+  EXPORT V_PAYFILE1 TO MEMORY ID 'V_PAYFILE1'.
+ENDFORM.
+*---------------------------------------------------------------------*
+*       FORM DETERMINE_VALUE_DATE                                     *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+FORM DETERMINE_VALUE_DATE.
+  DATA: VDATE LIKE BSEG-VALUT.
+
+  CALL FUNCTION 'DET_VALUE_DATE_FOR_PAYMENT'
+       EXPORTING
+            I_BLDAT            = REGUH-ZALDT  "pay date
+            I_BUDAT            = REGUH-ZALDT  "pay date
+            I_BUKRS            = REGUH-ZBUKR
+            I_FAEDT            = REGUH-ZALDT  "pay date
+            I_HBKID            = REGUH-HBKID
+            I_HKTID            = REGUH-HKTID
+            I_ZLSCH            = REGUH-RZAWE
+       IMPORTING
+            VALUTA             = VDATE
+       EXCEPTIONS
+            CAL_ID_ERROR       = 1
+            NOT_FOUND_IN_T012A = 2
+            NOT_FOUND_IN_T012C = 3
+            ERROR_IN_T012C     = 4
+            OTHERS             = 5.
+  IF SY-SUBRC EQ 0.
+    REGUH-VALUT = VDATE.
+  ENDIF.
+ENDFORM.
+
+*---------------------------------------------------------------------*
+*       FORM EXTRACT_DAYS                                            *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+FORM EXTRACT_DAYS.
+
+DATA: EXT TYPE i,
+      exceedmsg TYPE string.
+
+SELECT SINGLE * FROM YHFPARMI
+WHERE PARM1 = 'EXT'
+AND   ( BUKRS =  CO_CODE OR BUKRS EQ SPACE ).
+
+If SY-SUBRC EQ 0.
+  If YHFPARMI-PARM_VAL = '' OR YHFPARMI-PARM_VAL = ' '.
+  ELSE.
+    IF YHFPARMI-PARM_VAL = 'N'.
+        IF SY-BATCH NE SPACE.
+          WRITE:/ 'No Extraction is to be done.'.
+          STOP.
+        ENDIF.
+         MESSAGE E368 WITH 'No Extraction is to be done.'.
+         STOP.
+    ELSE.
+      clear EXT.
+      EXT = SY-DATUM - ZW_LAUFD.
+
+      If YHFPARMI-PARM_VAL < EXT.
+
+        clear exceedmsg.
+        CONCATENATE 'The Extraction exceeded the day limit of'
+        YHFPARMI-PARM_VAL INTO exceedmsg SEPARATED BY SPACE.
+        CONCATENATE exceedmsg '.' INTO exceedmsg.
+
+        IF SY-BATCH NE SPACE.
+          WRITE:/ exceedmsg.
+          WRITE:/ 'No Extraction is to be done.'.
+          STOP.
+        ENDIF.
+         MESSAGE E368 WITH exceedmsg 'No Extraction is to be done.'.
+         STOP.
+      ENDIF.
+   ENDIF.
+  ENDIF.
+ENDIF.
+ENDFORM.
+
+*---------------------------------------------------------------------*
+*       FORM REXTRACT_DAYS                                            *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+FORM REXTRACT_DAYS.
+
+DATA: REX TYPE i,
+      exceedmsg TYPE string.
+
+SELECT SINGLE * FROM YHFPARMI
+WHERE PARM1 = 'REX'
+AND   ( BUKRS =  CO_CODE OR BUKRS EQ SPACE ).
+
+If SY-SUBRC EQ 0.
+  If YHFPARMI-PARM_VAL = '' OR YHFPARMI-PARM_VAL = ' '.
+  ELSE.
+      IF W_LAUFI EQ SPACE.
+        SELECT LAUFI LAUFD MAX( YSYSDATE ) AS YSYSDATE
+        INTO CORRESPONDING FIELDS OF TABLE ITAB_YHFAUDTR
+        FROM YHFAUDTR
+        WHERE LAUFD = ZW_LAUFD
+        AND     LAUFI = ZW_LAUFI
+        GROUP BY LAUFI LAUFD.
+      ELSE.
+        SELECT LAUFI LAUFD MAX( YSYSDATE ) AS YSYSDATE
+        INTO CORRESPONDING FIELDS OF TABLE ITAB_YHFAUDTR
+        FROM YHFAUDTR
+        WHERE LAUFD = ZW_LAUFD
+        AND   ( LAUFI = ZW_LAUFI OR LAUFI IN W_LAUFI )
+        GROUP BY LAUFI LAUFD.
+      ENDIF.
+      LOOP AT ITAB_YHFAUDTR.
+
+        IF YHFPARMI-PARM_VAL = 'N'.
+            IF SY-BATCH NE SPACE.
+              WRITE:/ 'No Re-extraction is to be done.'.
+              STOP.
+            ENDIF.
+             MESSAGE E368 WITH 'No Re-extraction is to be done.'.
+             STOP.
+        ELSE.
+          clear REX.
+          REX = SY-DATUM - ZW_LAUFD.
+
+          If YHFPARMI-PARM_VAL < REX.
+
+            clear exceedmsg.
+            CONCATENATE 'The Re-extraction exceeded the day limit of'
+            YHFPARMI-PARM_VAL INTO exceedmsg SEPARATED BY SPACE.
+            CONCATENATE exceedmsg '.' INTO exceedmsg.
+
+            IF SY-BATCH NE SPACE.
+              WRITE:/ exceedmsg.
+              WRITE:/ 'No Re-extraction is to be done.'.
+              STOP.
+            ENDIF.
+     MESSAGE E368 WITH exceedmsg 'No Re-extraction is to be done.'.
+             STOP.
+          ENDIF.
+       ENDIF.
+      ENDLOOP.
+  ENDIF.
+ENDIF.
+ENDFORM.
+
+*---------------------------------------------------------------------*
+*       FORM REXTRACT_WARNING                                         *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+FORM REXTRACT_WARNING.
+  SELECT SINGLE * FROM YHFPARMI
+  WHERE PARM1 = 'DWR'
+  AND   ( BUKRS =  CO_CODE OR BUKRS EQ SPACE ).                  .
+  IF YHFPARMI-PARM_VAL = 'Y'.
+    IF W_LAUFI EQ SPACE.
+      SELECT LAUFI LAUFD MAX( YSYSDATE ) AS YSYSDATE
+      INTO CORRESPONDING FIELDS OF TABLE ITAB_YHFAUDTR
+      FROM YHFAUDTR
+      WHERE LAUFD = ZW_LAUFD
+      AND     LAUFI = ZW_LAUFI
+      GROUP BY LAUFI LAUFD.
+    ELSE.
+      SELECT LAUFI LAUFD MAX( YSYSDATE ) AS YSYSDATE
+      INTO CORRESPONDING FIELDS OF TABLE ITAB_YHFAUDTR
+      FROM YHFAUDTR
+      WHERE LAUFD = ZW_LAUFD
+      AND   ( LAUFI = ZW_LAUFI OR LAUFI IN W_LAUFI )
+      GROUP BY LAUFI LAUFD.
+    ENDIF.
+    LOOP AT ITAB_YHFAUDTR.
+      SELECT SINGLE MAX( YSYSTIME ) INTO ITAB_YHFAUDTR-YSYSTIME
+      FROM YHFAUDTR
+      WHERE LAUFD = ITAB_YHFAUDTR-LAUFD
+      AND   LAUFI = ITAB_YHFAUDTR-LAUFI
+      AND   YSYSDATE = ITAB_YHFAUDTR-YSYSDATE.
+      WRITE ITAB_YHFAUDTR-YSYSDATE DD/MM/YYYY TO V_EXTRACTDATE.
+      WRITE ITAB_YHFAUDTR-YSYSTIME TO V_EXTRACTTIME
+      USING EDIT MASK '__:__:__'.
+      CONCATENATE 'Last extraction for' ITAB_YHFAUDTR-LAUFI
+      'was done on' V_EXTRACTDATE V_EXTRACTTIME INTO V_EXTRACTMSG
+      SEPARATED BY SPACE.
+* If program is run in background, give error message and exit.
+      IF SY-BATCH NE SPACE.
+        WRITE:/ V_EXTRACTMSG.
+        WRITE:/ 'Kindly run in Foreground for re-extraction'.
+        STOP.
+      ENDIF.
+      CALL FUNCTION 'POPUP_TO_CONFIRM_STEP'
+           EXPORTING
+                TITEL     = 'Re-Extraction Warning'
+                TEXTLINE1 = V_EXTRACTMSG
+                TEXTLINE2 = 'Do you want to continue ?'
+           IMPORTING
+                ANSWER    = TO_PROCEED_FLAG.
+      IF TO_PROCEED_FLAG <> 'J'. "'J'-yes, 'N'-No, 'A'-Cancel
+        STOP.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  REXTRACT_ERROR
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+* SIA REQUIREMENT FOR re-extraction error logic
+FORM REXTRACT_ERROR.
+  DATA: YLAUFD(8), " LIKE SY-DATUM,
+               YLAUFI LIKE  YHFAUDTR-LAUFI.
+  CLEAR: YHFPARMI.
+  SELECT SINGLE * FROM YHFPARMI
+    WHERE PARM1 = 'DER' AND
+                    PARM2 = 'ALW'.
+  IF YHFPARMI-PARM_VAL+0(8)  EQ ZW_LAUFD
+       AND YHFPARMI-PARM_VAL+8(6)  EQ ZW_LAUFI.
+    MOVE YHFPARMI-PARM_VAL+0(8) TO YLAUFD.
+    MOVE YHFPARMI-PARM_VAL+8(6) TO YLAUFI.
+    TRANSLATE YLAUFI TO UPPER CASE.                   "#EC TRANSLANG
+    IF W_LAUFI EQ SPACE.
+      SELECT LAUFI LAUFD MAX( YSYSDATE ) AS YSYSDATE
+      INTO CORRESPONDING FIELDS OF TABLE ITAB_YHFAUDTR
+      FROM YHFAUDTR
+       WHERE LAUFD = YLAUFD
+       AND     LAUFI      = YLAUFI
+      GROUP BY LAUFI LAUFD.
+    ELSE.
+      SELECT LAUFI LAUFD MAX( YSYSDATE ) AS YSYSDATE
+      INTO CORRESPONDING FIELDS OF TABLE ITAB_YHFAUDTR
+      FROM YHFAUDTR
+         WHERE LAUFD = YLAUFD
+       AND     LAUFI      = YLAUFI
+      GROUP BY LAUFI LAUFD.
+    ENDIF.
+    LOOP AT ITAB_YHFAUDTR.
+      SELECT SINGLE MAX( YSYSTIME ) INTO ITAB_YHFAUDTR-YSYSTIME
+      FROM YHFAUDTR
+      WHERE LAUFD = ITAB_YHFAUDTR-LAUFD
+      AND   LAUFI = ITAB_YHFAUDTR-LAUFI
+      AND   YSYSDATE = ITAB_YHFAUDTR-YSYSDATE.
+      WRITE ITAB_YHFAUDTR-YSYSDATE DD/MM/YYYY TO V_EXTRACTDATE.
+      WRITE ITAB_YHFAUDTR-YSYSTIME TO V_EXTRACTTIME
+      USING EDIT MASK '__:__:__'.
+      CONCATENATE 'Last extraction for' ITAB_YHFAUDTR-LAUFI
+      'was done on' V_EXTRACTDATE V_EXTRACTTIME INTO V_EXTRACTMSG
+      SEPARATED BY SPACE.
+* If program is run in background, give error message and exit.
+      IF SY-BATCH NE SPACE.
+        WRITE:/ V_EXTRACTMSG.
+        WRITE:/ 'Kindly run in Foreground for re-extraction'.
+        STOP.
+      ENDIF.
+      CALL FUNCTION 'POPUP_TO_CONFIRM_STEP'
+           EXPORTING
+                TITEL     = 'Re-Extraction Warning'
+                TEXTLINE1 = V_EXTRACTMSG
+                TEXTLINE2 = 'Do you want to continue ?'
+           IMPORTING
+                ANSWER    = TO_PROCEED_FLAG.
+      IF TO_PROCEED_FLAG <> 'J'. "'J'-yes, 'N'-No, 'A'-Cancel
+        STOP.
+      ENDIF.
+    ENDLOOP.
+
+  ELSE.
+
+    SELECT SINGLE * FROM YHFPARMI
+    WHERE PARM1 = 'DER'
+    AND   ( BUKRS =  CO_CODE OR BUKRS EQ SPACE ).                  .
+    IF YHFPARMI-PARM_VAL = 'Y'.
+      IF W_LAUFI EQ SPACE.
+        SELECT LAUFI LAUFD MAX( YSYSDATE ) AS YSYSDATE
+        INTO CORRESPONDING FIELDS OF TABLE ITAB_YHFAUDTR
+        FROM YHFAUDTR
+        WHERE LAUFD = ZW_LAUFD
+        AND     LAUFI = ZW_LAUFI
+        GROUP BY LAUFI LAUFD.
+      ELSE.
+        SELECT LAUFI LAUFD MAX( YSYSDATE ) AS YSYSDATE
+        INTO CORRESPONDING FIELDS OF TABLE ITAB_YHFAUDTR
+        FROM YHFAUDTR
+        WHERE LAUFD = ZW_LAUFD
+        AND   ( LAUFI = ZW_LAUFI OR LAUFI IN W_LAUFI )
+        GROUP BY LAUFI LAUFD.
+      ENDIF.
+
+      LOOP AT ITAB_YHFAUDTR.
+        SELECT SINGLE MAX( YSYSTIME ) INTO ITAB_YHFAUDTR-YSYSTIME
+        FROM YHFAUDTR
+        WHERE LAUFD = ITAB_YHFAUDTR-LAUFD
+        AND   LAUFI = ITAB_YHFAUDTR-LAUFI
+        AND   YSYSDATE = ITAB_YHFAUDTR-YSYSDATE.
+        WRITE ITAB_YHFAUDTR-YSYSDATE DD/MM/YYYY TO V_EXTRACTDATE.
+        WRITE ITAB_YHFAUDTR-YSYSTIME TO V_EXTRACTTIME
+        USING EDIT MASK '__:__:__'.
+        CONCATENATE 'Last extraction for' ITAB_YHFAUDTR-LAUFI
+        'was done on' V_EXTRACTDATE V_EXTRACTTIME INTO V_EXTRACTMSG
+        SEPARATED BY SPACE.
+* If program is run in background, give error message and exit.
+        IF SY-BATCH NE SPACE.
+          WRITE:/ V_EXTRACTMSG.
+          WRITE:/ 'Kindly run in Foreground for re-extraction'.
+          STOP.
+        ENDIF.
+        IF SY-SUBRC EQ 0.
+          CALL FUNCTION 'POPUP_TO_INFORM'
+               EXPORTING
+                    TITEL   = 'Re-Extraction Error'
+                    TXT1    = V_EXTRACTMSG
+      TXT2    = 'You are not allowed to rextract the same payment run'
+                   TXT3    = ' '
+                   TXT4    = ' ' .
+          STOP.
+        ENDIF.
+      ENDLOOP.
+    ENDIF.
+  ENDIF.
+ENDFORM.                    " REXTRACT_ERROR
+******************************************************************PP01
+* Changed by : Purna Chandra
+* Date       : 08\06\2007
+* To skip the spool pop-up box
+
+*&---------------------------------------------------------------------*
+*&      Form  SKIP_SPOOL
+*&---------------------------------------------------------------------*
+*       skip the spool pop-up box
+*----------------------------------------------------------------------*
+FORM SKIP_SPOOL .
+
+   SELECT SINGLE PARM_VAL FROM YHFPARMI INTO V_SKIP_PARM
+              WHERE ( BUKRS = CO_CODE OR BUKRS = SPACE )
+              AND  PARM1 = 'STR'
+              AND  PARM2 = 'SPL'.
+     IF V_SKIP_PARM EQ C_Y.
+
+  SUBMIT YHFDBI88 TO SAP-SPOOL
+               AND RETURN
+               WITH SELECTION-TABLE SELTAB
+               IMMEDIATELY ' '
+               SAP COVER PAGE ' '
+               COVER TEXT 'Deutsche Bank AG - Auto Payment Summary'
+               WITHOUT SPOOL DYNPRO.
+     ELSE.
+  SUBMIT YHFDBI88 TO SAP-SPOOL
+               AND RETURN
+               WITH SELECTION-TABLE SELTAB
+               IMMEDIATELY ' '
+               SAP COVER PAGE ' '
+               COVER TEXT 'Deutsche Bank AG - Auto Payment Summary'.
+
+     endif.
+
+ENDFORM.                    " SKIP_SPOOL
+****************************************************************PP01
+
+* end changes PP01
+*Text symbol text£º
+*001:SAP/dbi Interface Parameters
+*003:Payment Details
+*004:Withholding Tax Details
+*005:Test Run
+*006:Live Run
+*007:Run Mode
+*009:'Invoice No.' from 'Assignment'
+*010:Invoice No. from Reference Text
+
+*011:Invoice No. from Doc.Header Text
+*Selection text£º
+*ACCT_ID:        Account ID
+*CO_CODE:        Company Code
+*DBD_PAY:        Export Path for DBI File
+*FALLBACK:        Stop FTP
+*HBK_KEY:        House Bank
+*KATAKANA:        KATAKANA 2-1 byte Conversion
+*PAYPROG:        Payment Detail Program
+*PAY_METH:        Payment Method
+*P_EMID:        Additional Information
+*S_WITHT:        Withholding Tax Type
+*WTXPROG:        Withholding Tax Program
+*W_LAUFI:        Additional Identification
+*YHLIVE:        Live Run
+*YHTEST:        Test Run

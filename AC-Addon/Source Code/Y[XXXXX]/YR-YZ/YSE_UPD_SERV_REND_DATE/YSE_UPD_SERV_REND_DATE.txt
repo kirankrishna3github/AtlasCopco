@@ -1,0 +1,535 @@
+*&---------------------------------------------------------------------*
+*& Report  YSE_UPD_SERV_REND_DATE
+*&---------------------------------------------------------------------*
+*&
+*& Update 'Service rendered date' for sales documents
+*& (For tax recalculation)
+*&
+*&---------------------------------------------------------------------*
+*  Author                : Jules Smets
+*  Date                  : 13.12.2010
+*  Change Request Number : CR1576
+*  Transport request Nr. : CD1K961858
+*----------------------------------------------------------------------*
+*                                                                      *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD.NR. |   DATE     | NAME               | CORRECT.NR.| CHANGE REF. *
+*----------------------------------------------------------------------*
+* MOD-001 | 01.01.9999 |                    | CD1K9..... | CR....      *
+*----------------------------------------------------------------------*
+
+************************************************************************
+
+REPORT  yse_upd_serv_rend_date.
+
+TABLES: vbak,
+        vbap,
+        vbuk,
+        vbup.
+
+* Internal table for sales documents (from input file)
+DATA: BEGIN OF it_inpc OCCURS 0,
+        line(50)   TYPE c,
+      END OF it_inpc.
+
+* Internal table (for sales document update)
+DATA: BEGIN OF it_vbap OCCURS 0,
+        vbeln      TYPE vbeln_va,
+        posnr      TYPE posnr_va,
+        fbuda      TYPE fbuda,
+      END OF it_vbap,
+      wa_vbap      LIKE LINE OF it_vbap.
+
+DATA: bdcdata      LIKE bdcdata  OCCURS 0
+                                 WITH HEADER LINE.
+
+DATA: gv_text        TYPE char80,
+      gv_vbeln       TYPE vbeln_va,
+      gv_date_c(10)  TYPE c,
+      gv_header      TYPE xfeld,
+      gv_error       TYPE xfeld,
+      gv_mode        TYPE ctu_mode  VALUE 'N',
+      gv_tcode       TYPE sytcode,
+      gv_mtext       TYPE string,
+      bdc_options    TYPE ctu_params,
+      it_messages    TYPE TABLE OF bdcmsgcoll,
+      wa_messages    LIKE bdcmsgcoll.
+
+*&---------------------------------------------------------------------*
+*&  Selection screen                                                   *
+*&---------------------------------------------------------------------*
+SELECTION-SCREEN BEGIN OF BLOCK b1  WITH FRAME  TITLE text-b01.
+
+PARAMETERS: p_trvog  TYPE trvog  OBLIGATORY.
+SELECT-OPTIONS: s_vkorg  FOR vbak-vkorg   OBLIGATORY  MEMORY ID vko
+                                          NO INTERVALS.
+SELECTION-SCREEN SKIP.
+PARAMETERS: p_opt1 RADIOBUTTON GROUP grp1  DEFAULT 'X'.
+PARAMETERS: p_fbuda  TYPE fbuda.
+SELECT-OPTIONS: s_vbeln  FOR vbak-vbeln.
+SELECTION-SCREEN SKIP.
+PARAMETERS: p_opt2 RADIOBUTTON GROUP grp1.
+* Input file
+PARAMETERS: p_infile  TYPE rlgrap-filename LOWER CASE.
+*                 DEFAULT 'C:\POLA.VAT.xls'.
+
+SELECTION-SCREEN END OF BLOCK b1.
+
+*----------------------------------------------------------------------*
+AT SELECTION-SCREEN.
+
+* Check authorization
+  PERFORM check_authorization.
+
+* Option 1: date is required
+  IF NOT p_opt1 IS INITIAL.
+    IF p_fbuda IS INITIAL.
+      MESSAGE e001(00) WITH 'Service rendered date is required'(e01).
+    ENDIF.
+  ENDIF.
+* Option 2: file name is required
+  IF NOT p_opt2 IS INITIAL.
+    IF p_infile IS INITIAL.
+      MESSAGE e001(00) WITH 'Input file name is required'(e02).
+    ENDIF.
+  ENDIF.
+
+*----------------------------------------------------------------------*
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_infile.
+
+* Get the filename
+  PERFORM get_filename USING p_infile.
+
+
+*&---------------------------------------------------------------------*
+*&  Main program                                                       *
+*&---------------------------------------------------------------------*
+START-OF-SELECTION.
+
+  CALL METHOD ycl_statistics=>record_transaction.
+
+  CONCATENATE 'VA' p_trvog '2' INTO gv_tcode.
+
+* Progress indicator
+  IF sy-batch IS INITIAL.
+    gv_text = 'Selecting data'(i01).
+    CALL FUNCTION 'SAPGUI_PROGRESS_INDICATOR'
+      EXPORTING
+        text = gv_text.
+  ENDIF.
+
+  CLEAR it_vbap[].
+
+* Select option
+  IF p_opt1 IS INITIAL.
+*   Option 2: Select from input file
+    PERFORM select_file.
+  ELSE.
+*   Option 1: Select from database
+    PERFORM select_db.
+  ENDIF.
+
+* No selection (End program)
+  IF it_vbap[] IS INITIAL.
+    WRITE: /01 '*** No sales documents selected ***'(i04).
+    ULINE.
+    EXIT.
+  ENDIF.
+
+* Process documents
+  PERFORM process_documents.
+
+  ULINE.
+
+
+*&---------------------------------------------------------------------*
+*&  Forms                                                              *
+*&---------------------------------------------------------------------*
+
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_AUTHORIZATION
+*&---------------------------------------------------------------------*
+*       Check authorization
+*----------------------------------------------------------------------*
+FORM check_authorization .
+
+  LOOP AT s_vkorg.
+    AUTHORITY-CHECK OBJECT 'V_VBAK_VKO'
+                        ID 'VKORG' FIELD s_vkorg-low
+                        ID 'VTWEG' DUMMY
+                        ID 'SPART' DUMMY
+                        ID 'ACTVT' DUMMY.
+
+    IF sy-subrc = 4.
+*   No authorisation to display data from Sales Organisation
+      MESSAGE ID 'YSE_GENERAL' TYPE 'E' NUMBER '006' WITH s_vkorg-low.
+    ELSEIF sy-subrc <> 0.
+*   Error checking authorization.
+      MESSAGE ID 'YSE_RENTAL' TYPE 'E' NUMBER '046'.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    " CHECK_AUTHORIZATION
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_FILENAME
+*&---------------------------------------------------------------------*
+*       Get the filename
+*----------------------------------------------------------------------*
+*      -->P_INFILE : Input file
+*----------------------------------------------------------------------*
+FORM get_filename  USING    p_infile.
+
+  CALL FUNCTION 'WS_FILENAME_GET'
+    EXPORTING
+      def_path         = 'C:\'
+      mask             = ',*.TXT.'
+    IMPORTING
+      filename         = p_infile
+    EXCEPTIONS
+      inv_winsys       = 1
+      no_batch         = 2
+      selection_cancel = 3
+      selection_error  = 4
+      OTHERS           = 5.
+
+  IF sy-subrc <> 0.
+  ENDIF.
+
+ENDFORM.                    " GET_FILENAME
+
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_FILE
+*&---------------------------------------------------------------------*
+*       Select data from input file
+*----------------------------------------------------------------------*
+FORM select_file .
+
+* Read EXCEL file
+  CALL FUNCTION 'FAA_FILE_UPLOAD_EXCEL'
+    EXPORTING
+      i_filename                 = p_infile
+*      I_TEST                     =
+*      I_UCOMM                    =
+*      I_MAXCOLS                  =
+      i_delimiter                = '|'
+    TABLES
+      et_filecontent             = it_inpc
+    EXCEPTIONS
+      error_accessing_file       = 1
+      OTHERS                     = 2
+            .
+  IF sy-subrc <> 0.
+*   MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*           WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+  ENDIF.
+
+* Process input file
+  LOOP AT it_inpc.
+
+    SPLIT it_inpc AT '|' INTO gv_vbeln gv_date_c.
+*   Add leading zeros to document number
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+      EXPORTING
+        input  = gv_vbeln
+      IMPORTING
+        output = gv_vbeln.
+*   Check sales document and get items
+    SELECT oh~vbeln oi~posnr INTO (it_vbap-vbeln, it_vbap-posnr)
+           FROM vbak AS oh
+           INNER JOIN vbuk AS sh
+                      ON oh~vbeln = sh~vbeln
+           INNER JOIN vbap AS oi
+                      ON oh~vbeln = oi~vbeln
+           INNER JOIN vbup AS si
+                      ON oi~vbeln = si~vbeln  AND
+                         oi~posnr = si~posnr
+           WHERE oh~vbeln = gv_vbeln        "Document Nr.
+             AND oh~vkorg IN s_vkorg        "Sales Org.
+             AND oh~trvog =  p_trvog        "Type of document
+             AND sh~fksak NE 'C'            "Doc. not compl. invoiced
+             AND si~fksaa NE 'C'.           "Item not compl. invoiced
+      IF gv_date_c+9(1) = space.
+        CONCATENATE '0' gv_date_c INTO gv_date_c.
+      ENDIF.
+      it_vbap-fbuda+0(4) = gv_date_c+6(4).
+      it_vbap-fbuda+4(2) = gv_date_c+3(2).
+      it_vbap-fbuda+6(2) = gv_date_c+0(2).
+      APPEND it_vbap.
+      CLEAR it_vbap.
+    ENDSELECT.
+    IF sy-subrc NE 0.
+*     Output
+      WRITE: /01 gv_vbeln,
+              15 gv_date_c,
+              30 'No open document in the given Sales Org.'(e03).
+    ENDIF.
+
+  ENDLOOP.
+
+ENDFORM.                    " SELECT_FILE
+
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_DB
+*&---------------------------------------------------------------------*
+*       Select data from Database
+*----------------------------------------------------------------------*
+FORM select_db .
+
+  SELECT oh~vbeln oi~posnr INTO TABLE it_vbap
+         FROM vbak AS oh
+         INNER JOIN vbuk AS sh
+                    ON oh~vbeln = sh~vbeln
+         INNER JOIN vbap AS oi
+                    ON oh~vbeln = oi~vbeln
+         INNER JOIN vbup AS si
+                    ON oi~vbeln = si~vbeln  AND
+                       oi~posnr = si~posnr
+         WHERE oh~vkorg IN s_vkorg          "Sales Org.
+           AND oh~vbeln IN s_vbeln          "Document Nr.
+           AND oh~trvog =  p_trvog          "Type of document
+           AND sh~fksak NE 'C'              "Doc. not compl. invoiced
+           AND si~fksaa NE 'C'.             "Item not compl. invoiced
+
+  LOOP AT it_vbap.
+    it_vbap-fbuda = p_fbuda.
+    MODIFY it_vbap.
+  ENDLOOP.
+
+ENDFORM.                    " SELECT_DB
+
+*&---------------------------------------------------------------------*
+*&      Form  PROCESS_DOCUMENTS
+*&---------------------------------------------------------------------*
+*       Process documents
+*----------------------------------------------------------------------*
+FORM process_documents .
+
+  SORT it_vbap.
+
+* Process data
+  LOOP AT it_vbap.
+
+*   New document
+    AT NEW vbeln.
+      CLEAR gv_error.
+*     Progress indicator
+      IF sy-batch IS INITIAL.
+        gv_text = 'Document & is being processed'(i02).
+        REPLACE '&' WITH it_vbap-vbeln INTO gv_text.
+        CONDENSE gv_text.
+        CALL FUNCTION 'SAPGUI_PROGRESS_INDICATOR'
+          EXPORTING
+            text = gv_text.
+      ENDIF.
+*     Modify header
+      PERFORM modify_header.
+      IF gv_error IS INITIAL.
+*       Clear structures and tables for the BAPI
+        CLEAR: bdcdata, it_messages.
+        REFRESH: bdcdata, it_messages.
+*       Select Sales Document (for update of items)
+        PERFORM bdc_dynpro USING 'SAPMV45A'   '0102'.
+        PERFORM bdc_field  USING 'BDC_OKCODE' '/00'.
+        PERFORM bdc_field  USING 'VBAK-VBELN' it_vbap-vbeln.
+      ENDIF.
+    ENDAT.
+
+*   Modify item
+    IF gv_error IS INITIAL.
+      PERFORM modify_item.
+    ENDIF.
+
+*   End of document
+    AT END OF vbeln.
+      IF gv_error IS INITIAL.
+*       Save sales document
+        PERFORM bdc_dynpro USING 'SAPMV45A'   '4001'.
+        PERFORM bdc_field  USING 'BDC_OKCODE' '=SICH'.
+*       Update sales document via VAx2
+        PERFORM call_vax2.
+      ENDIF.
+    ENDAT.
+
+  ENDLOOP.
+
+ENDFORM.                    " PROCESS_DOCUMENTS
+
+*&---------------------------------------------------------------------*
+*&      Form  MODIFY_HEADER
+*&---------------------------------------------------------------------*
+*       Modify header
+*----------------------------------------------------------------------*
+FORM modify_header .
+
+  gv_header = 'X'.
+
+* Get data from internal table
+  READ TABLE it_vbap INDEX sy-tabix
+                     INTO wa_vbap.
+
+* Clear structures and tables for the BAPI
+  CLEAR: bdcdata, it_messages.
+  REFRESH: bdcdata, it_messages.
+
+* Select Sales Document
+  PERFORM bdc_dynpro USING 'SAPMV45A'   '0102'.
+  PERFORM bdc_field  USING 'BDC_OKCODE' '/00'.
+  PERFORM bdc_field  USING 'VBAK-VBELN' it_vbap-vbeln.
+
+* Go to header (tab 'Billing')
+  PERFORM bdc_dynpro USING 'SAPMV45A'   '4001'.
+  PERFORM bdc_field  USING 'BDC_OKCODE' '=KDE3'.
+
+* Update field 'Service rendered date' -> triggers MWST condition update
+  PERFORM bdc_dynpro USING 'SAPMV45A'   '4002'.
+  PERFORM bdc_field  USING 'BDC_OKCODE' '=SICH'.
+  WRITE wa_vbap-fbuda TO gv_date_c.
+  PERFORM bdc_field  USING 'VBKD-FBUDA' gv_date_c.
+
+* Update sales document via VAx2
+  PERFORM call_vax2.
+
+  CLEAR gv_header.
+
+ENDFORM.                    " MODIFY_HEADER
+
+*&---------------------------------------------------------------------*
+*&      Form  MODIFY_ITEM
+*&---------------------------------------------------------------------*
+*       Modify item
+*----------------------------------------------------------------------*
+FORM modify_item .
+
+* Go to item selection
+  PERFORM bdc_dynpro USING 'SAPMV45A'    '4001'.
+  PERFORM bdc_field  USING 'BDC_OKCODE'  '=POPO'.
+
+* Select item
+  PERFORM bdc_dynpro USING 'SAPMV45A'    '0251'.
+  PERFORM bdc_field  USING 'BDC_OKCODE'  '=POSI'.
+  PERFORM bdc_field  USING 'RV45A-POSNR' it_vbap-posnr.
+
+* Go to item (tab 'Billing')
+  PERFORM bdc_dynpro USING 'SAPMV45A'    '4001'.
+  PERFORM bdc_field  USING 'BDC_OKCODE'  '=PDE3'.
+  PERFORM bdc_field  USING 'RV45A-VBAP_SELKZ(01)' 'X'.
+
+* Update field 'Service rendered date' -> triggers MWST condition update
+  PERFORM bdc_dynpro USING 'SAPMV45A'   '4003'.
+  PERFORM bdc_field  USING 'BDC_OKCODE' '/EBACK'.
+  WRITE it_vbap-fbuda TO gv_date_c.
+  PERFORM bdc_field  USING 'VBKD-FBUDA' gv_date_c.
+
+ENDFORM.                    " MODIFY_ITEM
+
+*&---------------------------------------------------------------------*
+*&      Form  CALL_VAX2
+*&---------------------------------------------------------------------*
+*       Update contract via VAx2
+*----------------------------------------------------------------------*
+FORM call_vax2 .
+
+  bdc_options-dismode = gv_mode.
+  bdc_options-updmode = 'S'.
+
+* Call the corresponding transaction for update
+  CALL TRANSACTION gv_tcode USING bdcdata
+                            OPTIONS FROM bdc_options
+                            MESSAGES INTO it_messages.
+
+* Get errors
+  CLEAR gv_mtext.
+  LOOP AT it_messages INTO wa_messages
+                      WHERE msgtyp = 'A'  OR
+                            msgtyp = 'E'.
+    MESSAGE ID wa_messages-msgid
+            TYPE wa_messages-msgtyp
+            NUMBER wa_messages-msgnr
+            INTO gv_mtext
+            WITH wa_messages-msgv1 wa_messages-msgv2
+                 wa_messages-msgv3 wa_messages-msgv4.
+    IF NOT gv_header IS INITIAL.
+      gv_error = 'X'.
+    ELSE.
+      WRITE: /01 it_vbap-vbeln,
+              12 it_vbap-posnr,
+              20 wa_vbap-fbuda,
+              35 gv_mtext.
+    ENDIF.
+    EXIT.
+  ENDLOOP.
+
+* Output
+  IF NOT gv_header IS INITIAL.
+* No errors
+    IF sy-subrc NE 0.
+      gv_mtext = 'Processed'(i03).
+    ENDIF.
+    WRITE: /01 it_vbap-vbeln,
+            20 wa_vbap-fbuda,
+            35 gv_mtext.
+  ENDIF.
+
+ENDFORM.                                                    " CALL_VAX2
+
+*&---------------------------------------------------------------------*
+*&      Form  BDC_DYNPRO
+*&---------------------------------------------------------------------*
+*       Start new screen
+*----------------------------------------------------------------------*
+*      -->PROGRAM : Program name
+*      -->DYNPRO  : Screen number
+*----------------------------------------------------------------------*
+FORM bdc_dynpro USING  program
+                       dynpro.
+
+  CLEAR bdcdata.
+  bdcdata-program  = program.
+  bdcdata-dynpro   = dynpro.
+  bdcdata-dynbegin = 'X'.
+  APPEND bdcdata.
+
+ENDFORM.                    " BDC_DYNPRO
+
+*&---------------------------------------------------------------------*
+*&      Form  BDC_FIELD
+*&---------------------------------------------------------------------*
+*       Screen field
+*----------------------------------------------------------------------*
+*      -->FNAM : Field name
+*      -->FVAL : Field value
+*----------------------------------------------------------------------*
+FORM bdc_field USING  fnam
+                      fval.
+
+  CLEAR bdcdata.
+  bdcdata-fnam = fnam.
+  bdcdata-fval = fval.
+  APPEND bdcdata.
+
+ENDFORM.                    " BDC_FIELD
+
+*List header: Column headings£º
+
+*001:Document   Item    Date           Message
+*Text symbol text£º
+*B01:Selection
+*E01:Service rendered date is required
+*E02:Input file name is required
+*E03:No open document in the given Sales Org.
+*I01:Selecting data
+*I02:Document & is being processed
+*I03:Processed
+
+*I04:*** No sales documents selected ***
+*Selection text£º
+*P_FBUDA:D       .
+*P_INFILE:        Input file (Excel)
+*P_OPT1:        All sales documents
+*P_OPT2:        Sales document list
+*P_TRVOG:        Type of document
+*S_VBELN:D       .
+*S_VKORG:D       .

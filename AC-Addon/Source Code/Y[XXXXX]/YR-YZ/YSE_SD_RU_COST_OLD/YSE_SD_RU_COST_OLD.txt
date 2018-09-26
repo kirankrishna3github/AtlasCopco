@@ -1,0 +1,532 @@
+*----------------------------------------------------------------------*
+* PROGRAM ID           : YSE_SD_RU_COST_OLD                            *
+*                        (Old version from YSE_SD_RU_COST) .            *
+* PROGRAM TITLE        : Local freight/customs/carrier/cost booking    *
+*                        automation                                    *
+* AUTHOR               : Jules Smets                                   *
+* DATE                 : 02/08/2010                                    *
+* DEVELOPMENT ID       : CR1295                                        *
+* CHANGE REQUEST NUMBER: CD1K958353                                    *
+* PROGRAM DESCRIPTION  : Russia will use actual costing as a stock     *
+*                        keeping mechanism. This means, next to the    *
+*                        VISA EDI logistics invoice, other costs need  *
+*                        to be booked on stock.                        *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG
+*----------------------------------------------------------------------*
+* MOD. NR. |  DATE      | NAME             | CORR. NR.  | CHANGE REF.  *
+*----------------------------------------------------------------------*
+* MOD-001  | 99.99.9999 | x                | CD1K9xxxxx | CRxxxx       *
+************************************************************************
+
+REPORT  yse_sd_ru_cost_old      NO STANDARD PAGE HEADING
+                                LINE-SIZE 160
+                                LINE-COUNT 80.
+
+*------- Tables -------------------------------------------------------*
+TABLES: bkpf, ekpo , t007a, t007s.
+*        ekes, ekbe, rseg.
+
+TYPE-POOLS : icon.
+
+*------- Variables ----------------------------------------------------*
+DATA: lv_bukrs         TYPE bukrs,
+      lv_cnt           TYPE i,
+      lv_land1         LIKE t001-land1,
+      lv_kalsm         LIKE t005-kalsm,
+      lv_belnr         LIKE rseg-belnr,
+      lv_gjahr         LIKE rseg-gjahr,
+      wa_rseg          TYPE rseg,
+      lv_kzabs(1)      TYPE c,
+      lv_date          TYPE sy-datum,
+      gv_nr(3)         TYPE c,
+      gv_mestx         LIKE t100-text.
+
+DATA: BEGIN OF gt_pos OCCURS 0,
+       ebeln           TYPE ebeln,
+       ebelp           TYPE ebelp,
+       menge           TYPE bstmg,
+       meins           TYPE bstme,
+*       mblnr           TYPE mblnr,
+*       mblpo           TYPE mblpo,
+*       gjahr           TYPE mjahr,
+      END OF gt_pos.
+
+DATA: BEGIN OF gt_awkey OCCURS 0,
+       awkey         TYPE awkey,
+      END OF gt_awkey.
+
+DATA: ls_header    TYPE bapi_incinv_create_header,
+      lt_item      TYPE bapi_incinv_create_item OCCURS 0 WITH HEADER LINE,
+      lt_tax       TYPE bapi_incinv_create_tax OCCURS 0 WITH HEADER LINE,
+      return       TYPE bapiret2 OCCURS 0 WITH HEADER LINE.
+
+DATA: belnr LIKE bkpf-belnr,
+      gjahr LIKE bkpf-gjahr.
+
+DATA: BEGIN OF i_logtab OCCURS 0,
+        cod(1)     TYPE c,
+        msg(119)   TYPE c,
+      END OF i_logtab.
+
+CONSTANTS: c_x(1)      TYPE c VALUE 'X'.
+
+*------- Selection screen ---------------------------------------------*
+SELECTION-SCREEN : BEGIN OF BLOCK b1a WITH FRAME TITLE text-001.
+PARAMETERS : p_bukrs    TYPE bukrs OBLIGATORY MEMORY ID buk,
+             p_waers    LIKE tcurc-waers OBLIGATORY,
+             p_lifre    LIKE wbrk-lifre OBLIGATORY,
+             p_beznk    TYPE beznk OBLIGATORY,
+             p_mwskz(50)    TYPE c AS LISTBOX VISIBLE LENGTH 50 ,
+             p_wmwst    TYPE wmwst,
+             p_invdt    LIKE sy-datum OBLIGATORY,
+             p_budat    TYPE sy-datum OBLIGATORY,
+             p_xblnr1   TYPE xblnr1 OBLIGATORY.
+
+PARAMETERS : p_relpo RADIOBUTTON GROUP 001 USER-COMMAND sc1 DEFAULT 'X',
+             p_relir RADIOBUTTON GROUP 001 .
+SELECTION-SCREEN END OF BLOCK b1a.
+
+SELECTION-SCREEN BEGIN OF BLOCK b1b WITH FRAME TITLE tit01.
+SELECTION-SCREEN BEGIN OF LINE .
+PARAMETERS : p_ebeln    LIKE ekpo-ebeln MODIF ID 001,
+             p_ebelp    LIKE ekpo-ebelp MODIF ID 001.
+*SELECTION-SCREEN PUSHBUTTON 19(10) push USER-COMMAND more MODIF ID 001.
+SELECTION-SCREEN END OF LINE.
+
+SELECTION-SCREEN BEGIN OF LINE.
+SELECT-OPTIONS : s_xblnr1 FOR bkpf-xblnr MODIF ID 002.
+SELECTION-SCREEN END OF LINE.
+SELECTION-SCREEN END OF BLOCK b1b.
+
+*----------------------------------------------------------------------*
+INITIALIZATION.
+
+  GET PARAMETER ID 'BUK' FIELD lv_bukrs.
+  IF p_waers IS INITIAL.
+    SELECT SINGLE waers land1 INTO (p_waers, lv_land1)
+           FROM t001
+           WHERE bukrs = lv_bukrs.
+  ENDIF.
+
+  PERFORM prepare_listbox USING 'P_MWSKZ' lv_land1.
+
+*  CALL FUNCTION 'ICON_CREATE'
+*    EXPORTING
+*      name   = 'ICON_ENTER_MORE'
+*      text   = 'Enter more'
+*      info   = 'More'
+*    IMPORTING
+*      RESULT = push
+*    EXCEPTIONS
+*      OTHERS = 1.
+
+*----------------------------------------------------------------------*
+AT SELECTION-SCREEN OUTPUT.
+
+  IF p_relpo = 'X'.
+    tit01 = text-t01.
+  ELSE.
+    tit01 = text-t02.
+  ENDIF.
+
+  LOOP AT SCREEN.
+    CASE screen-group1.
+      WHEN '001'.
+        IF p_relpo = 'X'.
+          screen-active = 1.
+        ELSE.
+          screen-active = 0.
+        ENDIF.
+      WHEN '002'.
+        IF p_relir = 'X'.
+          screen-active = 1.
+        ELSE.
+          screen-active = 0.
+        ENDIF.
+    ENDCASE.
+    MODIFY SCREEN.
+  ENDLOOP.
+
+  IF p_invdt IS INITIAL.
+    p_invdt = sy-datum.
+  ENDIF.
+  IF p_budat IS INITIAL.
+    p_budat = sy-datum.
+  ENDIF.
+
+*  IMPORT gt_pos FROM MEMORY ID 'YSE_COST_BOOK'.
+*  DESCRIBE TABLE gt_pos LINES lv_cnt.
+*
+*  IF lv_cnt <= 1 .
+*    CALL FUNCTION 'ICON_CREATE'
+*      EXPORTING
+*        name   = 'ICON_ENTER_MORE'
+*        text   = 'Enter more'
+*        info   = 'More'
+*      IMPORTING
+*        RESULT = push
+*      EXCEPTIONS
+*        OTHERS = 1.
+*  ELSE.
+*    CALL FUNCTION 'ICON_CREATE'
+*      EXPORTING
+*        name   = 'ICON_DISPLAY_MORE'
+*        text   = 'Enter more'
+*        info   = 'More'
+*      IMPORTING
+*        RESULT = push
+*      EXCEPTIONS
+*        OTHERS = 1.
+*  ENDIF.
+
+*----------------------------------------------------------------------*
+AT SELECTION-SCREEN ON EXIT-COMMAND.
+  FREE MEMORY ID 'YSE_COST_BOOK'.
+
+*----------------------------------------------------------------------*
+AT SELECTION-SCREEN ON p_bukrs.
+
+  AUTHORITY-CHECK OBJECT 'YAM_BUKRS'
+           ID 'BUKRS' FIELD p_bukrs.
+
+  IF sy-subrc NE 0.
+    MESSAGE e101(yam_sls) WITH p_bukrs.
+  ENDIF.
+
+*----------------------------------------------------------------------*
+AT SELECTION-SCREEN.
+
+*  CASE sy-ucomm.
+*    WHEN 'MORE'.
+*      IF gt_pos[] IS INITIAL.
+*        MOVE p_ebeln TO gt_pos-ebeln.
+*        MOVE p_ebelp TO gt_pos-ebelp.
+*        APPEND gt_pos.
+*        CLEAR gt_pos.
+*      ENDIF.
+*      EXPORT gt_pos TO MEMORY ID 'YSE_COST_BOOK'.
+*      CALL TRANSACTION 'YSE_SD_RU_COST' AND SKIP FIRST SCREEN.
+*      IMPORT gt_pos FROM MEMORY ID 'YSE_COST_BOOK'.
+*      IF NOT gt_pos[] IS INITIAL.
+*        LOOP AT gt_pos.
+*          WRITE gt_pos-ebeln TO p_ebeln.
+*          WRITE gt_pos-ebelp TO p_ebelp.
+*          EXIT.
+*        ENDLOOP.
+*      ELSE.
+*        CLEAR: p_ebeln , p_ebelp.
+*      ENDIF.
+*    WHEN OTHERS.
+*  ENDCASE.
+
+*----------------------------------------------------------------------*
+START-OF-SELECTION.
+
+  IF p_relpo = c_x.
+    IF gt_pos[] IS INITIAL.
+      IF NOT p_ebeln IS INITIAL AND NOT p_ebelp IS INITIAL.
+        MOVE p_ebeln TO gt_pos-ebeln.
+        MOVE p_ebelp TO gt_pos-ebelp.
+        SELECT SINGLE menge meins INTO (gt_pos-menge, gt_pos-meins)
+               FROM ekpo
+               WHERE ebeln = gt_pos-ebeln
+                 AND ebelp = gt_pos-ebelp.
+        APPEND gt_pos.
+**       Select corresponding Goods Receipts
+*        SELECT vc~ebeln vc~ebelp vc~menge po~meins
+*               hi~belnr hi~buzei hi~gjahr
+*               INTO TABLE gt_pos
+*               FROM ekpo AS po                   "Purchasing doc. items
+*               INNER JOIN ekes AS vc             "Vendor Confirmations
+*                     ON vc~ebeln = po~ebeln  AND
+*                        vc~ebelp = po~ebelp
+*               INNER JOIN ekbe AS hi             "History Purch. Doc.
+*                     ON hi~ebeln = vc~ebeln  AND
+*                        hi~ebelp = vc~ebelp  AND
+*                        hi~bwtar = vc~charg      "Batch
+*               WHERE po~ebeln = p_ebeln
+*                 AND po~ebelp = p_ebelp
+*                 AND vc~ebtyp = 'LA'             "Inbound Delivery
+*                 AND hi~vgabe = '1'.             "Goods Receipt
+      ENDIF.
+    ENDIF.
+    IF NOT gt_pos[] IS INITIAL.
+      PERFORM book_invoice.
+    ELSE.
+      MESSAGE i001(00) WITH text-i01.
+    ENDIF.
+  ELSE.
+    REFRESH gt_pos.
+    PERFORM find_pos_from_invoices.
+    IF NOT gt_pos[] IS INITIAL.
+      PERFORM book_invoice.
+    ELSE.
+      MESSAGE i001(00) WITH text-i01.
+    ENDIF.
+  ENDIF.
+
+*----------------------------------------------------------------------*
+END-OF-SELECTION.
+
+  PERFORM write_results.
+
+  SKIP.
+  WRITE: / 'End of Proces'(001).
+
+*----------------------------------------------------------------------*
+TOP-OF-PAGE.
+
+  WRITE: sy-title, 85 sy-datum, 100 sy-uzeit, 115 sy-pagno.
+  ULINE.
+  SKIP.
+
+*&---------------------------------------------------------------------*
+*&      Form  write_results
+*&---------------------------------------------------------------------*
+*       Results
+*----------------------------------------------------------------------*
+FORM write_results.
+
+*  LEAVE TO LIST-PROCESSING.
+
+  LOOP AT i_logtab.
+    IF i_logtab-cod = ' '.
+      WRITE: / i_logtab-msg.
+    ELSE.
+      FORMAT COLOR COL_NEGATIVE.
+      WRITE: /13 i_logtab-msg.
+      FORMAT RESET.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    "write_results
+
+*&---------------------------------------------------------------------*
+*&      Form  FIND_POS_FROM_INVOICES
+*&---------------------------------------------------------------------*
+*       Get quantities from invoice
+*----------------------------------------------------------------------*
+FORM find_pos_from_invoices .
+
+  REFRESH: gt_awkey, gt_pos.
+
+  IF NOT s_xblnr1[] IS INITIAL.
+    SELECT awkey INTO TABLE gt_awkey
+           FROM bkpf
+           WHERE bukrs = p_bukrs
+             AND bstat = ' '
+             AND xblnr IN s_xblnr1.
+    IF NOT gt_awkey[] IS INITIAL.
+      LOOP AT gt_awkey.
+        lv_belnr = gt_awkey-awkey+0(10).
+        lv_gjahr = gt_awkey-awkey+10(4).
+        SELECT * INTO wa_rseg
+                 FROM rseg
+                 WHERE belnr = lv_belnr
+                   AND gjahr = lv_gjahr.
+          gt_pos-ebeln = wa_rseg-ebeln.
+          gt_pos-ebelp = wa_rseg-ebelp.
+          gt_pos-menge = wa_rseg-menge.
+          gt_pos-meins = wa_rseg-bstme.
+          APPEND gt_pos.
+          CLEAR gt_pos.
+        ENDSELECT.
+**       Select corresponding Goods Receipts
+*        SELECT iv~ebeln iv~ebelp iv~menge iv~bstme
+*               hi~belnr hi~buzei hi~gjahr
+*               APPENDING TABLE gt_pos
+*               FROM rseg AS iv                   "Incoming Invoice Item
+*               INNER JOIN ekbe AS hi             "History Purch. Doc.
+*                     ON hi~ebeln = iv~ebeln  AND
+*                        hi~ebelp = iv~ebelp  AND
+*                        hi~bwtar = iv~bwtar      "Batch
+*               WHERE iv~belnr = lv_belnr
+*                 AND iv~gjahr = lv_gjahr
+*                 AND hi~vgabe = '1'.             "Goods Receipt
+      ENDLOOP.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    " FIND_POS_FROM_INVOICES
+
+*&---------------------------------------------------------------------*
+*&      Form  prepare_listbox
+*&---------------------------------------------------------------------*
+*       Listbox
+*----------------------------------------------------------------------*
+FORM prepare_listbox USING p_pname p_land1.
+
+  DATA: BEGIN OF wa_ddval OCCURS 0,
+          key(40)   TYPE c,
+          text(80)  TYPE c,
+        END OF wa_ddval.
+  DATA: it_ddval LIKE TABLE OF wa_ddval .
+  DATA: gv_kalsm LIKE t005-kalsm.
+
+
+  REFRESH it_ddval.
+  SELECT SINGLE kalsm INTO gv_kalsm
+         FROM t005
+         WHERE land1 EQ p_land1.
+
+  SELECT mwskz AS key
+         INTO TABLE it_ddval
+         FROM t007a
+         WHERE kalsm EQ gv_kalsm.
+
+  LOOP AT it_ddval INTO wa_ddval.
+    SELECT SINGLE text1 INTO wa_ddval-text
+           FROM t007s
+           WHERE spras EQ sy-langu
+             AND kalsm EQ gv_kalsm
+             AND mwskz EQ wa_ddval-key.
+    MODIFY it_ddval FROM wa_ddval.
+  ENDLOOP.
+
+  CALL FUNCTION 'VRM_SET_VALUES'
+    EXPORTING
+      id              = p_pname
+      values          = it_ddval
+    EXCEPTIONS
+      id_illegal_name = 1
+      OTHERS          = 2.
+
+ENDFORM.                    "prepare_listbox
+
+*&---------------------------------------------------------------------*
+*&      Form  invoice_create
+*&---------------------------------------------------------------------*
+*       Create invoice
+*----------------------------------------------------------------------*
+FORM book_invoice.
+
+  REFRESH: lt_item,  lt_tax, return, i_logtab.
+  CLEAR: ls_header, belnr, gjahr, lt_item, lt_tax, return.
+
+  ls_header-doc_date = p_invdt.
+  ls_header-pstng_date = p_budat.
+  ls_header-comp_code = p_bukrs.
+  ls_header-currency = p_waers.
+  ls_header-gross_amount = p_beznk + p_wmwst.
+  ls_header-invoice_ind = c_x.
+  ls_header-ref_doc_no = p_xblnr1.
+  ls_header-diff_inv = p_lifre.
+  ls_header-del_costs = p_beznk.
+
+  SORT gt_pos BY ebeln ebelp.
+*                mblnr mblpo gjahr.
+
+  LOOP AT gt_pos.
+    lt_item-invoice_doc_item = sy-tabix.
+    lt_item-po_number = gt_pos-ebeln.
+    lt_item-po_item = gt_pos-ebelp.
+    lt_item-quantity = gt_pos-menge.
+    lt_item-po_unit = gt_pos-meins.
+    lt_item-de_cre_ind = c_x.
+    lt_item-tax_code = p_mwskz.
+*    lt_item-ref_doc = gt_pos-mblnr.
+*    lt_item-ref_doc_it = gt_pos-mblpo.
+*    lt_item-ref_doc_year = gt_pos-gjahr.
+    APPEND lt_item.
+    CLEAR lt_item.
+  ENDLOOP.
+
+  IF NOT p_wmwst IS INITIAL.
+    lt_tax-tax_code = p_mwskz.
+    lt_tax-tax_amount = p_wmwst.
+    lt_tax-tax_base_amount = p_beznk.
+    APPEND lt_tax.
+    CLEAR lt_tax.
+  ENDIF.
+
+  lv_kzabs = 'D'.
+  EXPORT lv_kzabs TO MEMORY ID 'HOLDBAPIINV'.
+
+  CALL FUNCTION 'BAPI_INCOMINGINVOICE_CREATE'
+    EXPORTING
+      headerdata       = ls_header
+    IMPORTING
+      invoicedocnumber = belnr
+      fiscalyear       = gjahr
+    TABLES
+      itemdata         = lt_item
+      taxdata          = lt_tax
+      return           = return.
+
+  LOOP AT return WHERE type CA 'EA'.
+
+    gv_nr = return-number.
+    CALL FUNCTION 'RH_MESSAGE_GET'
+      EXPORTING
+        arbgb             = return-id
+        msgnr             = gv_nr
+        msgv1             = return-message_v1
+        msgv2             = return-message_v2
+        msgv3             = return-message_v3
+        msgv4             = return-message_v4
+      IMPORTING
+        msgtext           = gv_mestx
+      EXCEPTIONS
+        message_not_found = 1
+        OTHERS            = 2.
+
+    IF sy-subrc = 0.
+      PERFORM add_message_to_tab USING gv_mestx 'E'.
+    ENDIF.
+    EXIT.
+
+  ENDLOOP.
+
+  IF NOT belnr IS INITIAL.
+    gv_mestx = text-i02.
+    REPLACE '&1' WITH belnr INTO gv_mestx.
+    PERFORM add_message_to_tab USING gv_mestx ' ' .
+    CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+      EXPORTING
+        wait   = 'X'
+      IMPORTING
+        return = return.
+  ENDIF.
+
+ENDFORM.                    "invoice_create
+
+*&---------------------------------------------------------------------*
+*&      Form  add_message_to_tab
+*&---------------------------------------------------------------------*
+*       Add message to table
+*----------------------------------------------------------------------*
+FORM add_message_to_tab USING p_msg p_cod.
+
+  i_logtab-msg = p_msg.
+  i_logtab-cod = p_cod.
+  APPEND i_logtab.
+  CLEAR i_logtab.
+
+ENDFORM.                    " add_message_to_tab
+
+*Text symbol text£º
+*001:End of Proces
+*010:Selection
+*E04:Update material failed !!!
+*E10:No materials selected
+*I01:No purchase orders selected
+*I02:Invoice &1 created on hold
+*T01:Related purchase orders
+
+*T02:Related invoice references
+*Selection text£º
+*P_BEZNK:        Unplanned costs
+*P_BUDAT:        Posting date
+*P_BUKRS:        Company code
+*P_EBELN:
+*P_EBELP:
+*P_INVDT:        Invoice date
+*P_LIFRE:        Invoicing party
+*P_MWSKZ:        Tax code
+*P_RELIR:        Related invoice references
+*P_RELPO:        Related purchase orders
+*P_WAERS:        Currrency
+*P_WMWST:        Tax amount
+*P_XBLNR1:        Reference
+*S_XBLNR1:        Related invoice references

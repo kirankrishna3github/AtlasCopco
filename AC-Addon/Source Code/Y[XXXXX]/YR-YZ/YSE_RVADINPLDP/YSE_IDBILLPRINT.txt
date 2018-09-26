@@ -1,0 +1,302 @@
+*&---------------------------------------------------------------------*
+*&  Include           YSE_IDBILLPRINT                                  *
+*&---------------------------------------------------------------------*
+
+* This include is part of YSE_RVADINPLDP and contains some custom
+* routines
+
+*&---------------------------------------------------------------------*
+*&      Form  processing_sf
+*&---------------------------------------------------------------------*
+* This form is inspired on FORM "ENTRY_PL" in IDBILLPRINT but calls
+* FORM "PROCESSING_SF" instead of FORM "PROCESSING"
+* ---------------------------------------------------------------------*
+FORM entry_pl_sf USING return_code us_screen.
+  CLEAR retcode.
+  xscreen = us_screen.
+  header_userexit = 'HEADER_PL'.
+  header_print_userexit = 'HEADER_PRINT_PL'.
+* PERFORM processing USING us_screen.
+  PERFORM processing_sf USING us_screen.
+  CASE retcode.
+    WHEN 0.
+      return_code = 0.
+    WHEN 3.
+      return_code = 3.
+    WHEN OTHERS.
+      return_code = 1.
+  ENDCASE.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*&      Form  processing_sf
+*&---------------------------------------------------------------------*
+* This form is inspired on FORM "processing" in RVADINPLDP
+* and on FORM "PROCESSING_SF" in YSE_SD_INVOICE_SF
+* ---------------------------------------------------------------------*
+FORM processing_sf  USING    P_US_SCREEN.
+
+  DATA:
+    LS_PRINT_DATA_TO_READ TYPE LBBIL_PRINT_DATA_TO_READ,
+    LF_FM_NAME            TYPE RS38L_FNAM,
+    LS_CONTROL_PARAM      TYPE SSFCTRLOP,
+    LS_COMPOSER_PARAM     TYPE SSFCOMPOP,
+    LS_RECIPIENT          TYPE SWOTOBJID,
+    LS_SENDER             TYPE SWOTOBJID,
+    LF_FORMNAME           TYPE TDSFNAME,
+    LS_ADDR_KEY           LIKE ADDR_KEY,
+    LS_DLV-LAND           LIKE VBRK-LAND1,
+    LS_JOB_INFO           TYPE SSFCRESCL,
+    LS_SPOOLID            LIKE LINE OF LS_JOB_INFO-SPOOLIDS.
+
+* Get SmartForm name into local variable
+  LF_FORMNAME = TNAPR-SFORM.
+
+* Determine print data
+  PERFORM SET_PRINT_DATA_TO_READ USING    LF_FORMNAME
+                                 CHANGING LS_PRINT_DATA_TO_READ
+                                          RETCODE.
+  CHECK RETCODE = 0.
+
+* Get print data
+  PERFORM GET_DATA.
+
+  PERFORM SET_PRINT_PARAM USING    LS_ADDR_KEY
+                                   LS_DLV-LAND
+                          CHANGING LS_CONTROL_PARAM
+                                   LS_COMPOSER_PARAM
+                                   LS_RECIPIENT
+                                   LS_SENDER
+                                   RETCODE.
+  CHECK RETCODE = 0.
+
+* Determine smartform function module for invoice
+  CALL FUNCTION 'SSF_FUNCTION_MODULE_NAME'
+    EXPORTING
+      FORMNAME           = LF_FORMNAME
+    IMPORTING
+      FM_NAME            = LF_FM_NAME
+    EXCEPTIONS
+      NO_FORM            = 1
+      NO_FUNCTION_MODULE = 2
+      OTHERS             = 3.
+* error handling
+  IF SY-SUBRC <> 0.
+    RETCODE = SY-SUBRC.
+    PERFORM PROTOCOL_UPDATE.
+  ENDIF.
+
+* Check if output has been completed successfullly before
+* Set repeat flag if this is not the first request
+  CHECK RETCODE = 0.
+  PERFORM CHECK_REPEAT.
+
+* Set number of copies
+  IF LS_COMPOSER_PARAM-TDCOPIES EQ 0.
+    NAST_ANZAL = 1.
+  ELSE.
+    NAST_ANZAL = LS_COMPOSER_PARAM-TDCOPIES.
+  ENDIF.
+  LS_COMPOSER_PARAM-TDCOPIES = 1.
+
+  DO NAST_ANZAL TIMES.
+*   In case of repetition only one time archiving
+    IF SY-INDEX > 1 AND NAST-TDARMOD = 3.
+      NAST_TDARMOD = NAST-TDARMOD.
+      NAST-TDARMOD = 1.
+      LS_COMPOSER_PARAM-TDARMOD = 1.
+    ENDIF.
+*   Also set repeat flag if if this is not the first copy
+    IF SY-INDEX NE 1 AND REPEAT IS INITIAL.
+      REPEAT = 'X'.
+    ENDIF.
+
+*   Call smartform
+    CALL FUNCTION LF_FM_NAME
+      EXPORTING
+        ARCHIVE_INDEX        = TOA_DARA
+        ARCHIVE_PARAMETERS   = ARC_PARAMS
+        CONTROL_PARAMETERS   = LS_CONTROL_PARAM
+        MAIL_RECIPIENT       = LS_RECIPIENT
+        MAIL_SENDER          = LS_SENDER
+        OUTPUT_OPTIONS       = LS_COMPOSER_PARAM
+        USER_SETTINGS        = SPACE
+        IS_NAST              = NAST
+        IS_REPEAT            = REPEAT
+        SADR                 = SADR
+        VBDKR                = VBDKR
+        VBDPR                = VBDPR
+        KOMVD                = KOMVD
+        KOMK                 = KOMK
+        KOMP                 = KOMP
+        REPEAT               = REPEAT
+        GS_DP_CLEARING       = GS_DP_CLEARING
+        GS_LEFT_FOR_CLEARING = GS_LEFT_FOR_CLEARING
+        GT_PREV_DP_INV       = GT_PREV_DP_INV[]
+        GS_TO_BE_PAID        = GS_TO_BE_PAID
+        GV_DP_RCPT_DATE      = GV_DP_RCPT_DATE
+        GV_TO_PAY            = GV_TO_PAY
+        GV_TO_PAY_IN_WORDS   = GV_TO_PAY_IN_WORDS
+        GV_INV_TYP           = GV_INV_TYP
+      IMPORTING
+        JOB_OUTPUT_INFO      = LS_JOB_INFO
+*       DOCUMENT_OUTPUT_INFO =
+*       JOB_OUTPUT_OPTIONS   =
+      TABLES
+        TKOMV                = TKOMV
+      EXCEPTIONS
+        FORMATTING_ERROR     = 1
+        INTERNAL_ERROR       = 2
+        SEND_ERROR           = 3
+        USER_CANCELED        = 4
+        OTHERS               = 5.
+*   Error handling
+    IF SY-SUBRC <> 0.
+      RETCODE = SY-SUBRC.
+      PERFORM PROTOCOL_UPDATE.
+*     Get SmartForm protocoll and store it in the NAST protocoll
+      PERFORM ADD_SMFRM_PROT.
+    ENDIF.
+  ENDDO.
+
+* Get SmartForm spoolid and store it in the NAST protocoll
+  LOOP AT LS_JOB_INFO-SPOOLIDS INTO LS_SPOOLID.
+    IF LS_SPOOLID NE SPACE.
+      PERFORM PROTOCOL_UPDATE_SPOOL USING '342' LS_SPOOLID
+                                          SPACE SPACE SPACE.
+    ENDIF.
+  ENDLOOP.
+  LS_COMPOSER_PARAM-TDCOPIES = NAST_ANZAL.
+  IF NOT NAST_TDARMOD IS INITIAL.
+    NAST-TDARMOD = NAST_TDARMOD.
+    CLEAR NAST_TDARMOD.
+  ENDIF.
+
+ENDFORM.                    " PROCESSING_SF
+
+*---------------------------------------------------------------------*
+*       FORM SET_PRINT_DATA_TO_READ                                   *
+*---------------------------------------------------------------------*
+* General provision of data for the form
+* Copied from YSE_SD_INVOICE_SF
+*---------------------------------------------------------------------*
+FORM SET_PRINT_DATA_TO_READ
+         USING    IF_FORMNAME LIKE TNAPR-SFORM
+         CHANGING CS_PRINT_DATA_TO_READ TYPE LBBIL_PRINT_DATA_TO_READ
+                  CF_RETCODE.
+
+  FIELD-SYMBOLS: <FS_PRINT_DATA_TO_READ> TYPE XFELD.
+  DATA: LT_FIELDLIST TYPE TSFFIELDS.
+
+* See if all components can be assigned to field symbol
+  DO.
+    ASSIGN COMPONENT SY-INDEX OF STRUCTURE
+                     CS_PRINT_DATA_TO_READ TO <FS_PRINT_DATA_TO_READ>.
+    IF SY-SUBRC <> 0. EXIT. ENDIF.
+    <FS_PRINT_DATA_TO_READ> = 'X'.
+  ENDDO.
+
+* If successfull so far, get field list for the form name
+  CALL FUNCTION 'SSF_FIELD_LIST'
+    EXPORTING
+      FORMNAME                = IF_FORMNAME
+*     VARIANT                 = ' '
+    IMPORTING
+      FIELDLIST               = LT_FIELDLIST
+   EXCEPTIONS
+     NO_FORM                  = 1
+     NO_FUNCTION_MODULE       = 2
+     OTHERS                   = 3.
+  IF SY-SUBRC <> 0.
+*  error handling
+    CF_RETCODE = SY-SUBRC.
+    PERFORM PROTOCOL_UPDATE.
+  ENDIF.
+
+ENDFORM.                    "SET_PRINT_DATA_TO_READ
+
+*&---------------------------------------------------------------------*
+*&      Form  set_print_param
+*&---------------------------------------------------------------------*
+* Copied from YSE_SD_INVOICE_SF
+*----------------------------------------------------------------------*
+FORM SET_PRINT_PARAM USING    IS_ADDR_KEY LIKE ADDR_KEY
+                              IS_DLV-LAND LIKE VBRK-LAND1
+                     CHANGING CS_CONTROL_PARAM TYPE SSFCTRLOP
+                              CS_COMPOSER_PARAM TYPE SSFCOMPOP
+                              CS_RECIPIENT TYPE  SWOTOBJID
+                              CS_SENDER TYPE  SWOTOBJID
+                              CF_RETCODE TYPE SY-SUBRC.
+
+  DATA: LS_ITCPO     TYPE ITCPO.
+  DATA: LF_REPID     TYPE SY-REPID.
+  DATA: LF_DEVICE    TYPE TDDEVICE.
+  DATA: LS_RECIPIENT TYPE SWOTOBJID.
+  DATA: LS_SENDER    TYPE SWOTOBJID.
+
+  LF_REPID = SY-REPID.
+
+  CALL FUNCTION 'WFMC_PREPARE_SMART_FORM'
+    EXPORTING
+      PI_NAST       = NAST
+      PI_COUNTRY    = IS_DLV-LAND
+      PI_ADDR_KEY   = IS_ADDR_KEY
+      PI_REPID      = LF_REPID
+      PI_SCREEN     = XSCREEN
+    IMPORTING
+      PE_RETURNCODE = CF_RETCODE
+      PE_ITCPO      = LS_ITCPO
+      PE_DEVICE     = LF_DEVICE
+      PE_RECIPIENT  = CS_RECIPIENT
+      PE_SENDER     = CS_SENDER.
+
+  IF CF_RETCODE = 0.
+    MOVE-CORRESPONDING LS_ITCPO TO CS_COMPOSER_PARAM.
+*   CS_CONTROL_PARAM-NO_OPEN
+*   CS_CONTROL_PARAM-NO_CLOSE
+    CS_CONTROL_PARAM-DEVICE      = LF_DEVICE.
+    CS_CONTROL_PARAM-NO_DIALOG   = 'X'.
+    CS_CONTROL_PARAM-PREVIEW     = XSCREEN.
+    CS_CONTROL_PARAM-GETOTF      = LS_ITCPO-TDGETOTF.
+    CS_CONTROL_PARAM-LANGU       = NAST-SPRAS.
+*   CS_CONTROL_PARAM-REPLANGU1
+*   CS_CONTROL_PARAM-REPLANGU2
+*   CS_CONTROL_PARAM-REPLANGU3
+*   CS_CONTROL_PARAM-STARTPAGE
+  ENDIF.
+
+ENDFORM.                    " set_print_param
+
+*&---------------------------------------------------------------------*
+*&      Form  add_smfrm_prot
+*&---------------------------------------------------------------------*
+* Copied from YSE_SD_INVOICE_SF
+*----------------------------------------------------------------------*
+FORM ADD_SMFRM_PROT .
+
+  DATA:
+    LT_ERRORTAB     TYPE TSFERROR.
+  FIELD-SYMBOLS:
+    <FS_ERRORTAB>   TYPE LINE OF TSFERROR.
+
+* Get smart form protocoll
+  CALL FUNCTION 'SSF_READ_ERRORS'
+    IMPORTING
+      ERRORTAB = LT_ERRORTAB.
+
+* Add smartform protocoll to nast protocoll
+  LOOP AT LT_ERRORTAB ASSIGNING <FS_ERRORTAB>.
+    CALL FUNCTION 'NAST_PROTOCOL_UPDATE'
+      EXPORTING
+        MSG_ARBGB = <FS_ERRORTAB>-MSGID
+        MSG_NR    = <FS_ERRORTAB>-MSGNO
+        MSG_TY    = <FS_ERRORTAB>-MSGTY
+        MSG_V1    = <FS_ERRORTAB>-MSGV1
+        MSG_V2    = <FS_ERRORTAB>-MSGV2
+        MSG_V3    = <FS_ERRORTAB>-MSGV3
+        MSG_V4    = <FS_ERRORTAB>-MSGV4
+      EXCEPTIONS
+        OTHERS    = 1.
+  ENDLOOP.
+
+ENDFORM.                    " add_smfrm_prot

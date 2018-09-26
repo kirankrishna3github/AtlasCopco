@@ -1,0 +1,424 @@
+*&---------------------------------------------------------------------*
+*& Report  YRD_FICO_STD_COST_ESTIMATE_RP                               *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+*----------------------------------------------------------------------*
+* PROGRAM ID           : YRD_FICO_STD_COST_ESTIMATE_RP
+* PROGRAM TITLE        : Standard Cost Estimate Report
+* AUTHOR               : CSC Chris
+* DATE                 : 26/05/2015
+* DEVELOPMENT ID       : EXTCCG
+* TYPE                 : Report
+* DESCRIPTION          : Standard Cost Estimate Report
+* T-CODE               : YRD_SCOST
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME     | TRANSPORT NO | CHANGE REFERENCE #    *
+* Initial |26/05/2015| CSC Chris| CD1K985611   | #CR3632               *
+*----------------------------------------------------------------------*
+
+REPORT  yrd_fico_std_cost_estimate_rp.
+
+
+*&---------------------------------------------------------------------*
+*& DEFINE TABLES.                                                      *
+*&---------------------------------------------------------------------*
+TABLES: mara,marc,t001w.
+
+*&---------------------------------------------------------------------*
+*& DEFINE INNER TABLES.                                                *
+*&---------------------------------------------------------------------*
+DATA: it_output TYPE TABLE OF yrd_fico_scost_rp_alv WITH HEADER LINE.
+DATA: lv_errtxt TYPE string.
+
+*&---------------------------------------------------------------------*
+*&      DEFINE PARAMETERS                                              *
+*&---------------------------------------------------------------------*
+*Plant
+PARAMETERS p_werks TYPE marc-werks OBLIGATORY VALUE CHECK DEFAULT 'CN61'.
+*Fiscal Year
+PARAMETERS p_gjahr TYPE gjahr OBLIGATORY VALUE CHECK DEFAULT sy-datum(4).
+*Fiscal Period
+PARAMETERS p_monat TYPE monat OBLIGATORY VALUE CHECK DEFAULT sy-datum+4(2).
+*Material Number
+SELECT-OPTIONS s_matnr FOR mara-matnr OBLIGATORY.
+
+
+*&---------------------------------------------------------------------*
+*& INITIALIZATION                                                      *
+*&---------------------------------------------------------------------*
+INITIALIZATION.
+*  PERFORM initialization.
+*&---------------------------------------------------------------------*
+*& AT SELECTION-SCREEN                                                 *
+*&---------------------------------------------------------------------*
+AT SELECTION-SCREEN.
+  PERFORM check_input.
+*&---------------------------------------------------------------------*
+*& START-OF-SELECTION                                                  *
+*&---------------------------------------------------------------------*
+START-OF-SELECTION.
+* Get main data
+  PERFORM frm_get_maindata.
+*
+* ALV show
+  PERFORM frm_alv_show.
+
+
+
+
+
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM check_input .
+  SELECT SINGLE *
+    FROM t001w
+   WHERE werks = p_werks.
+  IF sy-subrc <> 0.
+    lv_errtxt = text-001.
+    MESSAGE lv_errtxt TYPE 'E'.
+  ENDIF.
+ENDFORM.                    " CHECK_INPUT
+*&---------------------------------------------------------------------*
+*&      Form  FRM_GET_MAINDATA
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM frm_get_maindata .
+
+  DATA: it_stb TYPE TABLE OF stpox WITH HEADER LINE,
+        it_matcat TYPE TABLE OF cscmat WITH HEADER LINE,
+        wa_topmat TYPE cstmat.
+
+  DATA: wa_mbew TYPE mbew,
+        wa_mapl TYPE mapl,
+        wa_plpo TYPE plpo,
+        wa_cssl TYPE cssl,
+        wa_cost TYPE cost,
+        wa_crco TYPE crco.
+
+
+* Kit Number
+  CLEAR: it_output,it_output[].
+  SELECT matnr
+    FROM mara
+    INTO CORRESPONDING FIELDS OF TABLE it_output
+   WHERE matnr IN s_matnr.
+
+  SORT it_output BY matnr.
+  DELETE ADJACENT DUPLICATES FROM it_output COMPARING matnr.
+
+
+  LOOP AT it_output.
+
+* Kit Description
+    SELECT SINGLE maktx
+      FROM makt
+      INTO it_output-maktx
+     WHERE matnr = it_output-matnr
+       AND spras = 'E'.
+
+    CLEAR: it_stb,it_stb[],it_matcat,it_matcat[],wa_topmat.
+    CALL FUNCTION 'CS_BOM_EXPL_MAT_V2'
+      EXPORTING
+        capid                 = 'PP01'           " BOM application
+        datuv                 = sy-datum         " BOM Validity date
+        ehndl                 = '1'
+        mehrs                 = 'X'              " Multi-level explosion
+        mmory                 = '1'
+        stlan                 = '1'              " BOM usage
+        stlal                 = '01'             " Alternative BOM
+        mtnrv                 = it_output-matnr  " Material number
+        werks                 = p_werks          " Plant
+      IMPORTING
+        topmat                = wa_topmat
+      TABLES
+        stb                   = it_stb
+        matcat                = it_matcat
+      EXCEPTIONS
+        alt_not_found         = 1
+        call_invalid          = 2
+        material_not_found    = 3
+        missing_authorization = 4
+        no_bom_found          = 5
+        no_plant_data         = 6
+        no_suitable_bom_found = 7
+        conversion_error      = 8.
+
+
+* Component Cost
+    LOOP AT it_stb WHERE postp = 'L'
+                     AND xtlty IS INITIAL
+                     AND xtlnr IS INITIAL.
+
+      CLEAR: wa_mbew.
+      SELECT SINGLE *
+        FROM mbew
+        INTO wa_mbew
+       WHERE matnr = it_stb-idnrk
+         AND bwkey = p_werks.
+      IF wa_mbew-vprsv = 'S'.
+        it_output-component = it_output-component + wa_mbew-stprs * it_stb-mnglg.
+      ELSEIF wa_mbew-vprsv = 'V'.
+        it_output-component = it_output-component + wa_mbew-verpr * it_stb-mnglg.
+      ENDIF.
+    ENDLOOP.
+
+
+* Labor Cost & Packing cost
+    it_stb-idnrk = wa_topmat-matnr.
+    it_stb-mnglg = wa_topmat-bmeng.
+    APPEND it_stb.
+
+    LOOP AT it_matcat.
+      CLEAR: wa_mapl.
+
+      READ TABLE it_stb WITH KEY idnrk = it_matcat-matnr.
+      CHECK sy-subrc = 0.
+
+      SELECT SINGLE *
+        FROM mapl
+        INTO wa_mapl
+       WHERE matnr = it_matcat-matnr
+         AND werks = p_werks
+         AND plnty = 'N'
+         AND loekz = ''.
+      CHECK sy-subrc = 0.
+
+      SELECT SINGLE *
+        FROM plpo
+        INTO wa_plpo
+       WHERE plnty = wa_mapl-plnty
+         AND plnnr = wa_mapl-plnnr
+         AND lar01 = 'ZAM107'
+         AND loekz = ''
+         AND plnkn = ( SELECT MAX( plnkn ) FROM plpo
+                        WHERE plnty = wa_mapl-plnty
+                          AND plnnr = wa_mapl-plnnr
+                          AND lar01 = 'ZAM107'
+                          AND loekz = '' ).
+      IF sy-subrc = 0.
+        SELECT SINGLE *
+          FROM crco
+          INTO wa_crco
+         WHERE objty = 'A'
+           AND objid = wa_plpo-arbid
+           AND lstar = wa_plpo-lar01.
+        CHECK sy-subrc = 0.
+        SELECT SINGLE *
+          FROM cssl
+          INTO wa_cssl
+         WHERE kokrs = wa_crco-kokrs
+           AND kostl = wa_crco-kostl
+           AND lstar = wa_crco-lstar
+           AND gjahr = p_gjahr.
+        CHECK sy-subrc = 0.
+        SELECT SINGLE *
+          FROM cost
+          INTO wa_cost
+         WHERE objnr = wa_cssl-objnr
+           AND gjahr = p_gjahr.
+        CHECK sy-subrc = 0.
+
+        CASE p_monat.
+          WHEN 01.
+            it_output-labor = it_output-labor + wa_cost-tof001 * wa_plpo-vgw01 * it_stb-mnglg / wa_plpo-bmsch.
+          WHEN 02.
+            it_output-labor = it_output-labor + wa_cost-tof002 * wa_plpo-vgw01 * it_stb-mnglg / wa_plpo-bmsch.
+          WHEN 03.
+            it_output-labor = it_output-labor + wa_cost-tof003 * wa_plpo-vgw01 * it_stb-mnglg / wa_plpo-bmsch.
+          WHEN 04.
+            it_output-labor = it_output-labor + wa_cost-tof004 * wa_plpo-vgw01 * it_stb-mnglg / wa_plpo-bmsch.
+          WHEN 05.
+            it_output-labor = it_output-labor + wa_cost-tof005 * wa_plpo-vgw01 * it_stb-mnglg / wa_plpo-bmsch.
+          WHEN 06.
+            it_output-labor = it_output-labor + wa_cost-tof006 * wa_plpo-vgw01 * it_stb-mnglg / wa_plpo-bmsch.
+          WHEN 07.
+            it_output-labor = it_output-labor + wa_cost-tof007 * wa_plpo-vgw01 * it_stb-mnglg / wa_plpo-bmsch.
+          WHEN 08.
+            it_output-labor = it_output-labor + wa_cost-tof008 * wa_plpo-vgw01 * it_stb-mnglg / wa_plpo-bmsch.
+          WHEN 09.
+            it_output-labor = it_output-labor + wa_cost-tof009 * wa_plpo-vgw01 * it_stb-mnglg / wa_plpo-bmsch.
+          WHEN 10.
+            it_output-labor = it_output-labor + wa_cost-tof010 * wa_plpo-vgw01 * it_stb-mnglg / wa_plpo-bmsch.
+          WHEN 11.
+            it_output-labor = it_output-labor + wa_cost-tof011 * wa_plpo-vgw01 * it_stb-mnglg / wa_plpo-bmsch.
+          WHEN 12.
+            it_output-labor = it_output-labor + wa_cost-tof012 * wa_plpo-vgw01 * it_stb-mnglg / wa_plpo-bmsch.
+        ENDCASE.
+
+        CLEAR: wa_plpo,wa_crco,wa_cssl,wa_cost.
+      ENDIF.
+
+      SELECT SINGLE *
+        FROM plpo
+        INTO wa_plpo
+       WHERE plnty = wa_mapl-plnty
+         AND plnnr = wa_mapl-plnnr
+         AND lar01 = 'ZAM106'
+         AND loekz = ''
+         AND plnkn = ( SELECT MAX( plnkn ) FROM plpo
+                        WHERE plnty = wa_mapl-plnty
+                          AND plnnr = wa_mapl-plnnr
+                          AND lar01 = 'ZAM106'
+                          AND loekz = '' ).
+      IF sy-subrc = 0.
+        SELECT SINGLE *
+          FROM crco
+          INTO wa_crco
+         WHERE objty = 'A'
+           AND objid = wa_plpo-arbid
+           AND lstar = wa_plpo-lar01.
+        CHECK sy-subrc = 0.
+        SELECT SINGLE *
+          FROM cssl
+          INTO wa_cssl
+         WHERE kokrs = wa_crco-kokrs
+           AND kostl = wa_crco-kostl
+           AND lstar = wa_crco-lstar
+           AND gjahr = p_gjahr.
+        CHECK sy-subrc = 0.
+        SELECT SINGLE *
+          FROM cost
+          INTO wa_cost
+         WHERE objnr = wa_cssl-objnr
+           AND gjahr = p_gjahr.
+        CHECK sy-subrc = 0.
+
+        CASE p_monat.
+          WHEN 01.
+            it_output-packing = it_output-packing + wa_cost-tof001 * wa_plpo-vgw01 * it_stb-mnglg / wa_plpo-bmsch.
+          WHEN 02.
+            it_output-packing = it_output-packing + wa_cost-tof002 * wa_plpo-vgw01 * it_stb-mnglg / wa_plpo-bmsch.
+          WHEN 03.
+            it_output-packing = it_output-packing + wa_cost-tof003 * wa_plpo-vgw01 * it_stb-mnglg / wa_plpo-bmsch.
+          WHEN 04.
+            it_output-packing = it_output-packing + wa_cost-tof004 * wa_plpo-vgw01 * it_stb-mnglg / wa_plpo-bmsch.
+          WHEN 05.
+            it_output-packing = it_output-packing + wa_cost-tof005 * wa_plpo-vgw01 * it_stb-mnglg / wa_plpo-bmsch.
+          WHEN 06.
+            it_output-packing = it_output-packing + wa_cost-tof006 * wa_plpo-vgw01 * it_stb-mnglg / wa_plpo-bmsch.
+          WHEN 07.
+            it_output-packing = it_output-packing + wa_cost-tof007 * wa_plpo-vgw01 * it_stb-mnglg / wa_plpo-bmsch.
+          WHEN 08.
+            it_output-packing = it_output-packing + wa_cost-tof008 * wa_plpo-vgw01 * it_stb-mnglg / wa_plpo-bmsch.
+          WHEN 09.
+            it_output-packing = it_output-packing + wa_cost-tof009 * wa_plpo-vgw01 * it_stb-mnglg / wa_plpo-bmsch.
+          WHEN 10.
+            it_output-packing = it_output-packing + wa_cost-tof010 * wa_plpo-vgw01 * it_stb-mnglg / wa_plpo-bmsch.
+          WHEN 11.
+            it_output-packing = it_output-packing + wa_cost-tof011 * wa_plpo-vgw01 * it_stb-mnglg / wa_plpo-bmsch.
+          WHEN 12.
+            it_output-packing = it_output-packing + wa_cost-tof012 * wa_plpo-vgw01 * it_stb-mnglg / wa_plpo-bmsch.
+        ENDCASE.
+
+        CLEAR: wa_plpo,wa_crco,wa_cssl,wa_cost.
+      ENDIF.
+
+    ENDLOOP.
+
+
+* Total Standard Cost
+    it_output-total = it_output-component + it_output-labor + it_output-packing.
+
+
+* Current Standard Cost
+    CLEAR: wa_mbew.
+    SELECT SINGLE *
+      FROM mbew
+      INTO wa_mbew
+     WHERE matnr = it_output-matnr
+       AND bwkey = p_werks.
+    IF wa_mbew-vprsv = 'S'.
+      it_output-current = wa_mbew-stprs.
+    ELSEIF wa_mbew-vprsv = 'V'.
+      it_output-current = wa_mbew-verpr.
+    ENDIF.
+
+
+* Different Standard Cost
+    it_output-different = it_output-total -  it_output-current.
+
+
+    SHIFT it_output-matnr LEFT DELETING LEADING '0'.
+
+    MODIFY it_output.
+  ENDLOOP.
+
+
+ENDFORM.                    " FRM_GET_MAINDATA
+*&---------------------------------------------------------------------*
+*&      Form  FRM_ALV_SHOW
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM frm_alv_show .
+
+  TYPE-POOLS: slis.
+  DATA: it_fieldcat TYPE slis_t_fieldcat_alv,
+        wa_layout   TYPE slis_layout_alv,
+        lv_variant  TYPE disvariant.
+
+
+  CALL FUNCTION 'REUSE_ALV_FIELDCATALOG_MERGE'
+    EXPORTING
+      i_program_name         = sy-repid
+      i_structure_name       = 'YRD_FICO_SCOST_RP_ALV'
+      i_inclname             = sy-repid
+    CHANGING
+      ct_fieldcat            = it_fieldcat
+    EXCEPTIONS
+      inconsistent_interface = 1
+      program_error          = 2
+      OTHERS                 = 3.
+  IF sy-subrc <> 0.
+*   message id sy-msgid type sy-msgty number sy-msgno
+*           with sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+
+*  wa_layout-box_fieldname = ''.
+*  wa_layout-box_tabname = 'IT_OUTPUT'.
+  wa_layout-zebra = 'X'.
+  wa_layout-colwidth_optimize = 'X'.
+
+
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+    EXPORTING
+      i_callback_program = sy-repid
+      is_layout          = wa_layout
+      it_fieldcat        = it_fieldcat
+      i_save             = 'A'
+      is_variant         = lv_variant
+    TABLES
+      t_outtab           = it_output
+    EXCEPTIONS
+      program_error      = 1
+      OTHERS             = 2.
+
+ENDFORM.                    " FRM_ALV_SHOW
+
+*Text symbol text£º
+
+*001:No entries found for Plant
+*Selection text£º
+*P_GJAHR:        Fiscal Year
+*P_MONAT:        Fiscal Period
+*P_WERKS:        Plant
+*S_MATNR:        Material Number

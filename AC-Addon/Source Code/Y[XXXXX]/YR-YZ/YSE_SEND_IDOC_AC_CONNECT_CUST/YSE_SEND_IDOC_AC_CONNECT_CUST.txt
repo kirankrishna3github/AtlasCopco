@@ -1,0 +1,784 @@
+*&---------------------------------------------------------------------*
+*& Report  YSE_SEND_IDOC_AC_CONNECT_CUST                               *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+*&                                                                     *
+*& AC Connect : AC Connect : Send Customer Idocs                       *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+*  Author                : AIR14518
+*  Date                  : 17.03.2009
+*  Change Request Number : CR0101
+*  Transport request Nr. : CD1K946555
+*----------------------------------------------------------------------*
+*                                                                      *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME     |CORRECTION NUMBER| CHANGE REFERENCE # *
+*----------------------------------------------------------------------*
+* MOD-001 |02.11.2009|M.Jacobs  |CD1K951532 |Extension length to comp  *
+*----------------------------------------------------------------------*
+* MOD-002 |03.11.2009|J. Smets  |CD1K951556 |New field: Main Warehouse *
+*----------------------------------------------------------------------*
+* MOD-003 |24.11.2011|G. Rutten |CD1K968953 | BUG IDOCs send when too  *
+*                                             many shipto's            *
+*----------------------------------------------------------------------*
+
+************************************************************************
+
+report  yse_send_idoc_ac_connect_cust  message-id yam_inf    .
+
+tables : yse_acc_files,
+         yse_sd_acc_cust,                                   "MOD-002
+         kna1,
+         knvv,
+         knvp.
+
+data : g_retcd         like     sy-subrc,
+       g_pfile         like      /sapdmc/lsoinp-filename,
+       g_ofile         like      /sapdmc/lsoinp-filename,
+       g_ersda(12)     type c,                      " YYYYMMDDHHMM
+       g_date          like sy-datum,
+       gv_adrnr        type adrnr,
+       g_directory(25) type c value '/var/load/xxx/UK/convert/',
+       p_logsys        like     tbdlst-logsys.
+data: wa_edidc    like edidc.
+data: wa_adrc type adrc.
+
+data: i_edidc_control_comm like edidc occurs 1 with header line ,
+      i_edidd_data like edidd occurs 0 with header line .
+data: created_idocs like sy-tabix.
+
+data: begin of it_acc occurs 0,
+        kunnr type kunnr,
+        vkorg type vkorg,
+        vtweg type vtweg,
+        spart type spart,
+        msgfn type msgfn,
+* begin of change MOD-001
+*        data(1000) TYPE c,
+        data(4000) type c,
+* end of change MOD-001
+      end of it_acc.
+
+data: begin of it_acc_delta occurs 0,
+        kunnr type kunnr,
+        vkorg type vkorg,
+        vtweg type vtweg,
+        spart type spart,
+        msgfn type msgfn,
+* begin of change MOD-001
+*        data(1000) TYPE c,
+        data(4000) type c,
+* end of change MOD-001
+ end of it_acc_delta.
+
+data : begin of i_prev occurs 0,
+       kunnr type kunnr,
+       vkorg type vkorg,
+       vtweg type vtweg,
+       spart type spart,
+       msgfn type msgfn,
+* begin of change MOD-001
+*        data(1000) TYPE c,
+        data(4000) type c,
+* end of change MOD-001
+end of i_prev.
+
+types: begin of t_kna1.
+        include structure yse_e1_acc_cust_kna1.
+types: end of t_kna1.
+data: it_kna1 type table of t_kna1.
+data: wa_kna1 type t_kna1.
+
+types: begin of t_knvv.
+        include structure yse_e1_acc_cust_knvv.
+types: end of t_knvv.
+data: it_knvv type table of t_knvv.
+data: wa_knvv type t_knvv.
+
+types: begin of t_knvp.
+        include structure yse_e1_acc_cust_knvp.
+types: end of t_knvp.
+data: it_knvp type table of t_knvp.
+data: wa_knvp type t_knvp.
+
+data : begin of wa_yse_acc_files,
+         mandt like yse_acc_files-mandt,
+         msgtyp like yse_acc_files-msgtyp,
+         vkorg like yse_acc_files-vkorg,
+         ersda like yse_acc_files-ersda,
+       end of wa_yse_acc_files.
+
+data : begin of i_delfiles occurs 0,
+         mandt like yse_acc_files-mandt,
+         msgtyp like yse_acc_files-msgtyp,
+         vkorg like yse_acc_files-vkorg,
+         ersda like yse_acc_files-ersda,
+       end of i_delfiles.
+
+*** MOD-002 * begin ***
+types: begin of t_cust,
+         kunnr   type kunnr,
+         vkorg   type vkorg,
+         vtweg   type vtweg,
+         spart   type spart,
+         werks   type zwerks,
+         frchc   type yfrchc,
+end of t_cust.
+data: it_cust type table of t_cust.
+data: wa_cust type t_cust.
+*** MOD-002 * end ***
+
+constants : c_input           type c     value '0',
+            c_ls(2)           type c     value 'LS',
+            c_mestyp_cust     like edidc-mestyp value 'YSE_ACC_CUST',
+            c_idoc_type_cust  like edidc-idoctp value 'YSE_ACC_CUST',
+            c_segment_kna1(20) type c           value 'YSE_E1_ACC_CUST_KNA1',
+            c_segment_knvv(20) type c           value 'YSE_E1_ACC_CUST_KNVV',
+            c_segment_knvp(20) type c           value 'YSE_E1_ACC_CUST_KNVP',
+            c_a(1)            type c     value 'A',
+            c_c(1)            type c     value 'C',    " Change
+            c_d(1)            type c     value 'D',    " Delete
+            c_x(1)            type c     value 'X',
+            c_004(3)          type c     value '004',
+            c_0000(4)         type c     value '0000',
+            c_underscore(1)   type c     value '_',    " Underscore
+            c_sc1(3)          type c     value 'SC1'.
+
+* Selection
+parameters: p_mess like tbdme-mestyp obligatory default 'YSE_ACC_CUST'
+              modif id sc1.
+
+selection-screen: begin of block block1 with frame title text-001.
+parameters: p_init type xfeld,
+            p_inorg  like knvv-vkorg.    "S.O. to be initial loaded
+select-options: s_kunnr for kna1-kunnr,
+                s_vkorg for knvv-vkorg obligatory no intervals,
+                s_vtweg for knvv-vtweg,
+                s_spart for knvv-spart.
+selection-screen: end of block block1.
+
+************************************************************************
+*    Disable Message Type Screen Field                                 *
+************************************************************************
+at selection-screen output.
+
+  loop at screen.
+    if screen-group1 = c_sc1.
+      screen-input   = c_input.
+      modify screen.
+      continue.
+    endif.
+  endloop.
+
+************************************************************************
+*       I N I T I A L I Z A T I O N    E V E N T                       *
+************************************************************************
+initialization.
+
+  call function 'OWN_LOGICAL_SYSTEM_GET'
+    importing
+      own_logical_system             = p_logsys
+    exceptions
+      own_logical_system_not_defined = 1
+      others                         = 2.
+  if sy-subrc <> 0.
+    message id sy-msgid type sy-msgty number sy-msgno
+         with sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  endif.
+
+************************************************************************
+*       S T A R T - O F - S E L E C T I O N    E V E N T               *
+************************************************************************
+start-of-selection.
+
+* Get the information for selected plant(s)
+  loop at s_vkorg.
+
+    perform get_detail using s_vkorg-low.
+
+*   Create delta with new creations/updates by comparing the selected
+*   data with this from the previous run. When a new sales organization
+*   has to be loaded, no comparison has to take place.
+    if not it_acc[] is initial.
+      perform add_segments_to_it_acc.
+      if p_init is initial.
+        if s_vkorg-low ne p_inorg.
+          clear: g_retcd.
+          perform get_previous_file using p_mess s_vkorg-low
+                                 changing g_retcd.
+          if g_retcd = 0.
+            perform create_delta.
+          else.
+            continue.                      " Pass to next S.O.
+          endif.
+        endif.
+      else.
+        if not p_inorg is initial.
+          loop at it_acc.
+            move-corresponding it_acc to it_acc_delta.
+            move c_a to it_acc_delta-msgfn.
+            append it_acc_delta.
+            clear it_acc_delta.
+          endloop.
+        else.
+          clear it_acc.
+          refresh it_acc.
+        endif.
+      endif.
+
+*     Write outputfile to application server
+      clear g_retcd.
+
+      concatenate sy-datum sy-uzeit(4) into g_ersda.
+      concatenate p_mess s_vkorg-low g_ersda
+                into g_ofile separated by c_underscore.
+
+      replace 'xxx' in g_directory with p_logsys(3).
+      concatenate g_directory g_ofile into g_ofile.
+
+      if not it_acc[] is initial.
+* Begin of insert MOD-003
+        if s_kunnr is initial.
+* End of insert MOD-003
+          perform write_outputfile.
+          if g_retcd is initial.
+*         Update custom table YSE_ACC_FILES
+            perform update_custom_table using s_vkorg-low.
+*         Delete older entries in custom table YSE_ACC_FILES
+            perform delete_old_table_entries using s_vkorg-low.
+*         Delete older files on appl.server
+            if not i_delfiles[] is initial.
+              perform delete_old_files.
+            endif.
+          endif.
+* Begin of insert MOD-003
+        endif.
+* End of insert MOD-003
+      endif.
+    endif.
+
+  endloop.
+
+************************************************************************
+*       E N D - O F - S E L E C T I O N    E V E N T                   *
+************************************************************************
+end-of-selection .
+
+  if it_acc_delta[] is initial .
+    write: / 'No Idocs created'.
+  else.
+*   Generate Idoc's
+    perform create_idocs_cust using p_mess.
+    write : /   created_idocs , ' Idocs created'.
+  endif.
+  write: / 'Job finished'.
+
+************************************************************************
+*--- S U B R O U T I N E S --------------------------------------------*
+************************************************************************
+*&---------------------------------------------------------------------*
+*&      Form  Validate_ALE_Configuration
+*&---------------------------------------------------------------------*
+form validate_ale_configuration .
+
+  data: l_create_idoc     type     c .
+
+* CHECK IF IDOC CONFIGURATION IS READY AND IDOC CAN BE PROCESSED.
+  call function 'ALE_MODEL_DETERMINE_IF_TO_SEND'
+    exporting
+      message_type           = p_mess
+    importing
+      idoc_must_be_sent      = l_create_idoc
+    exceptions
+      own_system_not_defined = 1
+      others                 = 2.
+
+  if sy-subrc <> 0.
+    message e029 with p_mess.
+    exit.
+  endif.
+
+endform.                    " Validate_ALE_Configuration
+
+*&---------------------------------------------------------------------*
+*&      Form  Get_Detail
+*&---------------------------------------------------------------------*
+*       To get the information for selected sales organizations
+*----------------------------------------------------------------------*
+form get_detail using p_vkorg.
+
+  clear it_acc.
+  refresh it_acc.
+
+* Select contract data based on Selection screen parameters
+  select kunnr vkorg vtweg spart into table it_acc
+         from yse_sd_acc_cust
+         where kunnr in s_kunnr
+           and vkorg  = s_vkorg-low
+           and vtweg in s_vtweg
+           and spart in s_spart.
+* Process Error - No data found for the Selected S.O.
+  if sy-subrc ne 0 .
+    write: text-e01, p_vkorg.
+    exit.
+  endif .
+* Take out the doubles
+  sort it_acc.
+  delete adjacent duplicates from it_acc.
+
+  if not it_acc[] is initial.
+*   General Data in Customer Master
+    select * from kna1 into corresponding fields of table it_kna1
+             for all entries in it_acc
+             where kunnr = it_acc-kunnr.
+    sort it_kna1.
+*   Customer Master Sales Data
+    select * from knvv into corresponding fields of table it_knvv
+             for all entries in it_acc
+             where kunnr = it_acc-kunnr
+               and vkorg = it_acc-vkorg
+               and vtweg = it_acc-vtweg
+               and spart = it_acc-spart.
+    sort it_knvv.
+
+*   Customer Master Partner Functions
+    select * from knvp into corresponding fields of table it_knvp
+             for all entries in it_acc
+             where kunnr = it_acc-kunnr
+               and vkorg = it_acc-vkorg
+               and vtweg = it_acc-vtweg
+               and spart = it_acc-spart
+               and parvw = 'WE'.
+    sort it_knvp.
+  endif.
+
+  loop at it_knvp into wa_knvp.
+    select single adrnr into gv_adrnr from kna1
+           where kunnr = wa_knvp-kunn2.
+    if sy-subrc = 0.
+      select single * into wa_adrc from adrc
+             where addrnumber = gv_adrnr.
+      if sy-subrc = 0.
+        wa_knvp-shipto_name1 = wa_adrc-name1.
+        wa_knvp-shipto_name2 = wa_adrc-name2.
+        wa_knvp-shipto_stras = wa_adrc-street.
+        wa_knvp-shipto_regio = wa_adrc-region.
+        wa_knvp-shipto_pstlz = wa_adrc-post_code1.
+        wa_knvp-shipto_ort01 = wa_adrc-city1.
+        wa_knvp-shipto_land1 = wa_adrc-country.
+      endif.
+      move c_004 to wa_knvp-msgfn.
+      modify it_knvp from wa_knvp.
+    endif.
+  endloop.
+
+*** MOD-002 * begin ***
+* Default warehouses for medium stock availability
+* Get warehouses for customers
+  select * into corresponding fields of table it_cust
+           from yse_sd_acc_cust
+           for all entries in it_knvv
+           where kunnr = it_knvv-kunnr
+             and vkorg = it_knvv-vkorg
+             and vtweg = it_knvv-vtweg
+             and spart = it_knvv-spart.
+  sort it_cust.
+* Fill warehouse in customer master data
+  loop at it_knvv into wa_knvv.
+    read table it_cust into wa_cust
+                       with key kunnr = wa_knvv-kunnr
+                                vkorg = wa_knvv-vkorg
+                                vtweg = wa_knvv-vtweg
+                                spart = wa_knvv-spart
+                       binary search.
+    if sy-subrc = 0.
+      wa_knvv-werks = wa_cust-werks.
+      wa_knvv-frchc = wa_cust-frchc.
+      modify it_knvv from wa_knvv.
+    endif.
+  endloop.
+*** MOD-002 *end ***
+
+endform.                    " Get_Detail
+
+*&---------------------------------------------------------------------*
+*&      Form  Create_delta
+*&---------------------------------------------------------------------*
+*       Create internal table with creates/updates/deletes
+*----------------------------------------------------------------------*
+form create_delta.
+
+* Creates/Updates
+  loop at it_acc.
+
+    read table i_prev with key kunnr = it_acc-kunnr
+                               vkorg = it_acc-vkorg
+                               vtweg = it_acc-vtweg
+                               spart = it_acc-spart
+                    binary search.
+
+    if sy-subrc = 0.
+* begin of change MOD-001
+*        IF it_acc(1000) <> i_prev(1000).
+      if it_acc(4000) <> i_prev(4000).
+* end of change MOD-001
+        move-corresponding it_acc to it_acc_delta.
+        move c_c to it_acc_delta-msgfn.
+        append it_acc_delta.
+        clear it_acc_delta.
+      endif.
+    else.
+      move-corresponding it_acc to it_acc_delta.
+      move c_a to it_acc_delta-msgfn.
+      append it_acc_delta.
+      clear it_acc_delta.
+    endif.
+
+  endloop.
+
+* Deletes
+  if not it_acc[] is initial.
+    clear i_prev.
+    loop at i_prev.
+      read table it_acc with key kunnr = i_prev-kunnr
+                                 vkorg = i_prev-vkorg
+                                 vtweg = i_prev-vtweg
+                                 spart = i_prev-spart
+                      binary search.
+      if sy-subrc <> 0.
+        move-corresponding i_prev to it_acc_delta.
+        move c_d to it_acc_delta-msgfn.
+        append it_acc_delta.
+        clear it_acc_delta.
+      endif.
+    endloop.
+  endif.
+
+endform.                    " Create_delta
+
+*&---------------------------------------------------------------------*
+*&      Form  Get_previous_file
+*&---------------------------------------------------------------------*
+*       Get file from previous run
+*----------------------------------------------------------------------*
+form get_previous_file using p_mess p_vkorg
+                    changing p_retcd.
+
+* Prepare filename of previous run
+  clear g_ersda.
+  select ersda into g_ersda
+         from yse_acc_files
+         where msgtyp = p_mess
+           and vkorg = p_vkorg.
+  endselect.
+
+  if sy-subrc <> 0.
+    write: / text-e02,p_mess,  p_vkorg.    "No filename of previous run
+*                                      available in table YSE_ACC_FILES
+    p_retcd = 4.
+    exit.
+  endif.
+
+  concatenate p_mess p_vkorg g_ersda
+                      into g_pfile separated by c_underscore.
+  replace 'xxx' in g_directory with p_logsys(3).
+  concatenate g_directory g_pfile into g_pfile.
+
+* FILE READ FROM APPLICATION SERVER
+  perform get_from_appl tables  i_prev
+                        using   g_pfile
+                                p_retcd.
+
+endform.                    " Get_previous_file
+
+*&---------------------------------------------------------------------*
+*&      Form  Get_from_appl
+*&---------------------------------------------------------------------*
+*       Get the file from application server into internal table
+*----------------------------------------------------------------------*
+form get_from_appl tables i_infile structure i_prev
+                   using p_infile p_subrc.
+
+  open dataset p_infile for input in text mode encoding default.
+  if sy-subrc <> 0.
+    write: / text-e03, p_infile.
+    p_subrc = 4.
+    exit.
+  endif.
+
+  refresh i_infile.
+
+  do.
+    read dataset p_infile into i_infile.
+    if sy-subrc <> 0.
+      exit.
+    endif.
+    append i_infile.
+  enddo.
+  close dataset p_infile.
+
+endform.                    " GET_FROM_APPL
+
+*&---------------------------------------------------------------------*
+*&      Form  Write_outputfile
+*&---------------------------------------------------------------------*
+*       Write outputfile
+*----------------------------------------------------------------------*
+form write_outputfile.
+
+  open dataset g_ofile for output in text mode encoding default.
+  if sy-subrc <> 0.
+    write: / text-e04, g_ofile.
+    g_retcd = 4.
+    exit.
+  endif.
+
+  loop at it_acc.
+* begin of change MOD-001
+*    TRANSFER it_acc(1000) TO g_ofile.
+    transfer it_acc(4000) to g_ofile.
+* end of change mOD-001
+  endloop.
+
+endform.                    " Write_outputfile
+
+*&---------------------------------------------------------------------*
+*&      Form  Update_custom_table
+*&---------------------------------------------------------------------*
+*       Update custom table YSE_ACC_FILES
+*----------------------------------------------------------------------*
+form update_custom_table using p_vkorg.
+
+  wa_yse_acc_files-mandt = sy-mandt.
+  wa_yse_acc_files-msgtyp = p_mess.
+  wa_yse_acc_files-vkorg = p_vkorg.
+  wa_yse_acc_files-ersda = g_ersda.
+
+  insert yse_acc_files from wa_yse_acc_files.
+
+endform.                    " Update_custom_table
+
+*&---------------------------------------------------------------------*
+*&      Form  Delete_old_files
+*&---------------------------------------------------------------------*
+*       Delete files from former runs on application server
+*----------------------------------------------------------------------*
+form delete_old_files.
+
+  data: g_dir_name like epsf-epsdirnam,
+        g_dfile    like epsf-epsfilnam.
+
+  loop at i_delfiles.
+
+    concatenate p_mess i_delfiles-vkorg i_delfiles-ersda
+                         into g_dfile separated by c_underscore.
+
+    move g_directory to g_dir_name.
+    replace 'xxx' in g_dir_name with p_logsys(3).
+    translate g_dir_name(10) to lower case.
+    translate g_dir_name+17(8) to lower case.
+
+    call function 'EPS_DELETE_FILE'
+      exporting
+        file_name              = g_dfile
+        dir_name               = g_dir_name
+      exceptions
+        invalid_eps_subdir
+        sapgparam_failed
+        build_directory_failed
+        no_authorization
+        build_path_failed
+        delete_failed.
+
+    if sy-subrc <> 0.
+      write: / text-e05, g_dfile.      "Could not delete file
+    endif.
+
+  endloop.
+
+endform.                    "delete_old_files
+
+*&---------------------------------------------------------------------*
+*&      Form  Delete_old_table_entries
+*&---------------------------------------------------------------------*
+*       Delete entries from former runs in custom table YSE_ACC_FILES
+*----------------------------------------------------------------------*
+form delete_old_table_entries using p_vkorg.
+
+  g_date = sy-datum - 7.
+  concatenate g_date c_0000 into g_ersda.
+
+  refresh i_delfiles.
+
+  select * from yse_acc_files
+      where msgtyp eq p_mess
+        and vkorg eq p_vkorg
+        and ersda lt g_ersda.
+    move yse_acc_files to i_delfiles.
+    append i_delfiles.
+    clear i_delfiles.
+  endselect.
+
+  if sy-subrc = 0.
+    delete from yse_acc_files where msgtyp eq p_mess
+                                and vkorg eq p_vkorg
+                                and ersda lt g_ersda.
+
+    if sy-subrc <> 0.
+      write: / text-e06, p_vkorg.        "Could not delete entrie(s) in
+*                                         table YSE_ACC_FILES
+    endif.
+
+  endif.
+
+endform.                    "delete_old_table_entries
+
+*&---------------------------------------------------------------------*
+*&      Form  create_idocs_cust
+*&---------------------------------------------------------------------*
+*      -->MESSAGE_TYPE
+*----------------------------------------------------------------------*
+form create_idocs_cust  using    message_type.
+
+  clear: created_idocs.
+* FIND RECEIVING PARTNER
+  select single rcvprn into wa_edidc-rcvprn
+         from edp13
+         where mestyp = c_mestyp_cust.
+* Polulate Control Record
+  wa_edidc-mestyp =  c_mestyp_cust.
+  wa_edidc-idoctp =  c_idoc_type_cust.
+  wa_edidc-rcvprt =  c_ls.
+
+  loop at it_acc_delta.
+    if not it_acc_delta-kunnr is initial.
+      clear i_edidd_data[].
+      read table it_kna1 into wa_kna1
+                         with key kunnr = it_acc_delta-kunnr
+                         binary search.
+      if sy-subrc = 0.
+        i_edidd_data-segnam  = c_segment_kna1.
+        i_edidd_data-sdata   = wa_kna1.
+        append i_edidd_data.
+        clear i_edidd_data.
+
+        loop at it_knvv into wa_knvv where kunnr = it_acc_delta-kunnr
+                                       and vkorg = it_acc_delta-vkorg
+                                       and vtweg = it_acc_delta-vtweg
+                                       and spart = it_acc_delta-spart.
+          i_edidd_data-segnam  = c_segment_knvv.
+          select single famback into wa_knvv-vkorg
+                 from yse_sd_acc_fam
+                 where vkorg = wa_knvv-vkorg
+                   and vtweg = wa_knvv-vtweg
+                   and spart = wa_knvv-spart.
+          i_edidd_data-sdata   = wa_knvv.
+          append i_edidd_data.
+          clear i_edidd_data.
+        endloop.
+
+        loop at it_knvp into wa_knvp where kunnr = it_acc_delta-kunnr
+                                       and vkorg = it_acc_delta-vkorg
+                                       and vtweg = it_acc_delta-vtweg
+                                       and spart = it_acc_delta-spart.
+          select single famback into wa_knvp-vkorg
+                 from yse_sd_acc_fam
+                 where vkorg = wa_knvp-vkorg
+                   and vtweg = wa_knvp-vtweg
+                   and spart = wa_knvp-spart.
+          i_edidd_data-segnam  = c_segment_knvp.
+          i_edidd_data-sdata   = wa_knvp.
+          append i_edidd_data.
+          clear i_edidd_data.
+        endloop.
+
+        if not i_edidd_data[] is initial.
+          call function 'MASTER_IDOC_DISTRIBUTE'
+            exporting
+              master_idoc_control            = wa_edidc
+            tables
+              communication_idoc_control     = i_edidc_control_comm
+              master_idoc_data               = i_edidd_data
+            exceptions
+              error_in_idoc_control          = 1
+              error_writing_idoc_status      = 2
+              error_in_idoc_data             = 3
+              sending_logical_system_unknown = 4
+              others                         = 5.
+
+          if sy-subrc <> 0.
+
+          else.
+            created_idocs = created_idocs + 1.
+          endif.
+
+          call function 'BAPI_TRANSACTION_COMMIT'.
+
+          call function 'EDI_DOCUMENT_DEQUEUE_LATER'
+            exporting
+              docnum                 = i_edidc_control_comm-docnum
+            exceptions
+              idoc_is_not_to_dequeue = 1
+              others                 = 2.
+
+        endif.
+      endif.
+    endif.
+  endloop.
+
+endform.                    " CREATE_IDOCS_CUST
+
+*&---------------------------------------------------------------------*
+*&      Form  add_segments_to_it_acc
+*&---------------------------------------------------------------------*
+form add_segments_to_it_acc.
+
+* begin of change MOD-001
+*  DATA : gv_data(1000) TYPE c.
+  data : gv_data(4000) type c.
+* end of change MOD-001
+
+  loop at it_acc.
+    clear gv_data.
+    loop at it_kna1 into wa_kna1 where kunnr = it_acc-kunnr.
+      gv_data = wa_kna1.
+    endloop.
+    loop at it_knvv into wa_knvv where kunnr = it_acc-kunnr
+                                   and vkorg = it_acc-vkorg
+                                   and vtweg = it_acc-vtweg
+                                   and spart = it_acc-spart.
+      concatenate gv_data wa_knvv into gv_data.
+    endloop.
+
+    loop at it_knvp into wa_knvp where kunnr = it_acc-kunnr
+                                   and vkorg = it_acc-vkorg
+                                   and vtweg = it_acc-vtweg
+                                   and spart = it_acc-spart.
+      concatenate gv_data wa_knvp into gv_data.
+    endloop.
+    move gv_data to it_acc-data.
+    modify it_acc.
+  endloop.
+
+endform.                    "add_segments_to_it_acc
+
+*Text symbol text£º
+*001:Initial load parameters
+*E01:No data found for the selected Sales Organization
+*E02:No filename of previous run for Sales Organization
+*E03:Could not open input file
+*E04:Could not open output file
+*E05:Could not delete file
+
+*E06:Could not delete entries in table YSE_ACC_FILES
+*Selection text£º
+*P_INIT:        Initial load
+*P_INORG:        Sales Org.to be initial loaded
+*P_MESS:        Message type
+*S_KUNNR:        Customer
+*S_SPART:        Division
+*S_VKORG:        Sales Organization
+*S_VTWEG:        Distribution Channel

@@ -1,0 +1,695 @@
+*&---------------------------------------------------------------------*
+*& Report  YSE_SO_REJECT
+*&
+*&---------------------------------------------------------------------*
+*&                                                                     *
+*&                     Mass reject SO items                            *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+*  Author                : Anda Wu
+*  Date                  : 26.11.2013
+*  Change Request Number : No CR, only work on CQ1 system
+*  Transport request Nr. : CD1K978556
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME     |CORRECTION NUMBER| CHANGE REFERENCE # *
+*----------------------------------------------------------------------*
+* MOD-001 |01.01.9999|          |CD1K9.....       |(Description)       *
+*----------------------------------------------------------------------*
+REPORT  yse_so_reject.
+
+************************************************************************
+* TABLES                                                               *
+************************************************************************
+TABLES: vbap.
+
+************************************************************************
+* TYPE POOLS                                                           *
+************************************************************************
+* ALV grid
+TYPE-POOLS:   icon.
+
+************************************************************************
+*        TYPES                                                         *
+************************************************************************
+TYPES:  BEGIN OF ty_out,
+          vbeln       TYPE vbap-vbeln,
+          posnr       TYPE vbap-posnr,
+        END OF ty_out.
+
+TYPES:  BEGIN OF ty_mess,
+          vbeln       TYPE vbap-vbeln,
+          posnr       TYPE vbap-posnr.
+        INCLUDE TYPE bapiret2.
+TYPES:  END OF ty_mess.
+
+************************************************************************
+* CLASSES                                                              *
+************************************************************************
+*----------------------------------------------------------------------*
+*       CLASS lcl_event_handler DEFINITION
+*----------------------------------------------------------------------*
+CLASS lcl_event_handler DEFINITION.
+
+  PUBLIC SECTION.
+    METHODS:
+*   Double click control
+    handle_double_click
+          FOR EVENT double_click OF cl_gui_alv_grid
+          IMPORTING e_row e_column,
+*   Double click control
+    handle_hot_spot
+          FOR EVENT hotspot_click  OF cl_gui_alv_grid
+          IMPORTING e_row_id  e_column_id  es_row_no.
+
+ENDCLASS.                    "lcl_event_handler DEFINITION
+
+*----------------------------------------------------------------------*
+*       CLASS lcl_event_handler IMPLEMENTATION
+*----------------------------------------------------------------------*
+CLASS lcl_event_handler IMPLEMENTATION.
+
+* Handle double click
+  METHOD handle_double_click.
+    PERFORM handle_double_click USING e_row e_column.
+  ENDMETHOD.                    "handle_double_click
+* Handle hot spot
+  METHOD handle_hot_spot.
+    PERFORM handle_hot_spot USING e_row_id  e_column_id  es_row_no.
+  ENDMETHOD.                    "handle_hot_spot
+
+ENDCLASS.                    "lcl_event_handler IMPLEMENTATION
+
+************************************************************************
+*           WORKAREAS                                                  *
+************************************************************************
+DATA: gs_out TYPE ty_out,
+      gt_out  TYPE STANDARD TABLE OF ty_out.
+
+DATA: go_grid             TYPE REF TO cl_gui_alv_grid,
+      go_custom_container TYPE REF TO cl_gui_custom_container,
+      gv_container        TYPE scrfname VALUE 'CUSTOM_CONTROL',
+      gs_layout           TYPE lvc_s_layo,
+      gt_message          TYPE STANDARD TABLE OF ty_mess,
+      gt_mess_succ        TYPE STANDARD TABLE OF ty_mess,
+      gt_message_head     TYPE STANDARD TABLE OF ty_mess,
+      gt_mess_succ_head   TYPE STANDARD TABLE OF ty_mess,
+      gt_selected_rows    TYPE lvc_t_roid,
+      gs_selected_rows    TYPE lvc_s_roid,
+      gt_fcat             TYPE lvc_t_fcat,
+      gs_fcat             LIKE LINE OF gt_fcat,
+      gs_stable           TYPE lvc_s_stbl,
+      obj_event_handler TYPE REF TO lcl_event_handler.
+
+************************************************************************
+*           VARIABLES                                                  *
+************************************************************************
+* Variables
+DATA: gv_col(10)        TYPE n,
+      gv_answer         TYPE c,
+*      gv_grid           TYPE lvc_s_glay,
+      ok_code TYPE sy-ucomm.
+
+************************************************************************
+*           CONSTANTS                                                  *
+************************************************************************
+CONSTANTS: gc_rej_06  TYPE vbap-abgru VALUE '06',
+           gc_x       TYPE c VALUE 'X'.
+
+************************************************************************
+*           SELECTION-SRCEEN                                           *
+************************************************************************
+SELECT-OPTIONS: s_vbeln FOR vbap-vbeln.
+PARAMETERS: cb_rel AS CHECKBOX.
+
+************************************************************************
+*           SELECTION-SCREEN OUTPUT                                    *
+************************************************************************
+AT SELECTION-SCREEN OUTPUT.
+  PERFORM frm_set_sreen.
+
+************************************************************************
+*           START-OF-SELECTION                                         *
+************************************************************************
+START-OF-SELECTION.
+
+* Statistics for transaction / program
+  CALL METHOD ycl_statistics=>record_transaction.
+
+  CALL SCREEN 0100.
+
+END-OF-SELECTION.
+  PERFORM frm_list_log.
+
+*&---------------------------------------------------------------------*
+*&      Form  FRM_SET_SREEN
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM frm_set_sreen .
+  LOOP AT SCREEN.
+    IF screen-group1 = 'M1'.
+      screen-input = '0'.
+      screen-invisible = '1'.
+      MODIFY SCREEN.
+    ENDIF.
+  ENDLOOP.
+ENDFORM.                    " FRM_SET_SREEN
+
+*&---------------------------------------------------------------------*
+*&      Form  FRM_GET_DATA
+*&---------------------------------------------------------------------*
+*       Gain process data
+*----------------------------------------------------------------------*
+FORM frm_get_data .
+
+  IF cb_rel IS NOT INITIAL.
+    SELECT  vbap~vbeln
+            vbap~posnr
+      FROM  vbap
+      INNER JOIN vbup
+      ON    vbap~vbeln = vbup~vbeln
+        AND vbap~posnr = vbup~posnr
+      INTO CORRESPONDING FIELDS OF TABLE gt_out
+      WHERE vbap~vbeln IN s_vbeln
+        AND vbup~absta <> 'C'.
+  ELSE.
+    SELECT  vbap~vbeln
+            vbap~posnr
+      FROM  vbap
+      INNER JOIN vbup
+      ON    vbap~vbeln = vbup~vbeln
+        AND vbap~posnr = vbup~posnr
+      INTO CORRESPONDING FIELDS OF TABLE gt_out
+      WHERE vbap~vbeln IN s_vbeln.
+  ENDIF.
+
+ENDFORM.                    " FRM_GET_DATA
+*&---------------------------------------------------------------------*
+*&      Form  FRM_PROC_REJ
+*&---------------------------------------------------------------------*
+*       Process REJ user-command
+*----------------------------------------------------------------------*
+FORM frm_proc_rej .
+
+  DATA: lt_selected_rows  TYPE lvc_t_roid,
+        lt_return         TYPE STANDARD TABLE OF  bapiret2,
+        ls_return         TYPE bapiret2,
+        ls_message        TYPE ty_mess,
+*        ls_order_header_in TYPE bapisdh1,
+        ls_order_header_inx TYPE  bapisdh1x,
+        ls_order_item_in  TYPE bapisditm,
+        lt_order_item_in  TYPE STANDARD TABLE OF  bapisditm,
+        ls_order_item_inx TYPE bapisditmx,
+        lt_order_item_inx TYPE STANDARD TABLE OF bapisditmx.
+
+  DATA: lv_item_no TYPE char10,
+        lv_curr_no TYPE char10,
+        lv_percent TYPE i,
+        lv_str     TYPE string.
+
+  REFRESH: gt_selected_rows.
+  CLEAR:   gs_selected_rows.
+
+  CALL METHOD go_grid->get_selected_rows
+    IMPORTING
+      et_row_no = gt_selected_rows.
+
+  DESCRIBE TABLE gt_selected_rows LINES lv_item_no.
+  IF NOT gt_selected_rows IS INITIAL.
+* Confirm delete
+    CALL FUNCTION 'POPUP_TO_CONFIRM'
+      EXPORTING
+        titlebar              = text-p01
+        text_question         = text-p02
+        icon_button_1         = 'ICON_OKAY'
+        icon_button_2         = 'ICON_CANCEL'
+        default_button        = '2'
+        display_cancel_button = space
+      IMPORTING
+        answer                = gv_answer
+      EXCEPTIONS
+        text_not_found        = 1
+        OTHERS                = 2.
+    IF sy-subrc <> 0.
+      MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+              WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+    ENDIF.
+    CHECK gv_answer = '1'.
+
+    PERFORM frm_del_purtype.
+    CLEAR: gs_selected_rows.
+    LOOP AT gt_selected_rows INTO gs_selected_rows.
+      CLEAR:  ls_order_header_inx,
+              ls_order_item_in,
+              ls_order_item_inx.
+      refresh:  lt_order_item_in,
+                lt_order_item_inx.
+
+      READ TABLE gt_out INTO gs_out
+        INDEX gs_selected_rows-row_id.
+      lv_curr_no = sy-tabix.
+      lv_percent = sy-tabix * 100 / lv_item_no.
+      CONCATENATE 'Processing the item ['(s60)
+                  gs_out-vbeln
+                  ' - '
+                  gs_out-posnr
+                  ' ] ('
+                  lv_curr_no
+                  ' /'
+                  lv_item_no
+                  ' )'
+            INTO lv_str.
+
+      CALL FUNCTION 'SAPGUI_PROGRESS_INDICATOR'
+        EXPORTING
+          percentage = lv_percent
+          text       = lv_str.
+*      CLEAR ls_order_header_in-po_method.
+
+      ls_order_header_inx-updateflag = 'U'.
+*      ls_order_header_inx-po_method = 'X'.
+
+      ls_order_item_in-itm_number = gs_out-posnr.
+      ls_order_item_in-reason_rej = gc_rej_06.
+      APPEND ls_order_item_in TO lt_order_item_in.
+
+      ls_order_item_inx-updateflag = 'U'.
+      ls_order_item_inx-itm_number = gs_out-posnr.
+      ls_order_item_inx-reason_rej = 'X'.
+      APPEND ls_order_item_inx TO lt_order_item_inx.
+
+      refresh: lt_return.
+      CALL FUNCTION 'BAPI_SALESORDER_CHANGE'
+        EXPORTING
+          salesdocument               = gs_out-vbeln
+*          order_header_in             = ls_order_header_in
+          order_header_inx            = ls_order_header_inx
+*         SIMULATION                  =
+*         BEHAVE_WHEN_ERROR           = ' '
+*         INT_NUMBER_ASSIGNMENT       = ' '
+*         LOGIC_SWITCH                =
+*         NO_STATUS_BUF_INIT          = ' '
+        TABLES
+          return                      = lt_return
+          order_item_in               = lt_order_item_in
+          order_item_inx              = lt_order_item_inx.
+      LOOP AT lt_return INTO ls_return WHERE type = 'E'
+                                         OR  type = 'W'.
+        CLEAR: ls_message.
+        ls_message-vbeln = gs_out-vbeln.
+        ls_message-posnr = gs_out-posnr.
+        MOVE-CORRESPONDING ls_return TO ls_message.
+        APPEND ls_message TO gt_message.
+      ENDLOOP.
+      IF sy-subrc <> 0.
+        CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+          EXPORTING
+            wait          = 'X'
+*         IMPORTING
+*           RETURN        =
+                  .
+
+        CLEAR: ls_message.
+        ls_message-vbeln = gs_out-vbeln.
+        ls_message-posnr = gs_out-posnr.
+        MOVE-CORRESPONDING ls_return TO ls_message.
+        APPEND ls_message TO gt_mess_succ.
+      ENDIF.
+    ENDLOOP.
+  ELSE.
+    MESSAGE i001(00) WITH 'Please select items!'(s30).
+  ENDIF.
+
+ENDFORM.                    " FRM_PROC_REJ
+
+*&---------------------------------------------------------------------*
+*&      Form  handle_double_click
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_E_ROW_ID     text
+*      -->P_E_COLUMN_ID  text
+*----------------------------------------------------------------------*
+FORM handle_double_click  USING    p_e_row_id
+                                   p_e_column_id.
+  DATA: ls_out  TYPE ty_out.
+  CLEAR ls_out.
+  READ TABLE gt_out INTO ls_out INDEX p_e_row_id.
+
+* If Contract Number clicked
+  SET PARAMETER ID 'AUN' FIELD ls_out-vbeln .
+  CALL TRANSACTION 'VA03' AND SKIP FIRST SCREEN.
+
+ENDFORM.            " handle_double_click
+*&---------------------------------------------------------------------*
+*&      Module  STATUS_0100  OUTPUT
+*&---------------------------------------------------------------------*
+*       BPO Module of sreen 100
+*----------------------------------------------------------------------*
+MODULE status_0100 OUTPUT.
+
+  SET PF-STATUS 'YSE_SO'.
+  SET TITLEBAR  'SO_LIST'.
+
+  PERFORM display_report.
+
+ENDMODULE.                 " STATUS_0100  OUTPUT
+
+*&---------------------------------------------------------------------*
+*&      Form  DISPLAY_REPORT
+*&---------------------------------------------------------------------*
+*       ALV display
+*----------------------------------------------------------------------*
+FORM display_report .
+  FIELD-SYMBOLS: <fs_out> TYPE ANY TABLE.
+
+  PERFORM frm_get_data.
+
+  ASSIGN gt_out TO <fs_out>.
+
+  IF go_custom_container IS INITIAL.
+
+    CREATE OBJECT go_custom_container
+      EXPORTING
+        container_name              = gv_container
+      EXCEPTIONS
+        cntl_error                  = 1
+        cntl_system_error           = 2
+        create_error                = 3
+        lifetime_error              = 4
+        lifetime_dynpro_dynpro_link = 5.
+
+    CREATE OBJECT go_grid
+      EXPORTING
+        i_parent = go_custom_container.
+
+    PERFORM alv_layout.
+    PERFORM alv_fcat.
+
+    CREATE OBJECT obj_event_handler.
+
+* Display the table Contents in ALV format
+    CALL METHOD go_grid->set_table_for_first_display
+      EXPORTING
+        is_layout       = gs_layout
+        i_default       = 'X'
+        i_save          = 'A'
+      CHANGING
+        it_outtab       = <fs_out>
+        it_fieldcatalog = gt_fcat.
+*   Enable line selection and double clicking
+    SET HANDLER obj_event_handler->handle_double_click  FOR go_grid.
+    SET HANDLER obj_event_handler->handle_hot_spot      FOR go_grid .
+  ELSE.
+    CALL METHOD go_grid->refresh_table_display
+      EXPORTING
+        is_stable      = gs_stable
+        i_soft_refresh = 'X'.
+  ENDIF.
+ENDFORM.                    " DISPLAY_REPORT
+*&---------------------------------------------------------------------*
+*&      Form  ALV_LAYOUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM alv_layout .
+
+  gs_layout-zebra       = gc_x.
+  gs_layout-no_keyfix   = gc_x.
+  gs_layout-info_fname  = 'ZZCOL'.
+  gs_layout-sel_mode    = 'A'.
+  gs_layout-grid_title = 'List SO items'(h02).
+
+*  gs_layout-BOX_FNAME   = 'CHECK_BOX'.
+
+ENDFORM.                    " ALV_LAYOUT
+*&---------------------------------------------------------------------*
+*&      Form  ALV_FCAT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM alv_fcat .
+
+** Create Fieldcatalogue from internal table
+** CALL FUNCTION 'REUSE_ALV_FIELDCATALOG_MERGE' ...
+
+  CLEAR gv_col.
+  REFRESH: gt_fcat.
+
+* Field definitions
+  PERFORM add_field USING 'VBELN' 10 'Sales Doc.'(s01)       'X'  'X'.
+  PERFORM add_field USING 'POSNR'  6 'SO.Item'(s03)          ' '  ' '.
+
+ENDFORM.                    " ALV_FCAT
+
+*&---------------------------------------------------------------------*
+*&      Form  ADD_FIELD
+*&---------------------------------------------------------------------*
+*       Add field to field catalog
+*----------------------------------------------------------------------*
+FORM add_field  USING    p_field
+                         p_len
+                         p_descr
+                         p_hotspot
+                         p_key.
+  CLEAR: gv_col.
+  gv_col = gv_col + 1.
+
+  CLEAR gs_fcat.
+  gs_fcat-col_pos    = gv_col.
+  gs_fcat-fieldname  = p_field.
+  gs_fcat-outputlen  = p_len.
+
+  gs_fcat-seltext  = p_descr.
+  gs_fcat-scrtext_l  = p_descr.
+  gs_fcat-scrtext_m  = p_descr.
+  gs_fcat-scrtext_s  = p_descr.
+  gs_fcat-fix_column = 'X'.
+  gs_fcat-emphasize  = 'X'.
+  gs_fcat-hotspot    = p_hotspot.
+  gs_fcat-key        = p_key.
+
+  IF gs_fcat-fieldname   = 'LIGHT'.
+    gs_fcat-icon         = 'X'.  " Display the field as ICON
+    gs_fcat-inttype      = 'C'.
+  ENDIF.
+
+  APPEND gs_fcat TO gt_fcat.
+
+ENDFORM.                    " ADD_FIELD
+*&---------------------------------------------------------------------*
+*&      Module  USER_COMMAND_0100  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE user_command_0100 INPUT.
+
+  DATA: lv_ok TYPE sy-ucomm.
+  lv_ok = ok_code.
+  CLEAR: ok_code.
+  CASE lv_ok.
+    WHEN 'BACK'.
+      SET SCREEN 0.
+      LEAVE SCREEN.
+    WHEN 'CANC'.
+      LEAVE LIST-PROCESSING.
+    WHEN 'EXIT'.
+      LEAVE PROGRAM.
+    WHEN 'REJ'.
+*     Reprocess IDocs
+      PERFORM frm_proc_rej.
+      LEAVE TO SCREEN 0.
+  ENDCASE.
+
+ENDMODULE.                 " USER_COMMAND_0100  INPUT
+*&---------------------------------------------------------------------*
+*&      Form  HANDLE_HOT_SPOT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_E_ROW_ID  text
+*      -->P_E_COLUMN_ID  text
+*      -->P_ES_ROW_NO  text
+*----------------------------------------------------------------------*
+FORM handle_hot_spot  USING    p_e_row_id
+                               p_e_column_id
+                               p_es_row_no.
+  DATA: ls_out  TYPE ty_out.
+  CLEAR ls_out.
+  READ TABLE gt_out INTO ls_out INDEX p_e_row_id.
+
+* If Contract Number clicked
+  SET PARAMETER ID 'AUN' FIELD ls_out-vbeln .
+  CALL TRANSACTION 'VA03' AND SKIP FIRST SCREEN.
+
+ENDFORM.                    " HANDLE_HOT_SPOT
+*&---------------------------------------------------------------------*
+*&      Form  FRM_LIST_LOG
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM frm_list_log .
+  DATA: ls_message TYPE ty_mess,
+        ls_temp    TYPE ty_mess.
+  IF gt_mess_succ_head IS NOT INITIAL.
+    WRITE: 'The Purchase order type of follow orders are cleared:'(S70), /.
+    LOOP AT gt_mess_succ_head INTO ls_message.
+      WRITE: / ls_message-vbeln.
+    ENDLOOP.
+    WRITE: /.
+  ENDIF.
+
+  IF gt_message_head IS NOT INITIAL.
+    WRITE:
+      'The Purchase order type of follow orders are failed to cleared:'(S77), /.
+    LOOP AT gt_message_head INTO ls_message.
+      WRITE: / ls_message-vbeln , 15 ls_message-message .
+    ENDLOOP.
+    WRITE: /.
+  ENDIF.
+
+  IF gt_message IS NOT INITIAL.
+    WRITE: 'The items below failed to reject: '(s40), /.
+    SORT gt_message.
+    LOOP AT gt_message INTO ls_message.
+      ls_temp = ls_message.
+*      SKIP 1.
+      AT NEW posnr.
+        WRITE: ls_temp-vbeln, ls_temp-posnr.
+      ENDAT.
+      WRITE: /30 ls_temp-message.
+    ENDLOOP.
+    WRITE: /.
+  ENDIF.
+
+  IF gt_mess_succ IS NOT INITIAL.
+    WRITE: 'The items below are successfully rejected:'(s41), /.
+    SORT gt_message.
+    LOOP AT gt_mess_succ INTO ls_message.
+      WRITE: / ls_temp-vbeln, ls_temp-posnr.
+    ENDLOOP.
+    WRITE: /.
+  ENDIF.
+ENDFORM.                    " FRM_LIST_LOG
+*&---------------------------------------------------------------------*
+*&      Form  FRM_DEL_PURTYPE
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM frm_del_purtype .
+
+  DATA: lt_selected_rows  TYPE lvc_t_roid,
+        lt_return         TYPE STANDARD TABLE OF  bapiret2,
+        ls_return         TYPE bapiret2,
+        ls_message        TYPE ty_mess,
+        ls_order_header_in TYPE bapisdh1,
+        ls_order_header_inx TYPE  bapisdh1x,
+        ls_order_item_in  TYPE bapisditm,
+        lt_order_item_in  TYPE STANDARD TABLE OF  bapisditm,
+        ls_order_item_inx TYPE bapisditmx,
+        lt_order_item_inx TYPE STANDARD TABLE OF bapisditmx.
+
+  DATA: lv_item_no TYPE char10,
+        lv_curr_no TYPE char10,
+        lv_percent TYPE i,
+        lv_str     TYPE string,
+        lt_out TYPE STANDARD TABLE OF ty_out,
+        ls_out TYPE ty_out.
+
+  CLEAR: gs_selected_rows.
+  APPEND LINES OF gt_selected_rows TO lt_selected_rows.
+  LOOP AT lt_selected_rows INTO gs_selected_rows.
+    READ TABLE gt_out INTO gs_out
+      INDEX gs_selected_rows-row_id.
+    APPEND gs_out TO lt_out.
+  ENDLOOP.
+  SORT lt_out BY vbeln.
+  DELETE ADJACENT DUPLICATES FROM lt_out COMPARING vbeln.
+  DESCRIBE TABLE lt_out LINES lv_item_no.
+  IF lt_out IS NOT INITIAL.
+    LOOP AT lt_out INTO gs_out.
+      lv_curr_no = sy-tabix.
+      lv_percent = sy-tabix * 100 / lv_item_no.
+      CONCATENATE 'Processing delete the Pur.type ['(s65)
+                  gs_out-vbeln
+                  ' ] ('
+                  lv_curr_no
+                  ' /'
+                  lv_item_no
+                  ' )'
+            INTO lv_str.
+
+      CALL FUNCTION 'SAPGUI_PROGRESS_INDICATOR'
+        EXPORTING
+          percentage = lv_percent
+          text       = lv_str.
+      CLEAR ls_order_header_in-po_method.
+
+      ls_order_header_inx-updateflag = 'U'.
+      ls_order_header_inx-po_method = 'X'.
+
+      refresh: lt_return.
+      CALL FUNCTION 'BAPI_SALESORDER_CHANGE'
+        EXPORTING
+          salesdocument               = gs_out-vbeln
+          order_header_in             = ls_order_header_in
+          order_header_inx            = ls_order_header_inx
+*         SIMULATION                  =
+*         BEHAVE_WHEN_ERROR           = ' '
+*         INT_NUMBER_ASSIGNMENT       = ' '
+*         LOGIC_SWITCH                =
+*         NO_STATUS_BUF_INIT          = ' '
+        TABLES
+          return                      = lt_return.
+*          order_item_in               = lt_order_item_in
+*          order_item_inx              = lt_order_item_inx.
+      LOOP AT lt_return INTO ls_return WHERE type = 'E'
+                                         OR  type = 'W'.
+        CLEAR: ls_message.
+        ls_message-vbeln = gs_out-vbeln.
+        MOVE-CORRESPONDING ls_return TO ls_message.
+        APPEND ls_message TO gt_message_head.
+      ENDLOOP.
+      IF sy-subrc <> 0.
+        CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+          EXPORTING
+            wait          = 'X'
+*         IMPORTING
+*           RETURN        =
+                  .
+
+        CLEAR: ls_message.
+        ls_message-vbeln = gs_out-vbeln.
+        MOVE-CORRESPONDING ls_return TO ls_message.
+        APPEND ls_message TO gt_mess_succ_head.
+      ENDIF.
+      CLEAR gs_out.
+    ENDLOOP.
+  ELSE.
+    MESSAGE i001(00) WITH 'Please select items!'(s30).
+  ENDIF.
+
+ENDFORM.                    " FRM_DEL_PURTYPE
+
+*Text symbol text£º
+*H02:List SO items
+*P01:Confirm to reject select items
+*P02:Are you sure to reject select items
+*S01:Sales Doc.
+*S03:SO.Item
+*S30:Please select items!
+*S40:The items below failed to reject:
+*S41:The items below are successfully rejected:
+*S60:Processing the item [
+*S65:Processing delete the Pur.type [
+*S70:The Purchase order type of follow orders are cleared:
+
+*S77:The Purchase order type of follow orders are failed to cleared:
+*Selection text£º
+*CB_REL:        Exclude rejected items
+*S_VBELN:D       .

@@ -1,0 +1,629 @@
+***INCLUDE IDBILLPRINT .
+
+**** Credit Invoices - Argentina
+FORM entry_credit_invoice USING return_code us_screen.
+
+  DATA: ls_bkpf TYPE bkpf,
+        ls_vbrk TYPE vbrk,
+        lv_save_message TYPE c.    "#ec needed
+
+* try to lock FI document
+
+  SELECT SINGLE * FROM vbrk INTO ls_vbrk
+  WHERE vbeln = nast-objky.
+  IF sy-subrc <> 0.
+* issue error message to log file
+    return_code = 1.
+    MESSAGE e562(8a) WITH nast-objky INTO lv_save_message.
+    CALL FUNCTION 'NAST_PROTOCOL_UPDATE'
+      EXPORTING
+        msg_arbgb = syst-msgid
+        msg_nr    = syst-msgno
+        msg_ty    = syst-msgty
+        msg_v1    = syst-msgv1
+      EXCEPTIONS
+        OTHERS    = 0.
+    EXIT.
+  ELSE.
+    SELECT SINGLE * FROM bkpf INTO ls_bkpf
+    WHERE bukrs =  ls_vbrk-bukrs
+    AND awtyp = 'VBRK'
+    AND awkey = ls_vbrk-vbeln.
+    IF sy-subrc <> 0.
+* issue error message to log file
+      return_code = 1.
+      MESSAGE e563(8a) WITH nast-objky INTO lv_save_message.
+      CALL FUNCTION 'NAST_PROTOCOL_UPDATE'
+        EXPORTING
+          msg_arbgb = syst-msgid
+          msg_nr    = syst-msgno
+          msg_ty    = syst-msgty
+          msg_v1    = syst-msgv1
+        EXCEPTIONS
+          OTHERS    = 0.
+      EXIT.
+    ELSE.
+
+      CALL FUNCTION 'ENQUEUE_EFBKPF'
+        EXPORTING
+          mode_bkpf      = 'E'
+          mandt          = sy-mandt
+          bukrs          = ls_bkpf-bukrs
+          belnr          = ls_bkpf-belnr
+          gjahr          = ls_bkpf-gjahr
+          x_bukrs        = ' '
+          x_belnr        = ' '
+          x_gjahr        = ' '
+          _scope         = '2'
+          _wait          = ' '
+          _collect       = ' '
+        EXCEPTIONS
+          foreign_lock   = 1
+          system_failure = 2
+          OTHERS         = 3.
+      IF sy-subrc <> 0.
+* issue error message to log file
+        return_code = 1.
+        MESSAGE e561(8a) WITH nast-objky INTO lv_save_message.
+        CALL FUNCTION 'NAST_PROTOCOL_UPDATE'
+          EXPORTING
+            msg_arbgb = syst-msgid
+            msg_nr    = syst-msgno
+            msg_ty    = syst-msgty
+            msg_v1    = syst-msgv1
+          EXCEPTIONS
+            OTHERS    = 0.
+        EXIT.
+      ELSE.
+
+* save the actual condition type for later processing
+        CALL FUNCTION 'J_1A_SD_NAST_SAVE'
+          EXPORTING
+            iv_message = nast-kschl.
+
+* perform standard print routine
+        PERFORM entry USING return_code us_screen.
+
+* take care of errors for Credit invoice
+        CALL FUNCTION 'J_1A_SD_ERROR_GET'
+          EXPORTING
+            iv_retcode = return_code
+            iv_objkey  = nast-objky
+          IMPORTING
+            ev_subrc   = return_code.
+
+      ENDIF. "Lock failure
+    ENDIF. "sy-subrc BKPF
+  ENDIF. "sy-subrc VBRK
+ENDFORM.                    "entry_credit_invoice
+
+data: begin of komvd_int occurs 0.
+        include structure komvd.
+data:   hwbas like bset-hwbas,
+        hwste like bset-hwste,
+        hwaer like t001-waers.
+data: end of komvd_int.
+
+FORM entry_sk USING return_code us_screen.
+  CLEAR retcode.
+  xscreen = us_screen.
+  header_userexit = 'HEADER_SK'.
+  header_print_userexit = 'HEADER_PRINT_SK'.
+  PERFORM processing USING us_screen.
+  CASE retcode.
+    WHEN 0.
+      return_code = 0.
+    WHEN 3.
+      return_code = 3.
+    WHEN OTHERS.
+      return_code = 1.
+  ENDCASE.
+ENDFORM.
+
+FORM header_sk.
+data: BEGIN OF ls_TEURB.
+        INCLUDE STRUCTURE TEURB.
+data:   HWAER LIKE BKPF-WAERS.
+data: END OF ls_TEURB.
+
+data:
+  lv_kursf       like bkpf-kursf,
+  lv_cust_id     like teurb-cprog.
+
+constants:
+  lc_skk_keydate type d value '20081231'.
+
+  SELECT SINGLE * FROM t001 WHERE bukrs EQ vbdkr-bukrs.
+  CHECK sy-subrc = 0.
+  if vbdkr-fkdat <= lc_skk_keydate.
+    lv_cust_id = 'IDBILLPRINT1'. "Official LC till keydate(SKK)
+  else.
+    lv_cust_id = 'IDBILLPRINT2'. "Official LC after keydate(EUR)
+  endif.
+* Get the alternative currency settings, if available
+  SELECT SINGLE * FROM TEURB INTO CORRESPONDING FIELDS
+    OF ls_TEURB WHERE CPROG = lv_cust_id
+                  AND BUKRS = T001-BUKRS
+                  AND LAND1 = T001-LAND1.
+  IF SY-SUBRC <> 0.
+    SELECT SINGLE * FROM TEURB INTO CORRESPONDING FIELDS
+      OF ls_TEURB WHERE CPROG = lv_cust_id
+                    AND BUKRS = T001-BUKRS
+                    AND LAND1 = space.
+  ENDIF.
+
+* No alternative currencies set => the tax values in CCode
+* currency are to be shown on the invoice
+  IF SY-SUBRC <> 0.
+    clear: teurb, ls_TEURB.
+  ENDIF.
+  ls_TEURB-HWAER = T001-WAERS.
+
+* Additional currency only needed if the target currency is not
+* equal the document currency (considering "fake" EUR currency)
+  if  ls_TEURB-WAERS <> vbdkr-waerk and
+    ( ls_TEURB-WAERS <> vbdkr-waerk(3) or
+      ls_TEURB-WAERS <> 'EUR' ).
+
+  select single * from vbrk
+    where vbeln = vbdkr-vbeln.
+  select single * FROM BKPF
+    where AWTYP = 'VBRK'
+      and AWKEY = vbrk-vbeln
+      and ( AWSYS = vbrk-logsys or AWSYS = space ).
+  if sy-subrc eq 0.
+    select * from BSET
+      where bukrs = bkpf-bukrs
+        and belnr = bkpf-belnr
+        and gjahr = bkpf-gjahr.
+      read table hkomvd with key mwskz = bset-mwskz
+                                 kawrt = bset-fwbas.
+      if sy-subrc eq 0.
+        move-corresponding hkomvd to komvd_int.
+          komvd_int-hwste = bset-hwste.
+          komvd_int-hwbas = bset-hwbas.
+*         If the target currency is equal to the CCode currency,
+*         get the LC tax values from the FI document
+          if ls_TEURB-WAERS = ls_TEURB-HWAER.
+            komvd_int-hwste = bset-hwste.
+            komvd_int-hwbas = bset-hwbas.
+            teurb-waers = ls_TEURB-WAERS.                "Form LCurr
+           else.
+*         Otherwise the values are not available on the DB, so
+*         recalculate the LC values into the target currency
+*           Case 1: EUR values are determined according to the
+*           rules for alternative currency handling
+            if lv_cust_id = 'IDBILLPRINT2'.
+
+              CALL FUNCTION 'CONVERT_TO_FOREIGN_CURRENCY'
+                 EXPORTING
+                      DATE              = vbrk-fkdat
+                      FOREIGN_CURRENCY  = ls_TEURB-WAERS
+                      LOCAL_AMOUNT      = bset-hwste
+                      LOCAL_CURRENCY    = ls_TEURB-HWAER
+                      TYPE_OF_RATE      = ls_TEURB-KURST
+                 IMPORTING
+                      FOREIGN_AMOUNT    = komvd_int-hwste.
+
+              CALL FUNCTION 'CONVERT_TO_FOREIGN_CURRENCY'
+                 EXPORTING
+                      DATE              = vbrk-fkdat
+                      FOREIGN_CURRENCY  = ls_TEURB-WAERS
+                      LOCAL_AMOUNT      = bset-hwbas
+                      LOCAL_CURRENCY    = ls_TEURB-HWAER
+                      TYPE_OF_RATE      = ls_TEURB-KURST
+                 IMPORTING
+                      FOREIGN_AMOUNT    = komvd_int-hwbas
+                      EXCHANGE_RATE     = lv_kursf.
+
+*             Adjust also the exchange rate and the local currency
+*             that will be printed on the form
+              if lv_kursf > 0.
+                BKPF-KURSF = lv_kursf * 100000 / BKPF-KURSF.
+              else.
+                lv_kursf = 0 - lv_kursf.
+                BKPF-KURSF = lv_kursf / 100000 * BKPF-KURSF.
+              endif.
+            else.
+*             Case 2: When the currency for the output is the former
+*             local currency SKK, the LC values are calculated from
+*             the values in document currency
+              CALL FUNCTION 'CONVERT_TO_LOCAL_CURRENCY'
+                 EXPORTING
+                      DATE              = vbdkr-fkdat
+                      FOREIGN_CURRENCY  = vbdkr-waerk "ls_TEURB-HWAER
+                      FOREIGN_AMOUNT    = bset-fwste  "bset-hwste
+                      LOCAL_CURRENCY    = ls_TEURB-WAERS
+                      TYPE_OF_RATE      = ls_TEURB-KURST
+                 IMPORTING
+                      LOCAL_AMOUNT      = komvd_int-hwste.
+
+              CALL FUNCTION 'CONVERT_TO_LOCAL_CURRENCY'
+                 EXPORTING
+                      DATE              = vbdkr-fkdat
+                      FOREIGN_CURRENCY  = vbdkr-waerk "ls_TEURB-HWAER
+                      FOREIGN_AMOUNT    = bset-fwbas  "bset-hwbas
+                      LOCAL_CURRENCY    = ls_TEURB-WAERS
+                      TYPE_OF_RATE      = ls_TEURB-KURST
+                 IMPORTING
+                      LOCAL_AMOUNT      = komvd_int-hwbas
+                      EXCHANGE_RATE     = lv_kursf.
+
+              if lv_kursf > 0.
+                BKPF-KURSF = lv_kursf.
+              else.
+                BKPF-KURSF = 0 - lv_kursf.
+              endif.
+
+*             Also apply the rounding for the tax amounts in SKK
+              komvd_int-hwste = komvd_int-hwste / 10.
+              komvd_int-hwste = komvd_int-hwste * 10.
+            endif.
+
+            teurb-waers = ls_TEURB-WAERS.                 "Form LCurr
+          endif.
+          append komvd_int.
+        endif.
+      endselect.
+    endif.
+    sort komvd_int by kawrt.
+  endif.
+ENDFORM.
+
+FORM header_print_sk.
+  DATA: save_waerk_fw LIKE komk-waerk.
+  save_waerk_fw = komk-waerk.
+  LOOP AT komvd_int where KOAID = 'D'.
+    at first.
+"#EC *
+      CALL FUNCTION 'WRITE_FORM'
+        EXPORTING
+          ELEMENT                        = 'EXCHANGE_RATE_SK'.
+    endat.
+    komvd = komvd_int.
+    komk-waerk = komvd-awein.
+    bset-hwste = komvd_int-hwste.
+    bset-hwbas = komvd_int-hwbas.
+    IF print_mwskz = space.
+      CLEAR komvd-mwskz.
+    ENDIF.
+    CALL FUNCTION 'WRITE_FORM'
+         EXPORTING
+              element = 'SUM_LINE_TAX_LC_SK'.
+  ENDLOOP.
+  komk-waerk = save_waerk_fw.
+ENDFORM.
+
+FORM GET_TAX_EXEMPT_REASON
+  tables in_tab  structure itcsy
+         out_tab structure itcsy.
+
+  data: lv_bukrs  like T001-bukrs,
+        lv_land1  like T005-land1,
+        lv_kalsm  like J_1ARZTX-kalsm,
+        lv_mwskz  like J_1ARZTX-mwskz,
+        lv_reason like J_1ARZTX-J_1ARFZ.
+
+  read table out_tab with key NAME = 'O_REASON'.
+  if sy-subrc eq 0.
+    out_tab-value = space.
+    modify out_tab index sy-tabix.
+  endif.
+
+  read table in_tab with key NAME = 'I_BUKRS'.
+  check sy-subrc eq 0.
+  lv_bukrs = in_tab-value.
+
+  read table in_tab with key NAME = 'I_MWSKZ'.
+  check sy-subrc eq 0.
+  lv_mwskz = in_tab-value.
+
+  clear: lv_reason.
+
+  if lv_bukrs ne space and lv_mwskz ne space.
+    select single LAND1 from T001 into lv_land1
+      where bukrs = lv_bukrs.
+    check sy-subrc eq 0.
+    select single KALSM from T005 into lv_kalsm
+      where land1 = lv_land1.
+    check sy-subrc eq 0.
+    select single J_1ARFZ from J_1ARZTX into lv_reason
+      where kalsm = lv_kalsm
+        and mwskz = lv_mwskz.
+  endif.
+
+  check sy-subrc eq 0.
+  read table out_tab with key NAME = 'O_REASON'.
+  if sy-subrc eq 0.
+    out_tab-value = lv_reason.
+    modify out_tab index sy-tabix.
+  endif.
+
+ENDFORM.
+
+
+* Entry point for Poland
+FORM entry_pl USING return_code us_screen.
+  CLEAR retcode.
+  xscreen = us_screen.
+  header_userexit = 'HEADER_PL'.
+  header_print_userexit = 'HEADER_PRINT_PL'.
+  PERFORM processing USING us_screen.
+  CASE retcode.
+    WHEN 0.
+      return_code = 0.
+    WHEN 3.
+      return_code = 3.
+    WHEN OTHERS.
+      return_code = 1.
+  ENDCASE.
+ENDFORM.
+
+FORM HEADER_PL.
+  data: lv_bukrs   like T001-bukrs,
+        lv_land1   like T005-land1,
+        lv_kalsm   like J_1ARZTX-kalsm,
+        lv_reason1 like J_1ARZTX-J_1ARFZ,
+        lv_reason2 like J_1ARZTX-J_1ARFZ,
+        lv_process type c,
+
+        lv_logsys  like vbrk-logsys,
+        lv_hwaer   type waers,
+        wa_bset    type bset,
+        lt_bset    type standard table of bset.
+
+  lv_bukrs = vbdkr-bukrs.
+  select single LAND1 WAERS from T001 into (lv_land1,lv_hwaer)
+    where bukrs = lv_bukrs.
+  check sy-subrc eq 0.
+  select single KALSM from T005 into lv_kalsm
+    where land1 = lv_land1.
+  check sy-subrc eq 0.
+
+  refresh: komvd_int, lt_bset.
+
+* Get the LC tax amounts from FI document
+  select single logsys from vbrk into lv_logsys
+    where vbeln = vbdkr-vbeln.
+  select single * FROM BKPF
+    where AWTYP = 'VBRK'
+      and AWKEY = vbdkr-vbeln
+      and ( AWSYS = lv_logsys or AWSYS = space ).
+  if sy-subrc eq 0.
+    select * from BSET into table lt_bset
+      where bukrs = bkpf-bukrs
+        and belnr = bkpf-belnr
+        and gjahr = bkpf-gjahr.
+  endif.
+
+* Process tax lines
+  LOOP AT HKOMVD where KOAID = 'D'.
+    clear: lv_reason1, lv_process.
+    select single J_1ARFZ from J_1ARZTX into lv_reason1
+      where kalsm = lv_kalsm
+        and mwskz = hkomvd-mwskz.
+*   Check if the same rate is already processed
+    LOOP AT komvd_int WHERE KBETR = HKOMVD-KBETR.
+*     Zero rate: consider exemption reasons
+      if komvd_int-KBETR = 0.
+        select single J_1ARFZ from J_1ARZTX into lv_reason2
+          where kalsm = lv_kalsm
+            and mwskz = komvd_int-mwskz.
+*       When the exemption reasons are different - skip komvd_int entry
+        check sy-subrc eq 0 and lv_reason2 ne lv_reason1.
+      endif.
+*     Entries with equal rate: sum the amount fields:
+      add: HKOMVD-KAWRT to komvd_int-KAWRT,
+           HKOMVD-KWERT to komvd_int-KWERT.
+      modify komvd_int.
+      lv_process = 'X'.
+    ENDLOOP.
+*   Check if the entry was processed above
+    IF lv_process eq space.
+      move-corresponding hkomvd to komvd_int.
+      read table lt_bset into wa_bset with key
+        mwskz = hkomvd-mwskz.
+      if sy-subrc eq 0.
+        komvd_int-hwste = wa_bset-hwste.
+        komvd_int-hwbas = wa_bset-hwbas.
+      endif.
+      komvd_int-hwaer = lv_hwaer.
+      append komvd_int.
+    endif.
+    delete hkomvd.
+  ENDLOOP.
+  append lines of komvd_int to hkomvd.
+  sort hkomvd by KPOSN STUNR ZAEHK.
+ENDFORM.
+
+FORM HEADER_PRINT_PL.
+DATA: save_waerk_fw LIKE komk-waerk.
+* The Repeat flag is determined in PROCESSING -> GET_DATA ->
+* CHECK_REPEAT and is redetermined in the PROCESSING loop when
+* multiple copies are requested
+  IF repeat EQ space.
+    CALL FUNCTION 'WRITE_FORM'
+         EXPORTING
+              element = 'ORYGINAL'
+              window  = 'REPEAT'
+         EXCEPTIONS
+              element = 1
+              window  = 2.
+    IF sy-subrc NE 0.
+      PERFORM protocol_update.
+    ENDIF.
+  ENDIF.
+
+  save_waerk_fw = komk-waerk.
+  LOOP AT komvd_int
+    where KOAID = 'D' and hwaer <> save_waerk_fw.
+    komvd = komvd_int.
+    komk-waerk = komvd_int-hwaer.
+    bset-hwste = komvd_int-hwste.
+    bset-hwbas = komvd_int-hwbas.
+    IF print_mwskz = space.
+      CLEAR komvd-mwskz.
+    ENDIF.
+    CALL FUNCTION 'WRITE_FORM'
+         EXPORTING
+              element = 'SUM_LINE_TAX_LC'.
+  ENDLOOP.
+  komk-waerk = save_waerk_fw.
+ENDFORM.
+
+
+* Entry point - printout of payment conditions details
+FORM entry_discount USING return_code us_screen.
+  CLEAR retcode.
+  xscreen = us_screen.
+  header_print_userexit = 'HEADER_PRINT_DISCOUNT'.
+  PERFORM processing USING us_screen.
+  CASE retcode.
+    WHEN 0.
+      return_code = 0.
+    WHEN 3.
+      return_code = 3.
+    WHEN OTHERS.
+      return_code = 1.
+  ENDCASE.
+ENDFORM.
+
+FORM HEADER_PRINT_DISCOUNT.
+  DATA: lt_fplt        LIKE fpltvb OCCURS 0 WITH HEADER LINE,
+        lt_pay_split   LIKE vtopis OCCURS 0 WITH HEADER LINE,
+        wa_fplt        LIKE fpltvb,
+        lv_brwrt       LIKE vbdkr-netwr,
+        lv_fkdat       LIKE vbdkr-fkdat,
+        lv_days        LIKE vtopis-TAGE,
+        lv_rate        LIKE vtopis-PRZ,
+        ls_vbdkr_save  like vbdkr.
+
+  DATA: begin of ls_terms,
+          days1      LIKE vtopis-TAGE,
+          days2      LIKE vtopis-TAGE,
+          days3      LIKE vtopis-TAGE,
+          rate1      LIKE vtopis-PRZ,
+          rate2      LIKE vtopis-PRZ,
+          rate3      LIKE vtopis-PRZ.
+  DATA: end of ls_terms.
+
+  ls_vbdkr_save = vbdkr.
+
+  lv_brwrt = vbdkr-netwr + vbdkr-mwsbk.  " Alternative: komk-fkwrt.
+  lv_fkdat = vbdkr-fkdat.
+  IF vbdkr-valtg NE 0.
+    lv_fkdat = vbdkr-fkdat + vbdkr-valtg.
+  ENDIF.
+  IF vbdkr-valdt NE 0.
+    lv_fkdat = vbdkr-valdt.
+  ENDIF.
+
+  clear ls_terms.
+  CALL FUNCTION 'FI_TERMS_OF_PAYMENT_PROPOSE'
+    EXPORTING
+      I_BLDAT               = lv_fkdat
+      I_BUDAT               = lv_fkdat
+      I_CPUDT               = lv_fkdat
+      I_ZFBDT               = lv_fkdat  "Compare SKONTOTERMIN(SAPLVPRI)
+      I_ZTERM               = vbdkr-zterm
+*     I_REINDAT             =
+*     I_LIFNR               =
+*     I_BUKRS               =
+    IMPORTING
+      E_ZBD1T               = ls_terms-days1
+      E_ZBD1P               = ls_terms-rate1
+      E_ZBD2T               = ls_terms-days2
+      E_ZBD2P               = ls_terms-rate2
+      E_ZBD3T               = ls_terms-days3
+      E_ZFBDT               = lv_fkdat
+*     E_SPLIT               =
+*     E_ZSCHF               =
+*     E_ZLSCH               =
+*     E_T052                =
+*   CHANGING
+*     C_REINDAT             =
+    EXCEPTIONS
+      TERMS_NOT_FOUND       = 1
+      OTHERS                = 2
+            .
+  IF SY-SUBRC <> 0.
+    perform protocol_update.
+  ENDIF.
+
+  check ls_terms-rate1 ne 0 or
+        ls_terms-rate2 ne 0 or
+        ls_terms-rate3 ne 0.
+  CALL FUNCTION 'WRITE_FORM'
+    EXPORTING
+      element = 'UNDER_LINE'
+    EXCEPTIONS
+      element = 1
+      window  = 2.
+  IF sy-subrc NE 0.
+    PERFORM protocol_update.
+  ENDIF.
+
+  if ls_terms-rate1 ne 0 or ls_terms-rate2 ne 0 or ls_terms-rate3 ne 0.
+*   Print discount header
+    CALL FUNCTION 'WRITE_FORM'
+      EXPORTING
+       element = 'DISCOUNT_HEADER'.
+    IF sy-subrc NE 0.
+      PERFORM protocol_update.
+    ENDIF.
+
+  endif.
+  do 3 times varying lv_days from ls_terms-days1 next ls_terms-days2
+             varying lv_rate from ls_terms-rate1 next ls_terms-rate2.
+
+    check lv_rate ne 0. " Only print data in case discount is non-zero
+
+    vtopis-hdatum = lv_fkdat + lv_days.
+    vtopis-prz    = lv_rate.
+    vtopis-tage   = lv_days.
+
+    vbdprl-netwr_vg2 = vbdkr-netwr * lv_rate / 100000.     "Net discount
+    vbdprl-mwsbp_vg2 = vbdkr-mwsbk * lv_rate / 100000.     "Tax discount
+    vbdprl-brtwr_vg2 = vbdprl-netwr_vg2 + vbdprl-mwsbp_vg2."Net + Tax
+    vbdkr-payam      = lv_brwrt - vbdprl-brtwr_vg2.        "To pay
+
+*   Print discount total line
+    CALL FUNCTION 'WRITE_FORM'
+      EXPORTING
+       element = 'DISCOUNT_TOTAL_LINE'.
+    IF sy-subrc NE 0.
+      PERFORM protocol_update.
+    ENDIF.
+
+*   Print discount lines
+    LOOP AT hkomvd.
+      komvd = hkomvd.
+*     Calculate the discount values
+      IF komvd-koaid = 'D'.
+        IF print_mwskz = space.
+          CLEAR komvd-mwskz.
+        ENDIF.
+        komvd-kawrt = komvd-kawrt * lv_rate / 100000.   "Tax base
+        komvd-kwert = komvd-kwert * lv_rate / 100000.   "Tax amount
+        check komvd-kwert ne 0.
+        CALL FUNCTION 'WRITE_FORM'
+          EXPORTING
+           element = 'DISCOUNT_TAX_LINE'.
+        IF sy-subrc NE 0.
+          PERFORM protocol_update.
+        ENDIF.
+      ENDIF.
+    ENDLOOP.
+  enddo.
+  CALL FUNCTION 'WRITE_FORM'
+    EXPORTING
+      element = 'UNDER_LINE'
+    EXCEPTIONS
+      element = 1
+      window  = 2.
+  IF sy-subrc NE 0.
+    PERFORM protocol_update.
+  ENDIF.
+
+  vbdkr = ls_vbdkr_save.
+ENDFORM.

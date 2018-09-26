@@ -1,0 +1,877 @@
+*&---------------------------------------------------------------------*
+*&  INCLUDE           J_1P_INTERNAL_INVOICE                            *
+*&---------------------------------------------------------------------*
+*{   INSERT         SF4K000082                                        1
+TABLES: marc, rseg, ekpo, ekko.
+TABLES: t007v.
+DATA: dot VALUE '.'.
+DATA: lp TYPE i.
+DATA: dummy(20).
+DATA: count TYPE i.
+DATA : addr_sel TYPE addr1_sel.
+DATA : addr_val TYPE addr1_val.
+DATA : addr_val_t001 TYPE addr1_val.
+DATA: supplier_nip LIKE bseg-stceg.
+DATA: BEGIN OF line_str,
+      lp(3),
+      maktx LIKE makt-maktx,
+      pkwiu LIKE marc-steuc,
+      meins(3),               "bseg-meins,
+      menge LIKE bseg-menge,
+      netpr LIKE rkb1n-bwrt,  "bseg-dmbtr,
+      netwr LIKE rkb1n-bwrt,  "bseg-dmbtr,
+      netwrf LIKE rkb1n-bwrt,
+      tax(2),
+      taxn(2) TYPE c,
+      taxn1(2) TYPE n,
+      vat LIKE rkb1n-bwrt,  "bseg-dmbtr,
+      mwskz LIKE bseg-mwskz,
+      END OF line_str.
+DATA: gt_line LIKE line_str OCCURS 10 WITH HEADER LINE.
+DATA: gt_totals LIKE line_str OCCURS 10 WITH HEADER LINE.
+DATA: sum_net LIKE rkb1n-bwrt.  "bseg-dmbtr
+DATA: sum_netf LIKE rkb1n-bwrt.  "bseg-dmbtr
+DATA: sum_vat LIKE rkb1n-bwrt.  "bseg-dmbtr.
+DATA: line.
+DATA: BEGIN OF amt_in_words.         "Due amount in words
+        INCLUDE STRUCTURE spell.
+DATA: END OF amt_in_words.
+DATA: gt_mwdat LIKE rtax1u15 OCCURS 0 WITH HEADER LINE.
+DATA: formname LIKE t001f-fornr.
+DATA: lg_inv_nr LIKE rseg-belnr.
+DATA: lg_inv_yr LIKE rseg-gjahr.
+DATA: fk_date(10).
+*dla dokument車w fi
+RANGES: rmwskz   FOR  bseg-mwskz.
+RANGES: rbktxt   FOR  bkpf-bktxt.
+DATA: id_mem(20).
+DATA: my_code LIKE sy-tcode.
+DATA: check_sum LIKE bseg-dmbtr.
+DATA: check_sumf LIKE bseg-dmbtr.
+DATA: correction_invoice.
+
+
+*INCLUDE z_fi_internal_invoice.
+INCLUDE yse_fi_internal_invoice.
+*****
+*&---------------------------------------------------------------------*
+*&      Form  print_invoice
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM print_invoice TABLES so_mwskz
+                    USING revent.
+
+*>>>air222296 on 10/08/2007: for reasons of internal numbering.
+  CLEAR bkpf.
+  SELECT SINGLE * FROM bkpf WHERE belnr = save_belnr
+                              AND bukrs = save_bukrs
+                              AND gjahr = save_gjahr.
+*<<<air222296 on 10/08/2007
+
+*IMPORT Z PAMI#CI dla dok FI
+  CONCATENATE sy-uname 'J_1P_RFKORB00' INTO id_mem.
+  IMPORT my_code formname rmwskz rbktxt FROM MEMORY ID id_mem.
+***
+  PERFORM fill_itcpo.
+
+  PERFORM output_exit_001.
+
+  PERFORM output_openfi.
+
+  IF save_koart NA 'DK'
+  OR ( save_koart = 'D' AND NOT kna1-xcpdk IS INITIAL )
+  OR ( save_koart = 'K' AND NOT lfa1-xcpdk IS INITIAL ).
+    finaa-nacha = '1'.
+  ELSE.
+    PERFORM output_check.
+  ENDIF.
+
+  CASE finaa-nacha.
+    WHEN '1'.
+      PERFORM printer.
+    WHEN '2'.
+      PERFORM telefax.
+    WHEN 'I'.
+      PERFORM internet.
+  ENDCASE.
+
+  PERFORM check_printer.
+
+* ****************************************
+  CLEAR: lg_inv_yr, lg_inv_nr.
+  lg_inv_nr = bkpf-awkey(10).
+  lg_inv_yr = bkpf-awkey+10(4).
+*data faktury
+  IF bkpf-bktxt(10) CO '0123456789.'.
+    fk_date = bkpf-bktxt(10).
+  ELSE.
+*>>>air22296 format
+    fk_date(2) = bkpf-budat+6(2).
+    fk_date+2(1) = '.'.
+    fk_date+3(2) =  bkpf-budat+4(2).
+    fk_date+5(1) = '.'.
+    fk_date+6(4) = bkpf-budat+0(4).
+  ENDIF.
+*  fk_date = bkpf-budat.
+******
+  CLEAR: check_sum, correction_invoice.
+  SELECT SINGLE * FROM bseg WHERE bukrs = bkpf-bukrs AND
+                                  belnr = bkpf-belnr AND
+                                  gjahr = bkpf-gjahr AND
+                                  lifnr <> ''        AND
+                                  mwskz IN so_mwskz.
+*>>>air22296
+  check_sum = bseg-dmbtr.
+  check_sumf = bseg-wrbtr. "foreign currency
+**czy jest to korekta
+  IF bseg-shkzg = 'S'.
+    correction_invoice = 'X'.
+  ENDIF.
+
+  SELECT SINGLE * FROM lfa1 WHERE lifnr = bseg-lifnr.
+  addr_sel-addrnumber = lfa1-adrnr.
+
+  CLEAR supplier_nip.
+  SELECT SINGLE stceg FROM bseg INTO supplier_nip
+                     WHERE bukrs = bkpf-bukrs AND
+                           belnr = bkpf-belnr AND
+                           gjahr = bkpf-gjahr AND
+                           stceg <> ''.
+
+  IF supplier_nip IS INITIAL.
+    supplier_nip = lfa1-stceg.
+  ENDIF.
+***SUPPLIER
+  CALL FUNCTION 'ADDR_GET'
+    EXPORTING
+      address_selection = addr_sel
+    IMPORTING
+      address_value     = addr_val
+    EXCEPTIONS
+      parameter_error   = 1
+      address_not_exist = 2
+      version_not_exist = 3
+      internal_error    = 4
+      OTHERS            = 5.
+
+****PURCHASER
+  CLEAR: addr_sel, addr_val_t001.
+
+  SELECT SINGLE * FROM t001 WHERE bukrs = bkpf-bukrs.
+  addr_sel-addrnumber = t001-adrnr.
+
+  CALL FUNCTION 'ADDR_GET'
+    EXPORTING
+      address_selection = addr_sel
+    IMPORTING
+      address_value     = addr_val_t001
+    EXCEPTIONS
+      parameter_error   = 1
+      address_not_exist = 2
+      version_not_exist = 3
+      internal_error    = 4
+      OTHERS            = 5.
+
+*>>>>AIR22296: docnumber 18/06/2007
+  PERFORM get_docnr USING v_intvb.
+*<<<air22296
+  CLEAR: lp, gt_line, gt_totals, sum_net, sum_netf, sum_vat, count.
+  REFRESH: gt_line, gt_totals.
+*selekcja dokument車w fi
+  IF my_code = 'J1PF62'.
+   PERFORM fi_selection TABLES rmwskz rbktxt gt_line gt_mwdat gt_totals
+                         USING count dummy dot.
+  ELSE.
+    SELECT COUNT(*) FROM rseg INTO count
+                   WHERE belnr = lg_inv_nr AND
+                         gjahr = lg_inv_yr.
+*******************
+    IF sy-subrc = 0. "istnieje faktura logistyczna
+      PERFORM read_rseg.
+    ELSE.            "brak faktury logistycznej
+      IF revent = 'PLFWA'.
+        PERFORM read_ekpo_archive.
+      ELSE.
+        PERFORM read_ekpo.
+      ENDIF.
+    ENDIF.
+
+
+    LOOP AT gt_totals.
+      SELECT SINGLE dmbtr FROM bseg INTO gt_totals-vat
+                         WHERE bukrs = bkpf-bukrs AND
+                               belnr = bkpf-belnr AND
+                               gjahr = bkpf-gjahr AND
+                               buzid = 'T' AND
+                               mwskz = gt_totals-mwskz.
+      MODIFY gt_totals.
+    ENDLOOP.
+  ENDIF. """"""""""
+  SORT gt_totals BY taxn1 DESCENDING.
+************************************************
+
+  IF NOT gt_line[] IS INITIAL.
+    IF my_code = 'J1PF62'.
+*    formname = 'Z_INT_INV'.
+    ELSE.
+*     IF t001f-fornr IS INITIAL.
+*       formname = 'J_1P_INT_INV'.
+*     ELSE.
+      formname = t001f-fornr.
+      IF formname IS INITIAL.
+        formname = 'YSE_J_1P_INT_INV'.
+      ENDIF.
+*     ENDIF.
+    ENDIF.
+*>>>insert air22296: 06/08/2007
+    IF save_rimmd = 'X'.
+      itcpo-tdimmed = save_rimmd.
+      itcpo-tdpreview = ' '.
+      itcpo-tdprinter = 'PRINTER'.
+    ENDIF.
+*<<<end insert
+    CALL FUNCTION 'OPEN_FORM'
+      EXPORTING
+        archive_index  = h_archive_index
+        archive_params = h_archive_params
+        device         = htddevice
+        dialog         = hdialog
+        form           = formname
+        OPTIONS        = itcpo
+      IMPORTING
+        RESULT         = itcpp
+      EXCEPTIONS
+        form           = 5.
+
+    CALL FUNCTION 'WRITE_FORM'
+         EXPORTING
+*                element = 'TITLE'
+              window  = 'SENDER2'
+         EXCEPTIONS
+              element = 1
+              window  = 2.
+*  CALL FUNCTION 'WRITE_FORM'
+*       EXPORTING
+*            element = 'ITEM_HEADER'
+*            window  = 'MAIN'
+*       EXCEPTIONS
+*            element = 1
+*            window  = 2.
+    CALL FUNCTION 'WRITE_FORM'
+      EXPORTING
+        element = 'ITEM_HEADER'
+        window  = 'MAIN'
+        type    = 'TOP'
+      EXCEPTIONS
+        element = 1
+        window  = 2.
+
+****dodawanie r車#nic
+    IF check_sum <> 0 AND my_code <> 'J1PF62'.
+      DATA: l_lines TYPE i.
+      DATA: diff LIKE bseg-dmbtr.
+      DATA: diff_f LIKE bseg-dmbtr.
+      SORT gt_line BY netwr DESCENDING.
+      CLEAR: sum_net, sum_net.
+
+      LOOP AT gt_line.
+*>>>air22296 18/06
+        sum_net  = sum_net + gt_line-netwr.
+        sum_netf = sum_netf + gt_line-netwrf.
+      ENDLOOP.
+      diff = check_sum - sum_net.
+      diff_f = check_sumf - sum_netf.
+      IF diff <> 0.
+*----------------------------------------------------------
+
+        READ TABLE gt_line INDEX 1.
+        gt_line-netwr = gt_line-netwr + diff.
+        MODIFY gt_line INDEX 1 TRANSPORTING netwr.
+*          DESCRIBE TABLE gt_line LINES l_lines.
+*          CLEAR gt_line.
+*          gt_line-lp = l_lines + 1.
+*          gt_line-maktx = 'R車#nice'.
+*          gt_line-menge = 1.
+*          gt_line-netwr = diff.
+*          gt_line-netpr = diff.
+*          gt_line-meins = 'ST'.
+*          gt_line-tax = 0.
+*          APPEND gt_line.
+*
+*          READ TABLE gt_totals WITH KEY taxn = gt_line-tax.
+*          IF sy-subrc = 0.
+*            gt_totals-netwr = gt_totals-netwr + diff.
+*            MODIFY gt_totals INDEX sy-tabix.
+*          ELSE.
+*            CLEAR gt_totals.
+*            gt_totals-taxn = gt_line-tax.
+*            gt_totals-netwr = diff.
+*            APPEND gt_totals.
+*          ENDIF.
+        READ TABLE gt_totals WITH KEY taxn = gt_line-tax.
+        gt_totals-netwr = gt_totals-netwr + diff.
+        gt_totals-netwrf = gt_totals-netwrf + diff. ">>>air22296 18/06.
+        MODIFY gt_totals INDEX sy-tabix.
+*----------------------------------------------------------
+
+      ENDIF.
+      SORT gt_line BY lp ASCENDING.
+      CLEAR: sum_net, sum_netf.
+    ENDIF.
+
+    LOOP AT gt_line.
+*zmiana znaku dla korekty
+      IF correction_invoice = 'X'.
+        gt_line-netwr = gt_line-netwr * -1.
+        gt_line-netpr = gt_line-netpr * -1.
+        gt_line-vat   = gt_line-vat * -1.
+      ENDIF.
+      CALL FUNCTION 'WRITE_FORM'
+        EXPORTING
+          element = 'ITEM_LINE'
+          window  = 'MAIN'
+        EXCEPTIONS
+          element = 1
+          window  = 2.
+
+    ENDLOOP.
+
+    CALL FUNCTION 'WRITE_FORM'
+      EXPORTING
+        element  = 'ITEM_HEADER'
+        window   = 'MAIN'
+        function = 'DELETE'
+      EXCEPTIONS
+        element  = 1
+        window   = 2.
+
+    CALL FUNCTION 'WRITE_FORM'
+      EXPORTING
+        element = 'ULINE1'
+        window  = 'MAIN'
+      EXCEPTIONS
+        element = 1
+        window  = 2.
+
+    LOOP AT gt_totals.
+      IF sy-tabix = 1.
+        line = 'X'.
+      ELSE.
+        line = ''.
+      ENDIF.
+*zmiana znaku dla korekty
+      IF correction_invoice = 'X'.
+        gt_totals-netwr = gt_totals-netwr * -1.
+        gt_totals-netwrf = gt_totals-netwrf * -1.">>>air22296 18/06.
+        gt_totals-vat   = gt_totals-vat * -1.
+      ENDIF.
+      CALL FUNCTION 'WRITE_FORM'
+        EXPORTING
+          element = 'TAX_TOTALS'
+          window  = 'MAIN'
+        EXCEPTIONS
+          element = 1
+          window  = 2.
+*>>>air22296 18/6
+      sum_net  = sum_net + gt_totals-netwr.
+      sum_netf = sum_netf + gt_totals-netwrf.
+      sum_vat  = sum_vat + gt_totals-vat.
+    ENDLOOP.
+
+    CALL FUNCTION 'WRITE_FORM'
+      EXPORTING
+        element = 'SUM'
+        window  = 'MAIN'
+      EXCEPTIONS
+        element = 1
+        window  = 2.
+**amount in words
+
+    CALL FUNCTION 'SPELL_AMOUNT'
+      EXPORTING
+        amount    = sum_net
+        currency  = 'PLN'
+        filler    = ' '
+        language  = 'L'
+      IMPORTING
+        in_words  = amt_in_words
+      EXCEPTIONS
+        not_found = 2
+        too_large = 4.
+    TRANSLATE amt_in_words-word TO LOWER CASE.
+    TRANSLATE amt_in_words-decword TO LOWER CASE.
+    CALL FUNCTION 'WRITE_FORM'
+      EXPORTING
+        element = 'IN_WORDS'
+        window  = 'MAIN'
+      EXCEPTIONS
+        element = 1
+        window  = 2.
+
+
+***
+    CALL FUNCTION 'CLOSE_FORM'
+      IMPORTING
+        RESULT   = itcpp
+      EXCEPTIONS
+        unopened = 3.
+  ENDIF.
+***
+  CLEAR prot_ausgabe.
+  prot_ausgabe-bukrs = bkpf-bukrs.
+  prot_ausgabe-event = revent.
+  prot_ausgabe-repid = sy-repid.
+  prot_ausgabe-tdspoolid = itcpp-tdspoolid.
+  prot_ausgabe-tddevice = htddevice.
+  prot_ausgabe-countp = itcpp-tdpages.
+  prot_ausgabe-tddataset = revent.
+  prot_ausgabe-tdsuffix2 = bkpf-bukrs.
+  APPEND prot_ausgabe.
+***
+*     CLEAR XKAUSG.
+  CLEAR xnach.
+  IF  NOT save_belnr IS INITIAL
+  AND NOT save_gjahr IS INITIAL.
+    IF save_belnr CO '* '.
+    ELSE.
+      CLEAR xprint.
+      CLEAR   hbkpf.
+      REFRESH hbkpf.
+      PERFORM read_bkpf.
+      APPEND hbkpf.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    " print_invoice
+
+
+
+*}   INSERT
+
+*{   INSERT         SF4K000109                                        2
+
+FORM read_rseg.
+  SELECT * FROM rseg WHERE belnr = lg_inv_nr AND
+                           gjahr = lg_inv_yr.
+
+    ADD 1 TO lp.
+    gt_line-lp = lp.
+    gt_line-meins = rseg-bstme.
+    gt_line-menge = rseg-menge.
+    gt_line-netwr = rseg-wrbtr * bkpf-kursf.
+    gt_line-netwrf = rseg-wrbtr. " net amount in foreign curr
+    IF NOT rseg-matnr IS INITIAL.
+      SELECT SINGLE maktx FROM makt INTO gt_line-maktx WHERE matnr =
+      rseg-matnr AND spras = 'L'.
+    ELSE.
+      SELECT SINGLE txz01 FROM ekpo INTO gt_line-maktx
+                                WHERE ebeln = rseg-ebeln AND
+                                      ebelp = rseg-ebelp.
+
+    ENDIF.
+
+
+    IF gt_line-menge <> 0.
+*     gt_line-netpr = gt_line-netwr / gt_line-menge.
+      gt_line-netpr = gt_line-netwrf / gt_line-menge.
+    ENDIF.
+***
+    CLEAR gt_mwdat. REFRESH gt_mwdat.
+
+    CALL FUNCTION 'CALCULATE_TAX_FROM_NET_AMOUNT'
+      EXPORTING
+        i_wrbtr                = gt_line-netwr
+        i_mwskz                = rseg-mwskz
+        i_waers                = 'PLN'
+        i_bukrs                = rseg-bukrs
+      TABLES
+        t_mwdat                = gt_mwdat
+      EXCEPTIONS
+*        multiple_mwdat_entries = 1
+        OTHERS                 = 2.
+
+
+    READ TABLE gt_mwdat INDEX 1.
+
+    dummy = ABS( gt_mwdat-msatz ).
+    CONDENSE dummy.
+    SPLIT dummy AT dot INTO gt_line-tax dummy.
+    IF count = 1.
+      SELECT SINGLE dmbtr FROM bseg INTO gt_line-vat
+                         WHERE bukrs = bkpf-bukrs AND
+                               belnr = bkpf-belnr AND
+                               gjahr = bkpf-gjahr AND
+                               buzid = 'T' AND
+                               mwskz = rseg-mwskz.
+    ELSE.
+      gt_line-vat = gt_line-netwr * ( ABS( gt_mwdat-msatz ) / 100 ).
+    ENDIF.
+
+*    SELECT SINGLE steuc FROM marc INTO gt_line-pkwiu
+*                                 WHERE matnr = rseg-matnr AND
+*                                       werks = rseg-werks.
+
+    APPEND gt_line.
+
+    gt_totals-taxn = gt_line-tax.
+    gt_totals-taxn1 = gt_line-tax.
+    gt_totals-netwr = gt_line-netwr.
+    gt_totals-netwrf = gt_line-netwrf. ">>>air22296 18/06.
+*    gt_totals-vat = gt_line-vat.
+    gt_totals-mwskz = rseg-mwskz.
+    COLLECT gt_totals.
+  ENDSELECT.
+
+
+
+ENDFORM.                    "read_rseg
+*&--------------------------------------------------------------------*
+*&      Form  read_ekpo
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+FORM read_ekpo.
+  DATA: it_col_items LIKE bseg OCCURS 10 WITH HEADER LINE.
+  CLEAR it_col_items. REFRESH it_col_items.
+
+  SELECT * FROM bseg WHERE bukrs = bkpf-bukrs AND
+                           belnr = bkpf-belnr AND
+                           gjahr = bkpf-gjahr AND
+                           ebeln <> ''.
+    IF bseg-shkzg = 'S'.
+      it_col_items-dmbtr = bseg-dmbtr.
+    ELSE.
+      it_col_items-dmbtr = bseg-dmbtr * -1.
+    ENDIF.
+    it_col_items-mwskz = bseg-mwskz.
+    it_col_items-ebeln = bseg-ebeln.
+    it_col_items-ebelp = bseg-ebelp.
+
+    COLLECT  it_col_items.
+
+  ENDSELECT.
+
+  DESCRIBE TABLE it_col_items LINES count.
+*  SELECT COUNT(*) FROM bseg INTO count
+*                 WHERE belnr = bkpf-belnr AND
+*                       gjahr = bkpf-gjahr AND
+*                       ebeln <> ''.
+
+
+*  SELECT * FROM bseg WHERE belnr = bkpf-belnr AND
+*                           gjahr = bkpf-gjahr AND
+*                           ebeln <> ''.
+
+  LOOP AT it_col_items.
+    ADD 1 TO lp.
+
+    SELECT SINGLE matnr werks menge meins FROM ekpo
+            INTO (it_col_items-matnr, it_col_items-werks,
+                  gt_line-menge, gt_line-meins)
+                              WHERE ebeln = it_col_items-ebeln AND
+                                    ebelp = it_col_items-ebelp.
+
+
+    gt_line-lp = lp.
+*    gt_line-meins = bseg-meins.
+*    gt_line-menge = bseg-menge.
+    gt_line-netwr = it_col_items-dmbtr.
+    IF NOT it_col_items-matnr IS INITIAL.
+      SELECT SINGLE maktx FROM makt INTO gt_line-maktx WHERE matnr =
+      it_col_items-matnr AND spras = 'L'.
+    ELSE.
+      SELECT SINGLE txz01 FROM ekpo INTO gt_line-maktx
+                                WHERE ebeln = it_col_items-ebeln AND
+                                      ebelp = it_col_items-ebelp.
+    ENDIF.
+
+    IF gt_line-menge <> 0.
+      gt_line-netpr = gt_line-netwr / gt_line-menge.
+    ENDIF.
+***
+    CLEAR gt_mwdat. REFRESH gt_mwdat.
+    CLEAR gt_mwdat. REFRESH gt_mwdat.
+    CALL FUNCTION 'CALCULATE_TAX_FROM_NET_AMOUNT'
+      EXPORTING
+        i_wrbtr = gt_line-netwr
+        i_mwskz = it_col_items-mwskz
+        i_waers = 'PLN'
+        i_bukrs = bkpf-bukrs
+      TABLES
+        t_mwdat = gt_mwdat.
+
+    READ TABLE gt_mwdat INDEX 1.
+    dummy = ABS( gt_mwdat-msatz ).
+    CONDENSE dummy.
+    SPLIT dummy AT dot INTO gt_line-tax dummy.
+    IF count = 1.
+
+      SELECT SINGLE dmbtr FROM bseg INTO gt_line-vat
+                         WHERE bukrs = bkpf-bukrs AND
+                               belnr = bkpf-belnr AND
+                               gjahr = bkpf-gjahr AND
+                               buzid = 'T' AND
+                               mwskz = it_col_items-mwskz.
+    ELSE.
+      gt_line-vat = gt_line-netwr * ( ABS( gt_mwdat-msatz ) / 100 ).
+    ENDIF.
+
+    SELECT SINGLE steuc FROM marc INTO gt_line-pkwiu
+                                 WHERE matnr = it_col_items-matnr AND
+                                       werks = it_col_items-werks.
+
+    APPEND gt_line.
+
+
+    gt_totals-taxn = gt_line-tax.
+    gt_totals-taxn1 = gt_line-tax.
+    gt_totals-netwr = gt_line-netwr.
+    gt_totals-netwrf = gt_line-netwrf.">>>air22296 18/06.
+*    gt_totals-vat = gt_line-vat.
+    gt_totals-mwskz = it_col_items-mwskz.
+    COLLECT gt_totals.
+  ENDLOOP.
+
+ENDFORM.                    "read_ekpo
+*&--------------------------------------------------------------------*
+*&      Form  read_ekpo_archive
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+FORM read_ekpo_archive.
+  DATA: it_col_items LIKE bseg OCCURS 10 WITH HEADER LINE.
+  DATA: deliv TYPE i.
+  DATA: ls_ekpo LIKE ekpo.
+  DATA: document LIKE  admi_run-document.
+  DATA: handle LIKE sy-tabix,
+         identity(10).
+  TABLES: filepath, filename, filenameci, arc_buffer.
+  DATA: ls_ekko LIKE ekko.
+  DATA: lt_ekpo LIKE ekpo OCCURS 1 WITH HEADER LINE.
+  DATA: check_ebeln LIKE it_col_items-ebeln.
+  DATA: archive_found.
+  CLEAR: it_col_items, deliv. REFRESH it_col_items.
+
+
+  SELECT * FROM bseg WHERE bukrs = bkpf-bukrs AND
+                           belnr = bkpf-belnr AND
+                           gjahr = bkpf-gjahr AND
+                           ebeln <> ''.
+    IF bseg-shkzg = 'S'.
+      it_col_items-dmbtr = bseg-dmbtr.
+    ELSE.
+      it_col_items-dmbtr = bseg-dmbtr * -1.
+    ENDIF.
+    it_col_items-mwskz = bseg-mwskz.
+    it_col_items-ebeln = bseg-ebeln.
+    it_col_items-ebelp = bseg-ebelp.
+
+    COLLECT  it_col_items.
+
+  ENDSELECT.
+
+  DESCRIBE TABLE it_col_items LINES count.
+
+  count = count + deliv.
+*sprawdzenie EKKO
+  SELECT SINGLE * FROM ekko
+                 WHERE ebeln = it_col_items-ebeln.
+  IF sy-subrc <> 0.
+    CLEAR handle.
+    CLEAR: lt_ekpo, lt_ekpo[].
+* open existing archive files for read
+    CALL FUNCTION 'ARCHIVE_OPEN_FOR_READ'
+      EXPORTING
+        object             = 'MM_EKKO'
+        archive_document   = document
+      IMPORTING
+        archive_handle     = handle
+      EXCEPTIONS
+        internal_error     = 01
+        no_files_available = 02
+        object_not_found   = 03
+        open_error         = 04.
+
+
+    CLEAR archive_found.
+    DO.
+      IF archive_found = 'X'.
+        EXIT.
+      ENDIF.
+      CALL FUNCTION 'ARCHIVE_GET_NEXT_OBJECT'
+        EXPORTING
+          archive_handle          = handle
+        IMPORTING
+          object_id               = filepath-pathintern
+        EXCEPTIONS
+          end_of_file             = 01
+          internal_error          = 02
+          open_error              = 03
+          wrong_access_to_archive = 04.
+      IF sy-subrc NE 0.
+        CLEAR ls_ekpo.
+        EXIT.
+      ELSE.
+        check_ebeln = filepath-pathintern+3.
+        IF it_col_items-ebeln <> check_ebeln.
+          CONTINUE.
+        ENDIF.
+      ENDIF.
+
+      DO.
+*          IF archive_found = 'X'.
+*            EXIT.
+*          ENDIF.
+        CALL FUNCTION 'ARCHIVE_GET_NEXT_RECORD'
+          EXPORTING
+            archive_handle          = handle
+          IMPORTING
+            record                  = arc_buffer-segment
+            record_structure        = arc_buffer-rname
+          EXCEPTIONS
+            end_of_object           = 01
+            internal_error          = 02
+            wrong_access_to_archive = 03.
+        IF sy-subrc NE 0.
+          CLEAR ls_ekpo.
+          EXIT.
+        ENDIF.
+
+
+        IF arc_buffer-rname = 'EKPO'.
+*            MOVE arc_buffer-segment TO ls_ekpo.
+*>>> next lines in comment: program does not exist.
+*          PERFORM arch_move IN PROGRAM j_1p_arch_read
+*               USING arc_buffer-segment CHANGING ls_ekpo.
+
+
+*          IF it_col_items-ebeln = ls_ekpo-ebeln AND
+*             it_col_items-ebelp = ls_ekpo-ebelp.
+          APPEND ls_ekpo TO lt_ekpo.
+          archive_found = 'X'.
+*              EXIT.
+*          ELSE.
+*            CONTINUE.
+*          ENDIF.
+        ELSE.
+          CONTINUE.
+        ENDIF.
+
+
+      ENDDO.
+
+    ENDDO.
+
+* close the archiv files
+    CALL FUNCTION 'ARCHIVE_CLOSE_FILE'
+      EXPORTING
+        archive_handle = handle.
+
+
+  ENDIF.
+
+
+  LOOP AT it_col_items.
+    ADD 1 TO lp.
+
+    SELECT SINGLE matnr werks menge meins FROM ekpo
+            INTO (it_col_items-matnr, it_col_items-werks,
+                  gt_line-menge, gt_line-meins)
+                              WHERE ebeln = it_col_items-ebeln AND
+                                    ebelp = it_col_items-ebelp.
+*-----------------------------------------------------------
+*czytamy archiwum
+    IF sy-subrc <> 0.
+      CLEAR ls_ekpo.
+    READ TABLE lt_ekpo INTO ls_ekpo WITH KEY ebeln = it_col_items-ebeln
+                                             ebelp = it_col_items-ebelp.
+
+      it_col_items-matnr = ls_ekpo-matnr.
+      it_col_items-werks = ls_ekpo-werks.
+      gt_line-menge = ls_ekpo-menge.
+      gt_line-meins = ls_ekpo-meins.
+
+
+    ENDIF.
+*-----------------------------------------------------------
+    gt_line-lp = lp.
+*    gt_line-meins = bseg-meins.
+*    gt_line-menge = bseg-menge.
+    gt_line-netwr = it_col_items-dmbtr.
+    IF NOT it_col_items-matnr IS INITIAL.
+      SELECT SINGLE maktx FROM makt INTO gt_line-maktx WHERE matnr =
+       it_col_items-matnr AND spras = 'L'.
+    ELSE.
+      SELECT SINGLE txz01 FROM ekpo INTO gt_line-maktx
+                               WHERE ebeln = it_col_items-ebeln AND
+                                      ebelp = it_col_items-ebelp.
+    ENDIF.
+
+    IF gt_line-menge <> 0.
+      gt_line-netpr = gt_line-netwr / gt_line-menge.
+    ENDIF.
+***
+    CLEAR gt_mwdat. REFRESH gt_mwdat.
+    CLEAR gt_mwdat. REFRESH gt_mwdat.
+    CALL FUNCTION 'CALCULATE_TAX_FROM_NET_AMOUNT'
+      EXPORTING
+        i_wrbtr = gt_line-netwr
+        i_mwskz = it_col_items-mwskz
+        i_waers = 'PLN'
+        i_bukrs = bkpf-bukrs
+      TABLES
+        t_mwdat = gt_mwdat.
+
+    READ TABLE gt_mwdat INDEX 1.
+    dummy = ABS( gt_mwdat-msatz ).
+    CONDENSE dummy.
+    SPLIT dummy AT dot INTO gt_line-tax dummy.
+    IF count = 1.
+
+      SELECT SINGLE dmbtr FROM bseg INTO gt_line-vat
+                         WHERE bukrs = bkpf-bukrs AND
+                               belnr = bkpf-belnr AND
+                               gjahr = bkpf-gjahr AND
+                               buzid = 'T' AND
+                               mwskz = it_col_items-mwskz.
+    ELSE.
+      gt_line-vat = gt_line-netwr * ( ABS( gt_mwdat-msatz ) / 100 ).
+    ENDIF.
+
+    SELECT SINGLE steuc FROM marc INTO gt_line-pkwiu
+                               WHERE matnr = it_col_items-matnr AND
+                                       werks = it_col_items-werks.
+    IF gt_line-pkwiu IS INITIAL.
+      SELECT SINGLE casnr FROM marc INTO gt_line-pkwiu
+                                   WHERE matnr = rseg-matnr AND
+                                         werks = rseg-werks.
+
+    ENDIF.
+    APPEND gt_line.
+
+
+    gt_totals-taxn = gt_line-tax.
+    gt_totals-taxn1 = gt_line-tax.
+    gt_totals-netwr = gt_line-netwr.
+    gt_totals-netwrf = gt_line-netwrf."air22296 18/06
+*    gt_totals-vat = gt_line-vat.
+    gt_totals-mwskz = it_col_items-mwskz.
+    COLLECT gt_totals.
+  ENDLOOP.
+
+
+*  IF NOT handle IS INITIAL.
+** close the archiv files
+*    CALL FUNCTION 'ZARCHIVE_CLOSE_FILE'
+*      EXPORTING
+*        archive_handle = handle.
+*
+*  ENDIF.
+
+ENDFORM.                    "read_ekpo_archive
+
+*}   INSERT

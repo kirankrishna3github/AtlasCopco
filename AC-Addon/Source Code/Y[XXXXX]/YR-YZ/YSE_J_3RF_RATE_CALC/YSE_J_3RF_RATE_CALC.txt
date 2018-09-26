@@ -1,0 +1,1862 @@
+*&---------------------------------------------------------------------*
+*& Report  YSE_J_3RF_RATE_CALC
+*&
+*&---------------------------------------------------------------------*
+*&
+*&
+*&---------------------------------------------------------------------*
+
+REPORT  yse_j_3rf_rate_calc MESSAGE-ID /ccis/ficlr.
+
+TYPE-POOLS rsds.
+
+INCLUDE j_3rcaltop.
+INCLUDE j_3rf_rate_calc_top.
+INCLUDE yse_j_3rf_rate_calc_sel.
+*INCLUDE j_3rcalf00.
+INCLUDE yse_j_3rf_rate_calc_forms.
+INCLUDE mrm_const_mrm.
+
+INITIALIZATION.
+
+  SET TITLEBAR '100' of program gc_main_func.
+  PERFORM j3rf_rate_calc_init.
+
+START-OF-SELECTION.
+
+  PERFORM start_selection CHANGING g_data_ok.
+
+END-OF-SELECTION.
+
+  IF NOT g_data_ok IS INITIAL.
+    " show grid
+    PERFORM end_selection CHANGING g_data_back.
+  ENDIF.
+
+*&---------------------------------------------------------------------*
+*&      Form  SHOW_SELECTION
+*&---------------------------------------------------------------------*
+*       show popup screen to select down payments
+* Returns p_sel_ok = 'X' - user clicked Execute
+*         p_sel_ok = ' ' - user clicked Cancel or Back
+*----------------------------------------------------------------------*
+FORM show_selection
+
+  CHANGING p_sel_ok TYPE c.
+
+  CLEAR p_sel_ok.
+
+* call selection screen
+  CALL FUNCTION 'YSE_J3RF_RATE_CALC_SEL'
+    CHANGING
+      f_p_invdat   = p_invdat
+      f_p_clcdat   = p_clcdat
+      f_p_invrat   = p_invrat
+      f_p_clcrat   = p_clcrat
+    EXCEPTIONS
+      ex_cancelled = 1.
+
+  IF sy-subrc IS INITIAL.
+    p_sel_ok = 'X'.
+*   " initiate variant
+*    PERFORM check_selection_screen.
+  ELSEIF sy-ucomm = 'CCAN' or
+         sy-ucomm = 'CEND' or
+         sy-ucomm = 'CBAC'.
+*    IF automode CA gc_auto_mode_sel.
+    " Cancel is clicked - abort processing
+    MESSAGE e342(F5).
+*    ENDIF.
+  ENDIF.
+
+ENDFORM.                    "SHOW_SELECTION
+
+*&---------------------------------------------------------------------*
+*&      Form  START_SELECTION
+*&---------------------------------------------------------------------*
+*   event START-OF-SELECTION
+*   validate selection parameters
+*----------------------------------------------------------------------*
+FORM start_selection
+  CHANGING p_data_ok TYPE c.
+
+  DATA: l_subrc TYPE sy-subrc.
+
+  " check the data
+  TRY.
+      CLEAR p_data_ok.
+
+      PERFORM acount_info_fill.
+
+      IF p_invdat = 'X'.                  " if rate is calculated by invoice date
+        PERFORM get_invoice_rate.
+*        CLEAR p_clcrat.                   " then clear rate
+      ELSE.
+        rateequation-conv_date = p_clcdat." save date
+*        CLEAR p_clcdat.                   " otherwise clear date
+      ENDIF.
+
+      p_data_ok = 'X'.
+
+    CATCH cx_root INTO g_err_ex.
+
+      g_err_str = g_err_ex->get_longtext( ).
+      WRITE: / g_err_str.
+
+*     clear array
+      REFRESH: it_j_3rf_invoice.
+      EXIT.
+  ENDTRY.
+
+ENDFORM.                    "START_SELECTION
+
+*&---------------------------------------------------------------------*
+*&      Form  END_SELECTION
+*&---------------------------------------------------------------------*
+*   event END-OF-SELECTION
+*   show down payments list or clear invoice with down payments
+*----------------------------------------------------------------------*
+FORM end_selection CHANGING p_back TYPE c.
+
+  DATA:
+  it_inv    TYPE STANDARD TABLE OF j_3rfin_rate_clc WITH HEADER LINE,
+  l_dat(10) TYPE c.
+
+* save to the database
+  CLEAR it_inv.
+
+  " create invoice
+  IF it_inv IS INITIAL.
+    it_inv-mandt     = sy-mandt.
+    it_inv-lifnr     = p_lifnr.
+    it_inv-kunnr     = p_kunnr.
+    it_inv-usnam     = sy-uname.
+    if not p_invdat is initial.
+      it_inv-rate_inv  = g_dp_rate.
+      it_inv-dmbtr_inv = g_dp_rate * p_amount.
+    else.
+      it_inv-rate_inv  = p_clcrat.
+      it_inv-dmbtr_inv = p_clcrat * p_amount.
+    endif.
+    it_inv-wrbtr_inv = p_amount.
+    it_inv-waers_inv = p_waers.
+*    it_inv-awkey_inv = g_awkey_inv.
+*    it_inv-rate_clr  = g_cl_rate.
+    IF p_clcdat IS INITIAL.
+      p_clcdat = sy-datum.
+    ENDIF.
+    WRITE p_clcdat TO l_dat MM/DD/YYYY.
+    it_inv-gjahr_inv = l_dat+6(4). " extract year
+    it_inv-bukrs_inv = p_bukrs.
+    APPEND it_inv.
+  ENDIF.
+
+  CHECK LINES( it_inv ) > 0.
+
+  REFRESH: it_j_3rf_invoice.
+  LOOP AT it_inv.
+    MOVE-CORRESPONDING it_inv TO it_j_3rf_invoice.          "#EC ENHOK
+    APPEND it_j_3rf_invoice.
+  ENDLOOP.
+
+* clear memory
+  REFRESH: it_inv.
+
+ENDFORM.                    "END_SELECTION
+
+*&---------------------------------------------------------------------*
+*&      Form  refresh_grid
+*&---------------------------------------------------------------------*
+*       reload ALV grid
+*----------------------------------------------------------------------*
+FORM refresh_grid USING rs_selfield TYPE slis_selfield.
+
+  rs_selfield-exit = 'X'. " regenerate the grid
+  g_loop           = 'X'.
+
+ENDFORM.                    "refresh_grid
+
+*&---------------------------------------------------------------------*
+*&      Form  alv_grid
+*&---------------------------------------------------------------------*
+*       show grid
+*----------------------------------------------------------------------*
+FORM alv_grid CHANGING p_back TYPE c.
+
+  DATA: gt_fieldcat TYPE slis_t_fieldcat_alv,
+        gt_events   TYPE slis_t_event,
+        gt_sort     TYPE slis_t_sortinfo_alv,
+        ls_layout   TYPE slis_layout_alv,
+        ls_print    TYPE slis_print_alv,
+        i_exit(1)   TYPE c,
+        is_exit     TYPE slis_exit_by_user.
+
+* if there are selected downpayments then grid cannot be changed
+  CLEAR: g_locked, p_back.
+  READ TABLE it_j_3rf_downpay WITH KEY chk_sel = 'X'.
+  IF sy-subrc EQ 0.
+    g_locked = 'X'.
+  ENDIF.
+
+  CLEAR ls_print.
+  ls_print-reserve_lines      = '2'.
+  ls_print-no_print_listinfos = 'X'. "No print info
+  ls_print-no_print_selinfos  = 'X'. "No sel info
+
+  PERFORM rc_make_fieldcatalog USING g_locked CHANGING gt_fieldcat.
+  PERFORM rc_alv_events_make   CHANGING gt_events.
+  PERFORM rc_layout_build      CHANGING ls_layout.
+
+  CALL FUNCTION 'REUSE_ALV_VARIANT_SELECT'
+    EXPORTING
+      i_dialog            = ' '
+      it_default_fieldcat = gt_fieldcat[]
+      i_layout            = ls_layout
+    IMPORTING
+      et_sort             = gt_sort[]  "info about sort,filters...
+    CHANGING
+      cs_variant          = gx_variant
+    EXCEPTIONS
+      wrong_input         = 1
+      fc_not_complete     = 2
+      not_found           = 3
+      program_error       = 4
+      OTHERS              = 5.
+
+  CALL FUNCTION 'REUSE_ALV_LIST_DISPLAY'
+    EXPORTING
+      i_buffer_active          = space
+      i_callback_program       = sy-repid
+      i_callback_pf_status_set = 'RC_SET_PF_STATUS'
+      i_callback_user_command  = 'RC_USER_COMMAND'
+      it_fieldcat              = gt_fieldcat
+      i_default                = 'X'
+      i_save                   = 'A'
+      it_events                = gt_events
+      is_variant               = g_variant          "ALV variant
+      is_layout                = ls_layout
+      is_print                 = ls_print
+      it_sort                  = gt_sort[]
+    IMPORTING
+      e_exit_caused_by_caller  = i_exit
+      es_exit_caused_by_user   = is_exit
+    TABLES
+      t_outtab                 = it_j_3rf_downpay[]
+    EXCEPTIONS
+      program_error            = 1
+      OTHERS                   = 2.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+  IF is_exit-back = 'X'.
+    p_back = 'X'.
+  ELSEIF is_exit-cancel = 'X'.
+*    IF automode CA gc_auto_mode_sel.
+    " Cancel is clicked - abort processing
+    MESSAGE e342(F5).
+*    ENDIF.
+  ENDIF.
+ENDFORM.                    "alv_grid
+
+*&---------------------------------------------------------------------*
+*&      Form  RC_MAKE_FIELDCATALOG
+*&---------------------------------------------------------------------*
+FORM rc_make_fieldcatalog
+  USING    pa_locked   TYPE c
+  CHANGING pa_fieldcat TYPE slis_t_fieldcat_alv.
+
+  DATA         : fn TYPE string.
+  FIELD-SYMBOLS: <fs> LIKE LINE OF pa_fieldcat.
+
+*  get J_3RFPM_RATE_CLC field catalog
+  CALL FUNCTION 'REUSE_ALV_FIELDCATALOG_MERGE'
+    EXPORTING
+      i_program_name         = sy-repid
+      i_structure_name       = 'J_3RF_RATE_CALC_ALV'
+    CHANGING
+      ct_fieldcat            = pa_fieldcat[]
+    EXCEPTIONS
+      inconsistent_interface = 1
+      program_error          = 2
+      OTHERS                 = 3.
+  IF sy-subrc <> 0.
+    MESSAGE a011(msitem).
+  ENDIF.
+
+* by default show only the following fields
+  LOOP AT pa_fieldcat ASSIGNING <fs>.
+    CONCATENATE ',' <fs>-fieldname ',' INTO fn.
+
+    <fs>-no_out = 'X'.
+    IF ',CHK_SEL,CHK_PART,BELNR,BLART,BLDAT,' CS fn  OR
+       ',UMSKZ,BUZEI,GSBER,DMBTR,HWAER,'      CS fn  OR
+       ',WRBTR_INV,WAERS_INV,RATE_PAY,ZUONR,' CS fn.
+      <fs>-no_out = ' '.
+    ENDIF.
+
+    IF <fs>-fieldname EQ 'CHK_SEL' OR <fs>-fieldname EQ 'CHK_PART'.
+      IF pa_locked IS INITIAL.
+        <fs>-input     = 'X'.
+      ENDIF.
+      <fs>-checkbox  = 'X'.
+      <fs>-just      = 'C'.
+      IF <fs>-fieldname EQ 'CHK_SEL'.
+        <fs>-ddictxt   = 'M'.
+      ENDIF.
+    ENDIF.
+
+  ENDLOOP.
+
+ENDFORM.                               " RC_MAKE_FIELDCATALOG
+
+*&---------------------------------------------------------------------*
+*&      Form  RC_ALV_EVENTS_MAKE
+*&---------------------------------------------------------------------*
+FORM rc_alv_events_make CHANGING t_events TYPE slis_t_event.
+  DATA: wa_event TYPE slis_alv_event.
+
+  CALL FUNCTION 'REUSE_ALV_EVENTS_GET'
+    EXPORTING
+      i_list_type     = 0
+    IMPORTING
+      et_events       = t_events
+    EXCEPTIONS
+      list_type_wrong = 1
+      OTHERS          = 2.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+  READ TABLE t_events WITH KEY name = slis_ev_top_of_page
+                      INTO wa_event.
+  IF sy-subrc = 0.
+    MOVE 'RC_TOP_OF_PAGE' TO wa_event-form.
+    MODIFY t_events FROM wa_event INDEX sy-tabix.
+  ENDIF.
+  READ TABLE t_events WITH KEY name = slis_ev_top_of_list
+                      INTO wa_event.
+  IF sy-subrc = 0.
+    MOVE 'RC_TOP_OF_LIST' TO wa_event-form.
+    MODIFY t_events FROM wa_event INDEX sy-tabix.
+  ENDIF.
+
+*...delete all unneeded events:
+  DELETE t_events WHERE form IS INITIAL.
+
+ENDFORM.                               " RC_ALV_EVENTS_MAKE
+
+*&---------------------------------------------------------------------*
+*&      Form  rc_layout_build
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->LS_LAYOUT  text
+*----------------------------------------------------------------------*
+FORM rc_layout_build USING ls_layout TYPE slis_layout_alv.
+  CLEAR ls_layout.
+ENDFORM.                                               "e05_layout_build
+
+*&---------------------------------------------------------------------*
+*&      Form  acount_info_fill
+*&---------------------------------------------------------------------*
+*       read company information
+*----------------------------------------------------------------------*
+FORM acount_info_fill.
+
+  IF it_rc_t001-bukrs NE p_bukrs.
+    SELECT * FROM t001 INTO TABLE it_rc_t001 WHERE bukrs = p_bukrs.
+    READ TABLE it_rc_t001 INTO it_rc_t001 INDEX 1.
+    IF NOT sy-subrc IS INITIAL.
+      CLEAR it_rc_t001.
+    ENDIF.
+  ENDIF.
+
+* N1363895: read conversion factors
+  IF g_kurstyp IS INITIAL.
+    g_kurstyp = 'M'.
+  endif.
+
+  IF it_rc_t001-waers NE p_waers.
+    IF rateequation-fcurrp    NE p_waers          OR
+       rateequation-tcurrp    NE it_rc_t001-waers OR
+       rateequation-fcurrm    NE p_waers          OR
+       rateequation-tcurrm    NE it_rc_t001-waers OR
+       rateequation-kurstyp   NE g_kurstyp        OR
+       rateequation-conv_date NE p_clcdat.
+
+      PERFORM init_currency
+        USING g_kurstyp
+              p_clcdat
+              p_waers
+              it_rc_t001-waers
+              g_dp_rate.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    "acount_info_fill
+
+*&---------------------------------------------------------------------*
+*&      Form  SET_PF_STATUS
+*&---------------------------------------------------------------------*
+FORM rc_set_pf_status USING t_extab TYPE slis_t_extab.
+  DATA: fcode TYPE TABLE OF sy-ucomm.
+
+* if locked then do not allow SAVE
+*  IF automode CA gc_auto_mode_sel.
+*   SD: select down payments - do not allow clear
+*    IF g_locked NE 'X'.
+*      APPEND 'RESET' TO fcode.
+*    ENDIF.
+*  ELSEIF g_locked = 'X'.
+  if g_locked = 'X'.
+    APPEND 'SAVE'  TO fcode.
+    APPEND 'SAVD'  TO fcode.
+  ELSE.
+    APPEND 'RESET' TO fcode.
+  ENDIF.
+
+  SET PF-STATUS 'ALV_ITEMS' OF PROGRAM sy-repid EXCLUDING fcode.
+ENDFORM.                    "set_pf_status
+
+*&---------------------------------------------------------------------*
+*&      Form  RC_TOP_OF_PAGE
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM rc_top_of_page.
+*  PERFORM show_status.
+ENDFORM.                    "RC_TOP_OF_PAGE
+
+*&---------------------------------------------------------------------*
+*&      Form  RC_TOP_OF_LIST
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM rc_top_of_list.
+
+ENDFORM.                    "RC_TOP_OF_LIST
+
+*&---------------------------------------------------------------------*
+*&      Form  show_status
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM show_status.
+  CONSTANTS: status_column TYPE i VALUE 56,
+             rate_column   TYPE i VALUE 63.
+  DATA     : s TYPE string.
+
+  " conversion factors
+  PERFORM get_conv_factor CHANGING s.
+
+  WRITE: / 'Average Invoice Exchange Rate:'(806).
+  IF NOT g_dp_rate IS INITIAL.
+    WRITE: AT rate_column(16) g_dp_rate RIGHT-JUSTIFIED,
+           s.
+  ENDIF.
+
+  SKIP.
+ENDFORM.                    "show_status
+
+*&---------------------------------------------------------------------*
+*&      Form  RC_USER_COMMAND
+*&---------------------------------------------------------------------*
+FORM rc_user_command USING r_ucomm     LIKE sy-ucomm
+                           rs_selfield TYPE slis_selfield.  "#EC CALLED
+  DATA: i TYPE i.
+
+  IF r_ucomm EQ 'SAVD'.  " dummy function code
+    r_ucomm = 'SAVE'.
+  ENDIF.
+
+*  IF r_ucomm EQ '&IC1'.  " double click
+*    r_ucomm = 'ITEM'.
+*  ENDIF.
+
+*  CASE r_ucomm.
+*
+**   select all
+*    WHEN 'ALL_RC'.
+*      PERFORM okcode_all USING rs_selfield 'X'.
+*
+**   deselect all
+*    WHEN 'SAL_RC'.
+*      PERFORM okcode_all USING rs_selfield space.
+*
+**   display item:
+*    WHEN 'ITEM'.
+*      PERFORM okcode_item USING rs_selfield.
+*      rs_selfield-row_stable = 'X'.
+*      rs_selfield-col_stable = 'X'.
+*
+**   display master record info:
+*    WHEN 'MAST'.
+*      PERFORM okcode_mast USING rs_selfield.
+*
+**  preform calculations
+*    WHEN 'CALC' OR 'SAVE'.
+**     validate - only one partial payment allowed
+*      CLEAR i.
+*      LOOP AT it_j_3rf_downpay WHERE chk_sel = 'X' AND chk_part = 'X'.
+*        i = i + 1.
+*      ENDLOOP.
+*      IF i > 1.
+*        MESSAGE i108(/ccis/ficlr).
+*      ENDIF.
+
+*     save selected down payments
+  IF r_ucomm = 'SAVE'.
+    PERFORM okcode_save USING rs_selfield.
+  ENDIF.
+
+**   reset down payments list for selected customer
+*    WHEN 'RESET'.
+*      PERFORM okcode_reset USING rs_selfield.
+*
+*  ENDCASE.
+  CLEAR r_ucomm.
+
+ENDFORM.                               " RC_USER_COMMAND
+
+*&---------------------------------------------------------------------*
+*&      Form  okcode_all
+*&---------------------------------------------------------------------*
+*       select or deselect all items
+*----------------------------------------------------------------------*
+*      -->RS_SELFIELD  text
+*      -->PA_VALUE     text
+*----------------------------------------------------------------------*
+FORM okcode_all
+  USING rs_selfield TYPE slis_selfield
+        pa_value    TYPE c.
+
+  FIELD-SYMBOLS: <fs> LIKE LINE OF it_j_3rf_downpay.
+
+  LOOP AT it_j_3rf_downpay ASSIGNING <fs>.
+    <fs>-chk_sel = pa_value.
+  ENDLOOP.
+
+  rs_selfield-row_stable = 'X'.
+  rs_selfield-col_stable = 'X'.
+  rs_selfield-refresh    = 'X'.
+
+ENDFORM.                    "okcode_all
+
+*&---------------------------------------------------------------------*
+*&      Form  OKCODE_ITEM
+*&---------------------------------------------------------------------*
+FORM okcode_item USING rs_selfield TYPE slis_selfield.
+*... cursor on item line?
+  IF rs_selfield-tabindex > 0 AND rs_selfield-sumindex LE 0.
+*   set parameters:
+    READ TABLE it_j_3rf_downpay
+      INTO  it_j_3rf_downpay
+      INDEX rs_selfield-tabindex.
+    IF sy-subrc = 0.
+      SET PARAMETER ID 'BLN' FIELD it_j_3rf_downpay-belnr.
+      SET PARAMETER ID 'BUK' FIELD it_j_3rf_downpay-bukrs.
+      SET PARAMETER ID 'GJR' FIELD it_j_3rf_downpay-gjahr.
+
+      CALL TRANSACTION 'FB03' AND SKIP FIRST SCREEN.
+    ENDIF.
+  ELSE.
+    MESSAGE s001(msitem).
+  ENDIF.
+ENDFORM.                               " OKCODE_ITEM
+
+*&---------------------------------------------------------------------*
+*&      Form  OKCODE_MAST
+*&---------------------------------------------------------------------*
+FORM okcode_mast USING rs_selfield TYPE slis_selfield.
+
+  DATA: l_konto TYPE ktonr_av.
+
+*... cursor on item line?
+  IF rs_selfield-tabindex > 0 AND rs_selfield-sumindex LE 0.
+*   display master data related to item:
+    READ TABLE it_j_3rf_downpay INDEX rs_selfield-tabindex.
+    IF sy-subrc = 0.
+      IF NOT it_j_3rf_downpay-lifnr IS INITIAL.
+        l_konto = it_j_3rf_downpay-lifnr.
+      ELSEIF NOT it_j_3rf_downpay-kunnr IS INITIAL.
+        l_konto = it_j_3rf_downpay-kunnr.
+      ELSE.
+        EXIT.
+      ENDIF.
+
+      PERFORM display_master_rec USING l_konto
+                                       it_j_3rf_downpay-bukrs
+                                       it_j_3rf_downpay-koart.
+    ENDIF.
+  ELSE.
+    MESSAGE s013(msitem).
+  ENDIF.
+
+ENDFORM.                               " OKCODE_MAST
+
+*&---------------------------------------------------------------------*
+*&      Form  DISPLAY_MASTER_REC
+*&---------------------------------------------------------------------*
+FORM display_master_rec USING    p_items_konto TYPE ktonr_av
+                                 p_items_bukrs TYPE bukrs
+                                 p_items_koart TYPE koart.
+
+  DATA: text(100)    TYPE c VALUE space.
+
+  SET PARAMETER ID 'BUK' FIELD p_items_bukrs.
+  CASE p_items_koart.
+    WHEN gc_koart_d.
+      text = '/111/120/125/130/210/215/220/230/340/360/370/600/610'.
+      SET PARAMETER ID 'KUN' FIELD p_items_konto.
+      SET PARAMETER ID 'DDY' FIELD text.
+      CALL TRANSACTION 'FD03' AND SKIP FIRST SCREEN.
+    WHEN gc_koart_k.
+      text = '/111/120/130/210/215/220/380/600/610'.
+      SET PARAMETER ID 'LIF' FIELD p_items_konto.
+      SET PARAMETER ID 'DDY' FIELD text.
+      CALL TRANSACTION 'FK03' AND SKIP FIRST SCREEN.
+    WHEN gc_shkzg_s.
+      CALL FUNCTION 'GL_ACCT_MASTER_MAINTAIN_SINGLE'
+        EXPORTING
+          activity            = '1'
+          x_chart_of_accounts = 'X'
+          x_company_code      = 'X'
+          account_number      = p_items_konto
+          company_code        = p_items_bukrs
+        EXCEPTIONS
+          OTHERS              = 0.
+    WHEN OTHERS.
+  ENDCASE.
+
+ENDFORM.                               " DISPLAY_MASTER_REC
+
+*&---------------------------------------------------------------------*
+*&      Form  okcode_save
+*&---------------------------------------------------------------------*
+FORM okcode_save USING rs_selfield TYPE slis_selfield.
+  DATA: it_inv   TYPE STANDARD TABLE OF j_3rfin_rate_clc WITH HEADER LINE,
+        l_waers  TYPE waers.
+  DATA         : l_dat(10) TYPE c.
+
+
+* save to the database
+  CLEAR it_inv.
+
+  " create invoice
+  IF it_inv IS INITIAL.
+    it_inv-mandt     = sy-mandt.
+    it_inv-lifnr     = p_lifnr.
+    it_inv-kunnr     = p_kunnr.
+    it_inv-usnam     = sy-uname.
+    it_inv-rate_inv  = g_dp_rate.
+    it_inv-dmbtr_inv = g_dp_rate * p_amount.
+    it_inv-wrbtr_inv = p_amount.
+    it_inv-waers_inv = p_waers.
+    it_inv-awkey_inv = g_awkey_inv.
+    it_inv-rate_clr  = g_cl_rate.
+*      IF NOT b_gjahr IS INITIAL.
+*        it_inv-gjahr_inv = b_gjahr.
+*      ELSE.
+    IF p_clcdat IS INITIAL.
+      p_clcdat = sy-datum.
+    ENDIF.
+    WRITE p_clcdat TO l_dat MM/DD/YYYY.
+    it_inv-gjahr_inv = l_dat+6(4). " extract year
+*      ENDIF.
+    it_inv-bukrs_inv = p_bukrs.
+
+*      " auto clearing options
+*      it_inv-clr_auto  = 'X'.
+*      it_inv-clr_blart = b_blart.
+*      it_inv-clr_rstgr = b_rstgr.
+*      it_inv-clr_part  = pa_prpay.
+*      IF automode CA gc_auto_mode_sel. " if selection from SD
+*        it_inv-clr_auto = p_clear.    " then use customer selection
+*      ENDIF.
+
+    APPEND it_inv.
+  ENDIF.
+
+  CHECK LINES( it_inv ) > 0.
+
+*  IF automode NE gc_auto_mode_mm.
+**   save to the database (except MM)
+*  INSERT j_3rfin_rate_clc FROM TABLE it_inv.
+*  INSERT j_3rfpm_rate_clc FROM TABLE it_dp.
+*
+**   refresh the grid
+*    PERFORM refresh_grid USING rs_selfield.
+*  ELSE.
+*   MM - update list
+*    DELETE it_j_3rf_downpay WHERE chk_sel NE 'X'.
+  REFRESH: it_j_3rf_invoice.
+  LOOP AT it_inv.
+    MOVE-CORRESPONDING it_inv TO it_j_3rf_invoice.          "#EC ENHOK
+    APPEND it_j_3rf_invoice.
+  ENDLOOP.
+*  ENDIF.
+
+* clear memory
+  REFRESH: it_inv.
+
+* for selection from SD/MM - close the form
+*  IF automode CA gc_auto_mode_sel.
+  CLEAR g_loop.
+  rs_selfield-exit = 'X'.
+*  ENDIF.
+
+ENDFORM.                    "okcode_save
+
+*&---------------------------------------------------------------------*
+*&      Form  okcode_reset
+*&---------------------------------------------------------------------*
+*       Delete down payments from the temporary table
+*----------------------------------------------------------------------*
+FORM okcode_reset USING rs_selfield TYPE slis_selfield.
+
+* delete from database
+  PERFORM db_clear_down_payments USING p_lifnr p_kunnr.
+
+*  refresh the grid
+  PERFORM refresh_grid USING rs_selfield.
+
+ENDFORM.                    "okcode_reset
+
+*&---------------------------------------------------------------------*
+*&      Form  build_positions
+*&---------------------------------------------------------------------*
+*  Build positions list to call J_3RCALD / J_3RCALK
+*  The read_invoice() should be called to initiate global variables
+*  before this routine.
+*----------------------------------------------------------------------*
+FORM build_positions
+  CHANGING it_pos TYPE j3rc_tt_selpos.
+
+*  DATA: pay_amount TYPE bseg-wrbtr, " amount of selected down payments
+*        v          TYPE bseg-wrbtr, " temporary variable
+*        wa_bkpf    TYPE bkpf,
+*        amt        TYPE bseg-wrbtr,
+*        it_bkpf    TYPE TABLE OF bkpf,
+*        it_bseg    TYPE TABLE OF bseg,
+*        it_paypos  TYPE j3rc_tt_selpos,
+*        it_paybseg TYPE TABLE OF bseg,
+*        it_invpos  TYPE j3rc_tt_selpos,
+*        l_group    LIKE procpos-group.
+*  FIELD-SYMBOLS: <fs_bseg> TYPE bseg,
+*                 <fs_pos>  LIKE LINE OF procpos,
+*                 <fs_paypos> LIKE LINE OF it_paypos,
+*                 <fs_invpos> LIKE LINE OF it_invpos.
+*
+*  REFRESH: procpos, selposgr.
+*  CLEAR  : pay_amount.
+*
+** read invoice
+*  SELECT * FROM bkpf
+*    INTO TABLE it_bkpf
+*    WHERE bukrs = p_bukrs AND
+*          belnr = b_inv   AND
+*          gjahr = b_gjahr.
+*
+*  SELECT * FROM bseg
+*    INTO TABLE it_bseg
+*    WHERE bukrs = p_bukrs AND
+*          belnr = b_inv   AND
+*          gjahr = b_gjahr.
+*
+*  READ TABLE it_bkpf INTO wa_bkpf INDEX 1.
+*
+*  inv_waer-low = p_waers.  " clearing currency
+*
+** N1310626: load original payments
+*  SELECT * FROM bseg
+*    INTO TABLE it_paybseg
+*    FOR ALL ENTRIES IN it_j_3rf_downpay
+*    WHERE bukrs = it_j_3rf_downpay-bukrs AND
+*          belnr = it_j_3rf_downpay-belnr AND
+*          gjahr = it_j_3rf_downpay-gjahr AND
+*          buzei = it_j_3rf_downpay-buzei.
+*  SORT it_paybseg BY bukrs belnr gjahr buzei.
+*
+** recalculate down payments and partial amount
+*  PERFORM calc_down_payments USING p_amount p_clcdat p_clcrat.
+*
+**  build positions
+*  LOOP AT it_j_3rf_downpay.
+*    CLEAR procpos.
+*    MOVE-CORRESPONDING it_j_3rf_downpay TO procpos.
+*
+*    procpos-kunnr = p_kunnr.
+*    procpos-lifnr = p_lifnr.
+*    procpos-dmbtr = it_j_3rf_downpay-dmbtr.
+*    procpos-wrbtr = it_j_3rf_downpay-wrbtr_inv.
+*    procpos-kursf = it_j_3rf_downpay-rate_pay.
+*    procpos-waers = p_waers.
+*    procpos-clwrs = p_waers.
+*    pay_amount    = pay_amount + procpos-wrbtr.
+*
+*    procpos-clrng = abs( procpos-wrbtr ). " payment amount
+*    IF it_j_3rf_downpay-chk_part = 'X' AND NOT g_dp_partial IS INITIAL.
+*      " partial payment
+*      procpos-clrng = g_dp_partial. " payment amount
+*      pay_amount = pay_amount - procpos-wrbtr + g_dp_partial.
+*      procpos-clrng = g_dp_partial.
+*    ENDIF.
+*
+*    "N1310626: restore original payment
+*    READ TABLE it_paybseg ASSIGNING <fs_bseg>
+*      BINARY SEARCH
+*      WITH KEY bukrs = it_j_3rf_downpay-bukrs
+*               belnr = it_j_3rf_downpay-belnr
+*               gjahr = it_j_3rf_downpay-gjahr
+*               buzei = it_j_3rf_downpay-buzei.
+*    IF sy-subrc IS INITIAL.
+*      IF <fs_bseg>-dmbtr NE procpos-dmbtr.
+*        procpos-dmbtr = <fs_bseg>-dmbtr.
+*        procpos-wrbtr = <fs_bseg>-wrbtr.
+*      ENDIF.
+*    ENDIF.
+*
+*    APPEND procpos TO it_paypos.
+*  ENDLOOP.
+*
+** append all items for invoice, limit invoice to selected down payments
+*  CLEAR amt.
+*  LOOP AT it_bseg ASSIGNING <fs_bseg>.
+*    IF NOT p_kunnr IS INITIAL.
+*      CHECK <fs_bseg>-kunnr = p_kunnr.
+*    ELSEIF NOT p_lifnr IS INITIAL.
+*      CHECK <fs_bseg>-lifnr = p_lifnr.
+*    ELSE.
+*      EXIT.
+*    ENDIF.
+*
+*    CLEAR procpos.
+*    MOVE-CORRESPONDING wa_bkpf   TO procpos.                "#EC ENHOK
+*    MOVE-CORRESPONDING <fs_bseg> TO procpos.                "#EC ENHOK
+*    procpos-clwrs = p_waers.
+*
+*    " if currency of the invoice doesn't match to clearing currency then convert
+*    IF procpos-waers NE p_waers.
+*      " for LC
+*      IF p_waers EQ it_rc_t001-waers.
+*        procpos-wrbtr = procpos-dmbtr.
+*      ELSE.
+*        " calculate exchange rate on the invoice date
+*        CALL FUNCTION 'CONVERT_TO_FOREIGN_CURRENCY'
+*          EXPORTING
+*            date             = wa_bkpf-budat
+*            foreign_currency = p_waers
+*            local_amount     = procpos-dmbtr
+*            local_currency   = it_rc_t001-waers
+*          IMPORTING
+*            foreign_amount   = procpos-wrbtr
+*          EXCEPTIONS
+*            OTHERS           = 6.
+*        IF sy-subrc <> 0.
+*          MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+*             WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+*        ENDIF.
+*      ENDIF.
+*
+*      procpos-waers = p_waers. " override currency
+*    ENDIF.
+*
+*    procpos-clrng = abs( procpos-wrbtr ).
+*
+*    " limit to payed amount
+*    v = amt + procpos-wrbtr.
+*    IF v > pay_amount.
+*      " partial payment amount
+*      procpos-clrng = abs( pay_amount - amt ).
+*    ENDIF.
+*
+*    APPEND procpos TO it_invpos.
+*
+*    IF procpos-difsumma IS INITIAL.
+*      amt = amt + procpos-wrbtr.
+*    ELSE.
+*      amt = amt + ABS( procpos-clrng ).
+*    ENDIF.
+*  ENDLOOP.
+*
+** N1307599 - split invoice positions for each payment
+** use group to group positions
+** sort by amount.
+*  SORT it_paypos BY wrbtr.
+*  SORT it_invpos BY wrbtr.
+*  LOOP AT it_paypos ASSIGNING <fs_paypos>.
+*    l_group = sy-tabix.
+*    pay_amount = <fs_paypos>-clrng. " payment clearing amount
+*
+*    " create payment position
+*    IF pay_amount <> abs( <fs_paypos>-wrbtr ).
+*      " change partial invoice
+*      IF pa_remin = 'X'.
+*        " residual item
+*        <fs_paypos>-difsumma = ABS( <fs_paypos>-wrbtr - pay_amount ).
+*        " set negative sign
+*        IF procpos-shkzg EQ gc_shkzg_h.
+*          <fs_paypos>-difsumma = - <fs_paypos>-difsumma.
+*        ENDIF.
+*      ELSE.
+*        " partial payment
+*        <fs_paypos>-difsumma = pay_amount.
+*      ENDIF.
+*    ENDIF.
+*    <fs_paypos>-clrng = pay_amount.
+*    <fs_paypos>-group = l_group.
+*    <fs_paypos>-umsks = 'A'.  " down payment
+*    APPEND <fs_paypos> TO it_pos.
+*
+*    " process invoice positions
+*    LOOP AT it_invpos ASSIGNING <fs_invpos> WHERE clrng > 0.
+*      amt = <fs_invpos>-clrng. " invoice clearing amount
+*      IF amt > pay_amount.
+*        amt = pay_amount. " amount for clearing
+*      ENDIF.
+*      MOVE-CORRESPONDING <fs_invpos> TO procpos.
+*      procpos-clrng = amt.
+*      procpos-clwrs = p_waers.
+*      IF procpos-wrbtr <> amt.
+*         " partial position
+*        IF pa_remin = 'X'.
+*          " residual item
+*          "procpos-difsumma = ABS( procpos-clrng - amt ).
+*          procpos-difsumma = ABS( procpos-wrbtr - amt ).
+*          " set negative sign
+*          IF procpos-shkzg EQ gc_shkzg_h.
+*            procpos-difsumma = - procpos-difsumma.
+*          ENDIF.
+*        ELSE.
+*          " partial payment
+*          procpos-difsumma = amt.
+*        ENDIF.
+*        procpos-clrng = amt.
+*      ENDIF.
+*      procpos-group = l_group.
+*      APPEND procpos TO it_pos.
+*
+*      " subtract cleared amount
+*      <fs_invpos>-clrng = <fs_invpos>-clrng - amt.
+*      pay_amount        = pay_amount - amt.
+*      IF pay_amount <= 0.
+*        EXIT. " if payment is assigned then stop the loop
+*      ENDIF.
+*    ENDLOOP.
+*  ENDLOOP.
+*
+** fill fields
+*  LOOP AT it_pos ASSIGNING <fs_pos>.
+*    IF <fs_pos>-rebzg EQ space OR
+*       <fs_pos>-rebzj EQ space OR
+*       <fs_pos>-rebzz EQ space OR
+*       <fs_pos>-rebzt = 'V'.
+*      <fs_pos>-rebzg = <fs_pos>-belnr.
+*      <fs_pos>-rebzz = <fs_pos>-buzei.
+*      <fs_pos>-rebzj = <fs_pos>-gjahr.
+*    ENDIF.
+*  ENDLOOP.
+
+ENDFORM.                    "build_positions
+
+*&---------------------------------------------------------------------*
+*&      Form  j_3rf_rate_calc_enabled
+*&---------------------------------------------------------------------*
+*       Returns pa_enabled='X' when customization in T007K is enabled
+*----------------------------------------------------------------------*
+*      -->FENABLED   text
+*----------------------------------------------------------------------*
+FORM j_3rf_rate_calc_enabled
+
+  USING    pa_land    TYPE t007k-land1
+  CHANGING pa_enabled TYPE c.
+
+  STATICS: l_enabled TYPE c VALUE '1',
+           l_land    TYPE t007k-land1.
+
+  IF l_enabled EQ '1'     OR   " valid values are ' ' or 'X'
+     l_land    NE pa_land.
+
+    DATA: wa_t007k TYPE t007k.
+
+    l_land    = pa_land.
+    l_enabled = ' '.
+    SELECT SINGLE * FROM t007k
+      INTO wa_t007k
+      WHERE land1   = l_land    AND
+            version = gc_t007k_ver_calc.
+    IF sy-subrc IS INITIAL.
+      l_enabled = 'X'.
+    ENDIF.
+  ENDIF.
+  pa_enabled = l_enabled.
+
+ENDFORM.                    "j_3rf_rate_calc_enabled
+
+*&---------------------------------------------------------------------*
+*&      Form  j_3rf_rate_calc_userexit
+*&---------------------------------------------------------------------*
+*
+*  SD part - show dialog, select down payments
+*  The routine is called from EXIT_SAPLV60A_001 (BADI enhancement SDVFX009)
+*  before the SD invoice is created. The routine allows a user to select
+*  down payments and replaces SD document currency rate (xvbrk-kurrf).
+*
+*----------------------------------------------------------------------*
+*      -->XVBRK      invoice header record
+*      -->VBRK       invoice header record
+*----------------------------------------------------------------------*
+FORM j_3rf_rate_calc_userexit
+  USING    with_posting TYPE c
+  CHANGING fxvbrk TYPE vbrkvb
+           fvbrk  TYPE vbrk.
+
+  DATA: l_valid   TYPE c,
+        l_sel_ok  TYPE c,
+        l_data_ok TYPE c,
+        l_konto   TYPE lifnr.
+
+** no dialog for batch inputs and backgrounds
+*  CHECK sy-binpt IS INITIAL AND sy-batch IS INITIAL.
+*
+** should the document be processed?
+*  PERFORM if_process_sd
+*     USING    with_posting
+*              fxvbrk
+*     CHANGING l_valid.
+*  CHECK l_valid = 'X'.
+*
+** skip STORNOs
+*  CHECK fxvbrk-fksto IS INITIAL.
+*  CHECK fxvbrk-sfakn IS INITIAL.
+*  CHECK fxvbrk-vbtyp CA vbtyp_fakt.     " only BILLING
+*  CHECK fxvbrk-vbtyp NA vbtyp_fakt_sto. " skip STORNO
+** N1340757 - now user defines document types
+** CHECK fxvbrk-vbtyp NA vbtyp_fakt_gut. " skip CREDIT MEMO
+** CHECK fxvbrk-vbtyp NA vbtyp_last.     " skip DEBIT MEMO
+** CHECK fxvbrk-vbtyp NA vbtyp_prof.     " skip PROFORMA
+** CHECK fxvbrk-fktyp NE 'P'.            " skip DOWN PAYMENTS
+*
+** routine works when a new document is created only
+*  CHECK fxvbrk-belnr IS INITIAL AND NOT fxvbrk-vbeln IS INITIAL.
+*
+** initialize global variables
+*  CLEAR: p_rb_lif, p_lifnr, p_clear.
+*  p_bukrs  = fxvbrk-bukrs.
+*  p_rb_kun = 'X'.
+*  p_kunnr  = fxvbrk-kunrg.
+** amount = NET + TAX
+*  p_amount = fxvbrk-netwr + fxvbrk-mwsbk.
+*  p_waers  = fxvbrk-waerk.
+*  p_clcdat = fxvbrk-fkdat.
+*  bkpf-waers = p_waers. "N1363895 - set currency
+*
+** N1363895
+*  if fxvbrk-vbtyp ca '56' and not fxvbrk-kurst is initial.
+*    g_kurstyp = fxvbrk-kurst.
+*  else.
+*    g_kurstyp = 'M'.
+*  endif.
+*  g_dp_rate = fxvbrk-kurrf.
+*
+** enable for foreign currencies only
+*  PERFORM acount_info_fill.
+*  CHECK ( NOT it_rc_t001-waers IS INITIAL ) AND
+*        ( it_rc_t001-waers NE p_waers     ).
+*
+** check whether the customization is enabled for country
+*  PERFORM j_3rf_rate_calc_enabled
+*    USING    it_rc_t001-land1
+*    CHANGING l_valid.
+*  CHECK l_valid = 'X'.
+*
+** check whether the SD biling type is enabled
+*  PERFORM if_sd_fkart_enabled
+*    USING    fxvbrk-fkart
+*             p_bukrs
+*    CHANGING l_valid.
+*  CHECK l_valid = 'X'.
+*
+** validate: if the customer/vendor was already locked then
+** invoice amount should be matched to the entered value
+** when down payments were selected
+*  PERFORM check_invoice
+*    USING p_bukrs
+*          p_lifnr
+*          p_kunnr
+*          p_amount
+*          p_waers
+*    CHANGING
+*          l_valid
+*          g_uname.
+*  IF l_valid NE 'X'.
+*    " show error, break billing process
+*    IF NOT p_lifnr IS INITIAL.
+*      l_konto = p_lifnr.
+*    ELSE.
+*      l_konto = p_kunnr.
+*    ENDIF.
+*    MESSAGE e115(/ccis/ficlr) WITH l_konto p_bukrs g_uname.
+*    EXIT.
+*  ENDIF.
+*
+*  CLEAR p_zuonr.
+*  IF fxvbrk-zuonr NE fxvbrk-vbeln AND fxvbrk-zuonr(1) NE '$'.
+*    " ZUONR is filled only when ZUONR is a parameter for automatic clearing
+*    DATA: l_ktopl TYPE tf123-ktopl.
+*    SELECT SINGLE ktopl FROM tf123
+*      INTO l_ktopl
+*      WHERE ktopl = it_rc_t001-ktopl
+*        AND ( bedg1 = 'ZUONR' OR
+*              bedg2 = 'ZUONR' OR
+*              bedg3 = 'ZUONR' OR
+*              bedg4 = 'ZUONR' OR
+*              bedg5 = 'ZUONR' ).
+*    IF sy-subrc IS INITIAL.
+*      p_zuonr = fxvbrk-zuonr.
+*    ENDIF.
+*  ENDIF.
+*
+** call the screen to select down payments
+*  automode = gc_auto_mode_sd.
+*  p_clear  = 'X'. " clearing by default
+*  DO.
+*    CLEAR: l_sel_ok, l_data_ok.
+*
+*    " call selection screen
+*    PERFORM show_selection  CHANGING l_sel_ok.
+*    IF l_sel_ok IS INITIAL.
+*      EXIT.
+*    ENDIF.
+*
+*    PERFORM start_selection CHANGING l_data_ok.
+*    IF l_data_ok EQ 'X'.
+*      PERFORM end_selection CHANGING g_data_back.
+*      IF g_data_back EQ 'X'.
+*        CONTINUE.
+*      ENDIF.
+*      EXIT.
+*    ENDIF.
+*  ENDDO.
+*
+*  CHECK NOT l_data_ok IS INITIAL.
+*
+** get list of down payments
+*  PERFORM get_down_payments
+*    TABLES p_belnr
+*           p_budat
+*           p_bldat
+*           p_umskz
+*    USING  p_bukrs
+*           p_lifnr
+*           p_kunnr
+*           p_zuonr
+*           p_gsber
+*           p_waers
+*           p_pwaers
+*  .
+*
+*  IF LINES( it_j_3rf_downpay ) > 0.
+*    " validate that there are selected payments
+*    READ TABLE it_j_3rf_downpay WITH KEY chk_sel = 'X'.
+*    IF sy-subrc IS INITIAL.
+*      PERFORM calc_down_payments USING p_amount p_clcdat p_clcrat.
+*
+*      IF NOT g_dp_rate IS INITIAL.
+*        " check back rates
+*        IF fxvbrk-kurrf < 0.
+*          g_dp_rate = - ( c_round_mul / g_dp_rate ) / c_round_mul.
+*        ENDIF.
+*
+*        " change currency rate in SD document
+*        fxvbrk-kurrf = g_dp_rate.
+*        fvbrk-kurrf  = fxvbrk-kurrf.
+*      ENDIF.
+*    ENDIF.
+*  ENDIF.
+
+ENDFORM.                    "j_3rf_rate_calc_userexit
+
+*&---------------------------------------------------------------------*
+*&      Form  send_message
+*&---------------------------------------------------------------------*
+*       send express document to a user
+*----------------------------------------------------------------------*
+*      -->t_msgs  - table with messages
+*      -->p_title - message title
+*----------------------------------------------------------------------*
+FORM send_message
+  TABLES t_msgs STRUCTURE soli
+  USING  p_title TYPE string.
+
+  DATA: l_object_type LIKE sood-objtp,
+        t_obj_hd_chn  TYPE TABLE OF sood1 WITH HEADER LINE,
+        t_obj_head    TYPE TABLE OF soli  WITH HEADER LINE,
+        t_raw_head    TYPE TABLE OF sorh  WITH HEADER LINE,
+        t_receivers   TYPE TABLE OF soos1 WITH HEADER LINE.
+
+*  message header
+  MOVE p_title  TO t_obj_hd_chn-objdes. " Title
+  MOVE 'F'      TO t_obj_hd_chn-objsns. " Functional OBJECT
+  MOVE sy-langu TO t_obj_hd_chn-objla.  " Language
+
+* Object type of the new document
+  MOVE 'RAW' TO l_object_type.
+
+* Specific header (Dependent on the object type, here RAW)
+  REFRESH t_obj_head.
+  DESCRIBE TABLE t_msgs LINES t_raw_head-rawsiz.
+  MOVE t_raw_head TO t_obj_head.
+  APPEND t_obj_head.
+
+* send to myself
+  REFRESH t_receivers.
+  CLEAR   t_receivers.
+  MOVE sy-uname TO t_receivers-recnam. " User name
+  MOVE 'B' TO t_receivers-recesc.      " Receiver type: "SAP user"
+  MOVE 'X' TO t_receivers-sndex.       " express document
+  APPEND t_receivers.
+
+* send message
+  CALL FUNCTION 'SO_OBJECT_SEND'
+    EXPORTING
+      object_hd_change = t_obj_hd_chn
+      object_type      = l_object_type
+      outbox_flag      = ''
+      owner            = sy-uname
+      store_flag       = space
+    TABLES
+      objcont          = t_msgs
+      objhead          = t_obj_head
+      receivers        = t_receivers.
+
+ENDFORM.                    "send_message
+
+*&---------------------------------------------------------------------*
+*&      Form  send_notify
+*&---------------------------------------------------------------------*
+*       send notification message
+*----------------------------------------------------------------------*
+FORM log_clearing_result
+  USING it_log_result TYPE t_log_result.
+
+*  DATA: t_msgs  TYPE STANDARD TABLE OF soli WITH HEADER LINE,
+*        l_title TYPE string,
+*        p_succ  TYPE c,
+*        p_fault TYPE c,
+*        p_batch TYPE c,
+*        i_batch TYPE i.
+*  FIELD-SYMBOLS: <fs> LIKE LINE OF it_log_result.
+*
+*  REFRESH t_msgs.
+*  CLEAR   t_msgs.
+*
+** set
+*  LOOP AT it_log_result ASSIGNING <fs>.
+*    IF <fs>-success = 'X'.
+*      p_succ = 'X'.
+*    ELSE.
+*      p_fault = 'X'.
+*    ENDIF.
+*    IF <fs>-batch = 'X'.
+*      p_batch = 'X'.
+*      i_batch = i_batch + 1.
+*    ENDIF.
+*  ENDLOOP.
+*
+**  build message body
+*  IF p_fault IS INITIAL.
+*    l_title = 'Invoice & has been cleared successfully'(812).
+*    REPLACE '&' WITH b_inv INTO l_title.
+*  ELSE.
+*    l_title = 'Invoice & cannot be cleared.'(808).
+*    REPLACE '&' WITH b_inv INTO l_title.
+*  ENDIF.
+*
+*  IF p_succ = 'X'.
+*    t_msgs-line = 'Invoice & is cleared automatically with down payments:'(813).
+*    REPLACE '&' WITH b_inv INTO t_msgs-line.
+*    APPEND t_msgs.
+*
+*    LOOP AT it_log_result ASSIGNING <fs> WHERE success = 'X'.
+*      CONCATENATE '   ' <fs>-belnr_pay ' - ' text-807 INTO t_msgs-line.
+*      REPLACE '&' WITH <fs>-desc INTO t_msgs-line.
+*      APPEND t_msgs.
+*    ENDLOOP.
+*    APPEND INITIAL LINE TO t_msgs.
+*  ENDIF.
+*
+*  IF p_fault = 'X'.
+**   message content
+*    t_msgs-line = 'Invoice & cannot be cleared automatically with down payments:'(814).
+*    REPLACE '&' WITH b_inv INTO t_msgs-line.
+*    APPEND t_msgs.
+*    LOOP AT it_log_result ASSIGNING <fs> WHERE success = ' '.
+*      IF NOT <fs>-belnr_pay IS INITIAL.
+*        CONCATENATE '   ' <fs>-belnr_pay INTO t_msgs-line.
+*        APPEND t_msgs.
+*      ENDIF.
+*      IF NOT <fs>-desc IS INITIAL.
+*        t_msgs-line = <fs>-desc.
+*        APPEND t_msgs.
+*      ENDIF.
+*    ENDLOOP.
+*    APPEND INITIAL LINE TO t_msgs.
+*    ENDIF.
+*
+*    IF p_batch = 'X'.
+*    t_msgs-line = 'Run batch input to clear invoice'(809).
+*    APPEND t_msgs.
+*    APPEND INITIAL LINE TO t_msgs.
+*  ENDIF.
+*
+** if several batch inputs are created then invoice should be cleared manually
+*  IF i_batch > 1.
+*    t_msgs-line = text-819.
+*    APPEND t_msgs.
+*  ENDIF.
+*
+** log
+*  WRITE: / l_title.
+*  SKIP.
+*  LOOP AT t_msgs.
+*    WRITE: / t_msgs-line.
+*  ENDLOOP.
+*
+** send message for job or background
+*  IF automode CA gc_auto_mode_sel OR g_bkgrnd = 'X'.
+*    PERFORM send_message
+*       TABLES t_msgs
+*       USING  l_title.
+*  ENDIF.
+
+ENDFORM.                    "send_notify
+
+*&---------------------------------------------------------------------*
+*&      Form  if_process_sd
+*&---------------------------------------------------------------------*
+*       Returns pa_enabled='X' when SD document should be processed
+*----------------------------------------------------------------------*
+*      <-- with_posting - posting type
+*      <-- fxvbrk       - SD document
+*      --> pa_enabled   - result
+*----------------------------------------------------------------------*
+FORM if_process_sd
+  USING    with_posting TYPE c
+           fxvbrk       TYPE vbrkvb
+  CHANGING pa_enabled TYPE c.
+
+  DATA: l_rfbsk   TYPE vbrkvb-rfbsk.
+
+* check validity of the SD document
+  l_rfbsk = fxvbrk-rfbsk.
+  IF l_rfbsk CA 'FGN'.
+    l_rfbsk = space.
+  ENDIF.
+  IF l_rfbsk CA ' B'.
+    IF fxvbrk-uvprs = 'X'.
+      l_rfbsk = 'F'.
+    ELSEIF fxvbrk-uvals CA 'XY'.
+      l_rfbsk = 'G'.
+    ENDIF.
+  ENDIF.
+
+  CLEAR pa_enabled.
+
+* Comment or uncomment lines 1) or 2) to define valid behaviour
+* 1) dialog for "Release to accounting" only
+  IF with_posting CA 'ABCDEFH'.
+    IF ( l_rfbsk CA ' H' ) OR
+       ( l_rfbsk = 'A' AND with_posting = 'H' ).
+      pa_enabled = 'X'.
+    ENDIF.
+  ENDIF.
+
+* 2) dialog when SD document is created only
+* IF fxvbrk-vbeln(1) EQ '$'.
+*   pa_enabled = 'X'.
+* ENDIF.
+
+* 3) or you can enhance the routine here
+ENDFORM.                    "if_process_sd
+
+*&---------------------------------------------------------------------*
+*&      Form  if_sd_fkart_enabled
+*&---------------------------------------------------------------------*
+*       Returns pa_enabled='X' when type of SD document is enabled
+*----------------------------------------------------------------------*
+*      <-- pa_fkart   - SD document type
+*      <-- pa_bukrs   - company code
+*      --> pa_enabled - result
+*----------------------------------------------------------------------*
+FORM if_sd_fkart_enabled
+  USING    pa_fkart   TYPE FKART
+           pa_bukrs   TYPE BUKRS
+  CHANGING pa_enabled TYPE c.
+
+  DATA: wa TYPE J_3RFSD_RATE_CLC.
+
+  CLEAR pa_enabled.
+
+  SELECT SINGLE * FROM J_3RFSD_RATE_CLC
+    INTO wa
+    WHERE ( bukrs = pa_bukrs and fkart = pa_fkart ) or
+          ( bukrs = ''       and fkart = pa_fkart ) or
+          ( bukrs = pa_bukrs and fkart = '' ).
+  IF sy-subrc IS INITIAL.
+    pa_enabled = 'X'.
+  ENDIF.
+
+ENDFORM.                    "if_sd_fkart_enabled
+
+************************************************************************
+*                               MM routines
+************************************************************************
+
+*&---------------------------------------------------------------------*
+*&      Form  j_3rf_rate_calc_mm_fcobu
+*&---------------------------------------------------------------------*
+*
+*  The routine is called before the MM invoice is created.
+*  The routine allows a user to select down payments and replaces MM
+*  document currency rate (rbkpv-kursf and it_drseg-kursf).
+*
+*----------------------------------------------------------------------*
+*      -->rbkpv      invoice header
+*      -->it_drseg   invoice positions
+*----------------------------------------------------------------------*
+FORM j_3rf_rate_calc_mm_fcobu
+  CHANGING rbkpv    TYPE mrm_rbkpv
+           it_drseg TYPE mmcr_tdrseg.
+
+  DATA: l_valid   TYPE c,
+        l_sel_ok  TYPE c,
+        l_data_ok TYPE c,
+        l_konto   TYPE lifnr,
+        l_abend   TYPE i,
+        l_error   TYPE i.
+  FIELD-SYMBOLS: <fs_drseg> LIKE LINE OF it_drseg.
+
+* no dialog for batch inputs and backgrounds
+  CHECK sy-binpt IS INITIAL AND sy-batch IS INITIAL.
+
+* skip STORNOs
+  CHECK rbkpv-stblg IS INITIAL.
+
+* should the MM document be processed?
+  PERFORM if_process_mm
+     USING    rbkpv
+              it_drseg
+     CHANGING l_valid.
+  CHECK l_valid = 'X'.
+
+* check for error messages
+  CALL FUNCTION 'MRM_PROT_ANALYSE'
+    EXPORTING
+      i_rblgp = 0
+    IMPORTING
+      e_abend = l_abend
+      e_error = l_error.
+* check for errors
+* CHECK l_abend EQ 0 AND l_error EQ 0.
+
+** did we already select down payments?
+*  PERFORM if_mm_selected
+*     USING    rbkpv
+*              it_drseg
+*     CHANGING l_valid.
+*  CHECK l_valid IS INITIAL. " do not reselect
+
+  REFRESH: it_j_3rf_invoice[].
+
+* initialize global variables
+  CLEAR: p_lifnr.
+  p_bukrs  = rbkpv-bukrs.
+  p_lifnr  = rbkpv-lifnr.
+  p_amount = rbkpv-rmwwr.
+  p_waers  = rbkpv-waers.
+  p_clcdat = rbkpv-budat.
+  bkpf-waers = p_waers. "N1363895 - set currency
+* CLEAR g_awkey_inv.
+
+* check invoice amount and currency
+  CHECK p_amount NE '0.00' AND
+        p_waers  NE space.
+
+* read Type for Determining the Proposed Rate
+  clear g_kurstyp.
+  select single kurst from t003 into g_kurstyp
+                      where blart = rbkpv-blart.
+  if sy-subrc ne 0.
+    g_kurstyp = 'M'.
+  endif.
+  g_dp_rate = rbkpv-kursf.
+
+* enable for foreign currencies only
+  PERFORM acount_info_fill.
+  CHECK ( NOT it_rc_t001-waers IS INITIAL ) AND
+        ( it_rc_t001-waers NE p_waers     ).
+
+* check whether the customization is enabled for country
+  PERFORM j_3rf_rate_calc_enabled
+    USING    it_rc_t001-land1
+    CHANGING l_valid.
+  CHECK l_valid = 'X'.
+
+* check whether the MM Purchase Order type is enabled
+  PERFORM if_mm_bsart_enabled
+    USING    rbkpv
+             it_drseg
+    CHANGING l_valid.
+  CHECK l_valid = 'X'.
+
+* call the screen to manipulate exchange rate
+  DO.
+    CLEAR: l_sel_ok, l_data_ok.
+
+    " call selection screen
+    PERFORM show_selection  CHANGING l_sel_ok.
+    IF l_sel_ok IS INITIAL.
+      EXIT.
+    ENDIF.
+
+    PERFORM start_selection CHANGING l_data_ok.
+    IF l_data_ok EQ 'X'.
+      PERFORM end_selection CHANGING g_data_back.
+      IF g_data_back EQ 'X'.
+        CONTINUE.
+      ENDIF.
+      EXIT.
+    ENDIF.
+  ENDDO.
+
+  if not p_clcrat is initial.
+    rbkpv-kursf = p_clcrat.
+  endif.
+
+  loop at it_drseg assigning <fs_drseg>.
+    <fs_drseg>-kursf = rbkpv-kursf.
+  endloop.
+
+ENDFORM.                    "j_3rf_rate_calc_mm_fcobu
+
+*&---------------------------------------------------------------------*
+*&      Form  j_3rf_rate_calc_mm_post
+*&---------------------------------------------------------------------*
+*
+*  The routine is called from function module MRM_INVOICE_POST.
+*  The routine locks the partner.
+*
+*----------------------------------------------------------------------*
+*      -->rbkpv      invoice header
+*      -->it_drseg   invoice positions
+*----------------------------------------------------------------------*
+FORM j_3rf_rate_calc_mm_post
+  USING rbkpv    TYPE mrm_rbkpv
+        it_drseg TYPE mmcr_tdrseg.
+
+  DATA: l_valid     TYPE c,
+        rs_selfield TYPE slis_selfield. "dummy variable
+
+* no dialog for batch inputs and backgrounds
+  CHECK sy-binpt IS INITIAL AND sy-batch IS INITIAL.
+
+* skip STORNOs
+  CHECK rbkpv-stblg IS INITIAL.
+
+* should the MM document be processed?
+  PERFORM if_process_mm
+     USING    rbkpv
+              it_drseg
+     CHANGING l_valid.
+  CHECK l_valid = 'X'.
+
+* did we already select down payments?
+  PERFORM if_mm_selected
+     USING    rbkpv
+              it_drseg
+     CHANGING l_valid.
+  CHECK l_valid = 'X'.
+
+* save to the database
+*  automode = gc_auto_mode_sd.
+  PERFORM okcode_save USING rs_selfield.
+
+  REFRESH: it_j_3rf_invoice, it_j_3rf_downpay[].
+
+ENDFORM.                    "j_3rf_rate_calc_mm_post
+
+*&---------------------------------------------------------------------*
+*&      Form  if_process_mm
+*&---------------------------------------------------------------------*
+*       Returns pa_enabled='X' when MM document should be processed
+*----------------------------------------------------------------------*
+*      <-- pa_rbkpv     - MM document
+*      <-- it_drseg     - MM items
+*      --> pa_enabled   - result
+*----------------------------------------------------------------------*
+FORM if_process_mm
+  USING    pa_rbkpv   TYPE mrm_rbkpv
+           it_drseg   TYPE mmcr_tdrseg
+  CHANGING pa_enabled TYPE c.
+
+  DATA: it_bkpf  TYPE bkpf_t,
+        wa_bkpf  TYPE bkpf,
+        ld_awkey TYPE bkpf-awkey,
+        ld_found TYPE c.
+
+  CLEAR pa_enabled.
+
+* Check transaction type
+*  CHECK pa_rbkpv-xrech EQ 'X' AND
+*        pa_rbkpv-tbtkz = space.
+* Transaction types:
+*   xrech = ' ' and tbtkz = ' ' - credit note
+*   xrech = ' ' and tbtkz = 'X' - subsequent credit
+*   xrech = 'X' and tbtkz = ' ' - invoice
+*   xrech = 'X' and tbtkz = 'X' - subsequent debit
+
+* Check mode
+  CHECK pa_rbkpv-ivtyp NE c_ivtyp_storno  AND
+        pa_rbkpv-ivtyp NE c_ivtyp_web     AND
+        pa_rbkpv-ivtyp NE c_ivtyp_edi     AND
+        pa_rbkpv-ivtyp NE c_ivtyp_ersnull.
+
+* Check invoice status
+  CHECK pa_rbkpv-rbstat NE c_rbstat_delete.
+
+* ignore items blocked for payment
+* init internal vars
+  IF it_008[] IS INITIAL.
+*    PERFORM init_var USING gc_creditor.
+  ENDIF.
+* check blocked reason
+  READ TABLE it_008
+    INTO wa_008
+    WITH KEY ZAHLS = pa_rbkpv-zlspr
+    BINARY SEARCH.
+  IF sy-subrc NE 0.
+    wa_008-XOZSP = SPACE.
+  ENDIF.
+  CHECK wa_008-XOZSP IS INITIAL.
+
+* if the document is updated check for FI reference
+  IF NOT pa_rbkpv-belnr IS INITIAL AND
+         pa_rbkpv-belnr(1) NE '$'.
+
+    CONCATENATE pa_rbkpv-belnr pa_rbkpv-gjahr INTO ld_awkey.
+    SELECT * FROM bkpf
+      INTO CORRESPONDING FIELDS OF TABLE it_bkpf
+      WHERE awtyp = c_awtyp_rmrp
+        AND awkey = ld_awkey.
+
+    IF sy-subrc IS INITIAL.
+*     validate status
+      CLEAR ld_found.
+      LOOP AT it_bkpf INTO wa_bkpf.
+        IF wa_bkpf-bstat NA 'VWZ' AND "ignore Parked documents
+           wa_bkpf-bstat NA 'S'.      "ignore Noted items
+          ld_found = 'X'.
+          EXIT.
+        ENDIF.
+      ENDLOOP.
+*     if FI document is found then not enabled
+      CHECK ld_found IS INITIAL.
+    ENDIF.
+  ENDIF.
+
+  pa_enabled = 'X'.
+
+* you can enhance the routine here
+* ...
+ENDFORM.                    "if_process_mm
+
+*&---------------------------------------------------------------------*
+*&      Form  if_mm_bsart_enabled
+*&---------------------------------------------------------------------*
+*       Returns pa_enabled='X' when type of MM document is enabled
+*----------------------------------------------------------------------*
+*      <-- rbkpv      - header
+*      <-- it_drseg   - items
+*      --> pa_enabled - result
+*----------------------------------------------------------------------*
+FORM if_mm_bsart_enabled
+  USING    rbkpv      TYPE mrm_rbkpv
+           it_drseg   TYPE mmcr_tdrseg
+  CHANGING pa_enabled TYPE c.
+
+  DATA: wa_drseg TYPE mmcr_drseg,
+        wa       TYPE J_3RFMM_RATE_CLC,
+        ld_bukrs TYPE bkpf-bukrs.
+  DATA: BEGIN OF it_order OCCURS 1, " list of PO
+          ebeln TYPE drseg-ebeln,
+        END OF it_order.
+  DATA: BEGIN OF it_bsart OCCURS 1, " list of PO types
+          bsart TYPE ekko-bsart,
+        END OF it_bsart,
+        it_tmp LIKE it_bsart[]. " temporary table
+
+  CLEAR pa_enabled.
+
+  ld_bukrs = rbkpv-bukrs.
+
+* get POs
+  LOOP AT it_drseg INTO wa_drseg.
+    it_order-ebeln = wa_drseg-ebeln.
+    COLLECT it_order.
+  ENDLOOP.
+
+* if order is not found then ignore
+  CHECK NOT it_order[] IS INITIAL.
+
+* get PO types
+  SELECT bsart FROM ekko
+    INTO CORRESPONDING FIELDS OF TABLE it_bsart
+    FOR ALL ENTRIES IN it_order
+    WHERE ebeln = it_order-ebeln.
+
+  CHECK NOT it_bsart[] IS INITIAL.
+
+* search types
+  SELECT bsart FROM YSE_SD_EXCH_MM
+    INTO CORRESPONDING FIELDS OF TABLE it_tmp
+    FOR ALL ENTRIES IN it_bsart
+    WHERE ( bukrs = ld_bukrs and bsart = it_bsart-bsart ) or
+          ( bukrs = ''       and bsart = it_bsart-bsart ) or
+          ( bukrs = ld_bukrs and bsart = '' ).
+  IF sy-subrc IS INITIAL.
+    pa_enabled = 'X'.
+  ENDIF.
+
+ENDFORM.                    "if_mm_bsart_enabled
+
+*&---------------------------------------------------------------------*
+*&      Form  if_mm_selected
+*&---------------------------------------------------------------------*
+*       Returns pa_selected='X' when down payments were already
+*       selected for MM document
+*----------------------------------------------------------------------*
+*      <-- rbkpv        - MM document
+*      <-- it_drseg     - MM items
+*      --> pa_selected  - result
+*----------------------------------------------------------------------*
+FORM if_mm_selected
+  USING    rbkpv       TYPE mrm_rbkpv
+           it_drseg    TYPE mmcr_tdrseg
+  CHANGING pa_selected TYPE c.
+
+  CLEAR pa_selected.
+
+* down payments should be selected
+  CHECK NOT it_j_3rf_invoice[] IS INITIAL AND
+        NOT it_j_3rf_downpay[] IS INITIAL.
+  READ TABLE it_j_3rf_invoice INTO it_j_3rf_invoice INDEX 1.
+
+* validate global variables
+  CHECK NOT p_bukrs IS INITIAL                   AND
+        p_bukrs     = rbkpv-bukrs                AND
+        p_lifnr     = it_j_3rf_invoice-lifnr     AND
+        p_amount    = rbkpv-rmwwr                AND
+        p_waers     = rbkpv-waers                AND
+        p_amount    = it_j_3rf_invoice-wrbtr_inv AND
+        p_waers     = it_j_3rf_invoice-waers_inv AND
+        rbkpv-kursf = it_j_3rf_invoice-rate_inv  AND
+        rbkpv-kursf = g_dp_rate.
+
+  pa_selected = 'X'.
+
+ENDFORM.                    "if_mm_selected
+
+*Text symbol text£º
+*001:Bill of debt course
+*002:Payment course
+*029:Clearing in currency
+*030:Open items list
+*031:Test processing
+*032:Batch input
+*033:DocumentCreation
+*034:Items for clearing
+*035:Residual items
+*036:With reference to invoice
+*037:Partitial payment
+*041:Parameter With reference to invoice isn't conform system set
+*240:DOC> Geneated clearing document number
+*241:BIS> Group items were included into batch input session
+*301:one <-> one
+*302:many <-> many
+*303:a invoice <-> payments
+*304:a payment <-> invoices
+*700:Down Payment Selection Parameters
+*701:Clearing
+*702:Call Transaction
+*703:Batch Input
+*704:Batch Input Session Name
+*705:Posting Document Type
+*706:Difference Reason
+*707:Clearing Posting Date
+*708:Posting Period
+*709:With Residual Items
+*710:With Partial Payment
+*711:Invoice Amount / Currency
+*712:/
+*713:Invoice
+*714:Partner Data
+*715:Run Mode
+*800:Customer:
+*801:Vendor:
+*802:Selected Down Payments:
+*803:Invoice Amount:
+*804:Assigned:
+*805:Not Assigned:
+*806:Average Invoice Exchange Rate:
+*807:Generated clearing document number &
+*808:Invoice & cannot be cleared.
+*809:Run batch input to clear invoice
+*810:Exch. Rate for Clearing Down Payts (Not Invoice Posting):
+*811:Partner Locked By:
+*812:Invoice & has been cleared successfully
+*813:Invoice & is cleared automatically with down payments:
+*814:Invoice & cannot be cleared automatically with down payments:
+*815:Invoice & is already cleared
+*816:Down payment & is already cleared
+*817:Invoice & is cancelled
+*818:Down payment & is cancelled
+
+*819:Clear invoice manually when batch inputs are executed
+*Selection text£º
+*B_BLART:D       .
+*B_BLDAT:D       .
+*B_BUDAT:D       .
+*B_BUPEM:D       .
+*B_GJAHR:D       .
+*B_INPUT:D       .
+*B_INV:D       .
+*B_NAME:D       .
+*B_RSTGR:D       .
+*PA_PRPAY:D       .
+*PA_REMIN:D       .
+*P_AMOUNT:D       .
+*P_BELNR:D       .
+*P_BLDAT:D       .
+*P_BUDAT:D       .
+*P_BUKRS:D       .
+*P_CLCDAT:        Invoice Date
+*P_CLCRAT:        Exchange Rate
+*P_CLEAR:        Clear Down Payments
+*P_GSBER:D       .
+*P_INVDAT:D       .
+*P_INVRAT:D       .
+*P_KUNNR:D       .
+*P_LIFNR:D       .
+*P_MODCLR:D       .
+*P_MODPAY:D       .
+*P_PWAERS:D       .
+*P_RB_KUN:        Customer
+*P_RB_LIF:        Vendor
+*P_UMSKZ:D       .
+*P_VARI:D       .
+*P_WAERS:D       .
+*P_ZUONR:D       .
+*X_CALL:D       .

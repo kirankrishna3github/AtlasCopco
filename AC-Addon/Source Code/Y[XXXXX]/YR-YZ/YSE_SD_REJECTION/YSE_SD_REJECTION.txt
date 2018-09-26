@@ -1,0 +1,415 @@
+*&---------------------------------------------------------------------*
+*& Report  YSE_SD_REJECTION
+*&
+*&---------------------------------------------------------------------*
+*&
+*& Set 'Reason for rejection' to close Sales documents
+*&
+*&---------------------------------------------------------------------*
+*  Author                : Jules Smets
+*  Date                  : 01.12.2010
+*  Change Request Number : CR1405
+*  Transport request Nr. : CD1K961488
+*----------------------------------------------------------------------*
+*                                                                      *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD.NR. |   DATE     | NAME               | CORRECT.NR.| CHANGE REF. *
+*----------------------------------------------------------------------*
+* MOD-001 | 17.03.2011 | limit to VBAP-PSTYV = ZO07  ... | Wouter Depl.*
+*----------------------------------------------------------------------*
+
+************************************************************************
+
+REPORT  yse_sd_rejection.
+
+TABLES: vbak,
+        vbap,
+        vbup,
+        tvag.
+
+* Internal table for document category descriptions
+DATA: BEGIN OF it_typd OCCURS 0,
+        vbtyp    TYPE vbtyp,
+        dtext    TYPE val_text,
+      END OF it_typd.
+
+* Internal table (for Document item update)
+DATA: BEGIN OF it_vbap OCCURS 0,
+        vbeln    TYPE vbeln_va,
+        posnr    TYPE posnr_va,
+        vkorg    TYPE vkorg,
+        objnr    TYPE j_objnr,
+        vbtyp    TYPE vbtyp,
+        trvog    TYPE trvog,
+      END OF it_vbap.
+
+* Internal table for document status
+DATA: it_jcds  TYPE TABLE OF jcds,
+      ws_jcds  TYPE jcds.
+
+DATA:bdcdata     LIKE bdcdata  OCCURS 0
+                              WITH HEADER LINE.
+
+DATA: gv_date_teco  TYPE datum,
+      gv_text       TYPE char80,
+      gv_teco       TYPE xfeld,
+      gv_mode       TYPE ctu_mode  VALUE 'N',
+      gv_mtext      TYPE string,
+      gv_tcode      TYPE sytcode,
+      gv_repid      LIKE sy-repid,
+      bdc_options   TYPE ctu_params,
+      it_messages   TYPE TABLE OF bdcmsgcoll,
+      wa_messages   LIKE bdcmsgcoll.
+
+* Constants
+CONSTANTS: gc_teco  TYPE j_status  VALUE 'I0045'.
+
+
+*&---------------------------------------------------------------------*
+*&  Selection screen                                                   *
+*&---------------------------------------------------------------------*
+SELECTION-SCREEN BEGIN OF BLOCK b1  WITH FRAME  TITLE text-s01.
+SELECT-OPTIONS: s_vkorg  FOR  vbak-vkorg   MEMORY ID vko,
+                s_vbeln  FOR  vbap-vbeln,
+                s_posnr  FOR  vbap-posnr,
+                s_pstyv  FOR  vbap-pstyv DEFAULT 'ZO07',    "MOD-001
+                s_vbtyp  FOR  vbak-vbtyp OBLIGATORY DEFAULT 'C'.
+SELECTION-SCREEN SKIP.
+PARAMETERS:     p_delay(4)  TYPE n  OBLIGATORY.
+SELECTION-SCREEN END OF BLOCK b1.
+SELECTION-SCREEN SKIP.
+SELECTION-SCREEN BEGIN OF BLOCK b2  WITH FRAME  TITLE text-s02.
+PARAMETERS:     p_test  AS CHECKBOX  DEFAULT 'X'.
+SELECTION-SCREEN END OF BLOCK b2.
+SELECTION-SCREEN SKIP.
+SELECTION-SCREEN BEGIN OF BLOCK b3  WITH FRAME  TITLE text-s03.
+PARAMETERS:     p_abgru  LIKE tvag-abgru  OBLIGATORY DEFAULT 'ZZ'.
+SELECTION-SCREEN END OF BLOCK b3.
+
+*----------------------------------------------------------------------*
+* Check 'Reason for rejection'
+AT SELECTION-SCREEN ON p_abgru.
+  SELECT SINGLE * FROM tvag
+         WHERE abgru = p_abgru.
+  IF sy-subrc NE 0.
+    MESSAGE e058(00) WITH p_abgru ' ' ' ' 'TVAG'.
+  ENDIF.
+
+*&---------------------------------------------------------------------*
+*&  Main program                                                       *
+*&---------------------------------------------------------------------*
+START-OF-SELECTION.
+
+* Fill internal table for document category descriptions
+  SELECT domvalue_l ddtext INTO TABLE it_typd
+         FROM dd07t
+         WHERE domname    = 'VBTYP'
+           AND ddlanguage = 'E'.
+
+* Select sales documents
+  PERFORM select_documents.
+
+* Process selected documents
+  IF it_vbap[] IS INITIAL.
+    WRITE /01 'No documents selected'(i01).
+  ELSE.
+    PERFORM process_selection.
+  ENDIF.
+
+*&---------------------------------------------------------------------*
+*&  Forms                                                              *
+*&---------------------------------------------------------------------*
+
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_DOCUMENTS
+*&---------------------------------------------------------------------*
+*       Select sales documents
+*----------------------------------------------------------------------*
+FORM select_documents .
+
+* Progress indicator
+  IF sy-batch IS INITIAL.
+    gv_text = 'Sales documents are being selected'(i99).
+    CALL FUNCTION 'SAPGUI_PROGRESS_INDICATOR'
+      EXPORTING
+        text = gv_text.
+  ENDIF.
+
+* Selection
+  SELECT h~vbeln p~posnr h~vkorg p~objnr h~vbtyp h~trvog
+         INTO TABLE it_vbap
+         FROM vbak AS h
+         INNER JOIN vbap AS p
+                    ON h~vbeln = p~vbeln
+         INNER JOIN vbup AS s
+                    ON p~vbeln = s~vbeln  AND
+                       p~posnr = s~posnr
+         WHERE h~vbeln IN s_vbeln
+           AND p~posnr IN s_posnr
+           AND h~vkorg IN s_vkorg
+           AND h~vbtyp IN s_vbtyp
+           AND p~pstyv IN s_pstyv                           "MOD-001
+           AND p~abgru  = '  '
+           AND p~objnr NE ' '
+           AND s~gbsta NE 'C'.
+
+  SORT it_vbap.
+
+ENDFORM.                    " SELECT_DOCUMENTS
+
+*&---------------------------------------------------------------------*
+*&      Form  PROCESS_SELECTION
+*&---------------------------------------------------------------------*
+*       Process selected documents
+*----------------------------------------------------------------------*
+FORM process_selection .
+
+  gv_date_teco = sy-datum - p_delay.
+  IF NOT p_test IS INITIAL.
+    gv_mtext = 'TEST : Will be processed'(i02).
+  ENDIF.
+
+  LOOP AT it_vbap.
+
+*   New Sales document
+    AT NEW vbeln.
+      IF sy-batch IS INITIAL.
+*     Progress indicator
+        CONCATENATE 'Sales document'(i04) it_vbap-vbeln
+                    'is being processed'(i98)
+                    INTO gv_text  SEPARATED BY space.
+        CALL FUNCTION 'SAPGUI_PROGRESS_INDICATOR'
+          EXPORTING
+            text = gv_text.
+      ENDIF.
+    ENDAT.
+
+*   Document category
+    CLEAR it_typd.
+    READ TABLE it_typd WITH KEY vbtyp = it_vbap-vbtyp.
+
+*   Check status TECO
+    PERFORM check_teco.
+    CHECK NOT gv_teco IS INITIAL.
+
+*   Test mode ?
+    IF NOT p_test IS INITIAL.
+*     Test : only write list
+      PERFORM write_list.
+    ELSE.
+*     Update sales document item
+      PERFORM update_item.
+    ENDIF.
+
+  ENDLOOP.
+
+ENDFORM.                    " PROCESS_SELECTION
+
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_TECO
+*&---------------------------------------------------------------------*
+*       Check status TECO
+*----------------------------------------------------------------------*
+FORM check_teco .
+
+  CLEAR gv_teco.
+
+*   Check if TECO
+  CALL FUNCTION 'STATUS_CHECK'
+    EXPORTING
+*       BYPASS_BUFFER           = ' '
+*       CLIENT                  = SY-MANDT
+      objnr                   = it_vbap-objnr
+      status                  = gc_teco
+    EXCEPTIONS
+      object_not_found        = 1
+      status_not_active       = 2
+      OTHERS                  = 3
+            .
+  IF sy-subrc <> 0.
+*   MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*           WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+  ENDIF.
+
+  CHECK sy-subrc = 0.
+
+* Get the latest activation of TECO
+  CLEAR it_jcds[].
+  CALL FUNCTION 'STATUS_READ_ARCHIVE_OBJECT'
+    EXPORTING
+*     ARCHIVE_HANDLE                = 0
+*     I_MANDT                       = SY-MANDT
+      i_objnr                       = it_vbap-objnr
+*     I_APPEND                      = ' '
+    TABLES
+*     T_JSTO                        =
+*     T_JCDO                        =
+*     T_JEST                        =
+      t_jcds                        = it_jcds
+*     T_DJEST                       =
+    EXCEPTIONS
+      wrong_access_to_archive       = 1
+      not_enough_info               = 2
+      OTHERS                        = 3
+            .
+  IF sy-subrc <> 0.
+* MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*         WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+  ENDIF.
+
+  CLEAR ws_jcds.
+  LOOP AT it_jcds INTO ws_jcds
+                  WHERE stat = gc_teco
+                    AND inact = ' '.
+  ENDLOOP.
+
+* Check time of the latest TECO
+  IF NOT ws_jcds-udate IS INITIAL  AND
+     ws_jcds-udate < gv_date_teco.
+    gv_teco  = 'X'.
+  ENDIF.
+
+ENDFORM.                    " CHECK_TECO
+
+*&---------------------------------------------------------------------*
+*&      Form  WRITE_LIST
+*&---------------------------------------------------------------------*
+*       Write list
+*----------------------------------------------------------------------*
+FORM write_list .
+
+  WRITE: /01 it_vbap-vbeln,
+          12 it_vbap-posnr,
+          20 it_typd-dtext(25),
+          45(80)  gv_mtext.
+
+ENDFORM.                    " WRITE_LIST
+
+*&---------------------------------------------------------------------*
+*&      Form  UPDATE_ITEM
+*&---------------------------------------------------------------------*
+*       Update sales document item via transaction VAx2
+*----------------------------------------------------------------------*
+FORM update_item .
+
+* Clear structures and tables for the BAPI
+  CLEAR: bdcdata, it_messages.
+  REFRESH: bdcdata, it_messages.
+
+* Select Sales document
+  PERFORM bdc_dynpro USING 'SAPMV45A'   '0102'.
+  PERFORM bdc_field  USING 'BDC_OKCODE' '/00'.
+  PERFORM bdc_field  USING 'VBAK-VBELN' it_vbap-vbeln.
+
+* Go to tab 'Reason for rejection'
+  PERFORM bdc_dynpro USING 'SAPMV45A'   '4001'.
+  PERFORM bdc_field  USING 'BDC_OKCODE' '=T\07'.
+
+* Go to item selection
+  PERFORM bdc_dynpro USING 'SAPMV45A'   '4001'.
+  PERFORM bdc_field  USING 'BDC_OKCODE' '=POPO'.
+
+* Select Sales Order item
+  PERFORM bdc_dynpro USING 'SAPMV45A'   '0251'.
+  PERFORM bdc_field  USING 'BDC_OKCODE' '=POSI'.
+  PERFORM bdc_field  USING 'RV45A-POSNR' it_vbap-posnr.
+
+* Fill 'Reason for rejection' and Save
+  PERFORM bdc_dynpro USING 'SAPMV45A'   '4001'.
+  PERFORM bdc_field  USING 'BDC_OKCODE' '=SICH'.
+  PERFORM bdc_field  USING 'VBAP-ABGRU(01)' p_abgru.
+
+* Processing mode
+  bdc_options-dismode = gv_mode.
+  bdc_options-updmode = 'S'.
+
+* Call the correponding transaction
+  CONCATENATE 'VA' it_vbap-trvog '2' INTO gv_tcode.
+
+  CALL TRANSACTION gv_tcode USING bdcdata
+                                  OPTIONS FROM bdc_options
+                                  MESSAGES INTO it_messages.
+
+* Get errors
+  LOOP AT it_messages INTO wa_messages
+                      WHERE msgtyp = 'A'  OR
+                            msgtyp = 'E'.
+    MESSAGE ID wa_messages-msgid
+            TYPE wa_messages-msgtyp
+            NUMBER wa_messages-msgnr
+            INTO gv_mtext
+            WITH wa_messages-msgv1 wa_messages-msgv2
+                 wa_messages-msgv3 wa_messages-msgv4.
+    EXIT.
+  ENDLOOP.
+  IF sy-subrc NE 0.
+    gv_mtext = 'Processed'(i03).
+  ENDIF.
+
+* Write list
+  PERFORM write_list.
+
+ENDFORM.                    " UPDATE_ITEM
+
+*&---------------------------------------------------------------------*
+*&      Form  BDC_DYNPRO
+*&---------------------------------------------------------------------*
+*       Start new screen
+*----------------------------------------------------------------------*
+*      -->PROGRAM : Program name
+*      -->DYNPRO  : Screen number
+*----------------------------------------------------------------------*
+FORM bdc_dynpro USING  program
+                       dynpro.
+
+  CLEAR bdcdata.
+  bdcdata-program  = program.
+  bdcdata-dynpro   = dynpro.
+  bdcdata-dynbegin = 'X'.
+  APPEND bdcdata.
+
+ENDFORM.                    " BDC_DYNPRO
+
+*&---------------------------------------------------------------------*
+*&      Form  BDC_FIELD
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->FNAM : Field name
+*      -->FVAL : Field value
+*----------------------------------------------------------------------*
+FORM bdc_field USING  fnam
+                      fval.
+
+  CLEAR bdcdata.
+  bdcdata-fnam = fnam.
+  bdcdata-fval = fval.
+  APPEND bdcdata.
+
+ENDFORM.                    " BDC_FIELD
+
+*List header: Column headings£º
+
+*001:Sales Doc. Item    Type                     Message
+*Text symbol text£º
+*I01:No documents selected
+*I02:TEST : Will be processed
+*I03:Processed
+*I04:Sales document
+*I98:is being processed
+*I99:Sales documents are being selected
+*S01:Selection
+*S02:Process mode
+
+*S03:Update
+*Selection text£º
+*P_ABGRU:D       .
+*P_DELAY:        Status TECO: Nr of days active
+*P_TEST:        Test mode
+*S_POSNR:D       .
+*S_PSTYV:        VBAP item category
+*S_VBELN:D       .
+*S_VBTYP:D       .
+*S_VKORG:D       .

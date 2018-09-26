@@ -1,0 +1,973 @@
+************************************************************************
+* Program ID           : YSE_CAPTURE_EXCH_RATE                         *
+* Program Title        : Auto-upload Russian Central bank rates from   *
+*                        internet                                      *
+* Author               : Lakshmi Reddy                                 *
+* Date                 : 05/01/2011                                    *
+* Change Request Number: CD1K962084                                    *
+* Description          : This program downloads Russian Central Bank   *
+*                        rates every day from the website:             *
+*                        http://www.cbr.ru/scripts/XML_daily.asp       *
+*                        and upload into SAP                           *
+* Note:                : Program YSE_FICO_UPLOAD_EXCH has been taken as*
+*                        reference                                     *
+*======================================================================*
+
+
+REPORT  zsr_temp5 NO STANDARD PAGE HEADING.
+*report   rftbff00  no standard page heading.
+
+*------------------ Constants -----------------------------------------*
+CONSTANTS: false VALUE ' '.
+
+*------------------ type pool market data -----------------------------*
+TYPE-POOLS: trgfm.
+TYPE-POOLS: slis.
+
+*------------------ database tables -----------------------------------*
+TABLES: vtbdff.
+
+*------------------ Types Structures-----------------------------------*
+TYPES: BEGIN OF ty_xmldata,
+         numcode TYPE numc3,
+         charcode TYPE char3,
+         nominal TYPE  char5,
+         name    TYPE char50,
+         value   TYPE char50,
+       END OF ty_xmldata.
+
+TYPES: BEGIN OF text,
+       line(120),
+       END OF text.
+*------------------ List Viewer ---------------------------------------*
+DATA: alv_variant LIKE disvariant.
+DATA: h_exit(1).
+DATA: alv_name_thead    TYPE slis_tabname VALUE 'THEAD',
+      alv_name_titem    TYPE slis_tabname VALUE 'TITEM'.
+DATA: alv_reprep_id     TYPE slis_reprep_id.
+
+*------------------ internal tables -----------------------------------*
+* interne Tabelle f¨¹r Marktdatenbank
+DATA:  BEGIN OF sap_vtb_market OCCURS 100.    "/ Schnittstelle
+        INCLUDE STRUCTURE vtb_market.
+DATA:  END OF sap_vtb_market.
+
+* interne Tabelle f¨¹r fehlerhafte Datafeed-Customizing-Requests
+DATA:  BEGIN OF error_sap_answer OCCURS 1.
+        INCLUDE STRUCTURE vtb_market.
+DATA:  END OF error_sap_answer.
+
+* interne Tabelle f¨¹r Dynpro "Select-Options"
+DATA  BEGIN OF dynpfields OCCURS 1.
+        INCLUDE STRUCTURE dynpread.
+DATA  END   OF dynpfields.
+
+*------------------ internal variables --------------------------------*
+DATA  fileshort LIKE authb-filename.
+DATA  datum_txt(10).
+DATA  datum LIKE sy-datum.
+DATA  filestring TYPE string.
+DATA  lv_kurst TYPE kurst_curr.  " tb_prpty.
+DATA  dest    TYPE rfcdes-rfcdest.
+DATA  btocrlf TYPE c.
+
+* Fehlertabelle in Datei schreiben
+DATA: error_rec TYPE trgfm_error_rec_type OCCURS 100 WITH HEADER LINE.
+
+*------------------ interne Tabelle f¨¹r DateiHeader--------------------*
+DATA  BEGIN OF header_rec OCCURS 20.
+DATA  text(70).
+DATA  END   OF header_rec.
+
+
+*------------------ ranges --------------------------------------------*
+RANGES sop_scl FOR vtb_market-sclass.
+
+* Interne Tabelle zum Speichern der Datei durch den Funktions-
+* baustein 'WS_UPLOAD'
+DATA input_rec TYPE trgfm_extern_rec_type OCCURS 500 WITH HEADER LINE.
+
+* Interne Tabelle zum sichern der orginal Marktdaten f¨¹r Erstellung der
+* Fehlerdatei
+DATA marktdaten_orginal TYPE trgfm_extern_rec_type OCCURS 500 WITH
+                        HEADER LINE.
+
+DATA save_subrc LIKE sy-subrc.
+DATA save_tabix LIKE sy-tabix.
+
+CONSTANTS : c_x(1)      TYPE c VALUE 'X',
+            con_tab     TYPE c VALUE cl_abap_char_utilities=>horizontal_tab.
+
+TYPES: BEGIN OF ty_upload,
+         v_text(100)  TYPE c,            " FILE UPLOAD TEXT
+       END OF ty_upload.
+
+DATA: gt_upload TYPE STANDARD TABLE OF ty_upload
+                INITIAL SIZE 0 WITH HEADER LINE.
+
+DATA: response TYPE TABLE OF text WITH HEADER LINE,
+      response_headers TYPE TABLE OF text WITH HEADER LINE.
+
+DATA: it_xmldata TYPE STANDARD TABLE OF ty_xmldata,
+      wa_xmldata TYPE ty_xmldata,
+      v_value    TYPE string,
+      v_start    TYPE char1,
+      v_end      TYPE char1,
+      v_date     TYPE char10.
+
+DATA: xuri(250) TYPE c,
+      status(3) TYPE c,
+      statustext(128) TYPE c,
+      rlength TYPE i,
+      key TYPE i VALUE 1303621,
+      slen TYPE i,
+      t1 TYPE i,
+      t2 TYPE i,
+      ti TYPE i.
+
+*DATA: gv_value   TYPE p DECIMALS 5.    "comment MOD-002
+DATA: gv_value   TYPE p DECIMALS 6.     "insert MOD-002
+DATA: gv_nominal TYPE i.
+************************************************************************
+*                   selection parameters                               *
+************************************************************************
+*                           Eingabe                                    *
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN POSITION 40.
+SELECTION-SCREEN COMMENT (50) text-133.
+SELECTION-SCREEN END   OF LINE.
+
+SELECTION-SCREEN BEGIN OF BLOCK 1 WITH FRAME TITLE text-100.
+PARAMETERS: p_uri(264)  TYPE c LOWER CASE.   "DEFAULT 'http://www.cbr.ru/scripts/XML_daily.asp'.
+PARAMETERS: p_proxy     TYPE proxy DEFAULT '10.25.52.205:8080' OBLIGATORY,
+            p_user(80)  TYPE c LOWER CASE OBLIGATORY,
+            p_pwd(30)   TYPE c LOWER CASE OBLIGATORY.
+SELECTION-SCREEN BEGIN OF LINE.                 " AG 18.11.99 begin
+SELECTION-SCREEN COMMENT 1(25) text-130.
+SELECTION-SCREEN POSITION 33.
+PARAMETERS:      par_prs  RADIOBUTTON GROUP noti DEFAULT 'X'.
+SELECTION-SCREEN COMMENT (12) text-131.
+PARAMETERS:      par_men  RADIOBUTTON GROUP noti.
+SELECTION-SCREEN COMMENT (15) text-132.
+SELECTION-SCREEN END OF LINE.                   " AG 18.11.99 end
+
+SELECTION-SCREEN END   OF BLOCK 1.
+************************************************************************
+*                         Datenlieferant                               *
+SELECTION-SCREEN BEGIN OF BLOCK feedname WITH FRAME TITLE text-003.
+SELECTION-SCREEN BEGIN OF LINE.
+PARAMETERS:      par_rfn  RADIOBUTTON GROUP feed DEFAULT 'X'.
+PARAMETERS:      par_feed LIKE vtb_ffs-rfeedname MEMORY ID 002.
+SELECTION-SCREEN END OF LINE.
+SELECTION-SCREEN BEGIN OF LINE.
+PARAMETERS:      par_rfd  RADIOBUTTON GROUP feed.
+SELECTION-SCREEN COMMENT 3(40) text-114.
+SELECTION-SCREEN END OF LINE.
+SELECTION-SCREEN END OF BLOCK feedname.
+************************************************************************
+*                              Fehlerdatei                             *
+SELECTION-SCREEN BEGIN OF BLOCK errorfile WITH FRAME TITLE text-115.
+PARAMETERS: log      LIKE filefeed-log    DEFAULT    'X'.
+PARAMETERS: logfile  LIKE rlgrap-filename OBLIGATORY DEFAULT
+                                                'C:\SAPPCADM\error.log'.
+PARAMETERS: logdwnld LIKE filefeed-downloadx DEFAULT 'X'.
+SELECTION-SCREEN END   OF BLOCK errorfile.
+************************************************************************
+*                               Sonstiges                              *
+SELECTION-SCREEN BEGIN OF BLOCK 2 WITH FRAME TITLE text-101.
+PARAMETERS: par_tst   AS CHECKBOX DEFAULT 'X'.
+*----------------------------------------------------------------------*
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(25) text-110.
+SELECTION-SCREEN POSITION 33.
+PARAMETERS:      par_dsal  RADIOBUTTON GROUP disp DEFAULT 'X'.
+SELECTION-SCREEN COMMENT (10) text-111.
+PARAMETERS:      par_dsfl  RADIOBUTTON GROUP disp.
+SELECTION-SCREEN COMMENT (10) text-112.
+PARAMETERS:      par_dsok  RADIOBUTTON GROUP disp.
+SELECTION-SCREEN COMMENT (25) text-113.
+SELECTION-SCREEN END OF LINE.
+PARAMETERS: par_var LIKE disvariant-variant.
+SELECTION-SCREEN END   OF BLOCK 2.
+************************************************************************
+*                   selection parameters end                           *
+************************************************************************
+
+
+*------------------ initialization ------------------------------------*
+INITIALIZATION.
+
+* ALV Variants - get active one
+  CLEAR alv_variant.
+  alv_variant-report = sy-repid.
+  CALL FUNCTION 'REUSE_ALV_VARIANT_DEFAULT_GET'
+    EXPORTING
+      i_save     = 'A'           "/ user specific save available
+    CHANGING
+      cs_variant = alv_variant
+    EXCEPTIONS
+      not_found  = 1.
+  IF sy-subrc = 0.
+    par_var = alv_variant-variant.
+  ENDIF.
+
+* set ALV parameters for selection callback
+  CLEAR alv_reprep_id.
+  alv_reprep_id-tool = 'RT'.
+  alv_reprep_id-onam = sy-repid.
+
+
+ IF SY-TCODE = 'ZSR_TEMP5'.
+    SY-TITLE = text-134.
+   else.
+      SY-TITLE =  text-133.
+  ENDIF.
+
+data : result type string.
+
+CALL FUNCTION 'F4_REPORT_VARIANT'
+  EXPORTING
+*   OBJECT                   = '*'
+    PROGRAM                  =  sy-repid
+   SUPPRESS_SELECTION       = 'X'
+*   DISPLAY_ONLY             =
+ IMPORTING
+   RESULT                   = result
+*   PROGRAM                  =
+          .
+
+
+
+
+
+AT SELECTION-SCREEN OUTPUT.
+
+
+
+
+
+  LOOP AT SCREEN.
+    IF screen-name EQ 'P_URI'.
+      screen-input = '0'.
+      MODIFY SCREEN.
+    ENDIF.
+  ENDLOOP.
+  LOOP AT SCREEN.
+    IF screen-name = 'P_PWD'.
+      screen-invisible = '1'.
+      MODIFY SCREEN.
+    ENDIF.
+  ENDLOOP.
+
+*----------------------------------------------------------------------*
+*------------------  F4-Help for logfile  -----------------------------*
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR logfile.
+* die zu aktualisierenden Felder in Tabelle schreiben
+  CLEAR dynpfields.
+  REFRESH dynpfields.
+  dynpfields-fieldname = 'LOGDWNLD'.
+  APPEND dynpfields.
+* Funktionsbaustein zur Aktualisierung der Dynpro-Felder aufrufen
+  CALL FUNCTION 'DYNP_VALUES_READ'
+    EXPORTING
+      dyname               = 'YSE_CAPTURE_EXCH_RATE'
+      dynumb               = '1000'
+      translate_to_upper   = 'X'
+    TABLES
+      dynpfields           = dynpfields
+    EXCEPTIONS
+      invalid_abapworkarea = 1
+      invalid_dynprofield  = 2
+      invalid_dynproname   = 3
+      invalid_dynpronummer = 4
+      invalid_request      = 5
+      no_fielddescription  = 6
+      invalid_parameter    = 7
+      undefind_error       = 8
+      OTHERS               = 9.
+* Auswerten der aktualisierten Felder
+  LOOP AT dynpfields.
+    IF dynpfields-fieldname = 'LOGDWNLD'.
+      logdwnld =  dynpfields-fieldvalue.
+    ENDIF.
+  ENDLOOP.
+* nur bei Pc-Download darf F4-Hilfe aufgerufen werden.
+  IF logdwnld = 'X'.
+    CALL FUNCTION 'WS_FILENAME_GET'
+      EXPORTING
+        mask             = ',*.*,*.*.'
+        mode             = 'S'
+        title            = text-002
+      IMPORTING
+        filename         = logfile
+      EXCEPTIONS
+        inv_winsys       = 1
+        no_batch         = 2
+        selection_cancel = 3
+        selection_error  = 4
+        OTHERS           = 5.
+    IF sy-subrc = 1.
+      MESSAGE i573(t2).
+*    Dateiselektion nicht m#glich (falsche Windows-Version)
+    ENDIF.
+  ELSE.  "/ tue nichts, da Basis keine Fehlermeldung in F4 zul##t
+*    message w574(t2).
+*    Eingabehilfe nur bei Upload der Datei von einem PC
+  ENDIF.
+
+*------------------  Check feedname -----------------------------------*
+AT SELECTION-SCREEN ON BLOCK feedname.
+* #berpr¨¹fe Feed/Workmodus, ob zul#ssig
+  IF  ( NOT par_feed IS INITIAL ) AND ( par_rfn = 'X' ).
+    SELECT * FROM vtbdff
+           WHERE rfeedname  = par_feed
+           AND   source     = 'D'.
+    ENDSELECT.
+    IF sy-subrc NE 0.
+      MESSAGE e575(t2) WITH par_feed.
+*   Feedname & unbekannt
+    ENDIF.
+  ENDIF.
+
+*------------------  Variant Value/Check ------------------------------*
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR par_var.
+  CALL FUNCTION 'REUSE_ALV_VARIANT_F4'
+       EXPORTING
+            is_variant          = alv_variant
+            i_tabname_header    = alv_name_thead
+            i_tabname_item      = alv_name_titem
+*           it_default_fieldcat =
+            i_save              = 'A'
+       IMPORTING
+            e_exit              = h_exit
+            es_variant          = alv_variant
+       EXCEPTIONS
+            not_found           = 1.
+  IF sy-subrc = 1.
+    MESSAGE ID sy-msgid TYPE 'S' NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ELSEIF h_exit = space.
+    par_var = alv_variant-variant.
+  ENDIF.
+
+AT SELECTION-SCREEN ON par_var.
+  IF NOT par_var IS INITIAL.
+    alv_variant-variant = par_var.
+    alv_variant-report  = sy-repid.
+    CALL FUNCTION 'REUSE_ALV_VARIANT_EXISTENCE'
+      EXPORTING
+        i_save     = 'A'
+      CHANGING
+        cs_variant = alv_variant.
+  ENDIF.
+
+************************************************************************
+*                           Programmablauf                             *
+************************************************************************
+START-OF-SELECTION.
+
+*Use destination as SAPHTTP for accessing HTML file in foreground
+  btocrlf = 'Y'.
+  dest    = 'SAPHTTP'.
+* set alv_variant
+  IF NOT par_var IS INITIAL.
+    alv_variant-variant = par_var.
+  ENDIF.
+
+  slen = STRLEN( p_user ).
+
+  CALL FUNCTION 'HTTP_SCRAMBLE'
+    EXPORTING
+      SOURCE      = p_user
+      sourcelen   = slen
+      key         = key
+    IMPORTING
+      destination = p_user.
+
+  slen = STRLEN( p_pwd ).
+
+  CALL FUNCTION 'HTTP_SCRAMBLE'
+    EXPORTING
+      SOURCE      = p_pwd
+      sourcelen   = slen
+      key         = key
+    IMPORTING
+      destination = p_pwd.
+
+  CALL FUNCTION 'HTTP_GET'
+    EXPORTING
+      absolute_uri                = p_uri
+      rfc_destination             = dest
+      proxy                       = p_proxy
+      user                        = p_user
+      password                    = p_pwd
+      blankstocrlf                = btocrlf
+    IMPORTING
+      status_code                 = status
+      status_text                 = statustext
+      response_entity_body_length = rlength
+    TABLES
+      response_entity_body        = response
+      response_headers            = response_headers
+    EXCEPTIONS
+      connect_failed              = 1
+      timeout                     = 2
+      internal_error              = 3
+      tcpip_error                 = 4
+      data_error                  = 5
+      system_failure              = 6
+      communication_failure       = 7
+      OTHERS                      = 8.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+  CLEAR:   v_start,
+           v_end,
+           wa_xmldata,
+           v_value.
+  REFRESH: it_xmldata.
+
+  LOOP AT response.
+
+    IF response-line CS '<ValCurs'.
+      CLEAR: v_value.
+      v_value = response-line.
+      REPLACE ALL OCCURRENCES OF '<ValCurs Date="'  IN v_value WITH ' '.
+      REPLACE ALL OCCURRENCES OF '" name="Foreign Currency Market">' IN v_value WITH ' '.
+      CONDENSE v_value.
+      v_date = v_value.
+    ELSEIF response-line CS '<Valute'.
+      v_start = 'X'.
+      v_end   = ' '.
+      CLEAR: wa_xmldata.
+    ELSEIF response-line CS '</Valute>'.
+      v_end   = 'X'.
+      v_start = ' '.
+    ELSEIF response-line CS '</ValCurs>'.
+      v_end   = ' '.
+      v_start = ' '.
+    ENDIF.
+
+    IF v_start EQ 'X'.
+      IF response-line CS 'NumCode'.
+        CLEAR: v_value.
+        v_value = response-line.
+        SHIFT v_value LEFT BY 1 PLACES.
+        REPLACE ALL OCCURRENCES OF '<NumCode>'  IN v_value WITH ' '.
+        REPLACE ALL OCCURRENCES OF '</NumCode>' IN v_value WITH ' '.
+        CONDENSE v_value.
+        wa_xmldata-numcode = v_value.
+      ENDIF.
+
+      IF response-line CS 'CharCode'.
+        CLEAR: v_value.
+        v_value = response-line.
+        SHIFT v_value LEFT BY 1 PLACES.
+        REPLACE ALL OCCURRENCES OF '<CharCode>'  IN v_value WITH ' '.
+        REPLACE ALL OCCURRENCES OF '</CharCode>' IN v_value WITH ' '.
+        CONDENSE v_value.
+        wa_xmldata-charcode = v_value.
+      ENDIF.
+
+      IF response-line CS 'Nominal'.
+        CLEAR: v_value.
+        v_value = response-line.
+        SHIFT v_value LEFT BY 1 PLACES.
+        REPLACE ALL OCCURRENCES OF '<Nominal>'  IN v_value WITH ' '.
+        REPLACE ALL OCCURRENCES OF '</Nominal>' IN v_value WITH ' '.
+        CONDENSE v_value.
+        wa_xmldata-nominal = v_value.
+      ENDIF.
+
+      IF response-line CS 'Name'.
+        CLEAR: v_value.
+        v_value = response-line.
+        SHIFT v_value LEFT BY 1 PLACES.
+        REPLACE ALL OCCURRENCES OF '<Name>'  IN v_value WITH ' '.
+        REPLACE ALL OCCURRENCES OF '</Name>' IN v_value WITH ' '.
+        CONDENSE v_value.
+        wa_xmldata-name = v_value.
+      ENDIF.
+
+      IF response-line CS 'Value'.
+        CLEAR: v_value.
+        v_value = response-line.
+        SHIFT v_value LEFT BY 1 PLACES.
+        REPLACE ALL OCCURRENCES OF '<Value>'  IN v_value WITH ' '.
+        REPLACE ALL OCCURRENCES OF '</Value>' IN v_value WITH ' '.
+        CONDENSE v_value.
+        wa_xmldata-value = v_value.
+      ENDIF.
+    ENDIF.
+
+    IF v_end EQ 'X'.
+      APPEND wa_xmldata TO it_xmldata.
+      CLEAR: wa_xmldata.
+    ENDIF.
+
+  ENDLOOP.
+
+  SORT it_xmldata BY charcode.
+  DELETE it_xmldata WHERE charcode EQ 'BYR'.
+  CLEAR  : wa_xmldata,
+           input_rec.
+  REFRESH: input_rec.
+  LOOP AT it_xmldata INTO wa_xmldata.
+    MOVE '01'                TO input_rec-sclass.
+    MOVE wa_xmldata-charcode TO input_rec-rkey1.
+    MOVE 'RUB'               TO input_rec-rkey2.
+    MOVE 'DRU'               TO input_rec-sinstrumnt.
+    CONCATENATE v_date+0(2)
+                v_date+3(2)
+                v_date+6(4)
+                INTO
+                input_rec-ddate.
+    MOVE ' '                 TO input_rec-ttime.
+    MOVE wa_xmldata-nominal  TO gv_nominal.
+    TRANSLATE wa_xmldata-value USING ',.'.
+    MOVE wa_xmldata-value    TO gv_value.
+    IF gv_nominal NE 0.
+      gv_value = gv_value / gv_nominal.
+    ENDIF.
+    MOVE gv_value            TO input_rec-value.
+    MOVE ' '                 TO input_rec-currency.
+    MOVE '1'                 TO input_rec-ffact.
+    MOVE '1'                 TO input_rec-tfact.
+    MOVE ' '                 TO input_rec-mkind.
+    MOVE ' '                 TO input_rec-sstats.
+    MOVE ' '                 TO input_rec-error.
+    APPEND input_rec.
+    CLEAR  input_rec.
+  ENDLOOP.
+
+  IF NOT input_rec[] IS INITIAL.
+*   Check if for all records in input_rec the user has
+*   authorization to upload the involved rate type.
+    LOOP AT input_rec.
+
+*     Check if currency field not empty
+      IF input_rec-sinstrumnt IS INITIAL.
+        CONTINUE.
+      ENDIF.
+
+      lv_kurst = input_rec-sinstrumnt.
+      AUTHORITY-CHECK OBJECT 'Z_KURST'
+        ID 'KURST' FIELD lv_kurst
+        ID 'ACTVT' FIELD '02'.
+
+      IF sy-subrc NE 0.
+        MESSAGE e594(t2) WITH input_rec-sinstrumnt.
+      ENDIF.
+    ENDLOOP.  " input_rec
+
+*Aufbereiten
+*Alle S#tze, die nicht dem Einleseformat entsprechen werden gl#scht.
+    DELETE input_rec WHERE sclass NE '01' AND  " Devisen
+                           sclass NE '02' AND  " Wertpapiere
+                           sclass NE '03' AND  " Referenzzinss#tze
+                           sclass NE '04' AND  " Indices
+                           sclass NE '21' AND  " SWAP-S#tze
+                           sclass NE '##' AND  " Kommentar
+                           sclass NE '90'.     " Datenlieferant
+
+*Interne Tabelle f¨¹llen mit den orginal Datens#tzen aus der Marktdaten-
+* Datei. Ist erforderlich, um nach der Umschl¨¹sselung fehlerhafte
+* orginal Datens#tze zu ermitteln.
+    INSERT LINES OF input_rec INTO marktdaten_orginal INDEX 1.
+    DELETE marktdaten_orginal WHERE sclass = '90'  " Datenlieferant
+                              OR    sclass = '##'. " Kommentar
+
+*Umschl¨¹sseln
+    CALL FUNCTION 'TB_FILEFEED_CONVERT'
+      EXPORTING
+        richtung        = 'X'
+        headerinfo      = par_rfd
+      TABLES
+        extern          = input_rec
+        intern          = sap_vtb_market
+      CHANGING
+        lieferant       = par_feed
+      EXCEPTIONS
+        no_lieferant    = 1
+        no_headerinfo   = 2
+        wrong_lieferant = 3
+        OTHERS          = 4.
+*Auswertung der Exceptions
+    save_subrc = sy-subrc.
+    CASE save_subrc.
+      WHEN 1.
+* wird im Funktionsbaustein abgefangen.
+*   Kein Datenlieferant. #bernahme der Daten ohne Umschl¨¹sselung.
+      WHEN 2.
+        MESSAGE i579(t2).
+*   Datei enth#lt keine Header-Info. Lieferant bitte manuell eingeben.
+        LEAVE LIST-PROCESSING.           " Zur¨¹ck zum Selektions-Dynpro
+      WHEN 3.
+        MESSAGE i580(t2) WITH par_feed.
+*   Datenlieferant & ist nicht im SAP-System bekannt.
+        LEAVE LIST-PROCESSING.           " Zur¨¹ck zum Selektions-Dynpro
+    ENDCASE.
+
+* preis und mengenorientierung " AG 18.11.99 begin
+    DATA: ukurs TYPE p DECIMALS 5.
+    CONSTANTS: con_zero_ukurs TYPE p DECIMALS 5 VALUE 0. "/AG 30.11.00
+
+    LOOP AT sap_vtb_market WHERE sclass = '01' AND sstats IS INITIAL.
+      " AG 18.10.00
+      ukurs = sap_vtb_market-value.
+      IF ukurs > con_zero_ukurs AND par_men = 'X'.
+        ukurs = ukurs * -1.
+        sap_vtb_market-value  = ukurs.
+        sap_vtb_market-mquote = 'X'.   "/ line added 18.10.2000 GeA
+        MODIFY sap_vtb_market.
+      ENDIF.
+    ENDLOOP.
+* preis und mengenorientierung " AG 18.11.99 end
+
+* Pr¨¹fe zuerst, ob Bearbeitung erlaubt (Pflegeberechtigung)
+    LOOP AT sap_vtb_market.            "/ construct sop_scl
+      MOVE 'I'      TO sop_scl-sign.
+      MOVE 'EQ'     TO sop_scl-option.
+      MOVE sap_vtb_market-sclass TO sop_scl-low.
+      MOVE sap_vtb_market-sclass TO sop_scl-high.
+      COLLECT sop_scl.                 "/ duplicates NOT
+    ENDLOOP.                           "/ construct sop_scl
+    CALL FUNCTION 'TB_DATAFEED_AUTHORITY_CHECKS'
+      TABLES
+        sop_scl = sop_scl.
+* Initialisieren der Fehlertabellen
+    REFRESH error_sap_answer. CLEAR error_sap_answer.
+
+
+* #berpr¨¹fe die Requests
+    CALL FUNCTION 'TB_DATAFEED_CHECK_CUSTOMIZING'
+      TABLES
+        sap_cust       = sap_vtb_market
+        error_sap_cust = error_sap_answer
+      EXCEPTIONS
+        error_found    = 1
+        OTHERS         = 2.
+
+* wenn ok., dann update
+    CALL FUNCTION 'TB_DATAFEED_R3TABLES_UPDATE'
+      EXPORTING
+        filesource   = 'X'
+        test_only    = par_tst
+      TABLES
+        sap_answer   = sap_vtb_market
+      EXCEPTIONS
+        update_error = 1
+        OTHERS       = 2.
+    IF sy-subrc <> 0.
+      MESSAGE i503(t2).
+    ENDIF.
+
+* Volas sind in dieser Dateischnittstelle nicht bekannt
+    PERFORM clear_volas.
+
+* Wenn LogDatei erstellt werden soll
+    IF log ='X'.
+*Errorlog-Datei Header schreiben.
+      PERFORM write_header.
+* Fehlerdatei schreiben
+      PERFORM write_errorlog.
+    ENDIF.
+
+*------------------ Ausgabe -------------------------------------------*
+    IF par_dsal NE 'X'.                  "/ display part only.
+      IF par_dsfl = 'X'.                 "/ display errors only.
+        LOOP AT sap_vtb_market WHERE sstats IS INITIAL.
+          DELETE sap_vtb_market.
+        ENDLOOP.
+      ELSE.                              "/ display ok-req only.
+        LOOP AT sap_vtb_market WHERE NOT sstats IS INITIAL.
+          DELETE sap_vtb_market.
+        ENDLOOP.
+      ENDIF.
+    ENDIF.
+
+* Anzeige Marktdaten
+    CALL FUNCTION 'TB_DATAFEED_SHOW_MARKET_DATA'
+      EXPORTING
+        flg_datafeed = false
+        alv_variant  = alv_variant
+        reprep_id    = alv_reprep_id
+      TABLES
+        market_data  = sap_vtb_market.
+  ELSE.
+    LOOP AT response.
+      WRITE: response-line.
+    ENDLOOP.
+  ENDIF.
+
+*&---------------------------------------------------------------------*
+*&      Form  WRITE_ERRORLOG
+*&---------------------------------------------------------------------*
+* Alle Eintr#ge aus der sap_vtb_market, die einen Fehlertext enthalten,*
+* werden in die Tabelle error_rec geschrieben.                         *
+* Es wird der entsprechende Satz aus der marktdaten_orginal ermittelt! *
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM write_errorlog.
+  CLEAR    error_rec.
+  REFRESH  error_rec.
+
+  LOOP AT sap_vtb_market WHERE NOT ( sstats IS INITIAL ).
+    save_tabix = sy-tabix.
+    error_rec-sclass      = '##'.
+    error_rec-sstats      = sap_vtb_market-sstats.
+    error_rec-error       = sap_vtb_market-error.
+    APPEND error_rec.
+
+* Es wird der entsprechende Satz aus der marktdaten_orginal ermittelt,
+* da in der Fehler-Log-Datei der nicht umgeschl¨¹sselte Datensatz
+* ausgegeben wird
+    CLEAR error_rec.
+    READ TABLE marktdaten_orginal INTO error_rec INDEX save_tabix.
+    APPEND error_rec.
+  ENDLOOP.
+
+*Falls logfile auf den PC geschrieben werden soll.
+  IF logdwnld = 'X'.
+
+* expilziter cast wegen Typkonflikt
+    MOVE logfile TO filestring.
+
+    CALL FUNCTION 'GUI_DOWNLOAD'
+      EXPORTING
+        filename                = filestring
+        filetype                = 'ASC'
+        append                  = 'X'
+      TABLES
+        data_tab                = error_rec
+      EXCEPTIONS
+        file_write_error        = 1
+        no_batch                = 2
+        gui_refuse_filetransfer = 3
+        invalid_type            = 4
+        no_authority            = 5
+        unknown_error           = 6
+        header_not_allowed      = 7
+        separator_not_allowed   = 8
+        filesize_not_allowed    = 9
+        header_too_long         = 10
+        dp_error_create         = 11
+        dp_error_send           = 12
+        dp_error_write          = 13
+        unknown_dp_error        = 14
+        access_denied           = 15
+        dp_out_of_memory        = 16
+        disk_full               = 17
+        dp_timeout              = 18
+        file_not_found          = 19
+        dataprovider_exception  = 20
+        control_flush_error     = 21
+        OTHERS                  = 22.
+
+    PERFORM ws_download_error.
+  ELSE.
+*Falls logfile auf den Applikationsserver geschrieben werden soll.
+*    perform write_header.
+    LOOP AT error_rec.
+      TRANSFER error_rec TO logfile.
+    ENDLOOP.
+* Datei wieder schlie#en
+    CLOSE DATASET logfile.
+  ENDIF.
+
+ENDFORM.                               " WRITE_ERRORLOG
+
+*&---------------------------------------------------------------------*
+*&      Form  WRITE_HEADER
+*&---------------------------------------------------------------------*
+*       text                                                           *
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM write_header.
+* Fill Heder_Rec
+  PERFORM fill_header_rec.
+  IF logdwnld = 'X'.
+
+    MOVE logfile TO filestring.
+
+    CALL FUNCTION 'GUI_DOWNLOAD'
+      EXPORTING
+        filename                = filestring
+        filetype                = 'ASC'
+      TABLES
+        data_tab                = header_rec
+      EXCEPTIONS
+        file_write_error        = 1
+        no_batch                = 2
+        gui_refuse_filetransfer = 3
+        invalid_type            = 4
+        no_authority            = 5
+        unknown_error           = 6
+        header_not_allowed      = 7
+        separator_not_allowed   = 8
+        filesize_not_allowed    = 9
+        header_too_long         = 10
+        dp_error_create         = 11
+        dp_error_send           = 12
+        dp_error_write          = 13
+        unknown_dp_error        = 14
+        access_denied           = 15
+        dp_out_of_memory        = 16
+        disk_full               = 17
+        dp_timeout              = 18
+        file_not_found          = 19
+        dataprovider_exception  = 20
+        control_flush_error     = 21
+        OTHERS                  = 22.
+
+    save_subrc = sy-subrc.
+*Auswertung SY-SUBRC
+    PERFORM ws_download_error.
+  ELSE.
+* Datei zum schreiben #ffnen
+    OPEN DATASET logfile FOR OUTPUT IN TEXT MODE ENCODING DEFAULT.
+    IF sy-subrc NE 0.         "/ Datei konnte nicht ge#ffnet werden
+      MESSAGE i516(t2) WITH logfile.
+* Datei & konnte nicht ge#ffnet werden!
+      LEAVE LIST-PROCESSING.
+    ENDIF.
+    LOOP AT header_rec.
+      TRANSFER header_rec TO logfile.
+    ENDLOOP.
+  ENDIF.
+ENDFORM.                               " WRITE_HEADER
+
+*&---------------------------------------------------------------------*
+*&      Form  FILL_HEADER_REC
+*&---------------------------------------------------------------------*
+*       text                                                           *
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM fill_header_rec.
+
+  datum = sy-datum.
+*     Datum konvertieren von TTMMYYYY nach YYYYMMTT konvertieren
+  MOVE datum(4)   TO datum_txt+6(4).   "/ Jahr
+  datum_txt+5(1) = '.'.
+  MOVE datum+4(2) TO datum_txt+3(2).   "/ Monat
+  datum_txt+2(1) = '.'.
+  MOVE datum+6(2) TO datum_txt(2)  .   "/ Tag
+
+  CLEAR header_rec.
+  REFRESH header_rec.
+  header_rec-text = text-116.
+  APPEND header_rec.
+  header_rec-text = text-117.
+  APPEND header_rec.
+  header_rec-text = text-118.
+*  header_rec-text+25(40) = file.
+  header_rec-text+25(40) = 'http://www.cbr.ru/scripts/XML_daily.asp'.
+  APPEND header_rec.
+  header_rec-text = text-119.
+  header_rec-text+25(20) = datum_txt.
+  APPEND header_rec.
+  header_rec-text = text-120.
+  header_rec-text+25(20) = sy-uname.
+  APPEND header_rec.
+  header_rec-text = text-121.
+  APPEND header_rec.
+  header_rec-text = text-122.
+  APPEND header_rec.
+  header_rec-text = text-124.
+  APPEND header_rec.
+* Headerinfo in Datei schreiben (Datenlieferant)
+  header_rec-text = text-125.
+  REPLACE '&' WITH par_feed INTO header_rec-text.
+  APPEND header_rec.
+ENDFORM.                               " FILL_HEADER_REC
+
+*&---------------------------------------------------------------------*
+*&      Form  WS_DOWNLOAD_ERROR
+*&---------------------------------------------------------------------*
+*       text                                                           *
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM ws_download_error.
+  IF save_subrc <> 0.
+    MESSAGE i516(t2) WITH logfile.     " Dann Fehler im Dateinamen
+* Datei & konnte nicht ge#ffnet werden!
+    LEAVE LIST-PROCESSING.             " Zur¨¹ck zum Selektions-Dynpro
+  ENDIF.
+ENDFORM.                               " WS_DOWNLOAD_ERROR
+*&---------------------------------------------------------------------*
+*&      Form  CLEAR_VOLAS
+*&---------------------------------------------------------------------*
+*       text                                                           *
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM clear_volas.
+  LOOP AT sap_vtb_market WHERE sclass <> '01'
+                         AND   sclass <> '02'
+                         AND   sclass <> '03'
+                         AND   sclass <> '04'
+                         AND   sclass <> '21'.
+    sap_vtb_market-sstats  = 'E'.
+    sap_vtb_market-error   = text-123.
+    REPLACE '&' WITH sap_vtb_market-sclass
+                INTO sap_vtb_market-error.
+    MODIFY sap_vtb_market.
+  ENDLOOP.
+
+ENDFORM.                               " CLEAR_VOLAS
+
+*Text symbol text£º
+*002:PC file
+*003:Data provider
+*100:Input
+*101:Output control
+*110:Output list of results
+*111:All
+*112:Errors
+*113:Correct results
+*114:Generate automatically from file
+*115:Error file
+*116:###Market data file interface: error log##############################
+*117:##                                                                  ##
+*118:## Market data file                                                 ##
+*119:## Created on:                                                      ##
+*120:## Created by:                                                      ##
+*121:##                                                                  ##
+*122:######################################################################
+*123:Instrument class & unknown
+*124:## Data provider
+*125:90&
+*130:Exchange rates
+*131:direct quot.
+*132:indirect quotation
+*133:***  This program can run only On-line!  ***
+*134:Auto Upload Russian Central Bank Rates from Internet
+
+*135:Auto Upload Poland Nationalk Bank Rates from Internet
+*Selection text£º
+*LOG:        Generate error file
+*LOGDWNLD:        Download
+*LOGFILE:        File name
+*PAR_DSAL:        Whole results list
+*PAR_DSFL:        Display error log
+*PAR_DSOK:        Display correct market data
+*PAR_FEED:        Name
+*PAR_RFD:        Determine provider
+*PAR_RFN:        Provider specified
+*PAR_TST:        Test run
+*PAR_VAR:        Layout
+*P_PROXY:        HTTP Proxy
+*P_PWD:        Password
+*P_URI:        Web Site
+*P_USER:        User Name

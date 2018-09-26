@@ -1,0 +1,479 @@
+*----------------------------------------------------------------------*
+*   INCLUDE RFZ30GET                                                   *
+*----------------------------------------------------------------------*
+
+GET reguh.
+
+  check s_zahlw .
+  check reguh-busab in s_sachb or reguh-vblnr eq space..
+  check s_hausb .
+  check s_waers .
+  check s_kkonto .
+  check s_dkonto .
+  if not reguh-vblnr is initial.
+    check s_zgsber .
+    check s_zusatz .
+  endif.
+
+* replaced
+* CHECK SELECT-OPTIONS.
+
+* ---- Nur zur Zahlung gelangte Posten selektieren --------------------
+* ---- select only valid items
+
+  IF p_ausna EQ space.
+    CHECK reguh-vblnr NE space.
+  ENDIF.
+
+  if not reguh-waers is initial.
+    check reguh-waers in s_waers.
+  endif.
+* ------ Nur Ausnahmne anzeigen ? --------------------------------------
+* ------ select only non valid items ? ---------------------------------
+  IF     p_regul IS INITIAL
+     AND p_asum  IS INITIAL
+     AND p_csum  IS INITIAL
+     AND p_wsum  IS INITIAL
+     AND p_msum  IS INITIAL
+     AND p_bsum  IS INITIAL.
+    CHECK reguh-vblnr EQ space.
+  ENDIF.
+
+  perform company_account_auth.
+
+* ---------- erste Schleifendurchlauf ----------------------------------
+* ---------- first round ? ---------------------------------------------
+  IF gx_firstround EQ 'X'.
+    gc_lastzbukr          = reguh-zbukr.
+    CLEAR gx_firstround.
+  ENDIF.
+
+*--------- Neuer Buchungskreis ? ---------------------------------------
+*--------- new company code ? ------------------------------------------
+  IF gc_lastzbukr NE reguh-zbukr.
+    PERFORM check_for_entries USING    gt_output_main
+                              CHANGING gx_entries.
+
+    IF gx_entries EQ 'X'.
+      SORT gt_output_main-poken BY poken.
+      APPEND  gt_output_main.
+    ENDIF.
+    CLEAR   gt_output_main.
+    gc_lastzbukr          = reguh-zbukr.
+  ENDIF.
+
+  REFRESH: gt_regup,
+           gt_regup_lst.
+
+*------ Lesen von Customizingtable -------------------------------------
+*------ read customizing tables ----------------------------------------
+  PERFORM read_bnka  USING reguh-zbnks
+                           reguh-zbnky.
+  PERFORM read_t001  USING reguh-zbukr.
+  PERFORM read_t005t USING t001-spras
+                           reguh-zland.
+  PERFORM read_t042  USING reguh-zbukr.
+  PERFORM read_t042h USING t001-spras
+                           reguh-uzawe.
+
+* ---- F¨¹llen der Tabelle gt_reguh_lst --------------------------------
+* ---- fill table gt_reguh_lst ----------------------------------------
+  CLEAR gt_reguh_lst.
+  CLEAR suref.                                "interne Summen HW 831755
+
+* feinere Berechtigunspr¨¹fung f¨¹r HR
+  clear sy-subrc.
+  if reguh-laufi+5(1) = 'P' and reguh-pernr ne 0.
+    CALL FUNCTION 'HR_CHECK_AUTHORITY_PERNR'
+         EXPORTING
+              PERNR  = reguh-PERNR
+              BEGDA  = reguh-LAUFD
+              ENDDA  = reguh-LAUFD
+         EXCEPTIONS
+              OTHERS = 4.
+    IF SY-SUBRC <> 0.
+      flg_pernr_err = 'X'.
+    ENDIF.
+  endif.
+  check sy-subrc eq 0.
+
+  MOVE-CORRESPONDING reguh TO gt_reguh_lst.
+  move reguh-ziban to gt_header_main-ziban.
+  MOVE reguh-zswif TO gt_header_main-zswif.
+
+  gt_reguh_lst-zbnka = bnka-banka.
+  gt_reguh_lst-zbrch = bnka-brnch.
+  gt_reguh_lst-zbort = bnka-ort01.
+
+  gt_reguh_lst-uzawx = t042h-txt30.
+
+  IF gt_reguh_lst-vblnr EQ space.
+    CLEAR: gt_reguh_lst-rwbtr,
+           gt_reguh_lst-rbetr,
+           gt_reguh_lst-rskon,
+           gt_reguh_lst-rwskt,
+           gt_reguh_lst-skvhw,
+           gt_reguh_lst-skvfw.
+    gt_reguh_lst-rzawx = text-014.     "keine Regulierung
+    gt_reguh_lst-vblnr = text-015.     "Ausnahme
+  ELSEIF reguh-edibn EQ space OR reguh-edibn EQ 'E'.
+    PERFORM read_t042z USING t001-land1 reguh-rzawe.
+    gt_reguh_lst-rzawx = t042z-text1.
+  ELSE.
+    gt_reguh_lst-rzawx = text-016.     "EDI-Zahlung
+  ENDIF.
+
+  IF reguh-rzawe EQ space.
+    IF reguh-avisg = 'A'.
+      gt_reguh_lst-rzawx = text-055.   "Saldo-Null Mitteilung
+    ELSEIF reguh-avisg = 'V'.
+      gt_reguh_lst-rzawx = text-056.   "Ausgleich ohne Mitteilung
+    ENDIF.
+  ENDIF.
+
+  IF gt_reguh_lst-empfg(1) EQ '>'.
+    gt_reguh_lst-empfg+0(10) = gt_reguh_lst-empfg+1(10).
+  ENDIF.
+
+* Keine Kurzdifferenzen beim Ausgleichsbeleg => RBETR nicht 0
+  IF reguh-avisg = 'A' and reguh-rwbtr is initial.
+    clear gt_reguh_lst-rbetr.
+  endif.
+
+* ------------ GET REGUP ---------------------------------------------
+GET regup.
+* ------------ Ausnahmen speziell behandeln ---------------------------
+* ------------ special treatment of exceptions ------------------------
+  IF regup-vblnr IS INITIAL.
+    CHECK s_pokekz.
+    CHECK s_zlspr.
+    check regup-waers in s_waers.
+*   check business area, because it was not checked
+*   while the REGUH Get
+    check regup-GSBER in s_zgsber.
+    check regup-uzawe in s_zusatz.
+    PERFORM read_t042 USING regup-bukrs.
+    CHECK t042-absbu IN zw_absbu.
+    IF REGUH-BUSAB IS INITIAL.   "// nur wenn in REGUH nicht vorhanden
+       perform read_busab using t042-absbu
+                                regup-laufi
+                       changing gt_reguh_lst.
+    ENDIF.
+    check gt_reguh_lst-busab in s_sachb.
+  ENDIF.
+
+* ------------- #bergabetabelle gt_regup fuer Open FI f¨¹llen ----------
+* ------------- fill table gt_regup for Open FI -----------------------
+  APPEND regup TO gt_regup.
+
+* ------------- Tabelle gt_Regup_lst f¨¹llen ---------------------------
+* ------------- fill table gt_regup -----------------------------------
+  clear gt_regup_lst.
+  MOVE-CORRESPONDING regup TO gt_regup_lst.
+
+  PERFORM read_tbslt USING t001-spras regup-bschl regup-umskz.
+  gt_regup_lst-bschx = tbslt-ltext.
+
+* ---- Zahlungsbetrag bei netto gef¨¹hrten Anzahlungen korrigieren -----
+* ---- correct amount for net-posted deposits -------------------------
+  IF regup-xanet NE space.
+    gt_regup_lst-dmbtr = regup-dmbtr + regup-mwsts.
+    gt_regup_lst-wrbtr = regup-wrbtr + regup-wmwst.
+  ENDIF.
+
+* ----------------- Skontoverlust berechnen ---------------------------
+* ----------------- calculate lost cash discount ----------------------
+
+  IF regup-vblnr NE space.
+    gt_regup_lst-skvfw = regup-msfbt - regup-wskto.
+    gt_regup_lst-skvhw = regup-mshbt - regup-sknto.
+  ELSE.
+    gt_regup_lst-vblnr = text-015.
+    gp_tage1 = regup-zfbdt + regup-zbd1t + t042-toltg.
+    gp_tage2 = regup-zfbdt + regup-zbd2t + t042-toltg.
+    MOVE: gp_tage1 TO gd_skntage1,
+          gp_tage2 TO gd_skntage2.
+    IF reguh-zaldt <= gd_skntage1.
+      gt_regup_lst-skvfw = 0.
+      gt_regup_lst-skvhw = 0.
+    ELSEIF reguh-zaldt <= gd_skntage2.
+      gt_regup_lst-skvfw = regup-msfbt -
+                       ( gt_regup_lst-wrbtr * regup-zbd2p ) / 1000000.
+      gt_regup_lst-skvhw = regup-mshbt -
+                       ( gt_regup_lst-dmbtr * regup-zbd2p ) / 1000000.
+    ELSE.
+      gt_regup_lst-skvfw = regup-msfbt.
+      gt_regup_lst-skvhw = regup-mshbt.
+    ENDIF.
+  ENDIF.
+
+  gt_regup_lst-empfg = gt_reguh_lst-empfg.
+  gt_regup_lst-qsteu = regup-qbshh. " Quellensteuerbetrag in Hausw#hrung
+  gt_regup_lst-wqste = regup-qbshb.    " Quellensteuerbetrag in Fremdw.
+
+
+* -------------- Vorzeichen f¨¹r Ausgabe setzen ------------------------
+* -------------- set sign for output ----------------------------------
+  IF regup-shkzg EQ 'H'.
+    gt_regup_lst-dmbtr = gt_regup_lst-dmbtr * -1.
+    gt_regup_lst-wrbtr = gt_regup_lst-wrbtr * -1.
+    gt_regup_lst-sknto = gt_regup_lst-sknto * -1.
+    gt_regup_lst-wskto = gt_regup_lst-wskto * -1.
+    gt_regup_lst-qsteu = gt_regup_lst-qsteu * -1.
+    gt_regup_lst-wqste = gt_regup_lst-wqste * -1.
+    gt_regup_lst-skvfw = gt_regup_lst-skvfw * -1.
+    gt_regup_lst-skvhw = gt_regup_lst-skvhw * -1.
+  ENDIF.
+
+  gt_regup_lst-abzug = gt_regup_lst-sknto + gt_regup_lst-qsteu.
+  gt_regup_lst-wabzg = gt_regup_lst-wskto + gt_regup_lst-wqste.
+  gt_regup_lst-netto = gt_regup_lst-dmbtr - gt_regup_lst-abzug.
+  gt_regup_lst-wnett = gt_regup_lst-wrbtr - gt_regup_lst-wabzg.
+
+  APPEND gt_regup_lst.
+
+* fill sum fields of reguh_lst, which are not in reguh
+  gt_reguh_lst-abzug = gt_reguh_lst-abzug + gt_regup_lst-abzug.
+  suref-netto        = suref-netto        + gt_regup_lst-netto.
+  suref-brutt        = suref-brutt        + gt_regup_lst-dmbtr.
+  gt_reguh_lst-qsteu = gt_reguh_lst-qsteu + gt_regup_lst-qsteu.
+
+* Betr#ge im Fremdw#hrung k#nnen nicht in
+* der Ausnahmeliste summiert werden (unterschiedliche W#hrungen)
+  if reguh-vblnr is initial.
+    clear: gt_reguh_lst-wnett,
+           gt_reguh_lst-wbrut,
+           gt_reguh_lst-wabzg,
+           gt_reguh_lst-wqste.
+  else.
+    suref-wnett        = suref-wnett        + gt_regup_lst-wnett.
+    suref-wbrut        = suref-wbrut        + gt_regup_lst-wrbtr.
+    gt_reguh_lst-wabzg = gt_reguh_lst-wabzg + gt_regup_lst-wabzg.
+    gt_reguh_lst-wqste = gt_reguh_lst-wqste + gt_regup_lst-wqste.
+  endif.
+
+* ------------------ Poken-Tabelle f¨¹llen -----------------------------
+* ------------------ fill table of item-indicator ---------------------
+  IF p_ausna NE space.
+    IF regup-poken NE space.
+      READ TABLE gt_output_main-poken WITH KEY poken = regup-poken
+                                      TRANSPORTING NO FIELDS.
+      if sy-subrc NE 0.
+      CLEAR t100.
+      gc_text = '5'.
+      gc_text+1(2) = regup-poken+1(2).
+
+      SELECT SINGLE * FROM t100 WHERE sprsl EQ sy-langu AND
+                                      arbgb EQ 'FZ'     AND
+                                      msgnr EQ gc_text.
+      IF sy-subrc EQ 0 AND t100-text NE space.
+        gt_pokentab-poken = regup-poken.
+        gt_pokentab-text = t100-text.
+        APPEND gt_pokentab TO gt_output_main-poken.
+        gx_showpoken = 'X'.
+        ENDIF.
+      endif.
+    ENDIF.
+  ENDIF.
+
+* fill sumlists
+  IF NOT p_asum IS INITIAL and T042-XGBTR IS INITIAL
+    AND NOT reguh-vblnr IS INITIAL.
+
+    PERFORM read_tgsbt USING t001-spras
+                             gt_regup_lst-gsber.
+    perform fill_business_area.
+
+  endif.
+GET reguh LATE.
+
+* ---------------------- Open FI -------------------------------------
+
+  CALL FUNCTION 'OPEN_FI_PERFORM_00002110_E'
+       EXPORTING
+            i_reguh     = reguh
+       TABLES
+            t_regup     = gt_regup
+            t_regup_lst = gt_regup_lst
+       CHANGING
+            c_reguh_lst = gt_reguh_lst
+       EXCEPTIONS
+            OTHERS      = 0.
+
+* ----------------- Ausgabetabellen f¨¹llen ----------------------------
+* ----------------- fill output table ---------------------------------
+
+  DESCRIBE TABLE gt_regup_lst LINES sy-tabix.
+  CHECK sy-tabix GT 0.
+
+  IF  suref-netto >= i_max  OR  suref-netto <= i_mmax     "// HW 831755
+  OR  suref-brutt >= i_max  OR  suref-brutt <= i_mmax
+  OR  suref-wnett >= i_max  OR  suref-wnett <= i_mmax
+  OR  suref-wbrut >= i_max  OR  suref-wbrut <= i_mmax.
+    gt_reguh_lst-netto = 0.
+    gt_reguh_lst-brutt = 0.
+    gt_reguh_lst-wnett = 0.
+    gt_reguh_lst-wbrut = 0.
+  ELSE.
+    gt_reguh_lst-netto = suref-netto.
+    gt_reguh_lst-brutt = suref-brutt.
+    gt_reguh_lst-wnett = suref-wnett.
+    gt_reguh_lst-wbrut = suref-wbrut.
+  ENDIF.
+
+* Fill gt_output_main
+  gt_output_main-zbukr  = gt_reguh_lst-zbukr.
+  gt_output_main-hwaer  = t001-waers.
+
+  IF    ( p_regul EQ 'X' AND NOT reguh-vblnr EQ space )
+     OR ( p_ausna EQ 'X' AND     reguh-vblnr EQ space ).
+
+    MOVE-CORRESPONDING gt_reguh_lst TO gt_header_main.
+    gt_header_main-hwaer = t001-waers.
+
+* Fill gt_header_main-ziban from TIBAN
+* (if ZIBAN is not already filled from REGUH, e.g. via PAYRQ from IHC)
+*    IF gt_header_main-ziban IS INITIAL.
+*      CALL FUNCTION 'READ_IBAN_FROM_DB'
+*           EXPORTING
+*                i_banks = gt_header_main-ZBNKS
+*                i_bankl = gt_header_main-zbnky
+*                i_bankn = gt_header_main-zbnkn
+*                i_bkont = gt_header_main-zbkon
+*                i_bkref = gt_header_main-bkref
+*           IMPORTING
+*                e_iban  = gt_header_main-ziban.
+*     ENDIF.
+
+* Fill gt_header_main-uiban from TIBAN
+      CALL FUNCTION 'READ_IBAN_FROM_DB'
+           EXPORTING
+                i_banks = gt_header_main-uBNKS
+                i_bankl = gt_header_main-ubnky
+                i_bankn = gt_header_main-UBKNT
+                i_bkont = gt_header_main-UBKON
+*                i_bkref = gt_header_main-bkref
+           IMPORTING
+                e_iban  = gt_header_main-uiban.
+
+    IF p_verd EQ space.
+      gt_header_main-expa = 'X'.
+    ENDIF.
+*-- IBAN without bank account check --------
+    IF gt_header_main-zbnkn NE SPACE.
+      DATA: l_xtechn TYPE c.
+      CALL FUNCTION 'FI_TECH_ACCNO_CHECK_TRY'
+        EXPORTING
+          i_bankn = gt_header_main-zbnkn
+        IMPORTING
+          e_xtech = l_xtechn.
+      IF l_xtechn EQ 'X'.
+        CLEAR gt_header_main-zbnkn.
+      ENDIF.
+    ENDIF.
+
+    PERFORM store_adrs.    " Adresse generieren, speichern und Key in
+    " Tabelle gt_header_main eintragen
+    " create and save adress, insert key in
+                                       " table gt_header_main
+
+*  APPEND gt_header_main.
+*  APPEND LINES OF gt_regup_lst TO gt_item_main.
+
+    APPEND          gt_header_main TO gt_output_main-header.
+    APPEND LINES OF gt_regup_lst   TO gt_output_main-item.
+  ENDIF.
+
+  CHECK reguh-vblnr NE space.          " no exception for sum lists
+
+* fill sumlists
+  IF NOT p_asum IS INITIAL AND NOT t042-XGBTR IS INITIAL.
+
+      PERFORM read_tgsbt USING t001-spras
+                               reguh-srtgb.
+    MOVE-CORRESPONDING gt_reguh_lst TO   gs_area.
+    MOVE:              t001-waers   TO   gs_area-hwaer,
+                gt_reguh_lst-rzawx  TO   gs_area-text1,
+                       tgsbt-gtext  TO   gs_area-gtext.
+    COLLECT            gs_area      INTO gt_output_main-area.
+
+  ENDIF.
+
+  IF NOT p_csum IS INITIAL.
+    MOVE-CORRESPONDING gt_reguh_lst TO   gs_coun.
+    MOVE:              t001-waers   TO   gs_coun-hwaer,
+                       t005t-landx  TO   gs_coun-landx,
+                gt_reguh_lst-rzawx  TO   gs_coun-text1.
+    COLLECT            gs_coun      INTO gt_output_main-coun.
+  ENDIF.
+
+  IF NOT p_wsum IS INITIAL.
+    MOVE-CORRESPONDING gt_reguh_lst TO   gs_curr.
+    MOVE:              t001-waers   TO   gs_curr-hwaer,
+                       t005t-landx  TO   gs_curr-landx,
+                gt_reguh_lst-rzawx  TO   gs_curr-text1.
+    COLLECT            gs_curr      INTO gt_output_main-curr.
+  ENDIF.
+
+  IF NOT p_msum IS INITIAL.
+    MOVE-CORRESPONDING gt_reguh_lst TO   gs_meth.
+    MOVE:              t001-waers   TO   gs_meth-hwaer,
+                gt_reguh_lst-rzawx  TO   gs_meth-text1.
+    COLLECT            gs_meth      INTO gt_output_main-meth.
+  ENDIF.
+
+  IF NOT p_bsum IS INITIAL.
+*   get bank name and bank place
+    CALL FUNCTION 'READ_BANK_ADDRESS'
+         EXPORTING
+              bank_country = gt_reguh_lst-ubnks
+              bank_number  = gt_reguh_lst-ubnky
+         IMPORTING
+              bnka_wa      = gs_bnka
+         EXCEPTIONS
+              not_found    = 1
+              OTHERS       = 2.
+
+    IF sy-subrc <> 0.
+      CLEAR gs_bnka.
+    ENDIF.
+
+    MOVE-CORRESPONDING gt_reguh_lst  TO   gs_bank.
+    MOVE:              t001-waers    TO   gs_bank-hwaer,
+                gt_reguh_lst-rzawx   TO   gs_bank-text1,
+                       gs_bnka-banka TO   gs_bank-ubnka,
+                       gs_bnka-ort01 TO   gs_bank-ort01.
+    CONCATENATE gs_bnka-banka gs_bnka-ort01
+      INTO gs_bank-ubank separated by '  '.
+    if reguh-avisg = 'A'.
+      gs_bank-ubank = text-055.
+    endif.
+    IF gs_bank-ubknt+17(1) NE SPACE                   "Hinweis 873835
+    OR NOT fl_gs_bank_ubkrf IS INITIAL.
+      CLEAR t012k.
+      SELECT SINGLE * FROM t012k
+             WHERE bukrs = reguh-zbukr
+               AND hbkid = reguh-hbkid
+               AND hktid = reguh-hktid.
+      CALL FUNCTION 'CONVERT_HOUSEBANK_ACCOUNT_NUM'
+           EXPORTING  i_land1      = gs_bank-ubnks
+                      i_bankk      = gs_bank-ubnky
+                      i_bankn      = gs_bank-ubknt
+                      i_bkont      = gs_bank-ubkon
+                      i_refzl      = t012k-refzl
+                      i_bankl      = gs_bank-ubnkl
+           IMPORTING  e_bankn_long = gs_bank-ubknt_long
+                      e_refzl      = gs_bank-refzl
+                      e_bkont      = gs_bank-ubkon
+                      e_subrc      = g_subrc.
+      IF gs_bank-ubknt_long GT gs_bank-ubknt.
+        fl_gs_bank_ubknt = 'X'.
+      ENDIF.
+    ELSE.
+      gs_bank-ubknt_long = gs_bank-ubknt.
+      gs_bank-refzl      = SPACE.
+    ENDIF.
+    lc_refzl-ubkrf = t012k-refzl.
+    MOVE-CORRESPONDING lc_refzl to gs_bank.      "Ende Hinweis 873835
+    COLLECT            gs_bank      INTO gt_output_main-bank.
+  ENDIF.

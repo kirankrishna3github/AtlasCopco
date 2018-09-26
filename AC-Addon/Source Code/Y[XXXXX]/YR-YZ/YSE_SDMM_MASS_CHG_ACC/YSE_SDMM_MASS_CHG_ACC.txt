@@ -1,0 +1,451 @@
+*&---------------------------------------------------------------------*
+* PROGRAM ID           : YSE_SDMM_MASS_CHG_ACC                         *
+* PROGRAM TITLE        : Program to upload  Product attribute          *
+*                        AC Connect for Materials in Sales org. view   *
+* AUTHOR               : Anda Wu                                       *
+* DATE                 : 07/05/2013                                    *
+* DEVELOPMENT ID       : CD1K975920                                    *
+* CHANGE REQUEST NUMBER: CR 2903                                       *
+* PROGRAM DESCRIPTION  : BAPI  program to mass update the AC Connect   *
+*                        Product attribute  for all the materials in   *
+*                        the sales view.                               *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME     |CORRECTION NUMBER| CHANGE REFERENCE # *
+*----------------------------------------------------------------------*
+* MOD-001 |24.03.2016| Anda Wu  |CD1K988531       |INC47371            *
+*  Can't mass update the ACC flag
+*----------------------------------------------------------------------*
+
+REPORT  yse_sdmm_mass_chg_acc NO STANDARD PAGE HEADING
+                             LINE-SIZE 200.
+
+************************************************************************
+* TABLES DECLARATIONS
+************************************************************************
+TABLES : tvkwz.
+
+************************************************************************
+* TYPES DECLARATIONS
+************************************************************************
+TYPES: BEGIN OF ty_upload_acc,
+        matnr TYPE mvke-matnr,
+       END OF ty_upload_acc.
+
+TYPES: BEGIN OF ty_product_att,
+        mandt TYPE  sy-mandt,
+        matnr TYPE  mvke-matnr,
+       END OF ty_product_att.
+
+TYPES: BEGIN OF ty_product_att_status,
+         matnr TYPE mvke-matnr,
+         vkorg TYPE mvke-vkorg,
+         vtweg TYPE mvke-vtweg,
+       message TYPE bapiret2-message,
+       END OF ty_product_att_status.
+
+************************************************************************
+* VARIABLES DECLARATIONS
+************************************************************************
+DATA : gv_prodatt_recs    TYPE i,
+       gv_prodatt_total   TYPE i,
+       gv_prodatt_succ    TYPE i,
+       gv_prodatt_fail    TYPE i,
+       gv_data_restrict   TYPE char1.
+
+************************************************************************
+* CONSTANTS DECLARATIONS
+************************************************************************
+CONSTANTS:  gc_x(1)         TYPE c VALUE 'X',
+            gc_date_low(2)  TYPE n VALUE '10',
+            gc_date_high(2) TYPE n VALUE '20'.
+
+************************************************************************
+* WORK AREA DECLARATIONS
+************************************************************************
+DATA : wa_headdata      TYPE bapimathead,
+       wa_plantdata     TYPE bapi_marc,
+       wa_plantdatax    TYPE bapi_marcx,
+       wa_salesdata     TYPE bapi_mvke,
+       wa_salesdatax    TYPE bapi_mvkex,
+       wa_return        TYPE bapiret2.
+
+************************************************************************
+* INTERNAL TABLE DECLARATIONS
+************************************************************************
+DATA:  gt_product_att   TYPE STANDARD TABLE OF ty_product_att,
+       gt_prodatt_succ  TYPE STANDARD TABLE OF ty_product_att_status,
+       gt_prodatt_fail  TYPE STANDARD TABLE OF ty_product_att_status.
+
+************************************************************************
+* SELECTION SCREEN
+************************************************************************
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE text-003.
+PARAMETERS: p_vkorg TYPE tvkwz-vkorg OBLIGATORY
+                    MODIF ID two DEFAULT 'RU03',
+            p_vtweg LIKE tvkwz-vtweg OBLIGATORY
+                    MODIF ID two DEFAULT '01'.
+SELECTION-SCREEN END OF BLOCK b1.
+
+SELECTION-SCREEN BEGIN OF BLOCK b2 WITH FRAME TITLE text-001.
+PARAMETERS:  cb_acc   AS CHECKBOX.
+SELECTION-SCREEN END OF BLOCK b2.
+
+************************************************************************
+* INITIALIZATION.
+************************************************************************
+INITIALIZATION.
+* Do initialization
+  PERFORM do_init.
+
+************************************************************************
+*AT SELECTION-SCREEN.
+************************************************************************
+AT SELECTION-SCREEN.
+  IF gv_data_restrict = gc_x.
+*   Date restrict
+    PERFORM check_date.
+  ENDIF.
+
+************************************************************************
+* START-OF-SELECTION
+************************************************************************
+START-OF-SELECTION.
+
+* Check the required authorizations
+  PERFORM  check_authorization.
+
+* Check if the database table has records in it
+  PERFORM check_tables.
+
+***********************************************************************
+*END-OF-SELECTION.
+***********************************************************************
+END-OF-SELECTION.
+
+* Update the product attributes for the material in sales org. view.
+  PERFORM update_prodatts.
+
+*Display the update status whether successful or not
+  PERFORM display_status.
+
+*Once the updates are done,delete entries in the database table
+  PERFORM delete_entries.
+
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_AUTHORIZATION
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM check_authorization .
+* Display the progress to the user in the status bar.
+  IF sy-batch <> gc_x.
+    CALL FUNCTION 'SAPGUI_PROGRESS_INDICATOR'
+      EXPORTING
+        percentage = '25'
+        text       = text-010.
+  ENDIF.
+
+* Check if the user has authorization for that sales org.
+*  / dist. channel or else display error.
+  AUTHORITY-CHECK OBJECT 'V_VBAK_VKO'
+         ID 'VKORG' FIELD p_vkorg
+         ID 'VTWEG' FIELD p_vtweg
+         ID 'SPART' DUMMY
+         ID 'ACTVT' DUMMY.
+  IF sy-subrc = 4.
+*   No authorisation to change data in sales org. / dist. channel
+    MESSAGE ID 'YSE_GENERAL' TYPE 'E' NUMBER '006' WITH p_vkorg.
+    EXIT.
+  ELSEIF sy-subrc <> 0.
+*   Error checking authorization.
+    MESSAGE ID 'YSE_GENERAL' TYPE 'E' NUMBER '004'.
+    EXIT.
+  ENDIF.
+
+ENDFORM.                    " CHECK_AUTHORIZATION
+
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_TABLES
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM check_tables .
+* Select the product attribute data into the internal table
+  SELECT * FROM yse_prodatt_upl INTO TABLE gt_product_att.
+
+* Check the number of records in the table
+  DESCRIBE TABLE gt_product_att  LINES gv_prodatt_recs.
+
+* If both product Attributes table is empty, don't proceed further.
+  IF  gv_prodatt_recs < 1.
+    MESSAGE text-004 TYPE 'E'.
+  ENDIF.
+ENDFORM.                    " CHECK_TABLES
+
+*&---------------------------------------------------------------------*
+*&      Form  UPDATE_PRODATTS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM update_prodatts.
+  DATA: ls_product_att  TYPE ty_product_att,
+        lv_werks        TYPE mard-werks,
+        ls_prodatt_succ TYPE ty_product_att_status,
+        ls_prodatt_fail TYPE ty_product_att_status.
+
+* Display the progress to the user in the status bar.
+  IF sy-batch <> gc_x.
+    CALL FUNCTION 'SAPGUI_PROGRESS_INDICATOR'
+      EXPORTING
+        percentage = '25'
+        text       = text-016.
+  ENDIF.
+
+  SELECT zwerks
+    FROM yse_sd_acc_fam
+    INTO lv_werks
+    UP TO 1 ROWS
+    WHERE vkorg = p_vkorg
+      AND vtweg = p_vtweg.
+  ENDSELECT.
+* Lets update the material product attributes in Sales view using the BAPI
+  LOOP AT gt_product_att INTO ls_product_att.
+    CLEAR: wa_headdata,
+           wa_plantdata,
+           wa_plantdatax,
+           wa_salesdata,
+           wa_salesdatax.
+* Add leading zeros to the material number incase it is not added in the file
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+      EXPORTING
+        input  = ls_product_att-matnr
+      IMPORTING
+        output = wa_headdata-material.
+
+    wa_headdata-sales_view   =  gc_x.
+********begin of mod-001  del
+*    wa_plantdata-plant = lv_werks.
+*    wa_plantdatax-plant = lv_werks.
+********end of mod-001  del
+    wa_salesdata-sales_org   =  p_vkorg.
+    wa_salesdata-distr_chan  =  p_vtweg.
+    IF cb_acc IS NOT INITIAL.
+      wa_salesdata-prod_att_2  =  gc_x.
+    ELSE.
+      CLEAR wa_salesdata-prod_att_2.
+    ENDIF.
+
+    wa_salesdatax-sales_org  =  p_vkorg.
+    wa_salesdatax-distr_chan =  p_vtweg.
+    wa_salesdatax-prod_att_2 =  gc_x.
+
+    CALL FUNCTION 'BAPI_MATERIAL_SAVEDATA'
+      EXPORTING
+        headdata   = wa_headdata
+        plantdata  = wa_plantdata
+        plantdatax = wa_plantdatax
+        salesdata  = wa_salesdata
+        salesdatax = wa_salesdatax
+      IMPORTING
+        return     = wa_return.
+
+*   Check if the update was successful.
+    IF wa_return-type = 'S'.
+      CLEAR ls_prodatt_succ.
+      ls_prodatt_succ-matnr     = ls_product_att-matnr.
+      ls_prodatt_succ-vkorg     = p_vkorg.
+      ls_prodatt_succ-vtweg     = p_vtweg.
+      APPEND ls_prodatt_succ TO gt_prodatt_succ.
+
+*        Lets save the record into the database.
+      CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+        EXPORTING
+          wait = 'X'.
+    ELSE.
+      CLEAR ls_prodatt_fail.
+      ls_prodatt_fail-matnr      = ls_product_att-matnr.
+      ls_prodatt_fail-vkorg      = p_vkorg.
+      ls_prodatt_fail-vtweg      = p_vtweg.
+      ls_prodatt_fail-message    = wa_return-message.
+      APPEND ls_prodatt_fail TO gt_prodatt_fail.
+    ENDIF.
+    CLEAR : wa_headdata,
+            wa_salesdata,
+            wa_salesdatax,
+            wa_return.
+
+  ENDLOOP.
+
+ENDFORM.                    " UPDATE_SALESVIEW
+
+
+*&---------------------------------------------------------------------*
+*&      Form  DISPLAY_STATUS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM display_status .
+  DATA: ls_prodatt_succ TYPE ty_product_att_status,
+        ls_prodatt_fail TYPE ty_product_att_status.
+* Display the progress to the user in the status bar.
+  IF sy-batch <> gc_x.
+    CALL FUNCTION 'SAPGUI_PROGRESS_INDICATOR'
+      EXPORTING
+        percentage = '25'
+        text       = text-017.
+  ENDIF.
+
+* Lets update the status
+  DESCRIBE TABLE gt_product_att   LINES gv_prodatt_total.
+  DESCRIBE TABLE gt_prodatt_succ  LINES gv_prodatt_succ.
+  DESCRIBE TABLE gt_prodatt_fail  LINES gv_prodatt_fail.
+
+
+  WRITE : /'*********************************************************************************************************************************'.
+  WRITE /35 text-018.
+  WRITE : /'*********************************************************************************************************************************'.
+  FORMAT COLOR COL_HEADING INTENSIFIED.
+  WRITE :/25 text-019 ,   gv_prodatt_total.
+  FORMAT RESET.
+*  WRITE : /'**********************************************************************'.
+
+  IF gv_prodatt_succ  > 0.
+    SKIP 2.
+    WRITE : /'**********************************************************************'.
+    FORMAT COLOR COL_POSITIVE INTENSIFIED.
+    WRITE : / text-020.
+    SKIP 1.
+    FORMAT RESET.
+    LOOP AT gt_prodatt_succ INTO ls_prodatt_succ.
+      WRITE :/2  ls_prodatt_succ-matnr, 21 text-021,
+        36 ls_prodatt_succ-vkorg , 42 text-022, 61 ls_prodatt_succ-vtweg.
+    ENDLOOP.
+    WRITE : /'**********************************************************************'.
+  ENDIF.
+
+  IF gv_prodatt_fail > 0.
+    SKIP 2.
+    WRITE : /'**********************************************************************'.
+    FORMAT COLOR COL_GROUP INTENSIFIED.
+    WRITE : / text-023.
+    SKIP 1.
+    FORMAT RESET.
+    LOOP AT gt_prodatt_fail INTO ls_prodatt_fail.
+      WRITE :/2 ls_prodatt_fail-matnr, 21 text-021,
+        36 ls_prodatt_fail-vkorg, 42 text-022, 61 ls_prodatt_fail-vtweg.
+      WRITE /: ls_prodatt_fail-message.
+    ENDLOOP.
+    WRITE : /'**********************************************************************'.
+  ENDIF.
+
+
+  IF gv_prodatt_succ > 0 OR gv_prodatt_fail > 0.
+    SKIP 2.
+    WRITE : /'**********************************************************************'.
+    IF gv_prodatt_succ > 0.
+      FORMAT COLOR COL_POSITIVE INTENSIFIED.
+      WRITE :  / text-024,  gv_prodatt_succ.
+      FORMAT RESET.
+    ENDIF.
+    IF gv_prodatt_fail > 0.
+      FORMAT COLOR COL_NEGATIVE INTENSIFIED.
+      WRITE : / text-025,  gv_prodatt_fail.
+      FORMAT RESET.
+    ENDIF.
+    WRITE : /'**********************************************************************'.
+  ENDIF.
+
+ENDFORM.                    " DISPLAY_STATUS
+
+*&---------------------------------------------------------------------*
+*&      Form  DELETE_ENTRIES
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM delete_entries .
+  DELETE FROM yse_prodatt_upl.
+ENDFORM.                    " DELETE_ENTRIES
+
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_DATE
+*&---------------------------------------------------------------------*
+*       Change if the date in valid perild
+*----------------------------------------------------------------------*
+FORM check_date .
+  DATA: lv_today(8) TYPE n.
+  lv_today = sy-datum.
+  IF   lv_today+6(2) < gc_date_low
+    OR lv_today+6(2) > gc_date_high.
+    MESSAGE  e000(yse_general)
+      WITH text-035
+            gc_date_low
+            text-036
+            gc_date_high.
+  ENDIF.
+ENDFORM.                    " CHECK_DATE
+
+*&---------------------------------------------------------------------*
+*&      Form  DO_INIT
+*&---------------------------------------------------------------------*
+*       Do initialization
+*----------------------------------------------------------------------*
+FORM do_init .
+
+  CLEAR:
+    gv_prodatt_recs    ,
+    gv_prodatt_total   ,
+    gv_prodatt_succ    ,
+    gv_prodatt_fail    ,
+    wa_headdata      ,
+    wa_salesdata     ,
+    wa_salesdatax    ,
+    wa_return        .
+
+  REFRESH:
+    gt_product_att   ,
+    gt_prodatt_succ  ,
+    gt_prodatt_fail  .
+
+*  gv_data_restrict = gc_x.
+
+ENDFORM.                    " DO_INIT
+
+*Text symbol text£º
+*001:Update Options
+*003:Sales Org. Selections
+*004:Please upload the product attributes data from excel then run this report type. Select option one to upload from excel.
+*010:Checking Authorizations
+*016:Updating the product attributes for the materials.
+*017:Collecting the update status information.
+*018:MATERIAL UPLOADS FOR PRODUCT ATTRIBUTES - AC CONNECT
+*019:Total Number of Materials to be updated         :
+*020:The Materials successfully updated are :
+*021:in Sales Org.
+*022:in Dist. Channel
+*023:The Materials not updated are :
+*024:Number of records updated successfully                 :
+*025:Total Number of records not updated                    :
+*035:Please do upload between month day
+
+*036:and
+*Selection text£º
+*CB_ACC:        ACConnect
+*P_VKORG:        Sales Organization
+*P_VTWEG:        Distribution Channel

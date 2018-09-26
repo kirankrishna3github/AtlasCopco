@@ -1,0 +1,291 @@
+*&---------------------------------------------------------------------*
+*&  Include           YSE_REN_SALES_FROM_RFL_EVENT                     *
+*&---------------------------------------------------------------------*
+
+* *******************************************************
+* Initialization (set default values on selection screen)
+* *******************************************************
+INITIALIZATION.
+  P_FYEAR = SY-DATUM(4).
+  P_FPFR  = SY-DATUM+4(2).
+  P_FPTO  = SY-DATUM+4(2).
+
+* *******************************************************
+* At selection screen
+* *******************************************************
+AT SELECTION-SCREEN.
+
+  PERFORM Check_Authorization.
+
+AT SELECTION-SCREEN ON P_FPFR.
+  IF P_FPFR > 12.
+    MESSAGE E057.
+  ELSEIF P_FPFR > P_FPTO.
+    MESSAGE E058.
+  ENDIF.
+
+AT SELECTION-SCREEN ON P_FPTO.
+  IF P_FPTO > 12.
+    MESSAGE E059.
+  ELSEIF P_FPFR > P_FPTO.
+    MESSAGE E058.
+  ENDIF.
+
+* *******************************************************
+* Start of selection
+* *******************************************************
+START-OF-SELECTION.
+
+* Determine date range in which we are interested to see deactivated assets
+  CONCATENATE P_FYEAR P_FPFR+1(2) '01' INTO GV_DATUM.
+  GV_DATFR = GV_DATUM.
+* Get last day in month of "closing" period
+  CALL FUNCTION 'NUMBER_OF_DAYS_PER_MONTH_GET'
+    EXPORTING
+      PAR_MONTH       = P_FPTO+1(2)
+      PAR_YEAR        = P_FYEAR
+    IMPORTING
+      PAR_DAYS        = GV_DAYS.
+  CONCATENATE P_FYEAR P_FPTO+1(2) GV_DAYS INTO GV_DATUM.
+  GV_DATTO = GV_DATUM.
+
+* Get all rental serial numbers
+  SELECT      EQUNR
+              SERNR
+              MATNR
+         INTO TABLE IT_EQUI
+         FROM EQUI
+        WHERE EQTYP EQ 'X'
+           OR EQTYP EQ 'Y'.
+* Put all rental serial numbers in a range
+  GR_EQUI-SIGN   = 'I'.
+  GR_EQUI-OPTION = 'EQ'.
+  LOOP AT IT_EQUI.
+    GR_EQUI-LOW = IT_EQUI-SERNR.
+    APPEND GR_EQUI.
+  ENDLOOP.
+
+* Select all assets that were deactivated in the selected period (of the selected company code)
+  SELECT      ANLN1
+              ANLN2
+              SERNR
+              ZUGDT
+              DEAKT
+         INTO TABLE IT_ANLA
+         FROM ANLA
+        WHERE BUKRS EQ P_BUKRS
+          AND SERNR IN GR_EQUI
+          AND DEAKT GE GV_DATFR
+          AND DEAKT LE GV_DATTO.
+* Put remaining rental serial numbers in a range
+  CLEAR: GR_EQUI, GR_EQUI[].
+  GR_EQUI-SIGN   = 'I'.
+  GR_EQUI-OPTION = 'EQ'.
+  LOOP AT IT_ANLA.
+    GR_EQUI-LOW = IT_ANLA-SERNR.
+    APPEND GR_EQUI.
+  ENDLOOP.
+
+* Remove entries from IT_EQUI for which no match was found with the above select clause and conditions
+  DELETE IT_EQUI WHERE SERNR NOT IN GR_EQUI.
+
+* Select equipment descriptions
+  SELECT      EQUNR
+              EQKTX
+         INTO TABLE IT_EQKT
+         FROM EQKT
+          FOR ALL ENTRIES IN IT_EQUI
+        WHERE EQUNR EQ IT_EQUI-EQUNR
+          AND SPRAS EQ 'EN'.
+
+* Select material descriptions
+  SELECT      MATNR
+              MAKTX
+         INTO TABLE IT_MAKT
+         FROM MAKT
+          FOR ALL ENTRIES IN IT_EQUI
+        WHERE MATNR EQ IT_EQUI-MATNR
+          AND SPRAS EQ 'EN'.
+
+* Select material details
+  SELECT      MATNR
+              PRDHA
+         INTO TABLE IT_MARA
+         FROM MARA
+          FOR ALL ENTRIES IN IT_EQUI
+        WHERE MATNR EQ IT_EQUI-MATNR.
+
+* Select the acquisition values (currency later to be retrieved from T093B)
+  SELECT       ANLN1
+               ANLN2
+               ANBTR
+          INTO TABLE IT_ANEP
+          FROM ANEP
+           FOR ALL ENTRIES IN IT_ANLA
+         WHERE BUKRS EQ P_BUKRS
+           AND ANLN1 EQ IT_ANLA-ANLN1
+           AND ANLN2 EQ IT_ANLA-ANLN2
+           AND AFABE EQ '30'
+           AND BWASL EQ '130'.
+
+* Select the net book value (currency later to be retrieved from T093B)
+  SELECT       ANLN1
+               ANLN2
+               KNAFA
+               NAFAG
+          INTO TABLE IT_ANLC
+          FROM ANLC
+           FOR ALL ENTRIES IN IT_ANLA
+         WHERE BUKRS EQ P_BUKRS
+           AND ANLN1 EQ IT_ANLA-ANLN1
+           AND ANLN2 EQ IT_ANLA-ANLN2
+           AND GJAHR EQ P_FYEAR
+           AND AFABE EQ '30'
+           AND ZUJHR EQ ''
+           AND ZUCOD EQ ''.
+
+* Select service costs (per equipment)
+  SELECT       EQUNR
+               VSERV
+          INTO TABLE IT_COPA
+          FROM YSE_RENT_COPA_CO
+           FOR ALL ENTRIES IN IT_EQUI
+         WHERE EQUNR EQ IT_EQUI-EQUNR.
+
+* Select the revenue sales from hire fleet (currency later to be retrieved from T093B)
+  SELECT       ANLN1
+               ANLN2
+               ERLBT
+          INTO TABLE IT_ANEA
+          FROM ANEA
+           FOR ALL ENTRIES IN IT_ANLA
+         WHERE BUKRS EQ P_BUKRS
+           AND ANLN1 EQ IT_ANLA-ANLN1
+           AND ANLN2 EQ IT_ANLA-ANLN2
+           AND GJAHR EQ P_FYEAR
+           AND AFABE EQ '30'
+           AND ZUJHR EQ ''
+           AND ZUCOD EQ ''.
+
+* Select the company code's currency
+  SELECT SINGLE WAERS
+           INTO GV_WAERS
+           FROM T093B
+          WHERE BUKRS EQ P_BUKRS
+            AND AFABE EQ '30'.
+
+* IT_ANLA is the definite list of rental assets which were sold or scrapped
+  SORT IT_EQUI BY SERNR.
+  SORT IT_EQKT BY EQUNR.
+  SORT IT_MAKT BY MATNR.
+  SORT IT_MARA BY MATNR.
+  SORT IT_ANEP BY ANLN1 ANLN2.
+  SORT IT_ANLC BY ANLN1 ANLN2.
+  SORT IT_ANEA BY ANLN1 ANLN2.
+  SORT IT_COPA BY EQUNR.
+
+  LOOP AT IT_ANLA.
+
+    CLEAR IT_RSFL.
+
+*   Copy fields from IT_ANLA
+    IT_RSFL-ANLN1 = IT_ANLA-ANLN1.
+    IT_RSFL-ANLN2 = IT_ANLA-ANLN2.
+    IT_RSFL-ZUGDT = IT_ANLA-ZUGDT.
+    IT_RSFL-DEAKT = IT_ANLA-DEAKT.
+    IT_RSFL-SERNR = IT_ANLA-SERNR.
+    IT_RSFL-WAERS = GV_WAERS.
+
+*   Summarize revenue postings (can include reversals)
+    READ TABLE IT_ANEA WITH KEY ANLN1 = IT_ANLA-ANLN1
+                                ANLN2 = IT_ANLA-ANLN2
+                       BINARY SEARCH.
+    IF SY-SUBRC EQ 0.
+      LOOP AT IT_ANEA FROM SY-INDEX.
+        CHECK IT_ANEA-ANLN1 = IT_ANLA-ANLN1.
+        CHECK IT_ANEA-ANLN2 = IT_ANLA-ANLN2.
+        IT_RSFL-REVRSFL = IT_RSFL-REVRSFL + IT_ANEA-ERLBT.
+      ENDLOOP.
+    ENDIF.
+*   If no revenue generated, don't keep the line
+    IF IT_RSFL-REVRSFL IS INITIAL.
+      CONTINUE.
+    ENDIF.
+
+*   Calc number of months in fleet
+*   CALL FUNCTION 'FI_PSO_DAYS_MONTHS_YEARS_GET'  " Function rounds up
+*     EXPORTING
+*       I_DATE_FROM       = IT_ANLA-ZUGDT
+*       I_DATE_TO         = IT_ANLA-DEAKT
+*     IMPORTING
+*       E_MONTHS          = IT_RSFL-INFLEET.
+    CALL FUNCTION 'HR_AUPBS_MONTH_DAY'      " Function rounds down
+      EXPORTING
+        BEG_DA           = IT_ANLA-ZUGDT
+        END_DA           = IT_ANLA-DEAKT
+      IMPORTING
+*       NO_DAY           =
+        NO_MONTH         = IT_RSFL-INFLEET
+        NO_YEAR          = GV_YEARS.
+*       NO_CAL_DAY       =.
+*   Add the number of years * 12 to the "Months in fleet"
+    IT_RSFL-INFLEET = IT_RSFL-INFLEET + ( GV_YEARS * 12 ).
+
+*   Find IT_EQUI entry
+    READ TABLE IT_EQUI WITH KEY SERNR = IT_ANLA-SERNR BINARY SEARCH.
+    IF SY-SUBRC EQ 0.
+
+      IT_RSFL-EQUNR = IT_EQUI-EQUNR.
+      IT_RSFL-MATNR = IT_EQUI-MATNR.
+
+*     Find equipment description
+      READ TABLE IT_EQKT WITH KEY EQUNR = IT_EQUI-EQUNR BINARY SEARCH.
+      IF SY-SUBRC EQ 0.
+        IT_RSFL-EQKTX = IT_EQKT-EQKTX.
+      ENDIF.
+
+*     Find material description
+      READ TABLE IT_MAKT WITH KEY MATNR = IT_EQUI-MATNR BINARY SEARCH.
+      IF SY-SUBRC EQ 0.
+        IT_RSFL-MAKTX = IT_MAKT-MAKTX.
+      ENDIF.
+
+*     Find material GAC/PGC
+      READ TABLE IT_MARA WITH KEY MATNR = IT_EQUI-MATNR BINARY SEARCH.
+      IF SY-SUBRC EQ 0.
+        IT_RSFL-PGC = IT_MARA-PRDHA.
+        IT_RSFL-GAC = IT_MARA-PRDHA(4).
+      ENDIF.
+
+*     Summarize service costs
+      READ TABLE IT_COPA WITH KEY EQUNR = IT_EQUI-EQUNR BINARY SEARCH.
+      IF SY-SUBRC EQ 0.
+        LOOP AT IT_COPA FROM SY-INDEX.
+          CHECK IT_COPA-EQUNR = IT_EQUI-EQUNR.
+          IT_RSFL-SRVCT = IT_RSFL-SRVCT + IT_COPA-VSERV.
+        ENDLOOP.
+      ENDIF.
+
+    ENDIF.
+
+*   Find acquisition value
+    READ TABLE IT_ANEP WITH KEY ANLN1 = IT_ANLA-ANLN1
+                                ANLN2 = IT_ANLA-ANLN2
+                       BINARY SEARCH.
+    IF SY-SUBRC EQ 0.
+      IT_RSFL-ACQVL = IT_ANEP-ANBTR.
+
+*     Calculate net book value (based on acq value - deprec. value)
+      READ TABLE IT_ANLC WITH KEY ANLN1 = IT_ANLA-ANLN1
+                                  ANLN2 = IT_ANLA-ANLN2
+                         BINARY SEARCH.
+      IF SY-SUBRC EQ 0.
+        IT_RSFL-NBVAL = IT_RSFL-ACQVL + ( IT_ANLC-KNAFA + IT_ANLC-NAFAG ).
+      ENDIF.
+
+    ENDIF.
+
+    APPEND IT_RSFL.
+  ENDLOOP.
+
+  CALL SCREEN 0100.

@@ -1,0 +1,187 @@
+*&---------------------------------------------------------------------*
+*& Report  YAM_ZTEXTR02                                                *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+*&  This program does the necessary corrections on longtexts in orders *
+*&  to prevent further problems (TECO-interface)                       *
+*&---------------------------------------------------------------------*
+
+REPORT  yam_ztextr02                                .
+TABLES aufk.
+TABLES stxh.
+
+*PARAMETERS PAUFNR LIKE AFKO-AUFNR OBLIGATORY.
+SELECT-OPTIONS saufnr FOR  aufk-aufnr.
+PARAMETERS     plangu LIKE sy-langu DEFAULT sy-langu.
+PARAMETERS     ptest  AS CHECKBOX DEFAULT 'X'.
+
+DATA iaufk  LIKE aufk       OCCURS 0 WITH HEADER LINE.
+DATA istxh  LIKE stxh       OCCURS 0 WITH HEADER LINE.
+DATA iaufnr LIKE aufk-aufnr OCCURS 0 WITH HEADER LINE.
+DATA iupdord LIKE aufk-aufnr OCCURS 0 WITH HEADER LINE.
+
+DATA:   BEGIN OF htlines OCCURS 10.
+        INCLUDE STRUCTURE tline.
+DATA:   END OF htlines.
+
+DATA:   BEGIN OF htheader.
+        INCLUDE STRUCTURE thead.
+DATA:   END OF htheader.
+
+DATA   l_txtname LIKE stxh-tdname.
+RANGES rname     FOR  stxh-tdname.
+
+constants : c_kopf    like stxh-tdid     value 'KOPF',
+            c_object  like stxh-tdobject value 'AUFK'.
+
+* copy the range to textname
+LOOP AT saufnr.
+  MOVE sy-mandt       TO rname-low(3).
+  MOVE sy-mandt       TO rname-high(3).
+  MOVE saufnr-sign    TO rname-sign.
+  MOVE saufnr-option  TO rname-option.
+  MOVE saufnr-low     TO rname-low+3(12).
+  MOVE saufnr-high    TO rname-high+3(12).
+  APPEND rname.
+ENDLOOP. "saufnr
+
+* Select the orders and texts
+SELECT aufnr ltext FROM aufk
+  INTO CORRESPONDING FIELDS OF TABLE iaufk
+  WHERE aufnr IN saufnr.
+
+SELECT tdobject tdname tdid tdspras FROM stxh
+  INTO CORRESPONDING FIELDS OF TABLE istxh
+  WHERE tdobject = 'AUFK'
+  AND   tdid     = 'KOPF'
+  AND   tdspras  = plangu
+  AND   tdname  IN rname.
+
+SORT iaufk BY aufnr.
+SORT istxh BY tdname.
+
+* collect all affected orders
+LOOP AT iaufk.
+  MOVE iaufk-aufnr TO iaufnr.
+  APPEND iaufnr.
+ENDLOOP.
+LOOP AT istxh.
+  MOVE istxh-tdname+3(12) TO iaufnr.
+  APPEND iaufnr.
+ENDLOOP.
+SORT iaufnr.
+DELETE ADJACENT DUPLICATES FROM iaufnr.
+
+IF NOT ptest IS INITIAL.
+  WRITE: / '*** Test Mode - no update ***'.
+ENDIF.
+
+refresh iupdord.
+
+LOOP AT iaufnr.
+  MOVE sy-mandt TO l_txtname(3).
+  MOVE iaufnr   TO l_txtname+3(12).
+  READ TABLE iaufk WITH KEY
+    aufnr = iaufnr
+    BINARY SEARCH.
+  IF sy-subrc EQ 0.
+* Order exists
+    READ TABLE istxh WITH KEY
+      tdname = l_txtname
+      BINARY SEARCH.
+    IF sy-subrc EQ 0.
+* Longtext for order exists => set indicator if not set
+      IF iaufk-ltext IS INITIAL.
+        WRITE: / 'Setting longtextindicator for order:',iaufnr.
+        IF ptest IS INITIAL.
+          UPDATE aufk
+            SET ltext   = plangu
+            WHERE aufnr EQ iaufk-aufnr.
+        ENDIF.
+      ENDIF.    "txtkz is not set, but should be
+    ELSE.
+* No longtext for order exists => clear indicator if set
+      IF NOT iaufk-ltext IS INITIAL.
+        WRITE: / 'Deleting longtextindicator for order:',iaufnr.
+        CLEAR iaufk-ltext.
+        IF ptest IS INITIAL.
+          UPDATE aufk
+            SET ltext   = iaufk-ltext
+            WHERE aufnr EQ iaufk-aufnr.
+* fill table iupdord to create longtext afterwards.
+          MOVE iaufk-aufnr TO iupdord.
+          APPEND iupdord.
+        ENDIF.
+      ENDIF.    "txtkz is set, but should not be
+    ENDIF.      "there is a long text
+  ELSE.
+* Order does not exist
+    READ TABLE istxh WITH KEY
+      tdname = l_txtname
+      BINARY SEARCH.
+    IF sy-subrc EQ 0.
+* Longtext for order exists, but no order => delete the long text
+*      WRITE: / 'Deleting longtext for not-existent order:',iaufnr.
+*      IF ptest IS INITIAL.
+*        CALL FUNCTION 'DELETE_TEXT'
+*             EXPORTING
+*                  id              = istxh-tdid
+*                  language        = istxh-tdspras
+*                  name            = istxh-tdname
+*                  object          = istxh-tdobject
+*                  savemode_direct = 'X'
+*             EXCEPTIONS
+*                  not_found       = 1
+*                  OTHERS          = 2.
+*      ENDIF.    "test mode
+    ENDIF.      "there is a long text
+  ENDIF.        "order exists?
+ENDLOOP.        "iaufnr
+
+COMMIT WORK.
+
+* copy shorttext to longtext for order in table iupdord
+
+IF NOT iupdord[] IS INITIAL.
+  WRITE: / .
+  WRITE: / '*** Long text creation ***'.
+ENDIF.
+
+
+LOOP AT iupdord.
+
+  REFRESH htlines.
+  clear htheader.
+  SELECT SINGLE * FROM aufk WHERE aufnr = iupdord.
+  IF sy-subrc = 0.
+
+    MOVE aufk-ktext TO htlines-tdline.
+    APPEND htlines.
+    move c_object to htheader-tdobject.
+    concatenate sy-mandt iupdord into htheader-tdname.
+    move c_kopf to htheader-tdid.
+    move aufk-ltext to htheader-tdspras.
+
+    CALL FUNCTION 'SAVE_TEXT'
+        EXPORTING
+             header          = htheader
+*            INSERT          = 'X'
+             savemode_direct = 'X'
+         IMPORTING
+             newheader       = htheader
+         TABLES
+             lines           = htlines.
+*        EXCEPTIONS
+*            ID              = 01
+*            LANGUAGE        = 02
+*            NAME            = 03
+*            OBJECT          = 04.
+
+    IF sy-subrc NE 0.
+      WRITE : /'Long text for order ' , iupdord, ' not created.'.
+    ELSE.
+      WRITE : /'Long text for order ' , iupdord, ' created.'.
+    ENDIF.
+  ENDIF.
+
+ENDLOOP.

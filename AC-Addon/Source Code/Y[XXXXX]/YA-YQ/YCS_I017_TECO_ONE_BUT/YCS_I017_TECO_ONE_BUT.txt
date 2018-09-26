@@ -1,0 +1,1052 @@
+*----------------------------------------------------------------------*
+*                                                                      *
+* PROGRAM ID           : COPY OF YAM_I017_TECO                         *
+* PROGRAM TITLE        : Stand Alone Service Order Confirmation Idoc   *
+*                        Program                                       *
+* AUTHOR               : Amit Mahajan                                  *
+* DATE                 : 09/05/2011                                    *
+* DEVELOPMENT ID       : XXXX                                          *
+*                                                                      *
+* CHANGE REQUEST NUMBER:                                               *
+* PROGRAM DESCRIPTION  : THIS IS A CUSTOM PROGRAM TO GENERATE THE      *
+*                        SERVICE ORDER OUTBOUND INTERFAC IDOC          *
+*                        FROM SAP TO BPCS.THIS PROGRAM WILL GENERATE   *
+*                        IT WILL,GO TO ORDER CONFIRMATION AND CALCULATE*
+*                        THE UNCONFIRMED QUANTITY FOR THE SERVICE ORDER*
+*                        AND SEND TO BPCS TO START THE WIP AND UPDATE  *
+*                        THE STOCK OF UNCONFIRMED COMPONENT WITH       *
+*                        UNCONFIRMED QUANTITY.IT WILL UPDATE THE       *
+*                        YAM_I017_TECO TABLE AT THE END TO HANDLE THE  *
+*                        DUPLICATION OF DATA WHICH IS ALREADY SENT     *
+*                                                                      *
+*                        The Difference with YAM_I017_TECO program:    *
+*                        - TECO Status is not obligatory               *
+*                        - You can process per material                *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME     |CORRECTION NUMBER| CHANGE REFERENCE # *
+*----------------------------------------------------------------------*
+*                                                                      *
+************************************************************************
+REPORT ycs_i017_teco_one_but NO STANDARD PAGE HEADING MESSAGE-ID yam_inf.
+************************************************************************
+TABLES:  aufk,                    "Order master data
+
+         resb,                   "Reservation/dependent requirements
+
+         jest,                    "Individual Object Status
+         aufm,                    "Goods movements for order
+         yam_i017_teco_e1hrd,     "Header Segment For TECO Outbound
+                                  "Interface
+         yam_i017_teco_e1hrd_item,"Item segment for TECO Outbound
+                                  "Interface
+         edidc,                   "Control record (EDI Intermediate
+                                  "Document)
+         edidd,                   "Data record (IDoc)
+         edids,                   "Status Record (IDoc)
+         yam_i017_teco.           "TABLE TO STORE TECHO UNCONFIRMED
+"QUANTITY INFO
+************************************************************************
+*                  I N T E R N A L   T A B L E S                       *
+************************************************************************
+*     TECO ORDER HEADER DATA TABLE                                     *
+************************************************************************
+DATA : BEGIN OF i_teco_ord_head OCCURS 0,
+       aufnr LIKE aufk-aufnr,
+       erdat LIKE aufk-erdat,
+       aedat LIKE aufk-aedat,
+       werks LIKE aufk-werks,
+       objnr LIKE aufk-objnr,
+       stat LIKE  jest-stat,
+       END OF i_teco_ord_head.
+************************************************************************
+*    COMPONENT REQUIRED QUANTITY TABLE CODE ADDED 5.10.2004            *
+************************************************************************
+DATA : BEGIN OF i_teco_ord_comp_reqty OCCURS 0,
+       aufnr LIKE resb-aufnr,
+       werks LIKE resb-werks,
+       matnr LIKE resb-matnr,
+       lgort LIKE resb-lgort,
+       menge LIKE resb-bdmng,
+       meins LIKE resb-meins,
+       END OF  i_teco_ord_comp_reqty.
+************************************************************************
+*    TECO ORDER COMPONENT DATA TABLE                                   *
+************************************************************************
+DATA : BEGIN OF i_teco_ord_comp OCCURS 0,
+       aufnr LIKE aufm-aufnr,
+       werks LIKE aufm-werks,
+       lgort LIKE aufm-lgort,
+       matnr LIKE aufm-matnr,
+       bwart LIKE aufm-bwart,
+       erfmg LIKE aufm-erfmg,             "QUANTITY
+       erfme LIKE aufm-erfme,             "UOM
+       END OF i_teco_ord_comp.
+************************************************************************
+*    TECO ORDER COMPONENT DATA TABLE1                                  *
+************************************************************************
+DATA : BEGIN OF i_teco_ord_comp_final OCCURS 0,
+       aufnr LIKE aufm-aufnr,
+       werks LIKE aufm-werks,
+       lgort LIKE aufm-lgort,
+       matnr LIKE aufm-matnr,
+       erfmg_261 LIKE aufm-erfmg,         "261 movement type quantity
+       erfmg_262 LIKE aufm-erfmg,         "262 movement type quantity
+       unconfirmed_qty LIKE aufm-erfmg,   " UNCONFIRMED QTY
+       unconfirmed_qty1 LIKE aufm-erfmg,  " UNCONFIRMED QTY
+       confirmed_qty LIKE aufm-erfmg,     "CONFIRMED QUANTITY
+       remaining_qty LIKE aufm-erfmg,     "REMAINING QTY
+       unconfirmed_uom LIKE aufm-erfme,   " UNCONFIRMED UOM
+       i017unconfqty LIKE aufm-erfmg, "keeping track of initial I017_TECO unconfirmed qty
+       END OF i_teco_ord_comp_final.
+
+
+DATA: BEGIN OF i_partner OCCURS 100.
+        INCLUDE STRUCTURE bapi_alm_order_partner.
+DATA: END OF i_partner.
+
+DATA: BEGIN OF i_operations OCCURS 100.
+        INCLUDE STRUCTURE bapi_alm_order_operation_e.
+DATA: END OF i_operations.
+DATA: BEGIN OF i_components OCCURS 100.
+        INCLUDE STRUCTURE bapi_alm_order_component_e.
+DATA: END OF i_components.
+DATA: BEGIN OF i_relations OCCURS 100.
+        INCLUDE STRUCTURE bapi_alm_order_relation_export.
+DATA: END OF i_relations.
+DATA: BEGIN OF i_texts OCCURS 100.
+        INCLUDE STRUCTURE bapi_alm_text.
+DATA: END OF i_texts.
+DATA: BEGIN OF i_text_lines OCCURS 100.
+        INCLUDE STRUCTURE bapi_alm_text_lines.
+DATA: END OF i_text_lines.
+DATA: BEGIN OF i_prts OCCURS 100.
+        INCLUDE STRUCTURE bapi_alm_order_prt_e.
+DATA: END OF i_prts.
+DATA: BEGIN OF i_costs_sum OCCURS 100.
+        INCLUDE STRUCTURE bapi_alm_order_costs_sum_e.
+DATA: END OF i_costs_sum.
+DATA: BEGIN OF i_costs_detail OCCURS 100.
+        INCLUDE STRUCTURE bapi_alm_order_costs_detail_e.
+DATA: END OF i_costs_detail.
+DATA: BEGIN OF i_return OCCURS 100.
+        INCLUDE STRUCTURE bapiret2.
+DATA: END OF i_return.
+
+
+DATA: gt_status TYPE STANDARD TABLE OF jstat
+        INITIAL SIZE 0 WITH HEADER LINE,
+
+
+      g_header  LIKE bapi2017_gm_head_01,
+      g_headret LIKE bapi2017_gm_head_ret,
+      gt_item   TYPE bapi2017_gm_item_create OCCURS 0 WITH HEADER LINE,
+      g_goodsmvt_code_tmp TYPE bapi2017_gm_code.
+
+DATA: BEGIN OF gt_return OCCURS 100.
+        INCLUDE STRUCTURE bapiret2.
+DATA: END OF gt_return.
+
+************************************************************************
+*    Internal Table and Work area                                      *
+************************************************************************
+DATA: i_edidc_control_comm LIKE edidc OCCURS 1 WITH HEADER LINE,
+      i_edidd_data LIKE edidd OCCURS 0 WITH HEADER LINE,
+      i_edids LIKE edids OCCURS 0 WITH HEADER LINE,
+      i_yam_i017_teco LIKE yam_i017_teco OCCURS 0 WITH HEADER LINE,
+      i_yam_i017_teco_final LIKE yam_i017_teco OCCURS 0 WITH HEADER LINE,
+      wa_teco LIKE yam_i017_teco,
+      wa_yam_i017_teco_e1hrd LIKE yam_i017_teco_e1hrd,
+      wa_yam_i017_teco_e1hrd_item LIKE yam_i017_teco_e1hrd_item,
+      wa_edidc_control LIKE edidc.
+
+
+DATA: BEGIN OF i_mvt_err OCCURS 0,
+        werks LIKE aufm-werks,
+        matnr LIKE aufm-matnr,
+      END OF i_mvt_err.
+
+************************************************************************
+*                   V A R I A B L E S / C O N S T A N T S              *
+************************************************************************
+CONSTANTS :c_idoc_type  LIKE edidc-idoctp VALUE 'YAM_I017_TECO01',
+           c_mestyp LIKE edidc-mestyp VALUE 'YAM_I017_TECO',
+           c_ord_header LIKE edidd-segnam VALUE 'YAM_I017_TECO_E1HRD',
+           c_ord_detail LIKE edidd-segnam VALUE 'YAM_I017_TECO_E1HRD_ITEM',
+           c_plant LIKE aufk-werks VALUE 'GBAA',
+           c_lgort LIKE aufm-lgort VALUE 'Z_01',
+           c_status LIKE jest-stat VALUE 'I0045',
+
+           c_status_cl LIKE jest-stat VALUE 'I0046',
+
+           c_status_rel LIKE jest-stat VALUE 'I0002',
+
+           c_501     TYPE bwart    VALUE '501',
+           c_502     TYPE bwart    VALUE '502',
+
+           c_05(2)   TYPE c        VALUE '05',          "Goods receipt
+           c_c62(3)  TYPE c        VALUE 'C62',         "ISO code
+
+           c_x       TYPE c        VALUE 'X',
+
+           c_space LIKE jest-inact VALUE ' ',
+           c_sc1(3) VALUE 'SC1',
+           c_input VALUE '0',
+           c_ls(2) VALUE 'LS',
+           c_261 LIKE aufm-bwart VALUE '261',
+           c_262 LIKE aufm-bwart VALUE '262',
+           c_bt(2) VALUE 'BT',
+           c_tabix(1) VALUE '1'.
+
+************************************************************************
+DATA: g_date         LIKE sy-datum,
+      g_orderno      TYPE aufnr,
+      g_workcenter   TYPE arbpl,
+      g_branch(4)    TYPE c,
+
+      g_sloc         LIKE yam_wc_map_sloc-zzlgret,
+
+      g_lgort        LIKE yam_wc_map_sloc-lgort,
+
+      g_idoc_sent(1) TYPE c,
+      l_erfmg        LIKE aufm-erfmg,
+      l_index        LIKE sy-tabix,
+      l_index1       LIKE sy-tabix,
+
+      g_mvt          TYPE bwart,
+      g_qty(13)      TYPE c,
+      g_retc         LIKE sy-subrc,
+
+      g_zzrecon      LIKE yam_wc_map_sloc-zzrecon,
+
+       g_bukrs  TYPE vkbuk,
+      p_logsys LIKE tbdlst-logsys .
+************************************************************************
+*       S E L E C T - O P T I O N S / P A R A M E T E R S              *
+************************************************************************
+SELECTION-SCREEN : BEGIN OF BLOCK b1 WITH FRAME TITLE text-001.
+* Begin Change One Button Specific
+PARAMETERS:    p_aufnr LIKE aufk-aufnr,
+               p_matnr LIKE resb-matnr,
+*              s_erdat FOR aufk-erdat,
+               p_werks LIKE aufk-werks OBLIGATORY  DEFAULT c_plant.
+* End Change One Button Specific
+
+PARAMETERS: p_mestyp LIKE edmsg-msgtyp DEFAULT c_mestyp MODIF ID sc1.
+
+SELECTION-SCREEN: END OF BLOCK b1.
+************************************************************************
+*      INITIALIZE THE CREATION DATE FIELD OF SERVICE ORDER             *
+*      S_ERDAT-LOW WILL HOLD THE DATE OF 2 DAYS EARLIER THAN THE       *
+*      SYSTEM DATE AND S_ERDAT-HIGH WILL HOLD THE TODAY'S DATE VALUE   *
+*      BY DEFAULT.USER CAN CHANGE THIS AS PER CONVINANCE               *
+************************************************************************
+INITIALIZATION.
+  g_date = sy-datum - 1.
+* Begin Delete One Button Specific
+*  MOVE:  c_bt TO s_erdat-option,
+*         g_date TO s_erdat-low,
+*         sy-datum TO s_erdat-high.
+*  APPEND s_erdat.
+* End Delete One Button Specific
+
+  CALL FUNCTION 'OWN_LOGICAL_SYSTEM_GET'
+    IMPORTING
+      own_logical_system             = p_logsys
+    EXCEPTIONS
+      own_logical_system_not_defined = 1
+      OTHERS                         = 2.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+         WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+
+  ENDIF.
+
+
+************************************************************************
+*      MODIFY THE SELECTION SCREEN BY MAKING THE INPUT FIELDS AS       *
+*      READALE                                                         *
+************************************************************************
+AT SELECTION-SCREEN OUTPUT.
+  LOOP AT SCREEN.
+    IF screen-group1 = c_sc1.
+      screen-input   = c_input.
+      MODIFY SCREEN.
+      CONTINUE.
+    ENDIF.
+  ENDLOOP.
+************************************************************************
+*       S T A R T - O F - S E L E C T I O N    E V E N T               *
+************************************************************************
+START-OF-SELECTION.
+************************************************************************
+*      CLEAR THE WORK AREA AND INTERNAL TABLES                         *
+************************************************************************
+  CLEAR:   wa_yam_i017_teco_e1hrd,
+           wa_yam_i017_teco_e1hrd_item,
+           wa_edidc_control,
+           l_erfmg.
+
+  REFRESH: i_teco_ord_head,
+           i_teco_ord_comp,
+           i_teco_ord_comp_final,
+           i_edidc_control_comm,
+           i_edidd_data,
+           i_edids.
+************************************************************************
+*CHECK IF IDOC CONFIGURATION IS READY AND IDOC CAN BE PROCESSED.       *
+************************************************************************
+  CALL FUNCTION 'ALE_MODEL_DETERMINE_IF_TO_SEND'
+    EXPORTING
+      message_type           = p_mestyp
+    IMPORTING
+      idoc_must_be_sent      = g_idoc_sent
+    EXCEPTIONS
+      own_system_not_defined = 1
+      OTHERS                 = 2.
+  IF sy-subrc <> 0.
+    MESSAGE e029 WITH c_mestyp.
+    EXIT.
+  ENDIF.
+************************************************************************
+*          FILL CONTROL RECORDS                                        *
+************************************************************************
+  wa_edidc_control-mestyp =  p_mestyp.
+  wa_edidc_control-idoctp =  c_idoc_type.
+  wa_edidc_control-rcvprt =  c_ls.
+
+************************************************************************
+*  SELECT SERVICE ORDER HEADER DATA                                    *
+************************************************************************
+  SELECT SINGLE a~aufnr a~erdat a~aedat a~werks a~objnr b~stat
+    INTO (i_teco_ord_head-aufnr,i_teco_ord_head-erdat,
+          i_teco_ord_head-aedat,i_teco_ord_head-werks,
+          i_teco_ord_head-objnr,i_teco_ord_head-stat)
+        FROM aufk AS a JOIN jest AS b ON
+        a~objnr = b~objnr
+* Begin Change One Button Specific
+*        WHERE aufnr IN s_aufnr
+        WHERE aufnr EQ p_aufnr
+        AND   werks EQ p_werks
+*        AND   werks IN s_werks
+* End Change  One Button Specific
+        AND  b~stat IN
+* Begin  One Button Specific
+       (c_status_rel,
+* End    One Button Specific
+        c_status, c_status_cl)
+        AND  b~inact EQ c_space.
+************************************************************************
+*         VALIDATION FOR SERVICE ORDER                                 *
+************************************************************************
+* Begin Delete One Button Specific
+*    IF sy-subrc NE 0.
+*      MESSAGE e024 .
+*    ENDIF.
+* End Delete One Button Specific
+************************************************************************
+*         CHECK FOR THE SERVICE ORDER IN BETWEEN DATE                  *
+************************************************************************
+* Begin Delete One Button Specific
+*    IF i_teco_ord_head-erdat IN s_erdat OR
+*       i_teco_ord_head-aedat IN s_erdat.
+* End Delete One Button Specific
+  APPEND  i_teco_ord_head.
+  CLEAR  i_teco_ord_head.
+* End Delete One Button Specific
+*    ENDIF.
+*  ENDSELECT.
+*
+*  IF sy-subrc NE 0.
+*    MESSAGE e036 .
+*  ENDIF.
+* End Delete One Button Specific
+
+  LOOP AT  i_teco_ord_head.
+    SELECT aufnr werks matnr meins SUM( bdmng )  INTO
+    (i_teco_ord_comp_reqty-aufnr,
+     i_teco_ord_comp_reqty-werks,
+     i_teco_ord_comp_reqty-matnr,
+     i_teco_ord_comp_reqty-meins,
+     i_teco_ord_comp_reqty-menge)
+    FROM resb
+*  FOR ALL ENTRIES IN i_teco_ord_head
+    WHERE aufnr EQ i_teco_ord_head-aufnr
+    AND werks EQ i_teco_ord_head-werks
+    AND wempf LIKE '280%'
+* Begin  One Button Specific
+    AND matnr EQ p_matnr
+* End    One Button Specific
+    GROUP BY aufnr werks matnr meins.
+      IF  sy-subrc EQ 0.
+        COLLECT i_teco_ord_comp_reqty.
+        CLEAR i_teco_ord_comp_reqty.
+      ENDIF.
+    ENDSELECT.
+  ENDLOOP.
+
+
+************************************************************************
+*  I_TECO_ORD_HEAD STORES THE SERVICE ORDER STATUS TECO                *
+*  LOOP THROUGH I_TECO_ORD_HEAD TO SELECT THE QTY FROM AUFM TABLE      *
+*  AND CALCULATE THE UNCONFIRMED QUANTITY                              *
+************************************************************************
+
+  CLEAR i_teco_ord_comp.
+  LOOP AT i_teco_ord_head.
+    CLEAR i_teco_ord_comp.
+    REFRESH i_teco_ord_comp.
+    l_index = c_tabix.
+
+
+    CLEAR g_orderno.
+    CALL FUNCTION 'CONVERSION_EXIT_AUFNR_INPUT'
+      EXPORTING
+        input  = i_teco_ord_head-aufnr
+      IMPORTING
+        output = g_orderno.
+* Get Service Order Details  to get the First Opertaion Work Center
+    CALL FUNCTION 'BAPI_ALM_ORDER_GET_DETAIL'
+       EXPORTING
+         number           = g_orderno
+*       IMPORTING
+*      es_header        = i_es_header
+*      es_srvdata       = i_es_srvdat
+       TABLES
+         et_partner       = i_partner
+         et_operations    = i_operations
+         et_components    = i_components
+         et_relations     = i_relations
+         et_texts         = i_texts[]
+         et_text_lines    = i_text_lines[]
+         et_prts          = i_prts[]
+         et_costs_sum     = i_costs_sum[]
+         et_costs_details = i_costs_detail[]
+         return           = i_return[].
+
+*If no Service Order has been found in SAP, Generate an error message
+*and leave the processing.   Else Get the first operation from the
+*internal table   i_operations and Get the first operation Work Center.
+
+*In case of any error, clear the flag for generating IDOC and add the
+*Service Order to the list of Orders for which no IDOC could be
+*generated.
+
+    IF NOT i_return[] IS INITIAL.
+*Details of Service Order could be determined, Generate Error Message
+*and Terminate Processing
+      MESSAGE a051 WITH i_teco_ord_head-aufnr.
+      EXIT.
+    ELSE.
+      SORT i_operations ASCENDING BY activity.
+      READ TABLE i_operations INDEX 1.
+      g_workcenter = i_operations-work_cntr.
+    ENDIF.
+
+
+    IF i_components[] IS INITIAL.
+*      write: 020 'No components'.
+      CONTINUE.
+    ENDIF.
+
+
+*Get First 4 letters of the WorkCenter, which is equivalent to branch
+*and then determine the Storage Location from Custom table
+*yam_wc_map_sloc
+    CLEAR g_sloc.
+
+* get the storage location for returns
+*   SELECT lgort
+    SELECT zzlgret
+        INTO  g_sloc
+    FROM yam_wc_map_sloc
+    WHERE werks = i_teco_ord_head-werks AND
+          arbpl = g_workcenter.
+    ENDSELECT.
+
+    IF g_sloc IS INITIAL.
+*No Storage Location could be determined, Generate Error Message abd
+*Terminate Processing
+
+*      write: 020 'Not processed'.
+      CONTINUE.
+
+    ENDIF.
+
+
+    SELECT aufnr werks lgort matnr bwart SUM( erfmg ) erfme INTO
+    TABLE i_teco_ord_comp FROM aufm
+    WHERE aufnr EQ i_teco_ord_head-aufnr
+    AND   werks EQ i_teco_ord_head-werks
+    AND   bwart IN (c_261, c_262)
+* Begin One Button Specific
+    AND   matnr EQ p_matnr
+* End One Button Specific
+    GROUP BY aufnr werks lgort matnr bwart erfme .
+
+************************************************************************
+* LOOP TABLE I_TECO_ORD_COMP INTO I_TECO_ORD_COMP_FINAL TO GENERATE THE*
+* FINAL INTERNAL TABLE WITH FINAL UNCONFIRMED QUANTITY FOR THE         *
+* COMPONENT                                                            *
+************************************************************************
+    LOOP AT  i_teco_ord_comp WHERE
+       aufnr = i_teco_ord_head-aufnr AND
+       werks = i_teco_ord_head-werks.
+
+      IF sy-subrc EQ 0.
+        CLEAR i_teco_ord_comp_final.
+        MOVE i_teco_ord_comp-aufnr TO  i_teco_ord_comp_final-aufnr.
+        MOVE i_teco_ord_comp-werks TO i_teco_ord_comp_final-werks.
+        MOVE g_sloc TO i_teco_ord_comp_final-lgort.
+        MOVE i_teco_ord_comp-matnr TO i_teco_ord_comp_final-matnr.
+
+        CASE i_teco_ord_comp-bwart.
+          WHEN c_261.
+            ADD i_teco_ord_comp-erfmg TO  i_teco_ord_comp_final-erfmg_261.
+          WHEN c_262.
+            ADD i_teco_ord_comp-erfmg TO  i_teco_ord_comp_final-erfmg_262.
+        ENDCASE.
+
+        i_teco_ord_comp_final-confirmed_qty =
+                      i_teco_ord_comp_final-erfmg_261 -
+                      i_teco_ord_comp_final-erfmg_262.
+        i_teco_ord_comp_final-unconfirmed_uom =  i_teco_ord_comp-erfme.
+        COLLECT i_teco_ord_comp_final.
+      ENDIF.
+    ENDLOOP.
+
+
+* It is possible that there are no confirmations for a material in an
+*order, which means that there will be no entries in table AUFM for this
+*case. In this case it is required that we compare the entries for the
+*Internal Table  I_TECO_COMP_FINAL and i_teco_ord_comp_reqty.
+    LOOP AT i_teco_ord_comp_reqty WHERE
+               aufnr = i_teco_ord_head-aufnr AND
+               werks = i_teco_ord_head-werks.
+      .
+      READ TABLE i_teco_ord_comp_final WITH KEY
+                                  aufnr = i_teco_ord_comp_reqty-aufnr
+                                  werks = i_teco_ord_comp_reqty-werks
+                                  lgort = g_sloc
+                                  matnr = i_teco_ord_comp_reqty-matnr.
+
+      IF sy-subrc = 0. " Entry Already Exists, no need to add new one
+      ELSE.
+        MOVE i_teco_ord_comp_reqty-aufnr TO
+                                    i_teco_ord_comp_final-aufnr.
+        MOVE i_teco_ord_comp_reqty-werks TO i_teco_ord_comp_final-werks.
+        MOVE g_sloc TO i_teco_ord_comp_final-lgort.
+        MOVE i_teco_ord_comp_reqty-matnr TO i_teco_ord_comp_final-matnr.
+        i_teco_ord_comp_final-unconfirmed_uom =
+                              i_teco_ord_comp_reqty-meins.
+        i_teco_ord_comp_final-confirmed_qty = 0.
+        APPEND i_teco_ord_comp_final.
+      ENDIF.
+    ENDLOOP.
+    CLEAR i_teco_ord_comp.
+************************************************************************
+*        COMPARING WITH CUSTOMER TABLE YAM_I017_TECO FOR THE COMPONENT *
+*        UNCONFIRMED QUANTITY                                          *
+*       1.IF THE ENTRY EXIST IN THE YAM_I017_TECO TABLE ,CHECK FOR THE
+*         UNCONFQTY FIELD FOR THE SERVICE ORDER,IF THE QUANTITY IS SAME*
+*         EXIT FROM PROGRAM AND DONT GENERATE THE IDOC.                *
+*       2.IF THERE IS A DIFFERENCE IN THE QUNATITY FIELD THEN CALCULATE*
+*         THE UNCONFIRMED QUANTITY AND GENERATE THE IDOC AND UPDATE THE*
+*         YAM_I017_TECO TABLE.
+*       3.IF THERE IS NO MATCHING ENTRY IN YAM_I017_TECO TABLE,GENERATE*
+*          THE IDOC.                                                   *
+************************************************************************
+*        PASSING THE CONTROL TO IDOC GENERATION FUNCTION MODULE        *
+************************************************************************
+
+    SELECT * FROM yam_i017_teco INTO TABLE i_yam_i017_teco
+    WHERE aufnr EQ i_teco_ord_head-aufnr
+* Begin  One Button Specific
+    AND matnr EQ p_matnr
+* End    One Button Specific
+    AND werks EQ i_teco_ord_head-werks.
+
+    CLEAR i_edidd_data.
+    REFRESH i_edidd_data.
+************************************************************************
+* LOOP THE HEADER TABLE TO POPULATE THE IDOC TABLE                     *
+************************************************************************
+    wa_yam_i017_teco_e1hrd-aufnr =  i_teco_ord_head.
+************************************************************************
+* APPEND SEGMENT NAME AND SEGMENT DATA TO I_EDIDD_DATA TABLE           *
+************************************************************************
+    i_edidd_data-segnam = c_ord_header.
+    i_edidd_data-sdata = wa_yam_i017_teco_e1hrd.
+    APPEND i_edidd_data.
+************************************************************************
+*  LOOP THE ITEM TABLE TO POPULATE THE SEGMENT DATA TO I_EDIDD_DATA    *
+*  TABLE                                                               *
+************************************************************************
+    LOOP AT i_teco_ord_comp_final
+                   WHERE aufnr EQ i_teco_ord_head-aufnr
+                   AND   werks EQ i_teco_ord_head-werks.
+      l_index1 = sy-tabix.
+
+      CLEAR  wa_edidc_control-rcvprn.
+      g_bukrs = i_teco_ord_head-werks+0(4).
+      SELECT SINGLE parnum INTO wa_edidc_control-rcvprn
+      FROM yam_sel_partner
+           WHERE bukrs  = g_bukrs
+             AND msgtyp = p_mestyp.
+
+************************************************************************
+*READ THE INTERNAL TABLE I_TECO_ORD_COMP_REQTY FOR GETTING THE REQUIRED*
+*QUANTITY,DEDUCT REQUIRED QUANTITY FROM CONFIRMED QUANTITY AND GET THE *
+*UNCONFIRMED QUANTITY                                                  *
+************************************************************************
+      READ TABLE i_teco_ord_comp_reqty
+                         WITH KEY aufnr = i_teco_ord_comp_final-aufnr
+                                  werks = i_teco_ord_comp_final-werks
+                                  matnr = i_teco_ord_comp_final-matnr.
+      IF sy-subrc EQ 0.
+
+        i_teco_ord_comp_final-unconfirmed_qty = i_teco_ord_comp_reqty-menge -
+                                        i_teco_ord_comp_final-confirmed_qty .
+        MODIFY i_teco_ord_comp_final INDEX l_index1.
+
+      ELSE.
+        DELETE i_teco_ord_comp_final INDEX l_index1.
+        CLEAR i_teco_ord_comp_final.
+
+        CONTINUE.
+
+      ENDIF.
+************************************************************************
+* READ THE I_YAM_I017_TECO TO MAKE SURE IF ENTRY EXISTS OR NOT         *
+* IF ENTRY EXISTS CALCULATE THE QUANTITY BY CHECKING THE               *
+* I_YAM_I017_TECO NE THE QUANTITY STORED IN I_TECO_ORD_COMP TABLE,IF IT*
+* IS YES THEN GENERATE THE IDOC ELSE EXIT FROM PROGRAM AND DONT        *
+* GENERATE THE IDOC                                                    *
+************************************************************************
+      READ TABLE i_yam_i017_teco WITH KEY aufnr = i_teco_ord_comp_final-aufnr
+                                       werks = i_teco_ord_comp_final-werks
+
+                                       matnr = i_teco_ord_comp_final-matnr.
+      IF sy-subrc EQ 0.
+        IF i_yam_i017_teco-unconfqty NE i_teco_ord_comp_final-unconfirmed_qty.
+          i_teco_ord_comp_final-remaining_qty =
+                i_teco_ord_comp_final-unconfirmed_qty - i_yam_i017_teco-unconfqty.
+          i_teco_ord_comp_final-i017unconfqty = i_yam_i017_teco-unconfqty.
+          MODIFY i_teco_ord_comp_final INDEX l_index1.
+          PERFORM check_update.
+        ELSE.
+***********************************************************************
+* IF THERE IS A RECORD IN I_YAM_I017_TECO TABLE FOR THE SERVICE       *
+* ORDER,CHECK FOR THE QUANTITY AND IF THE QUANTITY IS SAME,THEN DELETE*
+* THE ENTRY FROM I_TECO_ORD_COMP_FINAL TABLE                          *
+************************************************************************
+          DELETE i_teco_ord_comp_final INDEX l_index1.
+          CLEAR i_teco_ord_comp_final.
+        ENDIF.
+
+      ELSE.
+************************************************************************
+* IF THERE IS NO RECORD IN I_YAM_I017_TECO TABLE FOR THE SERVICE ORDER *
+* AND THE UNCONFIRMED QUANTITY IS EQUAL TO ZERO THEN DELETE THE ENTRY  *
+* FROM i_teco_ord_comp_final TABLE WITH THE INDEX,ELSE PASS THE VALUES *
+* TO THE IDOC SEGMENT                                                  *
+************************************************************************
+        IF i_teco_ord_comp_final-unconfirmed_qty IS INITIAL.
+          DELETE i_teco_ord_comp_final INDEX l_index1.
+          CLEAR i_teco_ord_comp_final.
+        ELSE.
+          PERFORM check_update.
+
+        ENDIF.
+      ENDIF.
+    ENDLOOP.
+************************************************************************
+* IF THERE IS NO RECORD IN i_teco_ord_comp_final TABLE FOR THE SERVICE *
+* ORDER DELETE THE ENTRY FROM I_EDIDD_DATA TABLE WITH THE INDEX,SO THAT*
+* IT SHOULDNOT GENERATE THE IDOC                                       *
+************************************************************************
+
+    IF i_teco_ord_comp_final[] IS INITIAL.
+      CLEAR  i_edidd_data.
+
+      REFRESH i_edidd_data.
+*      EXIT.
+    ENDIF.
+*    ENDIF.
+
+
+************************************************************************
+*        PASSING THE CONTROL TO IDOC GENERATION FUNCTION MODULE        *
+************************************************************************
+    IF NOT i_edidd_data[] IS INITIAL.
+      CALL FUNCTION 'MASTER_IDOC_DISTRIBUTE'
+        EXPORTING
+          master_idoc_control            = wa_edidc_control
+        TABLES
+          communication_idoc_control     = i_edidc_control_comm
+          master_idoc_data               = i_edidd_data
+        EXCEPTIONS
+          error_in_idoc_control          = 1
+          error_writing_idoc_status      = 2
+          error_in_idoc_data             = 3
+          sending_logical_system_unknown = 4
+          OTHERS                         = 5.
+      IF sy-subrc NE 0.
+        MESSAGE e025 WITH i_edidc_control_comm-docnum.
+      ELSE.
+*        WRITE: 020 i_edidc_control_comm-docnum.
+        LOOP AT i_teco_ord_comp_final.
+************************************************************************
+*
+** UPDATE THE YAM_I017_TECO TABLE WITH THE VALUES FROM I_TECO_ORD_COMP
+*
+************************************************************************
+          wa_teco-mandt = sy-mandt.
+          wa_teco-aufnr = i_teco_ord_comp_final-aufnr.
+          wa_teco-matnr = i_teco_ord_comp_final-matnr.
+          wa_teco-werks = i_teco_ord_comp_final-werks.
+          wa_teco-lgort = i_teco_ord_comp_final-lgort.
+          IF      i_teco_ord_comp_final-remaining_qty  <> 0.
+            IF i_teco_ord_comp_final-i017unconfqty <> 0.
+              wa_teco-unconfqty = i_teco_ord_comp_final-i017unconfqty + i_teco_ord_comp_final-remaining_qty.
+            ELSE.
+              wa_teco-unconfqty = i_teco_ord_comp_final-remaining_qty.
+            ENDIF.
+          ELSE.
+            wa_teco-unconfqty = i_teco_ord_comp_final-unconfirmed_qty.
+          ENDIF.
+
+          wa_teco-erfme = i_teco_ord_comp_final-unconfirmed_uom.
+          MODIFY yam_i017_teco FROM wa_teco.
+************************************************************************
+* END UPDATE YAM_I017_TECO TABLE WITH THE VALUES FROM I_TECO_ORD_COMP  *
+************************************************************************
+        ENDLOOP.
+
+*       select single zzrecon into g_zzrecon
+        SELECT SINGLE zzrecon lgort INTO (g_zzrecon, g_lgort)
+
+           FROM yam_wc_map_sloc
+           WHERE werks = i_teco_ord_head-werks
+             AND arbpl = g_workcenter.
+
+        IF sy-subrc = 0.
+
+
+*         perform post_goodstransfer.
+          PERFORM post_goodstransfer USING g_zzrecon.
+
+
+        ENDIF.
+
+      ENDIF.
+    ENDIF.
+    CLEAR i_teco_ord_comp_final.
+    REFRESH i_teco_ord_comp_final.
+  ENDLOOP.
+************************************************************************
+*     FORM CHECK_UPDATE                                                *
+************************************************************************
+FORM check_update .
+  wa_yam_i017_teco_e1hrd_item-werks  =  i_teco_ord_comp_final-werks.
+  wa_yam_i017_teco_e1hrd_item-lgort  =  i_teco_ord_comp_final-lgort.
+  wa_yam_i017_teco_e1hrd_item-matnr  =  i_teco_ord_comp_final-matnr.
+
+
+  IF  i_teco_ord_comp_final-unconfirmed_qty NE c_space
+  AND i_teco_ord_comp_final-remaining_qty IS INITIAL.
+    wa_yam_i017_teco_e1hrd_item-erfmg  =
+    i_teco_ord_comp_final-unconfirmed_qty.
+  ELSE.
+    wa_yam_i017_teco_e1hrd_item-erfmg  =
+    i_teco_ord_comp_final-remaining_qty.
+  ENDIF.
+
+  wa_yam_i017_teco_e1hrd_item-erfme =
+  i_teco_ord_comp_final-unconfirmed_uom.
+************************************************************************
+* APPEND SEGMENT NAME AND SEGMENT DATA TO I_EDIDD_DATA TABLE           *
+************************************************************************
+  i_edidd_data-segnam = c_ord_detail.
+  i_edidd_data-sdata = wa_yam_i017_teco_e1hrd_item.
+  APPEND i_edidd_data.
+ENDFORM.                    " CHECK_UPDATE
+
+END-OF-SELECTION.
+*  ULINE /2(039).
+
+*&---------------------------------------------------------------------*
+*&      Form  post_goodstransfer                        MOD-009
+*&---------------------------------------------------------------------*
+*       Transfer goods from order to Van
+*----------------------------------------------------------------------*
+*  -->  P_G_ZZRECON    to reconciliate or not
+*----------------------------------------------------------------------*
+*FORM post_goodstransfer .
+FORM post_goodstransfer USING p_g_zzrecon.
+
+  DATA: lv_check TYPE c.
+
+  CLEAR: g_retc.
+* Begin of insert One Button Specific
+  IF i_teco_ord_head-stat <> c_status_rel.
+
+    lv_check = 'X'.
+* End of insert One Button Specific
+* Inactivate TECO/CLSD-status
+    REFRESH gt_status.
+    gt_status-stat = i_teco_ord_head-stat.
+    gt_status-inact = 'X'.
+    APPEND gt_status.
+    gt_status-stat = c_status_rel.
+    gt_status-inact = space.
+    APPEND gt_status.
+
+    UPDATE afih SET iphas = '2'
+    WHERE aufnr EQ i_teco_ord_head-aufnr.
+
+    CALL FUNCTION 'STATUS_CHANGE_INTERN'
+       EXPORTING
+             objnr               = i_teco_ord_head-objnr
+       TABLES
+             status              = gt_status
+       EXCEPTIONS
+             object_not_found
+             status_inconsistent
+             status_not_allowed.
+
+    COMMIT WORK AND WAIT.
+
+    IF sy-subrc <> 0.
+*    write: 042 'Could not release order status'.
+      EXIT.
+    ENDIF.
+  ENDIF.
+  REFRESH i_mvt_err.
+
+  LOOP AT i_teco_ord_comp_final.
+
+    IF i_teco_ord_comp_final-remaining_qty <> 0.
+      i_teco_ord_comp_final-unconfirmed_qty =
+                    i_teco_ord_comp_final-remaining_qty.
+    ENDIF.
+
+
+    IF p_g_zzrecon NE c_x AND
+       i_teco_ord_comp_final-unconfirmed_qty > 0.
+      CONTINUE.
+    ENDIF.
+
+    g_mvt = c_501.
+
+    PERFORM prep_goods_movement USING g_mvt.
+
+    CLEAR: g_headret.
+
+
+    CLEAR gt_return[].
+    g_goodsmvt_code_tmp = c_05.
+
+    CALL FUNCTION 'BAPI_GOODSMVT_CREATE'
+      EXPORTING
+        goodsmvt_header  = g_header
+        goodsmvt_code    = g_goodsmvt_code_tmp
+      IMPORTING
+        goodsmvt_headret = g_headret
+      TABLES
+        goodsmvt_item    = gt_item
+        return           = gt_return.
+
+    COMMIT WORK AND WAIT.
+
+    IF g_headret IS INITIAL.
+
+*      write: /20 'Could not post mvt.', g_mvt,
+*             i_teco_ord_comp_final-matnr, i_teco_ord_comp_final-werks.
+
+*     save entry as error in internal table
+      MOVE i_teco_ord_comp_final-werks TO i_mvt_err-werks.
+      MOVE i_teco_ord_comp_final-matnr TO i_mvt_err-matnr.
+      APPEND i_mvt_err.
+      CLEAR i_mvt_err.
+    ENDIF.
+  ENDLOOP.
+
+
+  LOOP AT i_teco_ord_comp_final.
+
+*   check if entry is in error table
+    READ TABLE i_mvt_err WITH KEY werks = i_teco_ord_comp_final-werks
+                                  matnr = i_teco_ord_comp_final-matnr.
+
+    IF sy-subrc = 0.
+      CONTINUE.
+    ENDIF.
+
+
+    IF i_teco_ord_comp_final-remaining_qty <> 0.
+
+      i_teco_ord_comp_final-unconfirmed_qty =
+                      i_teco_ord_comp_final-remaining_qty.
+
+    ENDIF.
+
+    IF p_g_zzrecon NE c_x AND
+       i_teco_ord_comp_final-unconfirmed_qty < 0.
+      CONTINUE.
+    ENDIF.
+
+
+    g_mvt = c_502.
+
+    PERFORM prep_goods_movement USING g_mvt.
+
+    CLEAR: g_headret.
+
+    CLEAR gt_return[].
+    g_goodsmvt_code_tmp = c_05.
+
+    CALL FUNCTION 'BAPI_GOODSMVT_CREATE'
+      EXPORTING
+        goodsmvt_header  = g_header
+        goodsmvt_code    = g_goodsmvt_code_tmp
+      IMPORTING
+        goodsmvt_headret = g_headret
+      TABLES
+        goodsmvt_item    = gt_item
+        return           = gt_return.
+
+    COMMIT WORK AND WAIT.
+
+
+    IF g_headret IS INITIAL.
+*      write: /20 'Could not post mvt.', g_mvt,
+*             i_teco_ord_comp_final-matnr, i_teco_ord_comp_final-werks.
+
+    ENDIF.
+
+  ENDLOOP.
+
+  IF lv_check = 'X'. "Released order shouldn't be UNTECO'ed/Closed and RETECO'ed afterwards/UNClosed
+*   Set status to TECO/CLSD again
+    PERFORM set_status_teco CHANGING g_retc.
+    IF g_retc <> 0.
+
+*    write: /20 'Could not reset orig. order status'.
+
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    " post_goodstransfer
+
+
+*&---------------------------------------------------------------------*
+*&      Form  prep_goods_movement
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_G_MVT  text
+*----------------------------------------------------------------------*
+FORM prep_goods_movement  USING    p_g_mvt.
+
+  DATA: g_unconfirmed_qty LIKE aufm-erfmg.
+  DATA: g_meins TYPE meins.
+
+
+  g_header-pstng_date = sy-datum.
+  g_header-doc_date   = sy-datum.
+
+  REFRESH gt_item.
+
+  CLEAR gt_item.
+  gt_item-material  = i_teco_ord_comp_final-matnr.
+  gt_item-plant     = i_teco_ord_comp_final-werks.
+  gt_item-stge_loc  = g_lgort.
+
+  gt_item-move_type = p_g_mvt.
+
+  IF i_teco_ord_comp_final-unconfirmed_qty < 0.
+    g_unconfirmed_qty = i_teco_ord_comp_final-unconfirmed_qty * -1.
+  ELSE.
+    g_unconfirmed_qty = i_teco_ord_comp_final-unconfirmed_qty.
+  ENDIF.
+
+  WRITE g_unconfirmed_qty TO g_qty
+            UNIT i_teco_ord_comp_final-unconfirmed_uom.
+
+  gt_item-entry_qnt = g_unconfirmed_qty.
+
+  SELECT SINGLE meins INTO g_meins FROM mara
+      WHERE matnr = i_teco_ord_comp_final-matnr.
+
+  IF sy-subrc = 0.
+    SELECT SINGLE isocode INTO gt_item-entry_uom_iso
+       FROM t006
+       WHERE msehi = g_meins.
+  ENDIF.
+
+  IF ( p_g_mvt = c_502 AND i_teco_ord_comp_final-unconfirmed_qty > 0 )
+   OR ( p_g_mvt = c_501 AND i_teco_ord_comp_final-unconfirmed_qty < 0 ).
+    gt_item-orderid   = i_teco_ord_comp_final-aufnr.
+  ENDIF.
+  APPEND gt_item.
+
+ENDFORM.                    " prep_goods_movement
+
+*&---------------------------------------------------------------------*
+*&      Form  set_status_teco                          MOD-009
+*&---------------------------------------------------------------------*
+*       Set status to TECO/CLSD again
+*----------------------------------------------------------------------*
+*      <--P_G_RETC  text
+*----------------------------------------------------------------------*
+FORM set_status_teco  CHANGING p_g_retc.
+
+  REFRESH gt_status.
+* gt_status-stat = c_status.
+  gt_status-stat = i_teco_ord_head-stat.
+  gt_status-inact = ' '.
+  APPEND gt_status.
+  gt_status-stat = c_status_rel.
+  gt_status-inact = 'X'.
+  APPEND gt_status.
+
+  IF i_teco_ord_head-stat = c_status.
+    UPDATE afih SET iphas = '3'
+    WHERE aufnr EQ i_teco_ord_head-aufnr.
+  ELSE.
+    UPDATE afih SET iphas = '6'
+    WHERE aufnr EQ i_teco_ord_head-aufnr.
+*>>>> CR1158/INCIDENT 7015 EXTUVE 08.02.2010
+    UPDATE aufk SET idat3 = sy-datum
+    WHERE aufnr EQ i_teco_ord_head-aufnr.
+*>>>> CR1158/INCIDENT 7015 EXTUVE 08.02.2010
+  ENDIF.
+
+  CALL FUNCTION 'STATUS_CHANGE_INTERN'
+     EXPORTING
+           objnr               = i_teco_ord_head-objnr
+     TABLES
+           status              = gt_status
+     EXCEPTIONS
+           object_not_found
+           status_inconsistent
+           status_not_allowed.
+
+  COMMIT WORK AND WAIT.
+  p_g_retc = sy-subrc.
+
+ENDFORM.                    " set_status_teco
+
+*Text symbol text£º
+*001:Input Selection
+*T01:Idoc Generated
+*T02:No Idoc have been Created
+
+*T03:Idoc Generation Summary
+*Selection text£º
+*P_AUFNR:        Order Number
+*P_MATNR:        Material Number
+*P_MESTYP:D       .
+*P_WERKS:        Plant

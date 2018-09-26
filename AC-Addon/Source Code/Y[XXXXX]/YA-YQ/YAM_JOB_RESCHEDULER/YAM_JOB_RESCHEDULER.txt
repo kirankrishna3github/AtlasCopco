@@ -1,0 +1,1985 @@
+*----------------------------------------------------------------------*
+* PROGRAM ID           : YAM_JOB_RESCHEDULER                           *
+* PROGRAM TITLE        : Job Rescheduler                               *
+* AUTHOR               : Luc Mertens                                   *
+* DATE                 : 13/05/2005                                    *
+* DEVELOPMENT ID       :                                               *
+* CHANGE REQUEST NUMBER: CD1K902308                                    *
+* PROGRAM DESCRIPTION  : OSS 599835                                    *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME     |CORRECTION NUMBER| CHANGE REFERENCE # *
+*----------------------------------------------------------------------*
+*                                                                      *
+*----------------------------------------------------------------------*
+REPORT YAM_JOB_RESCHEDULER.
+
+DATA: jobname_wildcard LIKE tbtco-jobname.
+DATA: client_wildcard LIKE sy-mandt.
+DATA: timelimit_wildcard LIKE sy-uzeit.
+
+* section 1
+SELECTION-SCREEN BEGIN OF BLOCK bk1 WITH FRAME TITLE text-001.
+SELECT-OPTIONS clnt FOR client_wildcard NO INTERVALS.
+SELECT-OPTIONS jobnames FOR jobname_wildcard NO INTERVALS.
+PARAMETER strttick TYPE num02.
+SELECTION-SCREEN END OF BLOCK bk1.
+
+* section 2
+SELECTION-SCREEN BEGIN OF BLOCK bk2 WITH FRAME TITLE text-002.
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(59) text-005 FOR FIELD timelmt.
+PARAMETER: timelmt LIKE sy-uzeit DEFAULT '000500'.
+SELECTION-SCREEN END OF LINE.
+SELECTION-SCREEN END OF BLOCK bk2.
+
+* section 3
+SELECTION-SCREEN BEGIN OF BLOCK bk3 WITH FRAME TITLE text-006.
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(30) text-007 FOR FIELD runinbtc.
+PARAMETER: runinbtc AS CHECKBOX DEFAULT 'X'.
+SELECTION-SCREEN END OF LINE.
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(30) text-038 FOR FIELD period.
+PARAMETER: period LIKE sy-uzeit DEFAULT '000000'.
+SELECTION-SCREEN END OF LINE.
+
+SELECTION-SCREEN BEGIN OF BLOCK bk4 WITH FRAME TITLE text-008.
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(67) text-009 FOR FIELD strtatmp.
+PARAMETER: strtatmp TYPE i DEFAULT 10.
+SELECTION-SCREEN END OF LINE.
+SELECTION-SCREEN END OF BLOCK bk4.
+
+SELECTION-SCREEN END OF BLOCK bk3.
+
+PARAMETERS: dia_host LIKE msxxlist-host NO-DISPLAY,
+            dia_wp   LIKE wpinfo-wp_no NO-DISPLAY.
+
+
+DATA: BEGIN OF servers OCCURS 100.
+        INCLUDE STRUCTURE msxxlist.
+DATA: busy_from_date LIKE sy-datum,
+      busy_from_time LIKE sy-uzeit,
+      in_use.
+DATA: END OF servers.
+
+DATA: short_servers LIKE msxxlist OCCURS 10 WITH HEADER LINE.
+
+DATA: message(200).
+DATA: global_exit.
+DATA: btctime TYPE i.
+DATA: number_of_server_specific_jobs TYPE i VALUE 0.
+DATA: rc LIKE sy-subrc.
+DATA: exit_time2 LIKE sy-uzeit.
+DATA: exit_date2 LIKE sy-datum.
+
+DATA: report LIKE sy-repid.
+DATA: btcoptions_exists.
+DATA: tbcicpt1_exists.
+DATA: wa_btcoptions LIKE dd02l-tabname VALUE 'BTCOPTIONS'.
+DATA: wa_criteria1 LIKE dd02l-tabname VALUE 'TBCICPT1'.
+DATA: msg_wrong_server_written.
+
+DATA: oldest_job_date LIKE sy-datum VALUE '99999999'.
+DATA: oldest_job_time LIKE sy-uzeit VALUE '235959'.
+DATA: wp_waiting_time LIKE sy-uzeit VALUE '000500'.
+DATA: server_may_busy_time TYPE i VALUE 300.
+
+CONSTANTS:
+  no_suppress_msg TYPE c VALUE 'N',
+  suppress_msg    TYPE c VALUE 'Y'.
+
+
+START-OF-SELECTION.
+
+  DATA: running TYPE i.
+
+  report = sy-repid.
+
+* Check user authorization
+  AUTHORITY-CHECK OBJECT 'S_BTCH_ADM'
+           ID 'BTCADMIN' FIELD '*'.
+  IF sy-subrc <> 0.
+    PERFORM print_message USING no_suppress_msg text-010.
+    EXIT.
+  ENDIF.
+
+* Check is RSBTCSEXE is already running
+  PERFORM is_rep_running USING report
+                         CHANGING running rc.
+  IF rc <> 0.
+    PERFORM print_message USING no_suppress_msg text-011.
+    EXIT.
+  ENDIF.
+
+  IF running = 0.
+    PERFORM transform_init_data.
+    PERFORM print_init_data.
+    PERFORM read_btctime_parameter.
+
+    IF sy-batch = 'X'.
+* In BATCH
+      PERFORM start_short_runners.
+    ELSE.
+* In DIALOG
+      DATA: wp_pid LIKE wpinfo-wp_pid.
+      DATA: wp_index LIKE wpinfo-wp_index.
+      DATA: wp_get_id TYPE x VALUE 8.
+      CALL 'ThWpInfo' ID 'OPCODE'   FIELD wp_get_id
+                      ID 'WP'       FIELD dia_wp
+                      ID 'PID'      FIELD wp_pid
+                      ID 'WP_INDEX' FIELD wp_index.
+
+      PERFORM get_sy_host CHANGING dia_host.
+
+      IF runinbtc IS INITIAL.
+        SKIP.
+        PERFORM start_short_runners.
+      ELSE.
+        PERFORM execute_itself_in_batch.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+
+*&---------------------------------------------------------------------*
+*&      Form  lunch_starter
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM execute_itself_in_batch.
+
+  DATA BEGIN OF th_msg.
+          INCLUDE STRUCTURE tbtcm.
+  DATA END OF th_msg.
+  DATA: jobcount LIKE tbtco-jobcount.
+  DATA: jobname  LIKE tbtco-jobname.
+  DATA: rc LIKE sy-subrc.
+  DATA: start_successful.
+  DATA: server TYPE btctgtsrvr-srvname.
+  DATA: wa_tbtco LIKE tbtco.
+  DATA: wa_tbtcs LIKE tbtcs.
+  DATA: server2 TYPE btcsrvname.
+  DATA: wa_thisjob LIKE tbtco.
+  DATA: start_deadline LIKE sy-uzeit.
+  DATA: variant LIKE raldb-variant.
+
+  DATA: pp_wpnum  LIKE wpinfo-wp_no.
+  DATA: pp_user   LIKE sy-uname.
+  DATA: pp_running TYPE i.
+  DATA: pp_rc LIKE sy-subrc.
+
+  PERFORM create_variant
+    CHANGING variant rc.
+
+  IF rc <> 0.
+    EXIT.
+  ENDIF.
+
+  GET TIME.
+  CONCATENATE
+    'JOB_STARTER' '_' sy-uzeit '_' sy-datum INTO jobname.
+
+  CALL FUNCTION 'JOB_OPEN'
+    EXPORTING
+      jobname          = jobname
+    IMPORTING
+      jobcount         = jobcount
+    EXCEPTIONS
+      cant_create_job  = 1
+      invalid_job_data = 2
+      jobname_missing  = 3
+      OTHERS           = 5.
+
+  IF sy-subrc <> 0.
+    PERFORM print_message USING no_suppress_msg text-012.
+    EXIT.
+  ENDIF.
+
+  CALL FUNCTION 'JOB_SUBMIT'
+    EXPORTING
+      authcknam               = sy-uname
+      jobcount                = jobcount
+      jobname                 = jobname
+      language                = sy-langu
+      report                  = report
+      variant                 = variant
+    EXCEPTIONS
+      bad_priparams           = 1
+      bad_xpgflags            = 2
+      invalid_jobdata         = 3
+      jobname_missing         = 4
+      job_notex               = 5
+      job_submit_failed       = 6
+      lock_failed             = 7
+      program_missing         = 8
+      prog_abap_and_extpg_set = 9
+      OTHERS                  = 10.
+
+  IF sy-subrc <> 0.
+    PERFORM print_message USING no_suppress_msg text-013.
+    PERFORM delete_job_skeleton USING jobname jobcount.
+    EXIT.
+  ENDIF.
+
+  SELECT SINGLE * FROM tbtco INTO wa_tbtco
+    WHERE jobname  = jobname AND
+          jobcount = jobcount.
+  IF sy-subrc <> 0.
+    PERFORM print_message USING no_suppress_msg text-012.
+    PERFORM delete_job_skeleton USING jobname jobcount.
+    EXIT.
+  ELSE.
+    GET TIME.
+    wa_tbtco-jobclass = 'A'.
+    wa_tbtco-status = 'Y'.
+    wa_tbtco-reluname = sy-uname.
+    wa_tbtco-reldate = sy-datum.
+    wa_tbtco-reltime = sy-uzeit.
+    wa_tbtco-sdlstrtdt = sy-datum.
+    wa_tbtco-sdlstrttm = sy-uzeit.
+    IF NOT period IS INITIAL.
+      wa_tbtco-periodic = 'X'.
+      wa_tbtco-prdmins = period+2(2).
+      wa_tbtco-prdhours = period+0(2).
+    ENDIF.
+    MOVE-CORRESPONDING wa_tbtco TO wa_tbtcs.
+    wa_tbtcs-jobgroup  = '%_IMMEDIATE'.
+    INSERT tbtcs FROM wa_tbtcs.
+    UPDATE tbtco FROM wa_tbtco.
+    COMMIT WORK.
+  ENDIF.
+
+  IF strtatmp < 0.
+    strtatmp = 0.
+  ENDIF.
+  GET TIME.
+  start_deadline = sy-uzeit + strtatmp.
+
+  PERFORM get_servers TABLES servers.
+
+  DATA: i_rc TYPE i.
+  SELECT SINGLE * FROM tbtco INTO wa_thisjob
+    WHERE jobname  = jobname AND
+          jobcount = jobcount.
+
+  WHILE sy-uzeit <= start_deadline AND
+        start_successful IS INITIAL.
+    LOOP AT servers.
+      PERFORM has_server_free_batch_wp
+        USING servers-name
+        CHANGING i_rc.
+
+      IF i_rc = 0.
+        MOVE-CORRESPONDING wa_thisjob TO th_msg.
+        CALL 'SendSubmitReq'
+          ID 'TMSG' FIELD th_msg
+          ID 'TSYS' FIELD servers-name.
+
+        IF sy-subrc = 0.
+          start_successful = 'X'.
+          EXIT.
+        ENDIF.
+      ENDIF.
+    ENDLOOP.
+    GET TIME.
+  ENDWHILE.
+
+  IF start_successful IS INITIAL.
+    PERFORM delete_job_skeleton USING jobname jobcount.
+    IF strtatmp IS INITIAL.
+      WRITE: text-014 TO message.
+    ELSE.
+      WRITE: strtatmp TO message.
+      CONCATENATE text-015 ': ' message text-016 INTO message.
+    ENDIF.
+    PERFORM print_message USING no_suppress_msg message.
+  ELSE.
+    PERFORM print_message
+    USING no_suppress_msg text-017.
+  ENDIF.
+
+ENDFORM.                    " execute_itself_in_batch
+
+
+*&---------------------------------------------------------------------*
+*&      Form  check_if_already_running
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_RUNNING  text
+*----------------------------------------------------------------------*
+FORM is_rep_running
+  USING
+    p_report  LIKE sy-repid
+  CHANGING
+    p_running TYPE i
+    p_rc      LIKE sy-subrc.
+
+  DATA: jobs TYPE TABLE OF tbtco WITH HEADER LINE.
+  DATA: server LIKE msxxlist-name.
+  DATA: wpnum  LIKE wpinfo-wp_no.
+  DATA: user   LIKE sy-uname.
+
+* Check batch jobs, if they run RSBTCSEXE.
+  PERFORM check_active_btc
+      TABLES jobs
+      USING p_report
+      CHANGING p_running p_rc.
+  IF p_rc <> 0.
+    EXIT.
+  ENDIF.
+
+  IF p_running <> 0.
+    WRITE: p_running TO message LEFT-JUSTIFIED.
+    PERFORM print_message USING no_suppress_msg text-018.
+    PERFORM print_job_info TABLES jobs.
+    EXIT.
+  ENDIF.
+
+* RSBTCSEXE is not about to run in batch. Is it active in dialog?
+  PERFORM check_active_dlg
+      USING p_report
+      CHANGING server wpnum user p_running p_rc.
+
+  IF p_running <> 0.
+    PERFORM print_message USING no_suppress_msg text-019.
+    PERFORM print_wp_info USING server wpnum user.
+    EXIT.
+  ENDIF.
+
+ENDFORM.                    " is_rep_running
+*&---------------------------------------------------------------------*
+*&      Form  print_message
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM print_message
+  USING
+    p_suppress_msg TYPE c
+    p_text         LIKE message.
+
+  IF p_suppress_msg = no_suppress_msg.
+    IF sy-batch = 'X'.
+      MESSAGE i645(bt) WITH p_text ''.
+    ELSE.
+      GET TIME.
+      WRITE: / p_text.
+    ENDIF.
+  ENDIF.
+
+  CLEAR message.
+
+ENDFORM.                    " print_error
+
+*---------------------------------------------------------------------*
+*  FORM get_servers
+*---------------------------------------------------------------------*
+*
+*---------------------------------------------------------------------*
+FORM get_servers TABLES p_servers.
+
+  DATA: batch LIKE msxxlist-msgtypes VALUE 8.
+
+  FREE p_servers.
+  CALL FUNCTION 'TH_SERVER_LIST'
+    EXPORTING
+      services = batch
+    TABLES
+      list     = p_servers
+    EXCEPTIONS
+      OTHERS   = 99.
+
+ENDFORM.                    "GET_SERVERS
+
+
+*&--------------------------------------------------------------------*
+*&      Form  is_rep_running_on_server
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+*      -->P_REPORT   text
+*      -->P_SERVER   text
+*      -->P_RUNNING  text
+*      -->P_RC       text
+*---------------------------------------------------------------------*
+FORM is_rep_running_on_server
+  USING
+    p_report  LIKE sy-repid
+    p_server  LIKE msxxlist-name
+    p_host    LIKE msxxlist-host
+  CHANGING
+    p_wpnum   LIKE wpinfo-wp_no
+    p_user    LIKE sy-uname
+    p_running TYPE i
+    p_rc      LIKE sy-subrc.
+
+  DATA: wp     TYPE wpinfo.
+  DATA: wp_tab TYPE TABLE OF wpinfo WITH HEADER LINE.
+  DATA: diarec LIKE pfdiarec.
+  DATA: index TYPE i VALUE 0.
+  DATA: sy_host LIKE msxxlist-host.
+  DATA: wproc_no LIKE wpinfo-wp_no.
+  DATA: wproc_id LIKE wpinfo-wp_pid.
+  DATA: wproc_index LIKE wpinfo-wp_index.
+  DATA: code TYPE x VALUE 8.
+
+  CLEAR p_rc.
+  CLEAR p_running.
+
+  CALL 'ThWpInfo' ID 'OPCODE'   FIELD code          "opcode_wp_get_id
+                  ID 'WP'       FIELD wproc_no
+                  ID 'PID'      FIELD wproc_id
+                  ID 'WP_INDEX' FIELD wproc_index.
+
+  PERFORM get_sy_host CHANGING sy_host.
+
+  WHILE 1 = 1.
+    IF p_host = sy_host AND index = wproc_index.
+    ELSE.
+      CALL FUNCTION 'TH_WP_DETAIL_INFO' DESTINATION p_server
+        EXPORTING
+          wp_index               = index
+        IMPORTING
+          wpinfo                 = wp
+          diarec                 = diarec
+        EXCEPTIONS
+          th_bad_paramter_length = 1
+          th_no_parameter        = 2
+          th_bad_parameter_value = 3
+          th_list_error          = 4
+          th_internal_error      = 5
+          OTHERS                 = 6.
+
+      IF sy-subrc <> 0.
+        EXIT.
+      ENDIF.
+      APPEND wp TO wp_tab.
+    ENDIF.
+    index = index + 1.
+  ENDWHILE.
+
+  DELETE wp_tab WHERE wp_no = wproc_no.
+* Exclude parent dialog report
+  IF p_host = dia_host.
+    DELETE wp_tab WHERE wp_no = dia_wp.
+  ENDIF.
+
+  READ TABLE wp_tab WITH KEY wp_report = p_report.
+  IF sy-subrc = 0 AND ( wp_tab-wp_itype = 1 OR wp_tab-wp_itype = 4 ).
+    p_wpnum = wp_tab-wp_no.
+    p_user  = wp_tab-wp_bname.
+    p_running = 1.
+  ENDIF.
+
+ENDFORM.                    "is_rep_running_on_server
+*&---------------------------------------------------------------------*
+*&      Form  send_message_to_report
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM create_variant
+  CHANGING
+    p_variant LIKE raldb-variant
+    p_rc LIKE sy-subrc.
+
+  DATA: vardesc TYPE varid.
+  DATA: contents TYPE TABLE OF rsparams INITIAL SIZE 9 WITH HEADER LINE.
+  DATA: text TYPE TABLE OF varit INITIAL SIZE 9 WITH HEADER LINE.
+  DATA: del_variants TYPE TABLE OF c.
+
+  GET TIME.
+
+  CONCATENATE sy-datum '_' sy-uzeit INTO p_variant.
+
+  vardesc-mandt = sy-mandt.
+  vardesc-report = report.
+  vardesc-variant = p_variant.
+  vardesc-transport = 'F'.
+  vardesc-environmnt = 'A'.
+  vardesc-version = 1.
+  vardesc-ename = sy-uname.
+  vardesc-edat = sy-datum.
+  vardesc-etime = sy-uzeit.
+  vardesc-xflag1 = 20.
+
+  LOOP AT clnt.
+    contents-selname = 'CLNT'.
+    contents-kind = 'S'.
+    contents-sign = clnt-sign.
+    contents-option = clnt-option.
+    contents-low = clnt-low.
+    contents-high = clnt-high.
+    APPEND contents.
+  ENDLOOP.
+
+  LOOP AT jobnames.
+    contents-selname = 'JOBNAMES'.
+    contents-kind = 'S'.
+    contents-sign = jobnames-sign.
+    contents-option = jobnames-option.
+    contents-low = jobnames-low.
+    contents-high = jobnames-high.
+    APPEND contents.
+  ENDLOOP.
+
+  contents-selname = 'TIMELMT'.
+  contents-kind = 'P'.
+  contents-sign = 'I'.
+  contents-option = 'EQ'.
+  contents-low = timelmt.
+  contents-high = timelmt.
+  APPEND contents.
+
+  contents-selname = 'RUNINBTC'.
+  contents-kind = 'P'.
+  contents-sign = 'I'.
+  contents-option = 'EQ'.
+  contents-low = runinbtc.
+  contents-high = runinbtc.
+  APPEND contents.
+
+  contents-selname = 'STRTATMP'.
+  contents-kind = 'P'.
+  contents-sign = 'I'.
+  contents-option = 'EQ'.
+  contents-low = strtatmp.
+  contents-high = strtatmp.
+  APPEND contents.
+
+  contents-selname = 'DIA_HOST'.
+  contents-kind = 'P'.
+  contents-sign = 'I'.
+  contents-option = 'EQ'.
+  contents-low = dia_host.
+  contents-high = dia_host.
+  APPEND contents.
+
+  contents-selname = 'DIA_WP'.
+  contents-kind = 'P'.
+  contents-sign = 'I'.
+  contents-option = 'EQ'.
+  contents-low = dia_wp.
+  contents-high = dia_wp.
+  APPEND contents.
+
+  text-mandt = sy-mandt.
+  text-langu = sy-langu.
+  text-report = report.
+  text-variant = p_variant.
+  text-vtext = text-020.
+  APPEND text.
+
+  CALL FUNCTION 'RS_CREATE_VARIANT'
+    EXPORTING
+      curr_report               = report
+      curr_variant              = p_variant
+      vari_desc                 = vardesc
+    TABLES
+      vari_contents             = contents
+      vari_text                 = text
+    EXCEPTIONS
+      illegal_report_or_variant = 1
+      illegal_variantname       = 2
+      not_authorized            = 3
+      not_executed              = 4
+      report_not_existent       = 5
+      report_not_supplied       = 6
+      variant_exists            = 7
+      variant_locked            = 8
+      OTHERS                    = 9.
+
+  p_rc = sy-subrc.
+  IF sy-subrc <> 0.
+    PERFORM print_message USING no_suppress_msg text-021.
+  ENDIF.
+
+ENDFORM.                    " send_message_to_report
+*&---------------------------------------------------------------------*
+*&      Form  check_active_btc
+*&---------------------------------------------------------------------*
+* p_p_rc:
+*   0    - RSBTCSEXE is not about to run in other batch jobs
+*   1..N - RSBTCSEXE is running or is about to run in a batch job.
+*----------------------------------------------------------------------*
+*      -->P_P_REPORT  text
+*      <--P_P_RC  text
+*----------------------------------------------------------------------*
+FORM check_active_btc
+  TABLES
+    p_jobs           STRUCTURE tbtco
+  USING
+    p_report       LIKE sy-repid
+  CHANGING
+    p_running      TYPE i
+    p_rc           LIKE sy-subrc.
+
+  DATA: BEGIN OF jobinfo.
+          INCLUDE STRUCTURE tbtcm.
+  DATA: END OF jobinfo.
+  DATA: message(200).
+
+  FREE p_jobs.
+  CLEAR p_rc.
+
+  IF sy-batch = 'X'.
+    CALL 'GetRuntimeInfo'
+      ID 'JOB' FIELD jobinfo.
+    SELECT thead~jobname thead~jobcount thead~sdluname thead~status
+      INTO (p_jobs-jobname, p_jobs-jobcount,
+            p_jobs-sdluname, p_jobs-status)
+      FROM tbtcp AS tstep INNER JOIN tbtco AS thead ON
+        tstep~jobcount = thead~jobcount AND
+        tstep~jobname  = thead~jobname
+      WHERE
+*        thead~jobname <> jobinfo-jobname AND
+*        thead~jobcount <> jobinfo-jobcount AND
+        tstep~progname = p_report AND
+        ( thead~status = 'R' OR
+          thead~status = 'Y' ).
+      APPEND p_jobs.
+    ENDSELECT.
+    DELETE p_jobs
+      WHERE jobname  = jobinfo-jobname AND
+            jobcount = jobinfo-jobcount.
+  ELSE.
+    SELECT
+      thead~jobname thead~jobcount thead~sdluname thead~status
+      INTO (p_jobs-jobname, p_jobs-jobcount,
+            p_jobs-sdluname, p_jobs-status)
+      FROM tbtcp AS tstep INNER JOIN tbtco AS thead ON
+        tstep~jobcount = thead~jobcount AND
+        tstep~jobname  = thead~jobname
+      WHERE
+        tstep~progname = p_report AND
+        ( thead~status = 'R' OR thead~status = 'Y' ).
+      APPEND p_jobs.
+    ENDSELECT.
+  ENDIF.
+
+  DESCRIBE TABLE p_jobs LINES p_running.
+
+ENDFORM.                    " check_active_btc
+*&---------------------------------------------------------------------*
+*&      Form  delete_job_skeleton
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_JOBNAME  text
+*      -->P_JOBCOUNT  text
+*----------------------------------------------------------------------*
+FORM delete_job_skeleton  USING    p_jobname
+                                   p_jobcount.
+
+  DELETE FROM tbtco
+    WHERE jobname  = p_jobname AND
+          jobcount = p_jobcount.
+
+  DELETE FROM tbtcp
+    WHERE jobname  = p_jobname AND
+          jobcount = p_jobcount.
+
+ENDFORM.                    " delete_job_skeleton
+.
+*&---------------------------------------------------------------------*
+*&      Form  check_active_dlg
+*&---------------------------------------------------------------------*
+* p_running:
+*   N - number of active instances of p_report
+*----------------------------------------------------------------------*
+*      -->P_REPORT  text
+*      <--P_RUNNING  text
+*      <--P_RC  text
+*----------------------------------------------------------------------*
+FORM check_active_dlg
+  USING
+    p_report       LIKE sy-repid
+  CHANGING
+    p_server       LIKE msxxlist-name
+    p_wpnum        LIKE wpinfo-wp_no
+    p_user         LIKE sy-uname
+    p_running      TYPE i
+    p_rc           LIKE sy-subrc.
+
+  DATA: servers TYPE TABLE OF msxxlist WITH HEADER LINE.
+
+  CLEAR p_rc.
+  CLEAR p_running.
+
+  PERFORM get_servers TABLES servers.
+  LOOP AT servers.
+    PERFORM is_rep_running_on_server
+      USING p_report servers-name servers-host
+      CHANGING p_wpnum p_user p_running p_rc.
+    IF p_running <> 0.
+      p_server = servers-name.
+      EXIT.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    " check_active_dlg
+*&---------------------------------------------------------------------*
+*&      Form  print_job_info
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_JOBS  text
+*----------------------------------------------------------------------*
+FORM print_job_info
+  TABLES
+    p_jobs STRUCTURE tbtco.
+
+  DATA: num_of_lines TYPE i.
+
+  LOOP AT p_jobs.
+    CONCATENATE '  '
+           p_jobs-jobname ', '
+           p_jobs-jobcount ', '
+           p_jobs-sdluname ', '
+           p_jobs-status INTO message.
+    PERFORM print_message USING no_suppress_msg message.
+  ENDLOOP.
+
+ENDFORM.                    " print_job_info
+*&---------------------------------------------------------------------*
+*&      Form  print_wp_info
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_SERVER  text
+*      -->P_WPNUM  text
+*      -->P_USER  text
+*----------------------------------------------------------------------*
+FORM print_wp_info
+  USING
+    p_server LIKE msxxlist-name
+    p_wpnum  LIKE wpinfo-wp_no
+    p_user   LIKE sy-uname.
+
+CONCATENATE text-022 p_server ', ' text-023 p_wpnum ', ' text-024 space
+                                                    p_user INTO message.
+  PERFORM print_message USING no_suppress_msg message.
+
+ENDFORM.                    " print_wp_info
+
+*&---------------------------------------------------------------------*
+*&      Form  start_short_runners
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_RUNNERS  text
+*----------------------------------------------------------------------*
+FORM start_short_runners.
+
+  DATA: runners TYPE TABLE OF tbtco INITIAL SIZE 100 WITH HEADER LINE.
+  DATA: running.
+  DATA: number_of_jobs TYPE i.
+  DATA: number_of_jobs_copy TYPE i.
+  DATA: period TYPE i.
+  DATA: reserve_time TYPE i.
+  DATA: free_time TYPE i.
+  DATA: rc TYPE i.
+  DATA: number_as_string(8).
+  DATA: num_of_free_wp TYPE i.
+  DATA: temp_time LIKE sy-uzeit.
+  DATA: expired_servers TYPE i VALUE 0.
+  DATA: num_of_servers TYPE i VALUE 0.
+  DATA: expired_servers_exist.
+
+* check if interception is switched on.
+  DATA: wa_x030l LIKE x030l.
+
+  wa_x030l-tabname = wa_btcoptions.
+  CALL 'DB_RD_NTABHDR' ID 'NTABHDR' FIELD wa_x030l.
+  IF sy-subrc = 0.
+    btcoptions_exists = 'X'.
+  ENDIF.
+
+  wa_x030l-tabname = wa_criteria1.
+  CALL 'DB_RD_NTABHDR' ID 'NTABHDR' FIELD wa_x030l.
+  IF sy-subrc = 0.
+    tbcicpt1_exists = 'X'.
+  ENDIF.
+
+  WHILE 1 = 1.
+    FREE servers.
+    PERFORM get_servers TABLES short_servers.
+    LOOP AT short_servers.
+      MOVE-CORRESPONDING short_servers TO servers.
+      APPEND servers.
+    ENDLOOP.
+    PERFORM select_short_runners TABLES runners servers.
+    IF NOT global_exit IS INITIAL.
+      EXIT.
+    ENDIF.
+
+    DESCRIBE TABLE runners LINES number_of_jobs.
+    number_of_jobs_copy = 0.
+
+    number_of_server_specific_jobs = 0.
+    WHILE
+      number_of_jobs <> 0 AND
+      global_exit IS INITIAL.
+      PERFORM start_1st_job TABLES runners CHANGING rc.
+      IF rc = 0.
+        number_of_jobs_copy = number_of_jobs_copy + 1.
+        IF strttick <> 0.
+          WAIT UP TO strttick SECONDS.
+        ENDIF.
+      ENDIF.
+      DESCRIBE TABLE runners LINES number_of_jobs.
+      IF NOT global_exit IS INITIAL.
+        EXIT.
+      ENDIF.
+    ENDWHILE.
+
+    IF number_of_jobs_copy <> 0.
+      WRITE number_of_jobs_copy TO number_as_string.
+      CONDENSE number_as_string.
+      CONCATENATE '<' number_as_string '> ' text-025 ' <'
+      oldest_job_date ', ' oldest_job_time '>' INTO message.
+      PERFORM print_message USING no_suppress_msg message.
+    ELSE.
+      GET TIME.
+      num_of_servers = 0.
+      LOOP AT servers WHERE NOT in_use IS INITIAL.
+        expired_servers_exist = 'X'.
+        num_of_servers = num_of_servers + 1.
+        temp_time = servers-busy_from_time + server_may_busy_time.
+        IF temp_time < sy-uzeit.
+          expired_servers = expired_servers + 1.
+        ENDIF.
+      ENDLOOP.
+
+      IF NOT expired_servers_exist IS INITIAL.
+        IF expired_servers = num_of_servers.
+          DATA: server_may_busy_time_as_string(6).
+          DATA: num_of_spcfc_jobs_as_str(8).
+          WRITE server_may_busy_time TO server_may_busy_time_as_string.
+          CONDENSE server_may_busy_time_as_string.
+         CONCATENATE text-026 ' (<' server_may_busy_time_as_string '> '
+                                              text-016 ')' INTO message.
+          PERFORM print_message USING no_suppress_msg message.
+          LOOP AT servers WHERE NOT in_use IS INITIAL.
+            WRITE servers-name TO message.
+            PERFORM print_message USING no_suppress_msg message.
+          ENDLOOP.
+          WRITE number_of_server_specific_jobs TO
+                num_of_spcfc_jobs_as_str.
+          CONDENSE num_of_spcfc_jobs_as_str.
+          CONCATENATE text-027 ': ' num_of_spcfc_jobs_as_str
+            INTO message.
+          PERFORM print_message USING no_suppress_msg message.
+          PERFORM print_message USING no_suppress_msg text-028.
+          global_exit = 'X'.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+    IF NOT global_exit IS INITIAL.
+      EXIT.
+    ENDIF.
+
+    LOOP AT runners.
+      CALL FUNCTION 'DEQUEUE_ESTBTCS'
+        EXPORTING
+          mode_tbtcs = 'E'
+          jobname    = runners-jobname
+          jobcount   = runners-jobcount.
+      CALL FUNCTION 'DEQUEUE_ESTBTCO'
+        EXPORTING
+          mode_tbtco = 'E'
+          jobname    = runners-jobname
+          jobcount   = runners-jobcount.
+    ENDLOOP.
+  ENDWHILE.
+
+ENDFORM.                    " start_short_runners
+
+*&---------------------------------------------------------------------*
+*&      Form  select_short_runners
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM select_short_runners
+  TABLES
+    p_runners STRUCTURE tbtco
+    p_servers STRUCTURE msxxlist.
+
+  DATA: number_of_lines TYPE i.
+  DATA: no_selection_exit_time LIKE sy-uzeit.
+
+  CLEAR global_exit.
+  PERFORM select_jobs_by_names TABLES p_runners p_servers.
+  DESCRIBE TABLE p_runners LINES number_of_lines.
+
+  IF number_of_lines <> 0.
+    EXIT.
+  ENDIF.
+
+  GET TIME.
+  no_selection_exit_time = sy-uzeit + btctime.
+
+  WHILE sy-uzeit <= no_selection_exit_time.
+    PERFORM select_jobs_by_names TABLES p_runners p_servers.
+    DESCRIBE TABLE p_runners LINES number_of_lines.
+    IF number_of_lines <> 0.
+      EXIT.
+    ENDIF.
+    GET TIME.
+  ENDWHILE.
+
+  IF number_of_lines = 0.
+    DATA: btctime_as_string(4).
+    WRITE btctime TO btctime_as_string.
+    CONDENSE btctime_as_string.
+    CONCATENATE
+      text-029 ' (<' btctime_as_string '> ' text-016 ')' INTO message.
+    PERFORM print_message USING no_suppress_msg message.
+    IF ( sy-datum > exit_date2 ) OR
+       ( sy-datum = exit_date2 AND sy-uzeit >= exit_time2 ).
+      PERFORM print_message USING no_suppress_msg text-030.
+      global_exit = 'X'.
+      EXIT.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    " select_short_runners
+
+*&---------------------------------------------------------------------*
+*&      Form  select_jobs_by_name
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM select_jobs_by_names
+  TABLES
+    p_runners STRUCTURE tbtco
+    p_servers STRUCTURE msxxlist.
+
+  DATA: wa_tbtco LIKE tbtco.
+  DATA: job_should_be_intercepted.
+  DATA: opcode_wp_redispatch TYPE x VALUE 21.
+  DATA: number_of_jobs TYPE i.
+  DATA: lv_count TYPE i.
+
+  CALL 'ThWpInfo' ID 'OPCODE' FIELD opcode_wp_redispatch.
+  GET TIME.
+  FREE p_runners.
+
+  SELECT * FROM tbtco INTO TABLE p_runners UP TO 50 ROWS
+    WHERE authckman IN clnt AND
+          jobname IN jobnames AND
+          sdlstrtdt <> '' AND
+          sdlstrttm <> '' AND
+          (
+            ( sdlstrtdt = sy-datum AND sdlstrttm <= sy-uzeit )
+            OR
+            ( sdlstrtdt < sy-datum )
+          ) AND
+          status = 'S'.
+
+  IF NOT btcoptions_exists IS INITIAL.
+* Delete all jobs, which match intercept criterias.
+    SELECT COUNT(*) INTO lv_count FROM (wa_btcoptions)
+      WHERE btcoption = 'JOBINTERCEPTION' AND
+            value1    = 'ON'.
+    IF lv_count = 1.
+      LOOP AT p_runners.
+        CLEAR job_should_be_intercepted.
+        PERFORM check_icpt_crit_job
+        USING
+            p_runners-jobname
+            p_runners-authckman
+            p_runners-sdluname
+        CHANGING
+            job_should_be_intercepted.
+
+        IF NOT job_should_be_intercepted IS INITIAL.
+          DELETE p_runners.
+        ENDIF.
+      ENDLOOP.
+    ENDIF.
+  ENDIF.
+
+  PERFORM check_job_servers
+    TABLES p_runners p_servers.
+
+  DESCRIBE TABLE p_runners LINES number_of_jobs.
+  IF number_of_jobs = 0.
+    EXIT.
+  ENDIF.
+
+  LOOP AT p_runners WHERE jobclass = space.
+    p_runners-jobclass = 'C'.
+    MODIFY p_runners.
+  ENDLOOP.
+
+  SORT p_runners BY
+    jobclass ASCENDING
+    sdlstrtdt ASCENDING
+    sdlstrttm ASCENDING.
+  oldest_job_date = '99999999'.
+  oldest_job_time = '999999'.
+
+ENDFORM.                    " select_jobs_by_name
+
+*---------------------------------------------------------------------*
+*  FORM check_icpt_crit_job
+*---------------------------------------------------------------------*
+*
+*---------------------------------------------------------------------*
+*  -->  P_EXEC_JOBNAME
+*  -->  P_EXEC_JOBCOUNT
+*  -->  P_EXEC_SDLUNAME
+*  -->  P_IS_INTERCEPTED
+*---------------------------------------------------------------------*
+* This form checks if the given job fits at least to one of criteria in
+* the intercept criteria table (TBCICPT1).
+* If it does, then the p_is_intercepted flag is checked.
+FORM check_icpt_crit_job
+    USING p_exec_jobname      LIKE tbtcs-jobname
+          p_exec_client       LIKE sy-mandt
+          p_exec_sdluname     LIKE tbtcs-sdluname
+    CHANGING p_is_intercepted TYPE c.
+
+* Data declaration
+  DATA BEGIN OF jobs_of_wildcard OCCURS 50.
+          INCLUDE STRUCTURE tbtco.
+  DATA END OF jobs_of_wildcard.
+  DATA: wa_jobs_of_wildcard LIKE jobs_of_wildcard.
+
+* Function code
+  CLEAR p_is_intercepted.
+
+  DATA: lv_count TYPE i.
+  DATA: wa_criteria(47).
+
+  DATA: pp_jobname LIKE tbtco-jobname.
+  DATA: pp_client LIKE sy-mandt.
+  DATA: pp_jobcreator LIKE tbtco-sdluname.
+
+  IF NOT btcoptions_exists IS INITIAL AND
+     NOT tbcicpt1_exists IS INITIAL.
+    SELECT COUNT(*) INTO lv_count FROM (wa_btcoptions)
+      WHERE btcoption = 'JOBINTERCEPTION' AND
+            value1    = 'ON'.
+    IF lv_count = 1.
+      SELECT * FROM (wa_criteria1) INTO wa_criteria.
+        pp_client  = wa_criteria+0(3).
+        pp_jobname = wa_criteria+3(32).
+        pp_jobcreator = wa_criteria+35(12).
+        CLEAR jobs_of_wildcard.
+
+        TRANSLATE pp_jobname TO UPPER CASE.              "#EC TRANSLANG
+        TRANSLATE pp_client TO UPPER CASE.               "#EC TRANSLANG
+        TRANSLATE pp_jobcreator TO UPPER CASE.           "#EC TRANSLANG
+
+        IF p_exec_jobname  CP pp_jobname AND
+           p_exec_client   CP pp_client  AND
+           p_exec_sdluname CP pp_jobcreator.
+          p_is_intercepted = 'X'.
+          EXIT.
+        ENDIF.
+      ENDSELECT.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    "check_icpt_crit_job
+
+*&---------------------------------------------------------------------*
+*&      Form  check_job_servers
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM check_job_servers
+  TABLES
+    p_runners STRUCTURE tbtco
+    p_servers STRUCTURE msxxlist.
+
+  DATA: execserver LIKE p_runners-execserver.
+  DATA: sy_tabix LIKE sy-tabix.
+  DATA: there_are_jobs_with_wrong_srv.
+
+  LOOP AT p_runners.
+    sy_tabix = sy-tabix.
+    IF NOT p_runners-execserver IS INITIAL.
+      execserver = p_runners-execserver.
+      READ TABLE p_servers WITH KEY name = execserver.
+      IF sy-subrc <> 0.
+        DELETE p_runners INDEX sy_tabix.
+        there_are_jobs_with_wrong_srv = 'X'.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+  IF NOT there_are_jobs_with_wrong_srv IS INITIAL.
+    IF msg_wrong_server_written IS INITIAL.
+      PERFORM print_message
+        USING no_suppress_msg text-039.
+      msg_wrong_server_written = 'X'.
+    ENDIF.
+  ELSE.
+    CLEAR msg_wrong_server_written.
+  ENDIF.
+
+ENDFORM.                    " check_job_servers
+
+*&---------------------------------------------------------------------*
+*&      Form  start_1st_job
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM start_1st_job
+  TABLES
+    p_runners STRUCTURE tbtco
+  CHANGING
+    p_rc4.
+
+  DATA BEGIN OF exec_jobs OCCURS 50.
+          INCLUDE STRUCTURE tbtcs.
+  DATA END OF exec_jobs.
+  DATA BEGIN OF th_msg.
+          INCLUDE STRUCTURE tbtcm.
+  DATA END OF th_msg.
+  DATA: job_head LIKE tbtco.
+  DATA: server TYPE btctgtsrvr-srvname.
+  DATA: l_rc TYPE i.
+  DATA: wa_tbtco LIKE tbtco.
+  DATA: wa_tbtcs LIKE tbtcs.
+  DATA: wa_tbtcp LIKE tbtcp.
+  DATA: is_intercepted.
+  DATA: num_sel_jobs TYPE i VALUE 1.
+  DATA: execserver LIKE p_runners-execserver.
+  DATA: recpt_object LIKE swotobjid.
+  DATA: job_released LIKE btch0000-char1.
+  DATA: sy_subrc LIKE sy-subrc.
+  DATA: server2 TYPE btcsrvname.
+  DATA: itab_index LIKE sy-tabix.
+  DATA: wa_exec_jobs TYPE tbtcs.
+
+  READ TABLE p_runners INDEX 1.
+
+  p_rc4 = 1.
+
+  SELECT SINGLE * FROM tbtcs INTO wa_tbtcs
+    WHERE jobname  = p_runners-jobname AND
+          jobcount = p_runners-jobcount.
+  IF sy-subrc <> 0.
+    DELETE p_runners INDEX 1.
+    EXIT.
+  ENDIF.
+
+  CLEAR execserver.
+  execserver = wa_tbtcs-execserver.
+
+  PERFORM get_free_server USING p_runners-jobclass execserver
+                          CHANGING server l_rc.
+
+  IF l_rc = 0.
+    SELECT SINGLE * FROM tbtco INTO job_head
+      WHERE jobname  = p_runners-jobname AND
+            jobcount = p_runners-jobcount AND
+            status = 'S'.
+    IF sy-subrc <> 0.
+      DELETE p_runners INDEX 1.
+      CLEAR p_runners.
+      EXIT.
+    ENDIF.
+
+    SELECT SINGLE * FROM tbtcp INTO wa_tbtcp
+      WHERE jobname  = p_runners-jobname AND
+            jobcount = p_runners-jobcount AND
+            progname = sy-repid.
+    IF sy-subrc = 0.
+      DELETE p_runners INDEX 1.
+      CLEAR p_runners.
+      EXIT.
+    ENDIF.
+
+    CALL FUNCTION 'ENQUEUE_ESTBTCS'
+      EXPORTING
+        jobname        = p_runners-jobname
+        jobcount       = p_runners-jobcount
+      EXCEPTIONS
+        foreign_lock   = 1
+        system_failure = 2
+        OTHERS         = 3.
+
+    IF sy-subrc = 0.
+      CALL FUNCTION 'ENQUEUE_ESTBTCO'
+        EXPORTING
+          jobname        = p_runners-jobname
+          jobcount       = p_runners-jobcount
+        EXCEPTIONS
+          foreign_lock   = 1
+          system_failure = 2
+          OTHERS         = 3.
+
+      IF sy-subrc <> 0.
+        CALL FUNCTION 'DEQUEUE_ESTBTCS'
+          EXPORTING
+            jobname  = p_runners-jobname
+            jobcount = p_runners-jobcount.
+        DELETE p_runners INDEX 1.
+        CLEAR p_runners.
+        EXIT.
+      ENDIF.
+    ELSE.
+      DELETE p_runners INDEX 1.
+      CLEAR p_runners.
+      EXIT.
+    ENDIF.
+
+    recpt_object-logsys = job_head-reclogsys.
+    recpt_object-objtype = job_head-recobjtype.
+    recpt_object-objkey = job_head-recobjkey.
+    recpt_object-describe = job_head-recdescrib.
+
+    SELECT SINGLE * FROM tbtcs INTO wa_exec_jobs
+      WHERE jobname  = p_runners-jobname AND
+            jobcount = p_runners-jobcount.
+    IF sy-subrc <> 0.
+      CALL FUNCTION 'DEQUEUE_ALL'.
+      DELETE p_runners INDEX 1.
+      EXIT.
+    ENDIF.
+
+    SELECT SINGLE * FROM tbtco INTO job_head
+      WHERE jobname  = p_runners-jobname AND
+            jobcount = p_runners-jobcount AND
+            status = 'S'.
+    IF sy-subrc <> 0.
+      CALL FUNCTION 'DEQUEUE_ALL'.
+      DELETE p_runners INDEX 1.
+      EXIT.
+    ENDIF.
+
+    DELETE FROM tbtcs
+      WHERE jobname  = p_runners-jobname AND
+            jobcount = p_runners-jobcount.
+
+    GET TIME.
+    job_head-status = 'Y'.
+    job_head-strtdate = sy-datum.
+    job_head-strttime = sy-uzeit.
+    UPDATE tbtco FROM job_head.
+    COMMIT WORK.
+
+* run the job
+    WRITE server TO server2.
+
+    MOVE-CORRESPONDING job_head TO th_msg.
+    CALL 'SendSubmitReq'
+      ID 'TMSG' FIELD th_msg
+      ID 'TSYS' FIELD server2.
+    sy_subrc = sy-subrc.
+
+    FREE exec_jobs.
+    APPEND wa_exec_jobs TO exec_jobs.
+
+    CASE sy_subrc.
+      WHEN 0.
+        LOOP AT servers WHERE NOT in_use IS INITIAL.
+          itab_index = sy-tabix.
+          CLEAR servers-busy_from_date.
+          CLEAR servers-busy_from_time.
+          CLEAR servers-in_use.
+          MODIFY servers INDEX itab_index.
+        ENDLOOP.
+        IF oldest_job_date > p_runners-sdlstrtdt.
+          oldest_job_date = p_runners-sdlstrtdt.
+          oldest_job_time = p_runners-sdlstrttm.
+        ELSEIF oldest_job_date = p_runners-sdlstrtdt.
+          IF oldest_job_time >= p_runners-sdlstrttm.
+            oldest_job_time = p_runners-sdlstrttm.
+          ENDIF.
+        ENDIF.
+
+        PERFORM reschedule_periodic_jobs IN PROGRAM sapmssy2
+        TABLES
+          exec_jobs
+        USING
+          'TBS_UPDATE_TABLES'
+          'TBS_CALC_NEW_START_DATE'
+          num_sel_jobs.
+
+        DESCRIBE TABLE exec_jobs LINES num_sel_jobs.
+        IF num_sel_jobs = 1.
+          DELETE tbtcs FROM TABLE exec_jobs.
+        ENDIF.
+
+        CLEAR p_rc4.
+      WHEN OTHERS.
+        MOVE-CORRESPONDING wa_tbtco TO wa_tbtcs.
+        INSERT tbtcs FROM wa_tbtcs.
+    ENDCASE.
+    COMMIT WORK.
+  ELSE.
+    number_of_server_specific_jobs = number_of_server_specific_jobs + 1.
+    p_rc4 = 1.
+  ENDIF.
+
+  CALL FUNCTION 'DEQUEUE_ALL'.
+  DELETE p_runners INDEX 1.
+
+ENDFORM.                    " start_1st_job
+
+*&---------------------------------------------------------------------*
+*&      Form  get_free_server
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_SERVER  text
+*      <--P_RC  text
+*----------------------------------------------------------------------*
+FORM get_free_server
+  USING
+    p_jobclass
+    p_execserver
+  CHANGING
+    p_server
+    p_p_rc.
+
+  DATA: target_server LIKE msxxlist-name.
+  DATA: rc2 TYPE i.
+  DATA: tab_index LIKE sy-tabix.
+  DATA: rfcdest LIKE tbtcjob-execserver.
+  DATA: wps LIKE wpinfo OCCURS 20 WITH HEADER LINE.
+
+  CLEAR p_server.
+  p_p_rc = 1.
+
+  IF NOT p_execserver IS INITIAL.
+    READ TABLE servers WITH KEY name = p_execserver.
+    tab_index = sy-tabix.
+    IF sy-subrc = 0.
+      WRITE p_execserver TO target_server.
+      CALL FUNCTION 'TH_WPINFO'
+        EXPORTING
+          srvname    = target_server
+        TABLES
+          wplist     = wps
+        EXCEPTIONS
+          send_error = 1
+          OTHERS     = 2.
+      IF sy-subrc = 0.
+        LOOP AT wps
+          WHERE ( wp_istatus = 1 OR wp_istatus = 2 ) AND
+                wp_itype = 4.
+          p_server = servers-name.
+          p_p_rc = 0.
+          EXIT.
+        ENDLOOP.
+      ENDIF.
+
+      IF p_p_rc = 0.
+        p_server = target_server.
+        p_p_rc = 0.
+        CLEAR servers-busy_from_date.
+        CLEAR servers-busy_from_time.
+        CLEAR servers-in_use.
+        MODIFY servers INDEX tab_index.
+      ELSE.
+        GET TIME.
+        IF servers-busy_from_date IS INITIAL.
+          servers-busy_from_date = sy-datum.
+        ENDIF.
+        IF servers-busy_from_time IS INITIAL.
+          servers-busy_from_time = sy-uzeit.
+        ENDIF.
+        servers-in_use = 'X'.
+        MODIFY servers INDEX tab_index.
+      ENDIF.
+    ELSE.
+* wrong servers name.
+      p_p_rc = 0.
+    ENDIF.
+  ELSE.
+    GET TIME.
+    DATA: wp_limit_time LIKE sy-uzeit.
+    wp_limit_time = sy-uzeit + wp_waiting_time.
+
+    WHILE sy-uzeit < wp_limit_time.
+      LOOP AT servers.
+        CLEAR target_server.
+        WRITE servers-name TO target_server.
+        CALL FUNCTION 'TH_WPINFO'
+          EXPORTING
+            srvname    = target_server
+          TABLES
+            wplist     = wps
+          EXCEPTIONS
+            send_error = 1
+            OTHERS     = 2.
+        IF sy-subrc = 0.
+          LOOP AT wps
+            WHERE ( wp_istatus = 1 OR wp_istatus = 2 ) AND
+                  wp_itype = 4.
+            p_server = servers-name.
+            p_p_rc = 0.
+            EXIT.
+          ENDLOOP.
+        ENDIF.
+        IF p_p_rc = 0.
+          EXIT.
+        ENDIF.
+
+      ENDLOOP.
+      IF p_p_rc = 0.
+        EXIT.
+      ENDIF.
+      GET TIME.
+    ENDWHILE.
+
+    IF p_p_rc = 0.
+      EXIT.
+    ELSE.
+      DATA: wp_waiting_time_as_string(6).
+      DATA: time TYPE i.
+      time = wp_waiting_time.
+      WRITE time TO wp_waiting_time_as_string.
+      CONDENSE wp_waiting_time_as_string.
+      CONCATENATE text-031 ' (<'
+        wp_waiting_time_as_string '> ' text-016 ')' INTO message.
+      PERFORM print_message USING no_suppress_msg message.
+      global_exit = 'X'.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    " get_free_server
+
+*---------------------------------------------------------------------*
+*       FORM check_for_free_btc_wp                                    *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  SRVNAME                                                       *
+*  -->  JOBCLASS                                                      *
+*  -->  RC                                                            *
+*---------------------------------------------------------------------*
+FORM check_for_free_btc_wp USING srvname jobclass
+                           CHANGING rc.
+
+  DATA: srv_name  LIKE msxxlist-name,
+        isrv_type LIKE msxxlist-msgtypes VALUE 0,
+        btc_rqtyp(4) VALUE 'BTC ',
+        no_of_free_btc_wp  TYPE i VALUE 0,
+        no_of_total_btc_wp TYPE i VALUE 0.
+
+  DATA: BEGIN OF req_tbl OCCURS 5.
+          INCLUDE STRUCTURE sthcmlist.
+  DATA: END OF req_tbl.
+
+  DATA: BEGIN OF rsp_tbl OCCURS 20.
+          INCLUDE STRUCTURE sthcmlist.
+  DATA: END OF rsp_tbl.
+
+  DATA: BEGIN OF loc_int_tab OCCURS 10." Tabelle f¨¹r das Auslesen von
+          INCLUDE STRUCTURE salstintg. " 'privaten' Integerweten eines
+  DATA: END OF loc_int_tab.            " SAP-Servers
+
+  DATA: BEGIN OF loc_text_tab OCCURS 10. " Tabelle f¨¹r das Auslesen von
+          INCLUDE STRUCTURE salsttext. " 'privaten' Kurztexten eines
+  DATA: END OF loc_text_tab.           " SAP-Servers
+
+  DATA: BEGIN OF loc_long_text_tab OCCURS 10. " Tabelle f¨¹r das Auslesen
+          INCLUDE STRUCTURE salstltxt. " von 'privaten' Langtexten
+  DATA: END OF loc_long_text_tab.      " eines SAP-Servers
+
+  DATA: BEGIN OF wpstatus_tbl OCCURS 10, " Tabelle, die den Status aller
+       wp      TYPE i,                 " Workprozesse eines SAP-Servers
+        rqtyp(4),                      " enth#lt
+        stat    TYPE i,
+        END OF wpstatus_tbl.
+
+  DATA: class_a_btc_wp TYPE i.
+
+  DATA: BEGIN OF raw_ad_wpstat_rec,
+     wp(3),
+     rqtyp(4),
+     pid(11),
+     stat(5),
+     wait_for(3),
+     restart(3),
+     no_of_deaths(5),
+     sem(5),
+     runtime(11),
+     report(8),
+     mandt(3),
+     bname(12),
+     action(3),
+     tab_name(10),
+     END OF raw_ad_wpstat_rec.
+  DATA: ad_wpstat_stat_wait TYPE i VALUE 2.  " Status WAIT
+  DATA: btc_jobclass_a VALUE 'A'.
+  DATA: no_batch_wp_for_jobclass TYPE i VALUE 6.
+  DATA: no_free_batch_wp_now TYPE i VALUE 3.
+
+  srv_name = srvname.
+
+  REFRESH req_tbl.
+  REFRESH rsp_tbl.
+*
+* Request f¨¹r das Ermitteln der Workproze#status und der reservierten
+* Klasse-A-Batchworkprozesse auf dem genannten Server aufbauen
+*
+
+  DATA: ad_wpstat TYPE i VALUE  2. "Workprozess-Status wie SM50
+
+  CLEAR req_tbl.
+  req_tbl-opcode = ad_wpstat.
+  APPEND req_tbl.
+
+  DATA: class_a_wp_ident(20) VALUE 'BTC_CLASS_A_WP'.
+  DATA: tgt_host_chk_has_failed TYPE i VALUE 1.
+
+  CALL FUNCTION 'RZL_MAKE_STRG_READ_REQ'
+    EXPORTING
+      name    = class_a_wp_ident
+      typ     = 'C'
+    TABLES
+      req_tbl = req_tbl
+    EXCEPTIONS
+      OTHERS  = 99.
+
+  IF sy-subrc NE 0.
+    rc = tgt_host_chk_has_failed.
+    EXIT.
+  ENDIF.
+*
+* Request an Server schicken, Antwort abholen und Workproze#status-
+* tabelle aufbauen
+*
+  CALL FUNCTION 'RZL_EXECUTE_STRG_REQ'
+    EXPORTING
+      srvname = srvname
+    TABLES
+      req_tbl = req_tbl
+      rsp_tbl = rsp_tbl
+    EXCEPTIONS
+      OTHERS  = 99.
+
+  IF sy-subrc NE 0.
+    rc = tgt_host_chk_has_failed.
+    EXIT.
+  ENDIF.
+
+  CALL FUNCTION 'RZL_MAKE_STRG_RSP'
+    TABLES
+      intg_tbl      = loc_int_tab
+      text_tbl      = loc_text_tab
+      long_text_tbl = loc_long_text_tab
+      rsp_tbl       = rsp_tbl
+    EXCEPTIONS
+      OTHERS        = 99.
+
+  IF sy-subrc NE 0.
+    rc = tgt_host_chk_has_failed.
+    EXIT.
+  ENDIF.
+
+  MOVE space TO loc_text_tab.
+  loc_text_tab-name = class_a_wp_ident.
+  READ TABLE loc_text_tab.
+  IF sy-subrc EQ 0.                    " Anzahl reservierter
+    class_a_btc_wp = loc_text_tab-value.  " Klasse-A-Batch-WPs
+  ELSE.                                " ermitteln
+    class_a_btc_wp = 0.
+  ENDIF.
+
+  REFRESH wpstatus_tbl.
+
+  LOOP AT rsp_tbl.
+    IF rsp_tbl-opcode EQ ad_wpstat AND rsp_tbl-errno EQ 0.
+      raw_ad_wpstat_rec = rsp_tbl-buffer.
+      MOVE-CORRESPONDING raw_ad_wpstat_rec TO wpstatus_tbl.
+      APPEND wpstatus_tbl.
+    ENDIF.
+  ENDLOOP.
+*
+* Anzahl der (freien) Batchworkprozesse ermitteln. Bei Jobklasse un-
+* gleich A, sind die reservierten Klasse-A-WPs von der Anzahl der
+* freien WPs zu subtrahieren.
+*
+  LOOP AT wpstatus_tbl.
+    IF wpstatus_tbl-rqtyp EQ btc_rqtyp.
+      no_of_total_btc_wp = no_of_total_btc_wp + 1.
+      IF wpstatus_tbl-stat EQ ad_wpstat_stat_wait.
+        no_of_free_btc_wp = no_of_free_btc_wp + 1.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+  IF jobclass EQ btc_jobclass_a.
+  ELSE.
+    no_of_free_btc_wp = no_of_free_btc_wp - class_a_btc_wp.
+  ENDIF.
+
+  IF jobclass NE btc_jobclass_a AND
+     no_of_total_btc_wp EQ class_a_btc_wp.
+    rc = no_batch_wp_for_jobclass.
+    EXIT.
+  ENDIF.
+
+  IF no_of_free_btc_wp <= 0.
+    rc = no_free_batch_wp_now.
+    EXIT.
+  ENDIF.
+
+  rc = 0.
+
+ENDFORM.                               " CHECK_FOR_FREE_BTC_WP
+
+*&---------------------------------------------------------------------*
+*&      Form  get_message_from_starter
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM print_init_data.
+
+  DATA: exit_time_as_string(8).
+  DATA: exit_date_as_string(10).
+
+  WRITE: exit_time2 TO exit_time_as_string.
+  WRITE: exit_date2 TO exit_date_as_string.
+
+* print clients
+  PERFORM print_message USING no_suppress_msg text-032.
+  LOOP AT clnt.
+    IF clnt-sign = 'I'.
+      IF clnt-option = 'BT'.
+        CONCATENATE text-033 ' <' clnt-low '> - <'
+            clnt-high '>' INTO message.
+        PERFORM print_message USING no_suppress_msg message.
+      ELSE.
+        CONCATENATE text-034 ' <' clnt-low '>' INTO message.
+        PERFORM print_message USING no_suppress_msg message.
+      ENDIF.
+    ENDIF.
+    IF clnt-sign = 'E'.
+      IF clnt-option = 'BT'.
+        CONCATENATE text-035 ' <' clnt-low '> - <'
+            clnt-high '>' INTO message.
+        PERFORM print_message USING no_suppress_msg message.
+      ELSE.
+        CONCATENATE text-036 ' <' clnt-low '>' INTO message.
+        PERFORM print_message USING no_suppress_msg message.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+* print jobnames
+  PERFORM print_message USING no_suppress_msg text-040.
+  LOOP AT jobnames.
+    IF jobnames-sign = 'I'.
+      IF jobnames-option = 'BT'.
+        CONCATENATE text-033 ' <' jobnames-low '> - <'
+            jobnames-high '>' INTO message.
+        PERFORM print_message USING no_suppress_msg message.
+      ELSE.
+        CONCATENATE text-034 ' <' jobnames-low '>' INTO message.
+        PERFORM print_message USING no_suppress_msg message.
+      ENDIF.
+    ENDIF.
+    IF jobnames-sign = 'E'.
+      IF jobnames-option = 'BT'.
+        CONCATENATE text-035 ' <' jobnames-low '> - <'
+            jobnames-high '>' INTO message.
+        PERFORM print_message USING no_suppress_msg message.
+      ELSE.
+        CONCATENATE text-036 ' <' jobnames-low '>' INTO message.
+        PERFORM print_message USING no_suppress_msg message.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+  CONCATENATE text-037  ' <' exit_date_as_string ', '
+      exit_time_as_string '>' INTO message.
+  PERFORM print_message USING no_suppress_msg message.
+
+ENDFORM.                    " get_message_from_starter
+
+*&---------------------------------------------------------------------*
+*&      Form  read_btctime_parameter
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM read_btctime_parameter.
+
+* Read rdisp/btctime of the _current_ server.
+  DATA: buffer(20).
+  CALL 'C_SAPGPARAM' ID 'NAME'  FIELD 'rdisp/btctime'
+                     ID 'VALUE' FIELD buffer.
+  IF sy-subrc <> 0.
+    btctime = 65.
+  ELSE.
+    buffer = buffer + 5.
+    btctime = buffer.
+  ENDIF.
+
+ENDFORM.                    " read_btctime_parameter
+
+*&---------------------------------------------------------------------*
+*&      Form  transform_init_data
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM transform_init_data.
+
+  DATA: lines TYPE i.
+
+* Clients
+  LOOP AT clnt.
+    TRANSLATE clnt-low TO UPPER CASE.                    "#EC TRANSLANG
+    MODIFY clnt.
+  ENDLOOP.
+
+  DESCRIBE TABLE clnt LINES lines.
+  IF lines = 0.
+    clnt-low = '*'.
+    clnt-option = 'CP'.
+    clnt-sign = 'I'.
+    APPEND clnt.
+  ENDIF.
+
+* Jobnames
+  LOOP AT jobnames.
+    TRANSLATE jobnames-low TO UPPER CASE.                "#EC TRANSLANG
+    MODIFY jobnames.
+  ENDLOOP.
+
+  DESCRIBE TABLE jobnames LINES lines.
+  IF lines = 0.
+    jobnames-low = '*'.
+    jobnames-option = 'CP'.
+    jobnames-sign = 'I'.
+    APPEND jobnames.
+  ENDIF.
+
+  GET TIME.
+  exit_time2 = sy-uzeit.
+  exit_date2 = sy-datum.
+
+  PERFORM calc_new_time_date USING timelmt
+                             CHANGING exit_time2 exit_date2.
+
+ENDFORM.                    " transform_init_data
+
+*&--------------------------------------------------------------------*
+*&      Form  calc_new_time_date
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+*      -->P_INTERVAL text
+*      -->P_TIME     text
+*      -->P_DATE     text
+*---------------------------------------------------------------------*
+FORM calc_new_time_date USING p_interval
+                        CHANGING p_time p_date.
+
+  IF p_interval IS INITIAL.
+    exit_time2 = '235959'.
+    exit_date2 = '99999999'.
+    EXIT.
+  ENDIF.
+
+  DATA: diff LIKE sy-uzeit VALUE '000000'.
+  diff = diff - p_interval.
+
+  IF diff < p_time.
+    p_date = p_date + 1.
+  ENDIF.
+
+  p_time = p_time + p_interval.
+
+ENDFORM.                    "calc_new_time_date
+
+*---------------------------------------------------------------------*
+*       FORM get_rfc_destination_4_server                             *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  P_SERVER                                                      *
+*  -->  RFCDEST                                                       *
+*---------------------------------------------------------------------*
+FORM get_rfc_destination_4_server
+  USING
+    p_server LIKE tbtcjob-execserver
+  CHANGING
+    p_rfcdest LIKE rsposerver-server.
+
+  CALL 'RSPO_CACHE_CONTROL' ID 'AREA'     FIELD 'SERVER'
+                            ID 'OP'       FIELD 'MAP'
+                            ID 'NAME'     FIELD p_server
+                            ID 'ACTIVE'   FIELD 'X'
+                            ID 'RFCDEST'  FIELD p_rfcdest.
+
+ENDFORM.                    "get_rfc_destination_4_server
+
+
+*---------------------------------------------------------------------*
+*       FORM has_server_free_batch_wp                                 *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  P_SERVER                                                      *
+*  -->  P_RC                                                          *
+*---------------------------------------------------------------------*
+FORM has_server_free_batch_wp
+  USING p_server LIKE msxxlist-name
+  CHANGING p_rc TYPE i.
+
+  DATA: index TYPE i.
+  DATA: code TYPE x VALUE 8.
+  DATA: wp     TYPE wpinfo.
+  DATA: wp_tab TYPE TABLE OF wpinfo WITH HEADER LINE.
+  DATA: diarec LIKE pfdiarec.
+
+  WHILE 1 = 1.
+    CALL FUNCTION 'TH_WP_DETAIL_INFO' DESTINATION p_server
+      EXPORTING
+        wp_index               = index
+      IMPORTING
+        wpinfo                 = wp
+        diarec                 = diarec
+      EXCEPTIONS
+        th_bad_paramter_length = 1
+        th_no_parameter        = 2
+        th_bad_parameter_value = 3
+        th_list_error          = 4
+        th_internal_error      = 5
+        OTHERS                 = 6.
+
+    IF sy-subrc <> 0.
+      EXIT.
+    ENDIF.
+    APPEND wp TO wp_tab.
+    index = index + 1.
+  ENDWHILE.
+
+  READ TABLE wp_tab WITH KEY wp_istatus = 2 wp_itype = 4.
+  IF sy-subrc = 0.
+    p_rc = 0.
+  ELSE.
+    p_rc = 1.
+  ENDIF.
+
+ENDFORM.                    "has_server_free_batch_wp
+*&---------------------------------------------------------------------*
+*&      Form  get_sy_host
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_DIA_HOST  text
+*----------------------------------------------------------------------*
+FORM get_sy_host
+  CHANGING p_host LIKE msxxlist-host.
+
+  DATA: current_server LIKE msxxlist-name.
+  DATA: wa_servers LIKE msxxlist.
+
+  CALL FUNCTION 'TH_GET_ACTIVE_SERVER'
+    EXPORTING
+      tabname        = ' '
+      local_tabname  = ' '
+    IMPORTING
+      server         = current_server
+    EXCEPTIONS
+      no_server_list = 1
+      no_server      = 2
+      OTHERS         = 3.
+  IF sy-subrc <> 0.
+* this may be incorrect, because sy-host may change case of letters
+    p_host = sy-host.
+  ELSE.
+    PERFORM get_servers TABLES servers.
+    READ TABLE servers WITH KEY name = current_server
+      INTO wa_servers.
+    IF sy-subrc = 0.
+      p_host = wa_servers-host.
+    ELSE.
+      p_host = sy-host.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    " get_sy_host
+
+*Text symbol text£º
+*001:Job selection criteria
+*002:Runtime conditions
+*004:Jobnames:
+*005:Exit, if there are no waiting jobs after this interval:
+*006:Mode
+*007:Execute in background
+*008:Only when run in dialog
+*009:Do not try to execute in batch after this interval (in sec.):
+*010:You have no Batch-Administrator authority
+*011:Unrecoverable error
+*012:Error while creating batch job for RSBTCSEXE
+*013:Error while submitting RSBTCSEXE as a step
+*014:Cannot start RSBTCSEXE in batch
+*015:Failed to start RSBTCSEXE in this interval
+*016:seconds
+*017:RSBTCSEXE is started in batch
+*018:There are several WPs at the moment, which run RSBTCSEXE
+*019:There is at least one WP, which runs RSBTCSEXE
+*020:Generated variant
+*021:Cannot generate variant
+*022:Server:
+*023:Process:
+*024:User:
+*025:Jobs started. Oldest job:
+*026:There are several servers, which are busy too long time
+*027:Number of jobs, which could not start
+*028:No other jobs, which were scheduled for other servers.
+*029:There are no jobs to start
+*030:Timelimit expired.
+*031:There are no free workprocesses
+*032:Clients:
+*033:Included interval
+*034:Include
+*035:Excluded interval
+*036:Exclude
+*037:Timelimit:
+*038:Period of the job
+*039:There are jobs, whose execution server is unknown
+
+*040:Jobnames
+*Selection text£º
+*CLNT:        Client:
+*JOBNAMES:        Jobnames:
+*PERIOD:        Period
+*RUNINBTC:        Execution in background
+*STRTATMP:        Duration of start attempt
+*STRTTICK:        Pause between job starts:
+*TIMELMT:        Time limit

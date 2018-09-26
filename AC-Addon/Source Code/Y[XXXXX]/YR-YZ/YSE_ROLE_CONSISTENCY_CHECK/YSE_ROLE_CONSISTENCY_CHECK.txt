@@ -1,0 +1,693 @@
+*&---------------------------------------------------------------------*
+*& Report  YSE_ROLE_CONSISTENCY_CHECK
+*&
+*&---------------------------------------------------------------------*
+*&                                                                     *
+*&                   Roles consistency check                           *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+*  Author                : Anda Wu
+*  Date                  : 09.01.2014
+*  Change Request Number :
+*  Transport request Nr. :
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME     |CORRECTION NUMBER| CHANGE REFERENCE # *
+*----------------------------------------------------------------------*
+* MOD-001 |10.02.2014|          |CD1K979950       | Fix duplicate bug  *
+*----------------------------------------------------------------------*
+REPORT  yse_role_consistency_check.
+
+************************************************************************
+* TABLES                                                               *
+************************************************************************
+TABLES: agr_agrs.
+
+************************************************************************
+*        TYPES                                                         *
+************************************************************************
+TYPES:  BEGIN OF ty_out,
+          agr_name    TYPE agr_agrs-agr_name,
+          child_agr   TYPE agr_agrs-child_agr,
+          attributes  TYPE agr_agrs-attributes,
+          type        TYPE agr_tcodes-type,
+          tcode       TYPE agr_tcodes-tcode,
+          exclude     TYPE agr_tcodes-exclude,
+          direct      TYPE agr_tcodes-direct,
+          inherited   TYPE agr_tcodes-inherited,
+          folder      TYPE agr_tcodes-folder,
+        END OF ty_out.
+
+************************************************************************
+* CLASSES                                                              *
+************************************************************************
+*----------------------------------------------------------------------*
+*       CLASS lcl_event_handler DEFINITION
+*----------------------------------------------------------------------*
+CLASS lcl_event_handler DEFINITION.
+
+  PUBLIC SECTION.
+    METHODS:
+*   Double click control
+    handle_double_click
+          FOR EVENT double_click OF cl_gui_alv_grid
+          IMPORTING e_row e_column,
+*   Double click control
+    handle_hot_spot
+          FOR EVENT hotspot_click  OF cl_gui_alv_grid
+          IMPORTING e_row_id  e_column_id  es_row_no.
+
+ENDCLASS.                    "lcl_event_handler DEFINITION
+
+*----------------------------------------------------------------------*
+*       CLASS lcl_event_handler IMPLEMENTATION
+*----------------------------------------------------------------------*
+CLASS lcl_event_handler IMPLEMENTATION.
+
+* Handle double click
+  METHOD handle_double_click.
+    PERFORM handle_double_click USING e_row e_column.
+  ENDMETHOD.                    "handle_double_click
+* Handle hot spot
+  METHOD handle_hot_spot.
+    PERFORM handle_hot_spot USING e_row_id  e_column_id  es_row_no.
+  ENDMETHOD.                    "handle_hot_spot
+
+ENDCLASS.                    "lcl_event_handler IMPLEMENTATION
+
+************************************************************************
+*           WORKAREAS                                                  *
+************************************************************************
+DATA: gt_out        TYPE STANDARD TABLE OF ty_out,
+      gt_role_minus TYPE STANDARD TABLE OF ty_out,
+      gt_role_added TYPE STANDARD TABLE OF ty_out.
+
+DATA: go_grid             TYPE REF TO cl_gui_alv_grid,
+      go_custom_container TYPE REF TO cl_gui_custom_container,
+      gv_container        TYPE scrfname VALUE 'CUSTOM_CONTROL',
+      gs_layout           TYPE lvc_s_layo,
+      gv_send             TYPE char1,
+      gt_fcat             TYPE lvc_t_fcat,
+      gs_fcat             LIKE LINE OF gt_fcat,
+      gs_stable           TYPE lvc_s_stbl,
+      obj_event_handler TYPE REF TO lcl_event_handler.
+
+************************************************************************
+*           VARIABLES                                                  *
+************************************************************************
+* Variables
+DATA: gv_col(10)        TYPE n,
+      ok_code           TYPE sy-ucomm.
+
+************************************************************************
+*           CONSTANTS                                                  *
+************************************************************************
+CONSTANTS: gc_x         TYPE c VALUE 'X'.
+
+************************************************************************
+*           SELECTION-SRCEEN                                           *
+************************************************************************
+SELECT-OPTIONS: s_name FOR agr_agrs-agr_name.
+
+************************************************************************
+*           SELECTION-SCREEN OUTPUT                                    *
+************************************************************************
+AT SELECTION-SCREEN OUTPUT.
+  PERFORM frm_set_sreen.
+
+************************************************************************
+*           START-OF-SELECTION                                         *
+************************************************************************
+START-OF-SELECTION.
+
+* Statistics for transaction / program
+  CALL METHOD ycl_statistics=>record_transaction.
+
+* Get data
+  PERFORM frm_get_data.
+
+  IF gv_send IS NOT INITIAL.
+*   Send alter if needed
+    PERFORM send_mail.
+  ENDIF.
+
+* Show single role - transaction code map
+  CALL SCREEN 0100.
+
+*END-OF-SELECTION.
+*  PERFORM frm_list_log.
+
+*&---------------------------------------------------------------------*
+*&      Form  FRM_SET_SREEN
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM frm_set_sreen .
+  LOOP AT SCREEN.
+    IF screen-group1 = 'M1'.
+      screen-input = '0'.
+      screen-invisible = '1'.
+      MODIFY SCREEN.
+    ENDIF.
+  ENDLOOP.
+ENDFORM.                    " FRM_SET_SREEN
+
+*&---------------------------------------------------------------------*
+*&      Form  FRM_GET_DATA
+*&---------------------------------------------------------------------*
+*       Gain process data
+*----------------------------------------------------------------------*
+FORM frm_get_data .
+
+  DATA: lt_agr_agrs   TYPE STANDARD TABLE OF agr_agrs,
+        ls_agr_agrs   TYPE agr_agrs,
+        lt_agr_define TYPE STANDARD TABLE OF agr_define,
+        ls_agr_define TYPE agr_define,
+        lt_agr_tcodes TYPE STANDARD TABLE OF agr_tcodes,
+        lt_agr_tmp    TYPE STANDARD TABLE OF agr_tcodes,
+        lt_role_tcode TYPE STANDARD TABLE OF yse_role_tcode,
+        ls_role_tcode TYPE yse_role_tcode,
+        ls_agr_tcodes TYPE agr_tcodes,
+        ls_out        TYPE ty_out,
+        lt_out_tmp    TYPE STANDARD TABLE OF ty_out,
+        lv_agr_name   TYPE agr_agrs-agr_name.
+
+  SELECT  *
+    FROM agr_agrs
+    INTO TABLE lt_agr_agrs
+    WHERE agr_name IN s_name.
+
+  SELECT *
+    FROM agr_define
+    INTO TABLE lt_agr_define
+    FOR ALL ENTRIES IN lt_agr_agrs
+    WHERE agr_name = lt_agr_agrs-child_agr.
+
+  LOOP AT lt_agr_agrs INTO ls_agr_agrs.
+    REFRESH: lt_agr_tmp.
+    CALL FUNCTION 'PRGN_READ_TRANSACTIONS_ONE_AGR'
+      EXPORTING
+        activity_group            = ls_agr_agrs-child_agr
+      TABLES
+        transactions              = lt_agr_tmp
+      EXCEPTIONS
+        no_transactions_available = 1
+        activity_group_not_found  = 2
+        OTHERS                    = 3.
+    IF sy-subrc <> 0.
+      MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+           WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+    ELSE.
+      APPEND LINES OF lt_agr_tmp TO lt_agr_tcodes.
+    ENDIF.
+  ENDLOOP.
+
+  LOOP AT lt_agr_agrs INTO ls_agr_agrs.
+    CLEAR:  ls_out,
+            lv_agr_name.
+    ls_out-agr_name    = ls_agr_agrs-agr_name.
+    ls_out-child_agr   = ls_agr_agrs-child_agr.
+    ls_out-attributes  = ls_agr_agrs-attributes.
+    READ TABLE lt_agr_define INTO ls_agr_define
+        WITH KEY agr_name = ls_agr_agrs-child_agr.
+    IF ls_agr_define-parent_agr IS NOT INITIAL.
+      lv_agr_name = ls_agr_define-parent_agr.
+    ELSE.
+      lv_agr_name = ls_agr_agrs-child_agr.
+    ENDIF.
+    LOOP AT lt_agr_tcodes INTO ls_agr_tcodes
+        WHERE agr_name = lv_agr_name.
+      ls_out-type        = ls_agr_tcodes-type.
+      ls_out-tcode       = ls_agr_tcodes-tcode.
+      ls_out-exclude     = ls_agr_tcodes-exclude.
+      APPEND ls_out TO gt_out.
+    ENDLOOP.
+  ENDLOOP.
+
+  APPEND LINES OF  gt_out TO  lt_out_tmp.
+  SORT lt_out_tmp.
+  DELETE ADJACENT DUPLICATES FROM  lt_out_tmp
+    COMPARING   agr_name
+                child_agr.
+  SELECT *
+    FROM yse_role_tcode
+    INTO TABLE lt_role_tcode
+    FOR ALL ENTRIES IN lt_out_tmp
+    WHERE agr_name = lt_out_tmp-child_agr.
+  IF sy-subrc <> 0.
+    LOOP AT gt_out INTO ls_out.
+      ls_role_tcode-agr_name = ls_out-child_agr.
+      ls_role_tcode-tcode    = ls_out-tcode.
+      INSERT yse_role_tcode FROM ls_role_tcode.
+      CLEAR ls_role_tcode.
+    ENDLOOP.
+  ELSE.
+********* Begin of MOD-001 ADD ***************************
+    DATA: lt_out_temp  TYPE STANDARD TABLE OF ty_out.
+    APPEND LINES OF gt_out TO lt_out_temp.
+    SORT lt_out_temp by child_agr tcode.
+    DELETE ADJACENT DUPLICATES FROM lt_out_temp
+      COMPARING child_agr tcode.
+********* Begin of MOD-001 ADD ***************************
+********* Begin of MOD-001 MOD ***************************
+*    LOOP AT gt_out INTO ls_out.
+    LOOP AT lt_out_temp INTO ls_out.
+********* Begin of MOD-001 MOD ***************************
+      CLEAR: ls_role_tcode.
+      READ TABLE lt_role_tcode INTO ls_role_tcode
+          WITH KEY agr_name = ls_out-child_agr
+                   tcode    = ls_out-tcode.
+      IF sy-subrc <> 0.
+        ls_role_tcode-agr_name = ls_out-child_agr.
+        ls_role_tcode-tcode    = ls_out-tcode.
+        APPEND ls_out TO gt_role_added.
+        DELETE TABLE lt_role_tcode
+          FROM ls_role_tcode.
+      ELSE.
+        DELETE TABLE lt_role_tcode FROM ls_role_tcode.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+
+  CLEAR ls_out.
+  LOOP AT lt_role_tcode INTO ls_role_tcode.
+    ls_out-child_agr = ls_role_tcode-agr_name.
+    ls_out-tcode     = ls_role_tcode-tcode.
+    APPEND ls_out TO gt_role_minus.
+  ENDLOOP.
+
+  IF    gt_role_added IS NOT INITIAL
+     OR gt_role_minus IS NOT INITIAL.
+    gv_send = 'X'.
+  ENDIF.
+
+ENDFORM.                    " FRM_GET_DATA
+
+*&---------------------------------------------------------------------*
+*&      Form  handle_double_click
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_E_ROW_ID     text
+*      -->P_E_COLUMN_ID  text
+*----------------------------------------------------------------------*
+FORM handle_double_click  USING    p_e_row_id
+                                   p_e_column_id.
+  DATA: ls_out  TYPE ty_out.
+  CLEAR ls_out.
+  READ TABLE gt_out INTO ls_out INDEX p_e_row_id.
+
+  CHECK ls_out-child_agr IS NOT INITIAL.
+  CALL FUNCTION 'PGRN_SHOW_EDIT_AGR_VIA_REPORT'
+    EXPORTING
+      agr_name       = ls_out-child_agr.
+
+ENDFORM.            " handle_double_click
+*&---------------------------------------------------------------------*
+*&      Module  STATUS_0100  OUTPUT
+*&---------------------------------------------------------------------*
+*       BPO Module of sreen 100
+*----------------------------------------------------------------------*
+MODULE status_0100 OUTPUT.
+
+  SET PF-STATUS 'ROLE_COM'.
+
+  PERFORM display_report.
+
+ENDMODULE.                 " STATUS_0100  OUTPUT
+
+*&---------------------------------------------------------------------*
+*&      Form  DISPLAY_REPORT
+*&---------------------------------------------------------------------*
+*       ALV display
+*----------------------------------------------------------------------*
+FORM display_report .
+
+  FIELD-SYMBOLS: <fs_out> TYPE ANY TABLE.
+
+  ASSIGN gt_out TO <fs_out>.
+
+  IF go_custom_container IS INITIAL.
+
+    CREATE OBJECT go_custom_container
+      EXPORTING
+        container_name              = gv_container
+      EXCEPTIONS
+        cntl_error                  = 1
+        cntl_system_error           = 2
+        create_error                = 3
+        lifetime_error              = 4
+        lifetime_dynpro_dynpro_link = 5.
+
+    CREATE OBJECT go_grid
+      EXPORTING
+        i_parent = go_custom_container.
+
+    PERFORM alv_layout.
+    PERFORM alv_fcat.
+
+    CREATE OBJECT obj_event_handler.
+
+* Display the table Contents in ALV format
+    CALL METHOD go_grid->set_table_for_first_display
+      EXPORTING
+        is_layout       = gs_layout
+        i_default       = 'X'
+        i_save          = 'A'
+      CHANGING
+        it_outtab       = <fs_out>
+        it_fieldcatalog = gt_fcat.
+*   Enable line selection and double clicking
+    SET HANDLER obj_event_handler->handle_double_click  FOR go_grid.
+    SET HANDLER obj_event_handler->handle_hot_spot      FOR go_grid .
+  ELSE.
+    CALL METHOD go_grid->refresh_table_display
+      EXPORTING
+        is_stable      = gs_stable
+        i_soft_refresh = 'X'.
+  ENDIF.
+ENDFORM.                    " DISPLAY_REPORT
+*&---------------------------------------------------------------------*
+*&      Form  ALV_LAYOUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM alv_layout .
+
+  gs_layout-zebra       = gc_x.
+  gs_layout-no_keyfix   = gc_x.
+  gs_layout-info_fname  = 'ZZCOL'.
+  gs_layout-sel_mode    = 'A'.
+  gs_layout-grid_title = 'List Roles and T-Codes'(h02).
+
+*  gs_layout-BOX_FNAME   = 'CHECK_BOX'.
+
+ENDFORM.                    " ALV_LAYOUT
+*&---------------------------------------------------------------------*
+*&      Form  ALV_FCAT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM alv_fcat .
+
+** Create Fieldcatalogue from internal table
+** CALL FUNCTION 'REUSE_ALV_FIELDCATALOG_MERGE' ...
+
+  CLEAR gv_col.
+  REFRESH: gt_fcat.
+
+* Field definitions
+  PERFORM add_field USING 'AGR_NAME'  30 'Composite role'(s01)       'X'  'X'.
+  PERFORM add_field USING 'CHILD_AGR' 30 'Single Role'(s03)          ' '  ' '.
+  PERFORM add_field USING 'TYPE'      2  'Report type'(s04)          ' '  ' '.
+  PERFORM add_field USING 'TCODE'     48 'Trans.Code'(s05)           ' '  ' '.
+
+ENDFORM.                    " ALV_FCAT
+
+*&---------------------------------------------------------------------*
+*&      Form  ADD_FIELD
+*&---------------------------------------------------------------------*
+*       Add field to field catalog
+*----------------------------------------------------------------------*
+FORM add_field  USING    p_field
+                         p_len
+                         p_descr
+                         p_hotspot
+                         p_key.
+  CLEAR: gv_col.
+  gv_col = gv_col + 1.
+
+  CLEAR gs_fcat.
+  gs_fcat-col_pos    = gv_col.
+  gs_fcat-fieldname  = p_field.
+  gs_fcat-outputlen  = p_len.
+
+  gs_fcat-seltext  = p_descr.
+  gs_fcat-scrtext_l  = p_descr.
+  gs_fcat-scrtext_m  = p_descr.
+  gs_fcat-scrtext_s  = p_descr.
+  gs_fcat-fix_column = 'X'.
+  gs_fcat-emphasize  = 'X'.
+  gs_fcat-hotspot    = p_hotspot.
+  gs_fcat-key        = p_key.
+
+  IF gs_fcat-fieldname   = 'LIGHT'.
+    gs_fcat-icon         = 'X'.  " Display the field as ICON
+    gs_fcat-inttype      = 'C'.
+  ENDIF.
+
+  APPEND gs_fcat TO gt_fcat.
+
+ENDFORM.                    " ADD_FIELD
+*&---------------------------------------------------------------------*
+*&      Module  USER_COMMAND_0100  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE user_command_0100 INPUT.
+
+  DATA: lv_ok TYPE sy-ucomm.
+  lv_ok = ok_code.
+  CLEAR: ok_code.
+  CASE lv_ok.
+    WHEN 'BACK'.
+      SET SCREEN 0.
+      LEAVE SCREEN.
+    WHEN 'CANC'.
+      LEAVE LIST-PROCESSING.
+    WHEN 'EXIT'.
+      LEAVE PROGRAM.
+    WHEN 'REJ'.
+*     Reprocess IDocs
+*      PERFORM frm_proc_rej.
+      LEAVE TO SCREEN 0.
+  ENDCASE.
+
+ENDMODULE.                 " USER_COMMAND_0100  INPUT
+*&---------------------------------------------------------------------*
+*&      Form  HANDLE_HOT_SPOT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_E_ROW_ID  text
+*      -->P_E_COLUMN_ID  text
+*      -->P_ES_ROW_NO  text
+*----------------------------------------------------------------------*
+FORM handle_hot_spot  USING    p_e_row_id
+                               p_e_column_id
+                               p_es_row_no.
+  DATA: ls_out  TYPE ty_out.
+  CLEAR ls_out.
+  READ TABLE gt_out INTO ls_out INDEX p_e_row_id.
+
+  CHECK ls_out-agr_name IS NOT INITIAL.
+  CALL FUNCTION 'PGRN_SHOW_EDIT_AGR_VIA_REPORT'
+    EXPORTING
+      agr_name       = ls_out-agr_name
+*     MODE           = 'A'
+*     SCREEN         = '1'
+*     SICHT          = ' '
+            .
+
+ENDFORM.                    " HANDLE_HOT_SPOT
+*&---------------------------------------------------------------------*
+*&      Form  SEND_MAIL
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM send_mail .
+
+  DATA: ls_object_hd   TYPE sood1 ,
+        lt_receivers   TYPE TABLE OF soos1 ,
+        ls_receivers   TYPE soos1,
+        lt_body        TYPE TABLE OF soli ,
+        ls_body        TYPE soli,
+        lt_objhead     TYPE TABLE OF soli ,
+        ls_objhead     TYPE soli .
+
+  DATA: lt_mail        TYPE STANDARD TABLE OF yse_monitor_mail,
+        ls_mail        TYPE yse_monitor_mail,
+        lv_subject     TYPE so_obj_des.
+
+*   RAW-Text
+  DATA: BEGIN OF lv_head.
+          INCLUDE TYPE sorh.
+  DATA: END OF lv_head.
+
+  DATA: ls_name     LIKE LINE OF s_name,
+        ls_out      TYPE ty_out,
+        lv_cnt      TYPE sy-index,
+        lv_lines    TYPE sy-index,
+        lv_sub_str  TYPE string,
+        lv_line_str TYPE string.
+
+*   Build e-mail.
+  lv_subject = 'Single role modification alter'(t02).
+  ls_object_hd-objla  = sy-langu.
+  ls_object_hd-objdes = lv_subject.
+  ls_object_hd-objsns = 'F'.
+  ls_object_hd-objnam = 'EMAIL'.
+
+  SELECT *
+    FROM yse_monitor_mail
+    INTO TABLE lt_mail
+    WHERE active <> space .
+  IF sy-subrc <> 0.
+    MESSAGE e000(yse_sales_log) WITH
+      'Please maintain table'(s11)
+      'YSE_MONITOR_MAIL'(s13)
+      'for receivers!'(s15).
+  ENDIF.
+
+*   Fill recipients
+  LOOP AT lt_mail INTO ls_mail.
+    ls_receivers-rcdat  = sy-datum.
+    ls_receivers-rctim  = sy-uzeit.
+*   Check for e-mail address
+*    IF NOT lt_notif-email IS INITIAL.
+    FIND '@' IN ls_mail-email.
+    IF sy-subrc = 0.
+*     Given e-mail
+      ls_receivers-recesc = 'U'.     " Receiver type: "Internet address"
+      ls_receivers-sndart = 'MAIL'.
+      ls_receivers-recextnam = ls_mail-email.
+    ENDIF.
+*   Add recipient
+    APPEND ls_receivers TO lt_receivers.
+    CLEAR ls_receivers.
+  ENDLOOP.
+
+  CLEAR ls_body.
+  LOOP AT s_name INTO ls_name.
+    CONCATENATE ls_name-low ls_body-line
+      INTO ls_body-line.
+  ENDLOOP.
+*   Fill body
+  CONCATENATE 'Check consistence of composite roles'(t03)
+    ls_body-line INTO ls_body-line
+              SEPARATED BY space.
+  APPEND ls_body TO lt_body.
+
+  CLEAR ls_body-line.
+  APPEND ls_body TO lt_body.
+
+*   Lines
+  DESCRIBE TABLE lt_body LINES lv_head-rawsiz.
+  MOVE lv_head TO ls_objhead.
+  APPEND ls_objhead TO lt_objhead.
+
+  IF gt_role_added IS NOT INITIAL.
+    DESCRIBE TABLE gt_role_added LINES lv_lines.
+    ls_body-line = '------------------------------------------------------------------------------'.
+    APPEND ls_body TO lt_body.
+    CLEAR ls_body-line.
+
+    ls_body-line = 'Following T-codes are added:'(s21).
+    APPEND ls_body TO lt_body.
+    CLEAR ls_body-line.
+
+    LOOP AT gt_role_added INTO ls_out.
+      CLEAR lv_sub_str.
+      lv_cnt = lv_cnt + 1.
+      CONCATENATE ls_out-child_agr '-' ls_out-tcode
+        INTO lv_sub_str.
+      CONCATENATE lv_line_str lv_sub_str
+        INTO lv_line_str SEPARATED BY space.
+      IF lv_cnt = 3.
+        ls_body-line = lv_line_str.
+        APPEND ls_body TO lt_body.
+        CLEAR ls_body-line.
+        CLEAR: lv_cnt,lv_line_str.
+      ELSE.
+        IF sy-tabix = lv_lines.
+          ls_body-line = lv_line_str.
+          APPEND ls_body TO lt_body.
+          CLEAR ls_body-line.
+          CLEAR: lv_cnt,lv_line_str.
+        ENDIF.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+
+  IF gt_role_minus IS NOT INITIAL.
+    DESCRIBE TABLE gt_role_minus LINES lv_lines.
+    ls_body-line = '------------------------------------------------------------------------------'.
+    APPEND ls_body TO lt_body.
+    CLEAR ls_body-line.
+
+    ls_body-line = 'Following T-codes are removed:'(s23).
+    APPEND ls_body TO lt_body.
+    CLEAR ls_body-line.
+
+    LOOP AT gt_role_minus INTO ls_out.
+      CLEAR lv_sub_str.
+      lv_cnt = lv_cnt + 1.
+      CONCATENATE ls_out-child_agr '-' ls_out-tcode
+        INTO lv_sub_str.
+      CONCATENATE lv_line_str lv_sub_str
+        INTO lv_line_str SEPARATED BY space.
+      IF lv_cnt = 3.
+        ls_body-line = lv_line_str.
+        APPEND ls_body TO lt_body.
+        CLEAR ls_body-line.
+        CLEAR: lv_cnt,lv_line_str.
+      ELSE.
+        IF sy-tabix = lv_lines.
+          ls_body-line = lv_line_str.
+          APPEND ls_body TO lt_body.
+          CLEAR ls_body-line.
+          CLEAR: lv_cnt,lv_line_str.
+        ENDIF.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+
+*   Send e-mail
+  CALL FUNCTION 'SO_OBJECT_SEND'
+    EXPORTING
+      object_hd_change = ls_object_hd
+      object_type      = 'RAW'
+      outbox_flag      = 'X'
+      owner            = sy-uname
+    TABLES
+      objcont          = lt_body
+      objhead          = lt_objhead
+      receivers        = lt_receivers
+    EXCEPTIONS
+      object_not_sent  = 1
+      owner_not_exist  = 2
+      parameter_error  = 3
+      OTHERS           = 4.
+  IF sy-subrc NE 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+********* Begin of MOD-001 DEL ***************************
+*  ELSE.
+*    COMMIT WORK.
+**  Push mail out from SAP outbox
+*    SUBMIT rsconn01 WITH mode = 'INT' AND RETURN.
+********* End of MOD-001 DEL ***************************
+  ENDIF.
+
+ENDFORM.                    " SEND_MAIL
+
+*Text symbol text£º
+*H02:List Roles and T-Codes
+*S01:Composite role
+*S03:Single Role
+*S04:Report type
+*S05:Trans.Code
+*S11:Please maintain table
+*S13:YSE_MONITOR_MAIL
+*S15:for receivers!
+*S21:Following T-codes are added:
+*S23:Following T-codes are removed:
+*T02:Single role modification alter
+
+*T03:Check consistence of composite roles
+*Selection text£º
+*S_NAME:D       .

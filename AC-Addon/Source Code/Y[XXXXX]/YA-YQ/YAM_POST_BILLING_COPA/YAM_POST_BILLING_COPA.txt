@@ -1,0 +1,271 @@
+REPORT yam_post_billing_copa.
+
+
+*
+* PROGRAM ID           : yam_post_billing_copa                         *
+* PROGRAM TITLE        : AM: Post entreis in COPA based on Billing
+*Document.                                                             *
+*
+* AUTHOR               : Vikrant Sud                                   *
+* DATE                 : 28/10/2004                                    *
+* DEVELOPMENT ID       :                                           *
+*
+* CHANGE REQUEST NUMBER:                                               *
+*                                                                      *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME     |CORRECTION NUMBER| CHANGE REFERENCE # *
+*----------------------------------------------------------------------*
+* MOD-001 | xxxx.xx.xx | xxxxxxxxxxxxxxxxx |xxxxxxxxxx |xxxxxxxxxxxxx| *
+************************************************************************
+
+*This report calls the Standard SAP Report RKERV002, which posts the
+*entries in COPA based on the billing document. This report is called
+*based on messages from the Billing Document.
+
+
+*----------------------------------------------------------------------*
+*      Internal Table Defintions
+*
+*----------------------------------------------------------------------*
+
+DATA: i_bapiret2             TYPE STANDARD TABLE OF bapiret2,
+      i_bapi_copa_selection  TYPE STANDARD TABLE OF bapi_copa_selection,
+      i_bapi_copa_field      TYPE STANDARD TABLE OF bapi_copa_field,
+      i_bapi_copa_data       LIKE bapi_copa_data OCCURS 0
+                                  WITH HEADER LINE,
+      i_vbrp                 LIKE vbrp OCCURS 0,
+      wa_selection           LIKE bapi_copa_selection.
+
+*----------------------------------------------------------------------*
+*      DATA DECLARATIONS
+*
+*----------------------------------------------------------------------*
+
+
+DATA: l_belnr            TYPE belnr_d,
+      l_posnr            TYPE posnr,
+      wa_field           TYPE bapi_copa_field,
+      wa_ret2            TYPE bapiret2,
+      l_erkrs            TYPE erkrs,
+      l_vbeln            TYPE vbeln,
+      wa_bukrs           TYPE bukrs,
+      l_objky            TYPE vbeln,
+      l_post_status      TYPE return,
+      l_nast             TYPE nast,
+      l_info             TYPE c,
+      l_dummy TYPE c.
+
+
+TABLES: nast.
+
+
+CONSTANTS:       taskname(4) TYPE n VALUE '0001'.
+
+
+*&--------------------------------------------------------------------*
+*&      Form  INITIATE_PROCESSING
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+*      -->RC         text
+*      -->US_SCREEN  text
+*---------------------------------------------------------------------*
+FORM initiate_processing USING rc
+                          us_screen.                        "#EC CALLED
+
+* Move the entries from NAST to a local structure
+  l_nast = nast.
+
+* Get the OBJEY from NAST
+
+  l_objky = l_nast-objky.
+
+*Call the report RKERV002
+
+  break-point.
+
+  CALL FUNCTION 'YAM_SUBMIT_REPORT_RKERV002'
+    STARTING NEW TASK taskname
+    PERFORMING return_info ON END OF TASK
+    EXPORTING
+      vbeln = l_objky.
+  IF sy-subrc = 0.
+
+*Wait for the return info from the routine RETURN_INFO.
+
+    WAIT UNTIL l_info = 'X'.
+
+*It needs to be checked whether the entries have been successfully
+*posted in COPA from the Billing Document.
+
+* Get the Company Code from the Invoice Header
+
+    SELECT SINGLE bukrs INTO wa_bukrs
+          FROM vbrk
+          WHERE vbeln = l_objky.
+
+* Get the Line Numbers from VBRP based on the Billing Document Number.
+
+    SELECT * FROM vbrp
+    APPENDING CORRESPONDING FIELDS OF TABLE i_vbrp
+    WHERE vbeln = l_objky.
+
+** Based on the Billing Document Number and the Line item Number, query
+*COPA to check whether the entries have been cretaed or not.
+*
+
+
+* Get Operaing Concern from Controlling Area
+    CALL FUNCTION 'COPA_ERKRS_FIND'
+      EXPORTING
+        bukrs                    = wa_bukrs
+*   GSBER                    = ' '
+*   KOKRS                    = ' '
+  IMPORTING
+       erkrs                    = l_erkrs
+*   KOKRS                    =
+*   T_KEB                    =
+  EXCEPTIONS
+       error_kokrs_find         = 1
+       kokrs_wrong              = 2
+       no_erkrs_defined         = 3
+       no_erkrs_for_kokrs       = 4
+       OTHERS                   = 5
+              .
+    IF sy-subrc <> 0.
+* MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*         WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+    ENDIF.
+
+*Call the Conversion exit to convert from external Billing Document
+*Number to Internal Number, to be used in BAPI.
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+      EXPORTING
+        input  = l_objky
+      IMPORTING
+        output = l_vbeln.
+
+* Prepare the input parameters to be called with BAPI
+    CLEAR i_bapi_copa_selection.
+    MOVE 'RBELN' TO wa_selection-fieldname.
+    MOVE 'I'    TO wa_selection-sign.
+    MOVE 'EQ'   TO wa_selection-option.
+    MOVE l_vbeln TO wa_selection-low.
+    APPEND wa_selection TO i_bapi_copa_selection.
+
+* Select the fields to be selected.
+    MOVE 'RPOSN' TO wa_field.
+    APPEND wa_field TO i_bapi_copa_field.
+    MOVE 'BELNR' TO wa_field.
+    APPEND wa_field TO i_bapi_copa_field.
+
+    CALL FUNCTION 'BAPI_COPAQUERY_GETCOST_ACTDATA'
+      EXPORTING
+        operatingconcern = l_erkrs
+        currencytype     = 'B0'
+        maxrecords       = '1000'
+      TABLES
+        selection        = i_bapi_copa_selection
+        selectedfields   = i_bapi_copa_field
+        resultdata       = i_bapi_copa_data
+        return           = i_bapiret2.
+
+*........ Update NAST protocol
+    IF NOT i_bapiret2[] IS INITIAL.
+      LOOP AT i_bapiret2 INTO wa_ret2.
+        CALL FUNCTION 'NAST_PROTOCOL_UPDATE'
+          EXPORTING
+            msg_arbgb              = wa_ret2-id
+            msg_nr                 = wa_ret2-number
+            msg_ty                 = wa_ret2-type
+            msg_v1                 = l_vbeln
+            msg_v2                 = wa_ret2-message_v2
+            msg_v3                 = wa_ret2-message_v3
+            msg_v4                 = wa_ret2-message_v4
+          EXCEPTIONS
+            message_type_not_valid = 1
+            no_sy_message          = 2
+            OTHERS                 = 3.
+        IF sy-subrc <> 0.
+          MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+                  WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+        ENDIF.
+
+      ENDLOOP.
+    ELSE.
+      LOOP AT i_bapi_copa_data.
+        AT NEW record_id.
+          CLEAR: l_posnr,
+                 l_belnr.
+        ENDAT.
+
+        CASE i_bapi_copa_data-fieldname.
+          WHEN 'BELNR'.
+            l_belnr = i_bapi_copa_data-value.
+          WHEN 'RPOSN'.
+            l_posnr = i_bapi_copa_data-value.
+        ENDCASE.
+
+        AT END OF record_id.
+          MESSAGE s051(yam_prctr_derivation)
+          WITH l_vbeln l_posnr l_belnr INTO l_dummy.
+          CALL FUNCTION 'NAST_PROTOCOL_UPDATE'
+            EXPORTING
+              msg_arbgb              = sy-msgid
+              msg_nr                 = sy-msgno
+              msg_ty                 = sy-msgty
+              msg_v1                 = sy-msgv1
+              msg_v2                 = sy-msgv2
+              msg_v3                 = sy-msgv3
+*                msg_v4                 = wa_ret2-message_v4
+            EXCEPTIONS
+              message_type_not_valid = 1
+              no_sy_message          = 2
+              OTHERS                 = 3.
+          IF sy-subrc <> 0.
+            MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+                    WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+          ENDIF.
+          DELETE i_vbrp WHERE posnr = l_posnr.
+        ENDAT.
+      ENDLOOP.
+    ENDIF.
+
+    IF i_vbrp[] IS INITIAL.
+      rc = 0.
+    ELSE.
+      rc = 4.
+    ENDIF.
+
+
+  ENDIF.
+
+
+*  SUBMIT rkerv002 WITH vbeln = l_vbeln
+*                      WITH testlauf = ' '
+*                      WITH pruefen = 'X'
+*                      WITH p_no_enq = 'X'
+*                      EXPORTING LIST TO MEMORY AND RETURN.
+
+
+ENDFORM.                    "initiate_processing
+*&---------------------------------------------------------------------*
+*&      Form  return_info
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM return_info USING taskname .
+  RECEIVE RESULTS FROM FUNCTION 'YAM_SUBMIT_REPORT_RKERV002'
+  EXCEPTIONS
+    communication_failure = 1
+    system_failure = 2.
+
+  IF sy-subrc = 0.
+    l_info = 'X'.
+  ENDIF.
+ENDFORM.                    " return_info

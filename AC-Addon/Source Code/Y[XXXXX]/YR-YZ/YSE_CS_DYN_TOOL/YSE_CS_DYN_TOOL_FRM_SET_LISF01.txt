@@ -1,0 +1,920 @@
+*----------------------------------------------------------------------*
+***INCLUDE YSE_CS_DYN_TOOL_FRM_SET_LISF01 .
+*----------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  ini_process
+*&---------------------------------------------------------------------*
+*       initial process
+*----------------------------------------------------------------------*
+FORM ini_process .
+  REFRESH:
+    gt_log,
+    gt_fieldcat.
+  SELECT *
+    FROM yse_upload_appl
+    INTO TABLE gt_appl
+    WHERE struname <> ''.
+ENDFORM.                    " ini_process
+*&---------------------------------------------------------------------*
+*&      Form  authority_check
+*&---------------------------------------------------------------------*
+*       Authority check for Sales Organization
+*----------------------------------------------------------------------*
+FORM authority_check .
+
+** Authority check for Sales Organization
+*  AUTHORITY-CHECK OBJECT 'V_VBRK_VKO'
+*           ID 'VKORG' FIELD s_vkorg-low
+*           ID 'ACTVT' FIELD '03'.
+*  IF sy-subrc <> 0.
+*    MESSAGE e002.
+*  ENDIF.
+
+ENDFORM.                    " authority_check
+*&---------------------------------------------------------------------*
+*&      Form  main_process
+*&---------------------------------------------------------------------*
+*       main process
+*----------------------------------------------------------------------*
+FORM main_process .
+  DATA: s_equi          TYPE  v_equi.
+* Get application information
+  PERFORM get_appl_info.
+* Upload file
+  PERFORM upload_file.
+  CASE gs_appl-appl.
+    WHEN '01'.
+*     Create equipment
+      PERFORM create_equipment.
+    WHEN '02'.
+*     Mapping partners to equipment
+      PERFORM mapping_partner_ie.
+    WHEN '03'.
+*     Dismantle Euipement
+      PERFORM dismantle_equipment.
+    WHEN '04'.
+*     Migrate equipment - Old
+      CALL TRANSACTION  'YSE_MR_TOOLS'.
+    WHEN '05'.
+*     Auto-Install equipment - Third Level
+      CALL TRANSACTION 'YAM_EQUI_INST'.
+    WHEN '06'.
+*     Create Servie Product
+      CALL TRANSACTION 'YSE_IQ_SP'.
+    WHEN '07'.
+*     Upload Table Entries
+      MODIFY (gs_appl-struname) FROM TABLE <fs_tab>.
+    WHEN '08'.
+*     Migrate equipment - File
+      PERFORM equi_migration.
+    WHEN '09'.
+*     Install equipment - First Level
+      PERFORM equi_install.
+    WHEN OTHERS.
+  ENDCASE.
+
+ENDFORM.                    " main_process
+*&---------------------------------------------------------------------*
+*&      Form  upload_file
+*&---------------------------------------------------------------------*
+*       Upload file
+*----------------------------------------------------------------------*
+FORM upload_file.
+
+  DATA: filename  TYPE rlgrap-filename,
+
+        lt_raw_data   TYPE truxs_t_text_data,
+        ls_file TYPE REF TO data,
+        lr_wa     TYPE REF TO data,
+        lr_itab   TYPE REF TO data,
+        lv_name   TYPE string,
+        l_index   TYPE i.
+  FIELD-SYMBOLS:  <fs_wa> TYPE ANY,
+                  <fs_field> TYPE ANY.
+
+  CHECK  gs_appl-struname IS NOT INITIAL.
+  CREATE DATA ls_file TYPE (gs_appl-struname).
+  CREATE DATA lr_itab TYPE TABLE OF (gs_appl-struname) INITIAL SIZE 1.
+  lv_name = 'IT_FILE'.
+  ASSIGN lr_wa->* TO <fs_wa>.
+  ASSIGN lr_itab->* TO <fs_tab>.
+
+  filename = p_file.
+* Upload the Material data from the excel file
+  CALL FUNCTION 'TEXT_CONVERT_XLS_TO_SAP'
+    EXPORTING
+      i_line_header        = 'X'
+      i_tab_raw_data       = lt_raw_data
+      i_filename           = filename
+    TABLES
+      i_tab_converted_data = <fs_tab>
+    EXCEPTIONS
+      conversion_failed    = 1
+      OTHERS               = 2.
+  IF sy-subrc <> 0.
+    IF sy-msgty = 'E'.
+      MESSAGE ID sy-msgid TYPE 'S' NUMBER sy-msgno DISPLAY LIKE 'E'
+          WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+      LEAVE LIST-PROCESSING.
+    ENDIF.
+
+  ENDIF.
+ENDFORM.                    " upload_file
+*&---------------------------------------------------------------------*
+*&      Form  create_equipment
+*&---------------------------------------------------------------------*
+*       Create Equipment
+*----------------------------------------------------------------------*
+FORM create_equipment.
+
+  DATA: ls_file       TYPE yse_equip_creation.
+  DATA: l_matnr       TYPE matnr,
+        l_gernr       TYPE gernr,
+        l_kunnr       TYPE kunnr,
+        l_acqd        TYPE sy-datum,
+        l_start       TYPE sy-datum.
+
+  DATA: data_general  TYPE bapi_itob,
+        data_specific TYPE bapi_itob_eq_only,
+        data_install  TYPE bapi_itob_eq_install,
+        equipment     TYPE bapi_itob_parms-equipment,
+        return        TYPE bapiret2.
+
+  IF <fs_tab> IS INITIAL.
+    MESSAGE s014.
+    LEAVE LIST-PROCESSING.
+  ENDIF.
+
+  LOOP AT <fs_tab> INTO ls_file.
+*   Internal Material
+    PERFORM convert_matnr_input USING ls_file-material
+                             CHANGING l_matnr.
+*   Internal Serial number
+    PERFORM convert_gernr_input USING ls_file-serialno
+                             CHANGING l_gernr.
+
+****Set Specific
+    data_specific-material = l_matnr.
+    data_specific-serialno = l_gernr.
+    data_specific-equicatgry = 'Z'.
+
+****Set General
+*   Description
+    data_general-descript = ls_file-descript.
+*   Object type
+    data_general-objecttype = gc_equiptype.
+*   Acquisition date
+    data_general-acqdate    = ls_file-acqdate.
+*   Start-up date
+    data_general-start_from = ls_file-start_from.
+*   Construction type material of the object
+    data_general-consttype = l_matnr.
+*   Sales Org
+    data_general-sales_org  = ls_file-vkorg.
+    data_general-distr_chan = ls_file-vtweg.
+    data_general-division   = ls_file-spart.
+*   MaintPlant
+    data_general-maintplant = ls_file-swerk.
+    data_general-planplant  = ls_file-iwerk.
+    data_general-plangroup  = ls_file-ingrp.
+    data_general-sales_off  = ls_file-vkbur.
+    data_general-sales_grp  = ls_file-vkgrp.
+    data_general-abcindic   = ls_file-abckz.
+
+    SELECT SINGLE objid
+      FROM crhd
+      INTO data_general-work_ctr
+      WHERE objty = 'A'
+        AND arbpl = ls_file-arbpl
+        AND werks = ls_file-swerk.
+
+****Set Installation
+    data_install-funcloc    = ls_file-tplnr.
+
+*   BAPI: Create Equipment
+    CALL FUNCTION 'BAPI_EQUI_CREATE'
+      EXPORTING
+        data_general  = data_general
+        data_specific = data_specific
+        valid_date    = ls_file-valdate
+        data_install  = data_install
+      IMPORTING
+        equipment     = equipment
+        return        = return.
+
+    IF return-type = 'E' OR return-type = 'A' OR return-type = 'X'.
+    ELSE.
+      COMMIT WORK AND WAIT.
+    ENDIF.
+    PERFORM set_log USING data_specific-material
+                          data_specific-serialno
+                          data_specific-equicatgry
+                          equipment
+                          return-type
+                          return-message.
+    CLEAR: data_general, data_specific, data_install, equipment, return.
+  ENDLOOP.
+
+ENDFORM.                    " create_equipment
+*&---------------------------------------------------------------------*
+*&      Form  update_partner
+*&---------------------------------------------------------------------*
+*       Update Partner
+*----------------------------------------------------------------------*
+FORM update_partner.
+
+  DATA: l_objnr   TYPE ihpa-objnr.
+  DATA: ls_xihpa  TYPE ihpavb,
+        ls_ihpa   TYPE ihpa,
+        lv_count  TYPE i_count,
+        ls_log    TYPE yse_dyn_tool_log,
+        ls_part   TYPE yse_mapping_patner,
+        lt_xihpa  TYPE TABLE OF ihpavb.
+  FIELD-SYMBOLS: <fs_wa>   TYPE yse_mapping_patner.
+  DATA: lr_file   TYPE REF TO data,
+        lt_patner TYPE STANDARD TABLE OF yse_mapping_patner.
+
+  CREATE DATA lr_file TYPE (gs_appl-struname).
+  ASSIGN lr_file->* TO <fs_wa>.
+
+  IF <fs_tab> IS NOT INITIAL.
+    LOOP AT <fs_tab> INTO ls_part.
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+        EXPORTING
+          input  = ls_part-equnr
+        IMPORTING
+          output = ls_part-equnr.
+      APPEND    ls_part TO lt_patner.
+    ENDLOOP.
+  ELSE.
+    MESSAGE s014.
+    LEAVE LIST-PROCESSING.
+  ENDIF.
+
+  SORT: lt_patner.
+  LOOP AT lt_patner ASSIGNING <fs_wa>.
+*   Set Object number
+    CONCATENATE 'IE' <fs_wa>-equnr INTO l_objnr.
+    ls_xihpa-mandt   = sy-mandt.
+    ls_xihpa-objnr   = l_objnr.
+    ls_xihpa-obtyp   = 'IEQ'.
+    ls_xihpa-erdat   = sy-datum.
+    ls_xihpa-erzeit  = sy-uzeit.
+    ls_xihpa-ernam   = sy-uname.
+    ls_xihpa-aedat   = sy-datum.
+    ls_xihpa-aezeit  = sy-uzeit.
+    ls_xihpa-aenam   = sy-uname.
+    CLEAR: ls_ihpa, ls_log.
+    SELECT SINGLE *
+      FROM ihpa
+      INTO ls_ihpa
+      WHERE objnr = l_objnr
+        AND parvw = <fs_wa>-parvw.
+    IF sy-subrc <> 0.
+*     Insert new partner
+      ls_xihpa-updkz   = 'I'.
+      ls_xihpa-counter = lv_count.
+      ls_log-msgtx    = text-m06.
+      SELECT MAX( counter )
+        FROM ihpa
+        INTO lv_count
+        WHERE objnr = l_objnr.
+      lv_count = lv_count + 1.
+    ELSE.
+*     Update old partner
+      ls_xihpa-updkz   = 'U'.
+      ls_log-msgtx    = text-m05.
+      ls_xihpa-counter = ls_ihpa-counter.
+    ENDIF.
+    IF ls_ihpa-parnr <> <fs_wa>-parnr.
+      ls_xihpa-parvw   = <fs_wa>-parvw.
+      ls_xihpa-parnr   = <fs_wa>-parnr.
+      APPEND ls_xihpa TO lt_xihpa.
+      ls_log-equnr    = <fs_wa>-equnr.
+      ls_log-parvw    = <fs_wa>-parvw.
+      ls_log-parnr    = <fs_wa>-parnr.
+      APPEND ls_log TO gt_log.
+    ENDIF.
+
+    AT END OF equnr.
+      IF lt_xihpa IS NOT INITIAL.
+*       Partner Update
+        CALL FUNCTION 'PM_PARTNER_UPDATE'
+          TABLES
+            fxihpa = lt_xihpa.
+      ENDIF.
+      REFRESH: lt_xihpa.
+      CLEAR: lv_count.
+    ENDAT.
+  ENDLOOP.
+
+ENDFORM.                    " update_partner
+*&---------------------------------------------------------------------*
+*&      Form  display_log
+*&---------------------------------------------------------------------*
+*       display log
+*----------------------------------------------------------------------*
+FORM display_log .
+  DATA: ls_layout TYPE slis_layout_alv.
+
+* edit alv fieldcat
+  PERFORM edit_alv_fieldcat.
+
+  CHECK gt_fieldcat IS NOT INITIAL.
+  CHECK gt_log IS NOT INITIAL.
+  ls_layout-colwidth_optimize = 'X'.
+  ls_layout-zebra             = 'X'.
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+    EXPORTING
+      i_callback_program       = sy-repid
+      i_callback_pf_status_set = 'SET_STATUS_10001'
+      i_callback_user_command  = 'USER_COMMAND'
+      is_layout                = ls_layout
+      it_fieldcat              = gt_fieldcat
+    TABLES
+      t_outtab                 = gt_log
+    EXCEPTIONS
+      program_error            = 1
+      OTHERS                   = 2.
+  IF sy-subrc <> 0.
+    EXIT.
+  ELSE.
+    LEAVE LIST-PROCESSING.
+  ENDIF.
+
+ENDFORM.                    " display_log
+*&---------------------------------------------------------------------*
+*&      Form  edit_alv_fieldcat
+*&---------------------------------------------------------------------*
+*       edit alv fieldcat
+*----------------------------------------------------------------------*
+FORM edit_alv_fieldcat.
+
+  DATA: ls_fieldcat TYPE slis_fieldcat_alv,
+        lv_tabix    TYPE i,
+        lt_dyn_log_set TYPE STANDARD TABLE OF yse_dyn_log_set.
+  REFRESH: gt_fieldcat.
+
+  CALL FUNCTION 'REUSE_ALV_FIELDCATALOG_MERGE'
+    EXPORTING
+      i_structure_name       = gc_log_struct
+      i_bypassing_buffer     = 'X'
+    CHANGING
+      ct_fieldcat            = gt_fieldcat
+    EXCEPTIONS
+      inconsistent_interface = 1
+      program_error          = 2
+      OTHERS                 = 3.
+  IF sy-subrc <> 0.
+    EXIT.
+  ENDIF.
+
+  SELECT *
+    FROM yse_dyn_log_set
+    INTO TABLE lt_dyn_log_set
+    WHERE appl = gs_appl-appl
+      AND flag_need <> ' '.
+  LOOP AT gt_fieldcat INTO ls_fieldcat.
+    lv_tabix = sy-tabix.
+    READ TABLE lt_dyn_log_set
+      TRANSPORTING NO FIELDS
+      WITH KEY fieldname = ls_fieldcat-fieldname.
+    IF sy-subrc <> 0.
+      DELETE gt_fieldcat INDEX lv_tabix.
+    ENDIF.
+
+  ENDLOOP.
+
+ENDFORM.                    " edit_alv_fieldcat
+*&---------------------------------------------------------------------*
+*&      Form  set_status_10001
+*&---------------------------------------------------------------------*
+*       set screen status
+*----------------------------------------------------------------------*
+FORM set_status_10001 USING i_extab TYPE slis_t_extab.
+
+  SET PF-STATUS '10001'.
+  SET TITLEBAR  '10001'.
+
+ENDFORM.                               " set_status_10001
+*&---------------------------------------------------------------------*
+*&      Form  user_command
+*&---------------------------------------------------------------------*
+*       user command
+*----------------------------------------------------------------------*
+FORM user_command  USING    i_ucomm    LIKE sy-ucomm
+                            i_selfield TYPE slis_selfield.
+
+  CASE i_ucomm.
+    WHEN '&IC1'.
+      PERFORM display_process USING i_selfield.
+  ENDCASE.
+
+ENDFORM.                               " user_command
+*&---------------------------------------------------------------------*
+*&      Form  display_process
+*&---------------------------------------------------------------------*
+*       display process
+*----------------------------------------------------------------------*
+FORM display_process  USING    selfield TYPE slis_selfield.
+
+  DATA ls_log TYPE yse_dyn_tool_log.
+  READ TABLE gt_log INTO ls_log INDEX selfield-tabindex.
+  IF sy-subrc = 0.
+    CASE selfield-fieldname.
+      WHEN 'EQUNR'.
+        SET PARAMETER ID 'EQN' FIELD ls_log-equnr.
+        CALL TRANSACTION 'IE03' AND SKIP FIRST SCREEN.
+    ENDCASE.
+  ENDIF.
+
+ENDFORM.                    " display_process
+*&---------------------------------------------------------------------*
+*&      Form  SET_LOG
+*&---------------------------------------------------------------------*
+*       Set Log
+*----------------------------------------------------------------------*
+FORM set_log  USING matnr    TYPE matnr
+                    gernr    TYPE gernr
+                    eqtyp    TYPE eqtyp
+                    equnr    TYPE equnr
+                    msg_type TYPE bapi_mtype
+                    message  TYPE bapi_msg.
+
+  DATA: ls_log   TYPE yse_dyn_tool_log.
+  ls_log-matnr    = matnr.
+  ls_log-gernr    = gernr.
+  ls_log-eqtyp    = eqtyp.
+  ls_log-equnr    = equnr.
+  ls_log-msgty    = msg_type.
+  ls_log-msgtx    = message.
+  APPEND ls_log TO gt_log.
+
+ENDFORM.                    " SET_LOG
+*&---------------------------------------------------------------------*
+*&      Form  CONVERT_MATNR_INPUT
+*&---------------------------------------------------------------------*
+*       Internal Material
+*----------------------------------------------------------------------*
+FORM convert_matnr_input  USING    input
+                          CHANGING output.
+  CLEAR output.
+  CALL FUNCTION 'CONVERSION_EXIT_MATN1_INPUT'
+    EXPORTING
+      input        = input
+    IMPORTING
+      output       = output
+    EXCEPTIONS
+      length_error = 1
+      OTHERS       = 2.
+  IF sy-subrc <> 0.
+    EXIT.
+  ENDIF.
+ENDFORM.                    " CONVERT_MATNR_INPUT
+*&---------------------------------------------------------------------*
+*&      Form  CONVERT_GERNR_INPUT
+*&---------------------------------------------------------------------*
+*       Internal Serial
+*----------------------------------------------------------------------*
+FORM convert_gernr_input  USING    input
+                          CHANGING output.
+  CLEAR output.
+  CALL FUNCTION 'CONVERSION_EXIT_GERNR_INPUT'
+    EXPORTING
+      input  = input
+    IMPORTING
+      output = output.
+
+ENDFORM.                    " CONVERT_GERNR_INPUT
+*&---------------------------------------------------------------------*
+*&      Form  CONVERT_ALPHA_INPUT
+*&---------------------------------------------------------------------*
+*       Internal Alpha
+*----------------------------------------------------------------------*
+FORM convert_alpha_input  USING    input
+                          CHANGING output.
+  CLEAR output.
+  CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+    EXPORTING
+      input  = input
+    IMPORTING
+      output = output.
+ENDFORM.                    " CONVERT_ALPHA_INPUT
+*&---------------------------------------------------------------------*
+*&      Form  CONVERT_DATUM_INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_LS_FILE_ACQDATE  text
+*      -->P_L_ACQD  text
+*----------------------------------------------------------------------*
+FORM convert_datum_input  USING    value(input)
+                          CHANGING output.
+  CLEAR output.
+  IF input IS NOT INITIAL.
+    REPLACE ALL OCCURRENCES OF '-' IN input WITH space.
+    CONDENSE input NO-GAPS.
+    output = input.
+  ELSE.
+    output = '00000000'.
+  ENDIF.
+ENDFORM.                    " CONVERT_DATUM_INPUT
+*&---------------------------------------------------------------------*
+*&      Form  F_SCREEN_OUTPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM f_screen_output .
+  PERFORM frm_set_listbox.
+  PERFORM frm_com_screen.
+ENDFORM.                    " F_SCREEN_OUTPUT
+*&---------------------------------------------------------------------*
+*&      Form  FRM_SET_LISTBOX
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM frm_set_listbox .
+  DATA:   name   TYPE vrm_id,
+          list  TYPE vrm_values,
+          value LIKE LINE OF list.
+  DATA: lt_upload_appl TYPE STANDARD TABLE OF yse_upload_appl,
+        ls_upload_appl TYPE  yse_upload_appl.
+  name = 'P_APPL'.
+
+  SELECT *
+    FROM yse_upload_appl
+    INTO TABLE lt_upload_appl
+    WHERE active <> space.
+  IF sy-subrc = 0.
+    LOOP AT lt_upload_appl INTO ls_upload_appl.
+      value-key = ls_upload_appl-appl.
+      value-text = ls_upload_appl-description.
+      APPEND value TO list.
+    ENDLOOP.
+  ENDIF.
+
+  CALL FUNCTION 'VRM_SET_VALUES'
+    EXPORTING
+      id     = name
+      values = list.
+ENDFORM.                    " FRM_SET_LISTBOX
+*&---------------------------------------------------------------------*
+*&      Form  FRM_COM_SCREEN
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM frm_com_screen .
+  LOOP AT SCREEN.
+    IF ( NOT screen-group1 CS p_appl ) AND screen-group1 <> '00'.
+      screen-input = '0'.
+      screen-active = '0'.
+      MODIFY SCREEN.
+    ELSEIF screen-group1 = '00' AND screen-name CS 'P_FILE'.
+      READ TABLE gt_appl TRANSPORTING NO FIELDS
+        WITH KEY appl = p_appl.
+      IF sy-subrc <> 0.
+        screen-input = '0'.
+        screen-active = '0'.
+        MODIFY SCREEN.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    " FRM_COM_SCREEN
+*&---------------------------------------------------------------------*
+*&      Form  GET_APPL_INFO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM get_appl_info .
+  SELECT SINGLE *
+    FROM yse_upload_appl
+    INTO gs_appl
+    WHERE appl = p_appl.
+  IF sy-subrc <> 0 .
+    MESSAGE s005 DISPLAY LIKE 'E'.
+    LEAVE LIST-PROCESSING.
+  ENDIF.
+ENDFORM.                    " GET_APPL_INFO
+*&---------------------------------------------------------------------*
+*&      Form  mapping_partner_ie
+*&---------------------------------------------------------------------*
+*       Mapping partners to equipment
+*----------------------------------------------------------------------*
+FORM mapping_partner_ie .
+* Update Partner
+  PERFORM update_partner.
+ENDFORM.                    " mapping_partner_ie
+*&---------------------------------------------------------------------*
+*&      Form  DISMANTLE_EQUIPMENT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM dismantle_equipment .
+
+  DATA: lv_question TYPE string,
+        ls_log   TYPE yse_dyn_tool_log,
+        lv_lines    TYPE char8,
+        ls_equip    TYPE ty_equip,
+        lv_answer   TYPE char1.
+
+  lv_question = text-q01.
+
+  SELECT equnr
+         swerk
+         iwerk
+    FROM equz
+    INNER JOIN iloa
+    ON equz~iloan = iloa~iloan
+    INTO TABLE gt_equip
+    WHERE equnr IN s_equi
+      AND swerk IN s_swerk
+      AND iwerk IN s_iwerk
+      AND vkorg IN s_vkorg
+      AND vtweg IN s_vtweg
+      AND spart IN s_spart
+      AND datbi = gc_validto.
+  IF sy-subrc = 0.
+    DESCRIBE TABLE gt_equip LINES lv_lines.
+    REPLACE FIRST OCCURRENCE OF '&' IN lv_question WITH lv_lines.
+    CALL FUNCTION 'POPUP_TO_CONFIRM'
+      EXPORTING
+        titlebar                    = 'Dismantle equipment'
+*       DIAGNOSE_OBJECT             = ' '
+        text_question               = lv_question
+        text_button_1               = 'Yes'(t01)
+*       ICON_BUTTON_1               = ' '
+        text_button_2               = 'No'(t02)
+*       ICON_BUTTON_2               = ' '
+*       DEFAULT_BUTTON              = '1'
+*       DISPLAY_CANCEL_BUTTON       = 'X'
+*       USERDEFINED_F1_HELP         = ' '
+*       START_COLUMN                = 25
+*       START_ROW                   = 6
+*       POPUP_TYPE                  =
+*       IV_QUICKINFO_BUTTON_1       = ' '
+*       IV_QUICKINFO_BUTTON_2       = ' '
+      IMPORTING
+        answer                      = lv_answer
+*     TABLES
+*       PARAMETER                   =
+      EXCEPTIONS
+        text_not_found              = 1
+        OTHERS                      = 2
+              .
+    IF lv_answer <> '1'.
+      LEAVE LIST-PROCESSING.
+    ENDIF.
+  ELSE.
+    MESSAGE s001(00) DISPLAY LIKE 'E' WITH text-e02.
+    LEAVE LIST-PROCESSING.
+  ENDIF.
+
+  LOOP AT gt_equip INTO ls_equip.
+    CALL FUNCTION 'BAPI_EQUI_DISMANTLE'
+      EXPORTING
+        equipment               = ls_equip-equnr
+*       FUNCLOC                 =
+*       SUPEQUI                 =
+*       DISM_DATE               = SY-DATUM
+*       DISM_TIME               = SY-UZEIT
+*     IMPORTING
+*       DATA_GENERAL_EXP        =
+*       DATA_SPECIFIC_EXP       =
+*       RETURN                  =
+              .
+    IF sy-subrc  = 0.
+      CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+        EXPORTING
+          wait          = 'X'
+*       IMPORTING
+*         RETURN        =
+                .
+      ls_log-equnr    = ls_equip-equnr.
+      ls_log-msgty    = sy-msgty.
+      ls_log-msgtx    = text-t04.
+      APPEND ls_log TO gt_log.
+    ENDIF.
+
+  ENDLOOP.
+
+ENDFORM.                    " DISMANTLE_EQUIPMENT
+*&---------------------------------------------------------------------*
+*&      Form  EQUI_MIGRATION
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM equi_migration.
+
+  DATA: lt_equi_mig TYPE STANDARD TABLE OF yse_equi_mig,
+
+        ls_general_exp  TYPE bapi_itob,
+        ls_generalx     TYPE bapi_itobx,
+        ls_specific_exp TYPE bapi_itob_eq_only,
+        ls_specificx    TYPE bapi_itob_eq_onlyx,
+        lv_lgwid        TYPE lgwid,
+        lv_arbpl        TYPE crhd-arbpl,
+        ls_return       TYPE bapiret2,
+        lv_spart        TYPE mara-spart,
+        lv_vtweg        TYPE mvke-vtweg.
+  FIELD-SYMBOLS: <lfs_equi_mig> TYPE yse_equi_mig.
+  lt_equi_mig = <fs_tab>.
+  CHECK lt_equi_mig IS NOT INITIAL.
+
+  lv_spart = '41'.
+  lv_vtweg = '11'.
+
+  LOOP AT lt_equi_mig ASSIGNING <lfs_equi_mig> .
+    CLEAR: ls_general_exp,
+           ls_generalx,
+           ls_specific_exp,
+           ls_specificx,
+           lv_lgwid,
+           lv_arbpl.
+    <lfs_equi_mig>-aedat = sy-datum.
+    <lfs_equi_mig>-aenam = sy-uname.
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+      EXPORTING
+        input  = <lfs_equi_mig>-equnr
+      IMPORTING
+        output = <lfs_equi_mig>-equnr.
+
+    CALL FUNCTION 'BAPI_EQUI_GETDETAIL'
+      EXPORTING
+        equipment         = <lfs_equi_mig>-equnr
+      IMPORTING
+        data_general_exp  = ls_general_exp
+        data_specific_exp = ls_specific_exp
+        return            = ls_return.
+*   Maintanance plant
+    IF <lfs_equi_mig>-swerk IS NOT INITIAL
+       AND ls_general_exp-maintplant <> <lfs_equi_mig>-swerk.
+      ls_general_exp-maintplant = <lfs_equi_mig>-swerk.
+      ls_generalx-maintplant = 'X'.
+    ENDIF.
+*   Maintenance Planning Plant
+    IF <lfs_equi_mig>-iwerk IS NOT INITIAL
+       AND ls_general_exp-planplant <> <lfs_equi_mig>-iwerk.
+      ls_general_exp-planplant  = <lfs_equi_mig>-iwerk.
+      ls_generalx-planplant  = 'X'.
+    ENDIF.
+*   Sales Organization
+    IF <lfs_equi_mig>-vkorg IS NOT INITIAL
+        AND ls_general_exp-sales_org <> <lfs_equi_mig>-vkorg.
+      ls_general_exp-sales_org  = <lfs_equi_mig>-vkorg.
+      ls_generalx-sales_org  = 'X'.
+      ls_general_exp-distr_chan = lv_vtweg.
+      ls_general_exp-division   = lv_spart.
+      ls_generalx-distr_chan    = 'X'.
+      ls_generalx-division    = 'X'.
+    ENDIF.
+
+*   Work center
+    IF <lfs_equi_mig>-swerk IS NOT INITIAL.
+      SELECT SINGLE objid
+        FROM crhd
+        INTO lv_lgwid
+        WHERE objty = 'A'
+          AND arbpl = <lfs_equi_mig>-arbpl
+          AND werks = <lfs_equi_mig>-swerk.
+      IF sy-subrc <> 0.
+        CONCATENATE 'The work center'(080) <lfs_equi_mig>-arbpl
+                    'not exist in plant'(085) <lfs_equi_mig>-swerk '.'
+          INTO <lfs_equi_mig>-msg
+          SEPARATED BY space.
+        CONTINUE.
+      ELSE.
+        ls_general_exp-work_ctr = lv_lgwid.
+        ls_generalx-work_ctr = 'X'.
+      ENDIF.
+    ENDIF.
+*   Sales Office
+    IF <lfs_equi_mig>-vkbur IS NOT INITIAL
+        AND ls_general_exp-sales_off <> <lfs_equi_mig>-vkbur.
+      ls_general_exp-sales_off = <lfs_equi_mig>-vkbur.
+      ls_generalx-sales_off = 'X'.
+    ENDIF.
+
+*Sales Group
+    IF <lfs_equi_mig>-vkgrp IS NOT INITIAL
+        AND ls_general_exp-sales_grp <> <lfs_equi_mig>-vkgrp.
+      ls_general_exp-sales_grp = <lfs_equi_mig>-vkgrp.
+      ls_generalx-sales_grp = 'X'.
+    ELSEIF ls_general_exp-sales_grp IS NOT INITIAL
+      AND <lfs_equi_mig>-vkgrp IS INITIAL.
+      CLEAR: ls_general_exp-sales_grp.
+      ls_generalx-sales_grp = 'X'.
+    ENDIF.
+
+*   Planner group
+    IF <lfs_equi_mig>-ingrp IS NOT INITIAL.
+      ls_general_exp-plangroup = <lfs_equi_mig>-ingrp.
+      ls_generalx-plangroup = 'X'.
+    ENDIF.
+
+    CALL FUNCTION 'BAPI_EQUI_CHANGE'
+      EXPORTING
+        equipment      = <lfs_equi_mig>-equnr
+        data_general   = ls_general_exp
+        data_generalx  = ls_generalx
+        data_specific  = ls_specific_exp
+        data_specificx = ls_specificx
+      IMPORTING
+        return         = ls_return.
+    IF ls_return-type = 'E'.
+      MESSAGE ID ls_return-id TYPE ls_return-type
+        NUMBER ls_return-number WITH ls_return-message_v1
+        ls_return-message_v2 ls_return-message_v3 ls_return-message_v4
+        INTO <lfs_equi_mig>-msg.
+    ELSE.
+      CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+        EXPORTING
+          wait = 'X'.
+    ENDIF.
+  ENDLOOP.
+
+  MODIFY yse_equi_mig FROM TABLE lt_equi_mig.
+
+
+ENDFORM.                    " EQUI_MIGRATION
+*&---------------------------------------------------------------------*
+*&      Form  EQUI_INSTALL
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM equi_install.
+
+  DATA: ls_inherit_flags TYPE inheritance_flags,
+        ls_equi          TYPE v_equi,
+        ls_iflo          TYPE iflo,
+        ls_equi2         TYPE equi,
+        ls_log           TYPE yse_dyn_tool_log,
+        lt_equi          TYPE STANDARD TABLE OF equi.
+
+  CLEAR: ls_inherit_flags,
+         ls_equi,
+         ls_iflo.
+  SELECT *
+    FROM equi
+    INTO TABLE lt_equi
+    WHERE equnr IN s_equi9.
+  LOOP AT lt_equi INTO ls_equi2.
+    CLEAR: ls_equi,ls_log.
+
+    MOVE 'X' TO: ls_inherit_flags-stort,
+               ls_inherit_flags-msgrp,
+               ls_inherit_flags-beber,
+               ls_inherit_flags-ppsid,
+               ls_inherit_flags-abckz,
+               ls_inherit_flags-eqfnr,
+               ls_inherit_flags-gsber,
+               ls_inherit_flags-kostl,
+               ls_inherit_flags-proid,
+               ls_inherit_flags-daufn,
+               ls_inherit_flags-aufnr,
+               ls_inherit_flags-iwerk,
+               ls_inherit_flags-ingrp,
+               ls_inherit_flags-gewrk,
+               ls_inherit_flags-rbnr,
+               ls_inherit_flags-vkorg,
+               ls_inherit_flags-vtweg,
+               ls_inherit_flags-spart,
+               ls_inherit_flags-adrnr,
+               ls_inherit_flags-vkbur,
+               ls_inherit_flags-vkgrp.
+    ls_equi-equnr = ls_equi2-equnr.
+    ls_iflo-tplnr = p_tplnr.
+*     refer to YAM_AUTO_INSTALL_EQUI_F03
+    CALL FUNCTION 'EQUIPMENT_INSTALL'
+      EXPORTING
+        i_inherit_flags = ls_inherit_flags
+      CHANGING
+        s_equi          = ls_equi
+        r_iflo          = ls_iflo
+      EXCEPTIONS
+        err_install     = 1
+        OTHERS          = 2.
+    IF sy-subrc <> 0.
+      ls_log-equnr = ls_equi2-equnr.
+      ls_log-msgty = sy-msgty.
+      MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+        WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4
+        INTO ls_log-msgtx.
+    ELSE.
+      CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+        EXPORTING
+          wait = 'X'.
+      ls_log-equnr = ls_equi2-equnr.
+      ls_log-msgty = 'S'.
+      ls_log-msgtx = 'Successfully installed'.
+    ENDIF.
+    APPEND ls_log TO gt_log.
+  ENDLOOP.
+
+ENDFORM.                    " EQUI_INSTALL

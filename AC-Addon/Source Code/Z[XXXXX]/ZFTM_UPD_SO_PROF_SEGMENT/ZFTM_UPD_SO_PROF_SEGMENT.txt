@@ -1,0 +1,580 @@
+*&---------------------------------------------------------------------*
+*& Report  ZFTM_UPD_SO_PROF_SEGMENT
+*&
+*&---------------------------------------------------------------------*
+*&
+*& Change sales orders : re-derive profitability segment
+*&
+*&---------------------------------------------------------------------*
+*  Author                : Luc Mertens     USG Innotiv
+*  Date                  : 16.04.2013
+*  Change Request Number :
+*  Transport request Nr. : AD1K913728
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD.NR. |   DATE     | NAME               | CORRECT. NR| CHANGE REF. *
+*----------------------------------------------------------------------*
+* MOD-001 | 16.09.2014 | L. Mertens   USG   | AD1K936050 | CR3760      *
+*----------------------------------------------------------------------*
+report  zftm_upd_so_prof_segment.
+
+tables: vbak.
+
+* ALV grid
+type-pools: slis.
+
+* Internal table for Sales Order Items (from input file)
+data: begin of it_inso occurs 0,
+        vbeln    type vbeln_va,
+        posnr_i  type posnr_va,
+        vkorg    type vkorg,
+        vtweg    type vtweg,
+        matnr_i  type matnr,
+        prodh_i  type prodh_d,
+      end of it_inso.
+
+data: begin of it_sldoc occurs 0,
+        vbeln    type vbeln_va,
+        posnr    type posnr_va,
+      end of it_sldoc.
+
+* Internal table MVKE
+data: begin of it_mvke occurs 0,
+        matnr    type matnr,
+        vkorg    type vkorg,
+        vtweg    type vtweg,
+        prodh    type prodh_d,
+      end of it_mvke.
+
+* Internal table (for Error output)
+data: begin of it_err occurs 0,
+        vbeln      type vbeln_va,
+        posnr      type posnr_va,
+        mtext      type string,
+      end of it_err.
+
+data: ws_err  like line of it_err.
+
+data: bdcdata     like bdcdata  occurs 0
+                              with header line.
+
+data: xv_variant         like disvariant,
+      xv_variant_flag    type c,
+      xv_sd_alv_variant  like disvariant,
+      xt_fcat            type slis_t_fieldcat_alv,
+      ls_fcat            like line of xt_fcat,
+      xt_alv_sort        type slis_t_sortinfo_alv,
+      xv_user_command    type slis_formname  value 'USER_COMMAND',
+      xv_variant_save    type c              value 'U',
+      xv_layout          type slis_layout_alv.
+
+data: gv_mode      type ctu_mode  value 'N',
+      gv_mtext     type string,
+      gv_tcode     type sytcode,
+      gv_belnr     type rke_belnr,
+      gv_col(3)    type n,
+      gv_sldoc(17) type c,                                "+MOD-001
+      gv_repid     like sy-repid,
+      bdc_options  type ctu_params,
+      it_messages  type table of bdcmsgcoll,
+      wa_messages  like bdcmsgcoll.
+
+*&---------------------------------------------------------------------*
+*&  Selection screen                                                   *
+*&---------------------------------------------------------------------*
+select-options: s_erdat  for vbak-erdat  obligatory,
+                s_vkorg  for vbak-vkorg  obligatory,
+                s_vtweg  for vbak-vtweg,
+                s_vbeln  for vbak-vbeln,
+                s_sldoc  for gv_sldoc    no intervals.    "+MOD-001
+selection-screen skip.
+parameters:     p_upd(1) type c default 'X'.
+
+*&---------------------------------------------------------------------*
+at selection-screen on s_sldoc.                           "+MOD-001
+
+  if not s_sldoc is initial.
+    loop at s_sldoc.
+      if s_sldoc-low na '_'.
+        message e001(00) with 'Split sign "_" not found'(i05).
+      endif.
+    endloop.
+  endif.
+
+*&---------------------------------------------------------------------*
+*&  Main program                                                       *
+*&---------------------------------------------------------------------*
+start-of-selection.
+
+* Select data
+  perform select_data.
+
+  if it_inso[] is initial.
+    message i001(00) with 'No sales orders selected'(i03).
+  endif.
+
+* Process input
+  perform process_data.
+
+* Display errors
+  if it_err[] is initial.
+    message i001(00) with 'No errors found'(i04).
+  else.
+    perform alv_fcat.
+    perform alv_layout.
+    perform alv_display.
+  endif.
+
+
+*&---------------------------------------------------------------------*
+*&  Forms                                                              *
+*&---------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_DATA
+*&---------------------------------------------------------------------*
+*       Select data
+*----------------------------------------------------------------------*
+form select_data .
+
+* begin of insert MOD-001
+  if not s_sldoc is initial.
+    loop at s_sldoc.
+      move s_sldoc-low(10)   to it_sldoc-vbeln.
+      move s_sldoc-low+11(6) to it_sldoc-posnr.
+      append it_sldoc.
+      clear it_sldoc.
+    endloop.
+
+    select vbeln posnr_i vkorg vtweg matnr_i prodh_i
+      into corresponding fields of table it_inso
+      from wb2_v_vbak_vbap2
+      for all entries in it_sldoc
+      where vbeln   eq it_sldoc-vbeln
+        and posnr_i eq it_sldoc-posnr
+        and erdat   in s_erdat
+        and vkorg   in s_vkorg.
+  else.
+* end of insert MOD-001
+    select vbeln posnr_i vkorg vtweg matnr_i prodh_i
+      into corresponding fields of table it_inso
+      from wb2_v_vbak_vbap2
+      where vbeln in s_vbeln
+        and erdat in s_erdat
+        and vkorg in s_vkorg.
+  endif.                                                  "+MOD-001
+
+  sort it_inso by vbeln posnr_i.
+
+endform.                    "select_data
+
+*&---------------------------------------------------------------------*
+*&      Form  PROCESS_DATA
+*&---------------------------------------------------------------------*
+*       Process input data
+*----------------------------------------------------------------------*
+form process_data .
+
+* Get prodhierarchy of material on sales order item
+  select matnr vkorg vtweg prodh
+    into corresponding fields of table it_mvke
+    from mvke
+    for all entries in it_inso
+    where matnr = it_inso-matnr_i
+      and vkorg = it_inso-vkorg
+*      and vtweg = '01'.
+      and vtweg in s_vtweg.
+
+  sort it_mvke by matnr vkorg.
+
+
+* Process input
+  loop at it_inso.
+
+    clear it_mvke.
+    read table it_mvke with key matnr = it_inso-matnr_i
+                                vkorg = it_inso-vkorg
+                                vtweg = it_inso-vtweg
+                       binary search.
+
+    if it_mvke-prodh = '99  99'.
+      continue.
+    endif.
+
+    if it_inso-prodh_i = it_mvke-prodh.
+      if p_upd <> 'X'.                    "no update when no difference
+        continue.
+      endif.
+    endif.
+
+*   Update 2x SO via transaction VA02 (order)
+    perform call_va02.
+
+  endloop.
+
+endform.                    " PROCESS_DATA
+
+*&---------------------------------------------------------------------*
+*&      Form  CALL_VA02
+*&---------------------------------------------------------------------*
+*       Update 2x SO via transaction VA02
+*----------------------------------------------------------------------*
+form call_va02 .
+
+* I. Update SO item with product hierarchy of material
+  perform update_prodh using it_inso-vbeln it_inso-posnr_i it_mvke-prodh.
+
+* II. Re-derive CO-PA characteristics
+  if it_inso-vtweg = '01'.
+    perform re_derive using it_inso-vbeln it_inso-posnr_i.
+  endif.
+endform.                                                    " CALL_VA02
+
+*&---------------------------------------------------------------------*
+*&      Form  BDC_DYNPRO
+*&---------------------------------------------------------------------*
+*       Start new screen
+*----------------------------------------------------------------------*
+*      -->PROGRAM : Program name
+*      -->DYNPRO  : Screen number
+*----------------------------------------------------------------------*
+form bdc_dynpro using  program
+                       dynpro.
+
+  clear bdcdata.
+  bdcdata-program  = program.
+  bdcdata-dynpro   = dynpro.
+  bdcdata-dynbegin = 'X'.
+  append bdcdata.
+
+endform.                    " BDC_DYNPRO
+
+*&---------------------------------------------------------------------*
+*&      Form  BDC_FIELD
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->FNAM : Field name
+*      -->FVAL : Field value
+*----------------------------------------------------------------------*
+form bdc_field using  fnam
+                      fval.
+
+  clear bdcdata.
+  bdcdata-fnam = fnam.
+  bdcdata-fval = fval.
+  append bdcdata.
+
+endform.                    " BDC_FIELD
+
+*&---------------------------------------------------------------------*
+*&      Form  ADD_ERROR
+*&---------------------------------------------------------------------*
+*       Add error
+*----------------------------------------------------------------------*
+*      -->P_MTEXT : Error text
+*----------------------------------------------------------------------*
+form add_error  using    p_mtext.
+
+  clear it_err.
+
+  it_err-vbeln = it_inso-vbeln.
+  it_err-posnr = it_inso-posnr_i.
+  it_err-mtext = p_mtext.
+  append it_err.
+
+endform.                    " ADD_ERROR
+
+*&---------------------------------------------------------------------*
+*&      Form  ALV_FCAT
+*&---------------------------------------------------------------------*
+*       ALV field catalog
+*----------------------------------------------------------------------*
+form alv_fcat .
+
+  perform add_field using 'VBELN'  10  'Document'(t01)  'X'.
+  perform add_field using 'POSNR'  06  'Item'(t02)      ' '.
+  perform add_field using 'MTEXT'  80  'Message'(t03)   ' '.
+
+endform.                    " ALV_FCAT
+
+*&---------------------------------------------------------------------*
+*&      Form  ADD_FIELD
+*&---------------------------------------------------------------------*
+*       Add field to field catalog
+*----------------------------------------------------------------------*
+form add_field  using    p_field
+                         p_len
+                         p_descr
+                         p_hotsp.
+
+  gv_col = gv_col + 1.
+
+  clear ls_fcat.
+  ls_fcat-col_pos    = gv_col.
+  ls_fcat-fieldname  = p_field.
+  ls_fcat-outputlen  = p_len.
+  ls_fcat-seltext_l  = p_descr.
+  ls_fcat-seltext_m  = p_descr.
+  ls_fcat-seltext_s  = p_descr.
+  ls_fcat-fix_column = 'X'.
+  ls_fcat-emphasize  = 'X'.
+  ls_fcat-hotspot    = p_hotsp.
+  ls_fcat-key        = p_hotsp.
+
+* Suppress leading zeros for the material number
+  if p_field = 'VBELN'.
+    ls_fcat-edit_mask = '==ALPHA'.
+  endif.
+
+  append ls_fcat to xt_fcat.
+
+endform.                    " ADD_FIELD
+
+*&---------------------------------------------------------------------*
+*&      Form  ALV_LAYOUT
+*&---------------------------------------------------------------------*
+*       Modify ALV layout
+*----------------------------------------------------------------------*
+form alv_layout .
+
+  xv_layout-zebra = 'X'.
+*  xv_layout-colwidth_optimize = 'X'.
+*  xv_layout-smalltitle = 'X'.
+*  xv_layout-grid_title = 'title'.
+
+endform.                    " ALV_LAYOUT
+
+*&---------------------------------------------------------------------*
+*&      Form  ALV_DISPLAY
+*&---------------------------------------------------------------------*
+*       Display ALV grid
+*----------------------------------------------------------------------*
+form alv_display .
+
+*  xv_sd_alv_variant = xv_variant.
+  gv_repid = sy-repid.
+
+  sort it_err.
+
+  call function 'REUSE_ALV_GRID_DISPLAY'
+    exporting
+      i_callback_program      = gv_repid
+      i_callback_user_command = xv_user_command
+*      i_callback_top_of_page  = 'ALV_TOP'
+      i_grid_title            = 'Re-derive COPA'(h01)
+      is_layout               = xv_layout
+      it_fieldcat             = xt_fcat
+      it_sort                 = xt_alv_sort
+      i_default               = 'X'
+      i_save                  = 'A'
+*      is_variant              = xv_sd_alv_variant
+      i_screen_start_column   = 0
+      i_screen_start_line     = 0
+      i_screen_end_column     = 0
+      i_screen_end_line       = 0
+    tables
+      t_outtab                = it_err
+    exceptions
+      program_error           = 1
+      others                  = 2.
+
+  if sy-subrc ne 0.
+*   message id sy-msgid type sy-msgty number sy-msgno
+*           with sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  endif.
+
+endform.                    " ALV_DISPLAY
+
+*&---------------------------------------------------------------------*
+*&   Form  USER_COMMAND
+*&---------------------------------------------------------------------*
+*    Process user command
+*----------------------------------------------------------------------*
+form user_command using ucomm    like sy-ucomm
+                        selfield type slis_selfield.
+
+* Check function code
+  case ucomm.
+    when '&IC1'.
+*     Select hotspot
+      if not selfield-value is initial.
+        case selfield-fieldname.
+          when 'VBELN'.
+            if not selfield-value is initial.
+*             Sales Order
+              set parameter id 'AUN' field selfield-value.
+              call transaction 'VA03' and skip first screen.
+            endif.
+        endcase.
+      endif.
+  endcase.
+
+endform.                    " USER_COMMAND
+*&---------------------------------------------------------------------*
+*&      Form  UPDATE_PRODH
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_VBELN  text
+*      -->P_POSNR  text
+*      -->P_PRODH  text
+*----------------------------------------------------------------------*
+form update_prodh  using    p_vbeln type vbap-vbeln
+                            p_posnr type vbap-posnr
+                            p_prodh type mvke-prodh.
+* Clear structures and tables for the BAPI
+* Select Sales Order
+  clear: bdcdata, it_messages.
+  refresh: bdcdata, it_messages.
+
+  perform bdc_dynpro using 'SAPMV45A'   '0102'.
+  perform bdc_field  using 'BDC_OKCODE' '=UER2'.
+  perform bdc_field  using 'VBAK-VBELN' p_vbeln.
+
+* Item overview
+  perform bdc_dynpro using 'SAPMV45A'   '4001'.
+  perform bdc_field  using 'BDC_OKCODE' '=POPO'.
+
+* Position item
+  perform bdc_dynpro using 'SAPMV45A'   '0251'.
+  perform bdc_field  using 'RV45A-POSNR' p_posnr.
+  perform bdc_field  using 'BDC_OKCODE' '=POSI'.
+
+* Go to Sales B
+  perform bdc_dynpro using 'SAPMV45A'   '4001'.
+  perform bdc_field  using 'BDC_OKCODE' '=PSTE'.
+
+* Save
+  perform bdc_dynpro using 'SAPMV45A'   '4003'.
+  perform bdc_field  using 'VBAP-PRODH' p_prodh.
+  perform bdc_field  using 'BDC_OKCODE' '=SICH'.
+
+  bdc_options-dismode = gv_mode.
+  bdc_options-updmode = 'S'.
+
+* Sales Order
+  call transaction 'VA02' using bdcdata
+                          options from bdc_options
+                          messages into it_messages.
+
+* Get errors
+  loop at it_messages into wa_messages
+                      where msgtyp = 'A'  or
+                            msgtyp = 'E'.
+    message id wa_messages-msgid
+            type wa_messages-msgtyp
+            number wa_messages-msgnr
+            into gv_mtext
+            with wa_messages-msgv1 wa_messages-msgv2
+                 wa_messages-msgv3 wa_messages-msgv4.
+    perform add_error using gv_mtext.
+    exit.
+  endloop.
+
+endform.                    " UPDATE_PRODHIERARCHY
+*&---------------------------------------------------------------------*
+*&      Form  RE_DERIVE
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_IT_INSO_VBELN  text
+*      -->P_IT_INSO_POSNR_I  text
+*----------------------------------------------------------------------*
+form re_derive  using    p_vbeln type vbap-vbeln
+                         p_posnr type vbap-posnr.
+
+* Clear structures and tables for the BAPI
+  clear: bdcdata, it_messages.
+  refresh: bdcdata, it_messages.
+
+* Select Sales Order
+  perform bdc_dynpro using 'SAPMV45A'   '0102'.
+  perform bdc_field  using 'BDC_OKCODE' '=UER2'.
+  perform bdc_field  using 'VBAK-VBELN' p_vbeln.
+
+* Item overview
+  perform bdc_dynpro using 'SAPMV45A'   '4001'.
+  perform bdc_field  using 'BDC_OKCODE' '=POPO'.
+
+* Position item
+  perform bdc_dynpro using 'SAPMV45A'   '0251'.
+  perform bdc_field  using 'RV45A-POSNR' p_posnr.
+  perform bdc_field  using 'BDC_OKCODE' '=POSI'.
+
+* Go to account assignment
+  perform bdc_dynpro using 'SAPMV45A'   '4001'.
+  perform bdc_field  using 'BDC_OKCODE' '=PKNT'.
+
+* Go to Profitability segment
+  perform bdc_dynpro using 'SAPMV45A'   '4003'.
+  perform bdc_field  using 'DKACB-FMORE' 'X'.
+  perform bdc_field  using 'BDC_OKCODE' '/00'.
+
+* Profitability segment
+  perform bdc_dynpro using 'SAPLKACB'   '0002'.
+  perform bdc_field  using 'BDC_OKCODE' '=COBL_XERGO'.
+
+* Delete assignment
+  perform bdc_dynpro using 'SAPLKEAK'   '0300'.
+  perform bdc_field  using 'BDC_OKCODE' '=DEBS'.
+
+* Continue
+  perform bdc_dynpro using 'SAPLKEAK'   '0300'.
+  perform bdc_field  using 'BDC_OKCODE' '=WEIT'.
+
+*
+  perform bdc_dynpro using 'SAPLKACB'   '0002'.
+  perform bdc_field  using 'BDC_OKCODE' '=COBL_XERGO'.
+
+* Profitability segment
+  perform bdc_dynpro using 'SAPLKEAK'   '0300'.
+  perform bdc_field  using 'BDC_OKCODE' '=WEIT'.
+
+* Continue
+  perform bdc_dynpro using 'SAPLKACB'   '0002'.
+  perform bdc_field  using 'BDC_OKCODE' '=ENTE'.
+
+* Save
+  perform bdc_dynpro using 'SAPMV45A'   '4001'.
+  perform bdc_field  using 'BDC_OKCODE' '=SICH'.
+
+  bdc_options-dismode = gv_mode.
+  bdc_options-updmode = 'S'.
+
+* Sales Order
+  call transaction 'VA02' using bdcdata
+                          options from bdc_options
+                          messages into it_messages.
+
+* Get errors
+  loop at it_messages into wa_messages
+                      where msgtyp = 'A'  or
+                            msgtyp = 'E'.
+    message id wa_messages-msgid
+            type wa_messages-msgtyp
+            number wa_messages-msgnr
+            into gv_mtext
+            with wa_messages-msgv1 wa_messages-msgv2
+                 wa_messages-msgv3 wa_messages-msgv4.
+    perform add_error using gv_mtext.
+    exit.
+  endloop.
+endform.                    " RE_DERIVE
+
+*Text symbol text£º
+*H01:Re-derive COPA
+*I03:No sales orders selected
+*I04:No errors found
+*I05:Split sign "_" not found
+*T01:Document
+*T02:Item
+
+*T03:Message
+*Selection text£º
+*P_UPD:        Update when no difference
+*S_ERDAT:D       .
+*S_SLDOC:        Sales document & line item
+*S_VBELN:D       .
+*S_VKORG:D       .
+*S_VTWEG:D       .

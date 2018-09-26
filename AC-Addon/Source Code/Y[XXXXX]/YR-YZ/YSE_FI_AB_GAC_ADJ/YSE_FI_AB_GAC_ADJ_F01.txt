@@ -1,0 +1,453 @@
+*&---------------------------------------------------------------------*
+*&  Include           YSE_FI_AB_GAC_ADJ_F01
+*&---------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  FRM_SCREE_SET
+*&---------------------------------------------------------------------*
+*       set screen option
+*----------------------------------------------------------------------*
+FORM frm_scree_set .
+  LOOP AT SCREEN.
+    IF    screen-name = 'P_ACC1'
+      OR  screen-name = 'P_ACC2'
+      OR  screen-name = 'P_BLART'  .
+      screen-input = '0'.
+      MODIFY SCREEN.
+    ENDIF.
+  ENDLOOP.
+ENDFORM.                    " FRM_SCREE_SET
+*&---------------------------------------------------------------------*
+*&      Form  FRM_GET_DATA
+*&---------------------------------------------------------------------*
+*       Get the process data
+*----------------------------------------------------------------------*
+FORM frm_get_data.
+
+  DATA: lrg_invgac TYPE RANGE OF setvalmin,
+        ls_invgac  LIKE LINE OF lrg_invgac,
+        lt_setleaf  TYPE STANDARD TABLE OF setleaf,
+        lv_tabix   TYPE sy-tabix,
+        ls_bsas     TYPE ty_bsas,
+        ls_setleaf TYPE setleaf.
+
+* Get the invalid gac from table YSE_INVALID_GAC
+  SELECT *
+    FROM setleaf
+    INTO TABLE lt_setleaf
+    WHERE setname = gc_leaf_invgac.
+
+  LOOP AT lt_setleaf INTO ls_setleaf.
+    ls_invgac-sign   = ls_setleaf-valsign.
+    ls_invgac-option = ls_setleaf-valoption.
+    ls_invgac-low    = ls_setleaf-valfrom.
+    ls_invgac-high   = ls_setleaf-valto.
+    APPEND ls_invgac TO lrg_invgac.
+  ENDLOOP.
+
+  CHECK lrg_invgac IS NOT INITIAL.
+* Get the Accounting document from table BSAS
+  SELECT  bukrs
+          hkont
+          gjahr
+          belnr
+          buzei
+          budat
+          blart
+          bschl
+          shkzg
+          dmbtr
+          pswsl
+          prctr
+          segment
+    FROM bsas
+    INTO TABLE gt_bsas
+    WHERE bukrs = p_bukrs
+      AND hkont IN (p_acc1,p_acc2)
+      AND belnr IN s_belnr
+      AND budat IN s_budat
+      AND blart = p_blart
+      AND prctr IN lrg_invgac.
+
+  CHECK gt_bsas IS NOT INITIAL.
+* Get the Accounting document from table BSAS
+  SELECT  bukrs
+          hkont
+          gjahr
+          belnr
+          buzei
+          budat
+          blart
+          bschl
+          shkzg
+          dmbtr
+          pswsl
+          prctr
+          segment
+    FROM bsas
+    INTO TABLE gt_bsas2
+    FOR ALL ENTRIES IN gt_bsas
+    WHERE bukrs = p_bukrs
+      AND hkont = gt_bsas-hkont
+      AND belnr = gt_bsas-belnr.
+  LOOP AT gt_bsas2 INTO ls_bsas.
+    lv_tabix  = sy-tabix.
+    READ TABLE gt_bsas TRANSPORTING NO FIELDS
+      WITH KEY bukrs = ls_bsas-bukrs
+               hkont = ls_bsas-hkont
+               belnr = ls_bsas-belnr
+               buzei = ls_bsas-buzei.
+    IF sy-subrc = 0.
+      DELETE gt_bsas2 INDEX lv_tabix.
+      CONTINUE.
+    ENDIF.
+    IF ls_bsas-prctr IN lrg_invgac .
+      DELETE gt_bsas2 INDEX lv_tabix.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    " FRM_GET_DATA
+*&---------------------------------------------------------------------*
+*&      Form  FRM_PROC_ADJ
+*&---------------------------------------------------------------------*
+*     Process adjust
+*----------------------------------------------------------------------*
+FORM frm_proc_adj.
+
+  DATA: ls_bsas     TYPE ty_bsas,
+        ls_bsas2    TYPE ty_bsas.
+
+  IF gt_bsas IS INITIAL.
+    MESSAGE s001(00) WITH text-e70 DISPLAY LIKE 'E'.
+    LEAVE LIST-PROCESSING.
+  ENDIF.
+  LOOP AT gt_bsas INTO ls_bsas.
+    CLEAR:  gs_alv_output,
+            gv_obtype,
+            gv_objkey,
+            gv_obsys.
+    refresh:  gt_accountgl,
+              gt_currencyamount,
+              gt_return.
+    MOVE-CORRESPONDING ls_bsas TO gs_alv_output.
+    READ TABLE gt_bsas2 INTO ls_bsas2
+      WITH KEY belnr = ls_bsas-belnr
+               hkont = ls_bsas-hkont
+               dmbtr = ls_bsas-dmbtr.
+    IF sy-subrc = 0.
+      gs_alv_output-ngac = ls_bsas2-prctr.
+    ELSE.
+      READ TABLE gt_bsas2 INTO ls_bsas2
+        WITH KEY belnr = ls_bsas-belnr
+                 hkont = ls_bsas-hkont.
+      IF sy-subrc = 0.
+        gs_alv_output-ngac = ls_bsas2-prctr.
+      ENDIF.
+    ENDIF.
+*If set A-NGAC is blank, remove the line from set A
+    IF gs_alv_output-ngac IS INITIAL.
+      CONTINUE.
+    ENDIF.
+
+    CASE gs_alv_output-bschl.
+      WHEN '40'.
+        gs_alv_output-nbschl = '50'.
+      WHEN '50'.
+        gs_alv_output-nbschl = '40'.
+      WHEN OTHERS.
+    ENDCASE.
+
+*   If not in test mode than do posting else do nothing
+    IF p_test IS INITIAL.
+*     Creat document header
+      PERFORM frm_create_header.
+
+*     Copy all the characteristics to the bapi internal table.
+      PERFORM create_line_10.
+      PERFORM create_line_20.
+*     Do posting
+      PERFORM frm_do_posting.
+    ENDIF.
+    APPEND gs_alv_output TO gt_alv_output.
+  ENDLOOP.
+
+ENDFORM.                    " FRM_PROC_ADJ
+*&---------------------------------------------------------------------*
+*&      Form  FRM_DO_POSTING
+*&---------------------------------------------------------------------*
+*       Do posting
+*----------------------------------------------------------------------*
+FORM frm_do_posting .
+
+  DATA: ls_return TYPE bapiret2.
+* Posting the document and got return
+  CALL FUNCTION 'BAPI_ACC_DOCUMENT_POST'
+    EXPORTING
+      documentheader = gs_documentheader
+    IMPORTING
+      obj_type       = gv_obtype
+      obj_key        = gv_objkey
+      obj_sys        = gv_obsys
+    TABLES
+      accountgl      = gt_accountgl
+      currencyamount = gt_currencyamount
+      return         = gt_return.
+  READ TABLE gt_return INTO ls_return
+    WITH KEY type = 'E'.
+  IF sy-subrc = 0.
+    gs_alv_output-message = ls_return-message.
+    CLEAR: gs_alv_output-nbelnr.
+  ELSE.
+    READ TABLE gt_return INTO ls_return
+      WITH KEY type = 'S'.
+    CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+      EXPORTING
+        wait = 'X'.
+    gs_alv_output-nbelnr = ls_return-message_v2(10).
+  ENDIF.
+ENDFORM.                    " FRM_DO_POSTING
+*&---------------------------------------------------------------------*
+*&      Form  FRM_CREATE_HEADER
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM frm_create_header .
+
+  gs_documentheader-header_txt =  'CR4142 GAC correct'(t70).
+  gs_documentheader-ref_doc_no =  'CR4142 GAC ADJ'(t71).
+  gs_documentheader-comp_code  =  gs_alv_output-bukrs.
+  gs_documentheader-username   =  sy-uname.
+  gs_documentheader-doc_date   =  s_budat-high.
+  gs_documentheader-pstng_date =  s_budat-high.
+  gs_documentheader-doc_type   =  p_blart.
+
+ENDFORM.                    " FRM_CREATE_HEADER
+
+*&---------------------------------------------------------------------*
+*&      Form  create_line_10
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM   create_line_10 .
+
+  CLEAR: gs_accountgl.
+  gs_accountgl-itemno_acc = '10'.
+  gs_accountgl-gl_account = gs_alv_output-hkont.
+  gs_accountgl-tax_code   = gc_tax_zs.
+  gs_accountgl-profit_ctr = gs_alv_output-prctr.
+  gs_accountgl-alloc_nmbr = gs_alv_output-belnr.
+  gs_accountgl-comp_code  = p_bukrs.
+  gs_accountgl-pstng_date = s_budat-high.
+  APPEND gs_accountgl TO gt_accountgl.
+
+  CLEAR gs_currencyamount.
+  gs_currencyamount-itemno_acc = '10'.
+  gs_currencyamount-currency = gs_alv_output-pswsl.
+  IF gs_alv_output-shkzg = 'H'.
+    gs_currencyamount-amt_doccur = gs_alv_output-dmbtr.
+  ELSE.
+    gs_currencyamount-amt_doccur = 0 - gs_alv_output-dmbtr.
+  ENDIF.
+  APPEND gs_currencyamount TO gt_currencyamount.
+
+ENDFORM.                    " create_line_10
+
+*&---------------------------------------------------------------------*
+*&      Form  create_line_20
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM create_line_20 .
+
+  CLEAR: gs_accountgl.
+  gs_accountgl-itemno_acc = '20'.
+  gs_accountgl-gl_account = gs_alv_output-hkont.
+  gs_accountgl-tax_code   = gc_tax_zs.
+  gs_accountgl-alloc_nmbr = gs_alv_output-belnr.
+  gs_accountgl-comp_code  = p_bukrs.
+  gs_accountgl-pstng_date = s_budat-high.
+  gs_accountgl-profit_ctr = gs_alv_output-ngac.
+  APPEND gs_accountgl TO gt_accountgl.
+
+  CLEAR gs_currencyamount.
+  gs_currencyamount-itemno_acc = '20'.
+  gs_currencyamount-currency = gs_alv_output-pswsl.
+  IF gs_alv_output-shkzg = 'H'.
+    gs_currencyamount-amt_doccur = 0 - gs_alv_output-dmbtr.
+  ELSE.
+    gs_currencyamount-amt_doccur = gs_alv_output-dmbtr.
+  ENDIF.
+  APPEND gs_currencyamount TO gt_currencyamount.
+
+ENDFORM.                    " create_line_20
+*&---------------------------------------------------------------------*
+*&      Form  FRM_SET_ALV
+*&---------------------------------------------------------------------*
+*      Set ALV result
+*----------------------------------------------------------------------*
+FORM frm_set_alv .
+
+* FIELDCAT set
+  PERFORM alv_fieldcat_set.
+
+* LAYOUT set
+  PERFORM alv_layout_set.
+
+* Set Others
+  PERFORM alv_others_set.
+
+ENDFORM.                    " FRM_SET_ALV
+
+*&---------------------------------------------------------------------*
+*&      Form  ALV_OTHERS_SET
+*&---------------------------------------------------------------------*
+*       Set Others
+*----------------------------------------------------------------------*
+FORM alv_others_set .
+  gv_callback = gc_back_rout.
+  gv_save = 'A'.
+ENDFORM.                    " ALV_OTHERS_SET
+
+*&---------------------------------------------------------------------*
+*&      Form  FRM_SHOW_ALV
+*&---------------------------------------------------------------------*
+*       Display ALV result
+*----------------------------------------------------------------------*
+FORM frm_show_alv .
+
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+    EXPORTING
+      i_callback_program       = sy-repid
+*      i_callback_pf_status_set = 'FRM_MY_STATUS'
+      i_callback_user_command  = gv_callback
+      is_layout                = gs_layout
+      it_fieldcat              = gt_fieldcat
+      i_save                   = gv_save
+    TABLES
+      t_outtab                 = gt_alv_output
+    EXCEPTIONS
+      program_error            = 1
+      OTHERS                   = 2.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+ENDFORM.                    " FRM_SHOW_ALV
+
+*&---------------------------------------------------------------------*
+*&      Form  ALV_FIELDCAT_SET
+*&---------------------------------------------------------------------*
+*       FIELDCAT set
+*----------------------------------------------------------------------*
+FORM alv_fieldcat_set .
+
+** Create Fieldcatalogue from internal table
+
+  CLEAR gv_col.
+* Field definitions
+  PERFORM add_field USING:
+    'BUKRS'       4    'Company Code'(f01)  'X' ' ',
+    'NBELNR'      10   'Adj.DocNo'(f02)     'X' 'X',
+    'BELNR'       10   'Orig.DocNo'(f03)    'X' 'X',
+    'PRCTR'       10   'Old.GAC'(f04)       ' ' ' ',
+    'NGAC'        10   'New.GAC'(f05)       ' ' ' ',
+    'DMBTR'       15   'Amount'(f06)        ' ' ' ',
+    'PSWSL'       6    'Currency'(f07)      ' ' ' ',
+    'BSCHL'       2    'Post.Key'(f08)      ' ' ' ',
+    'MESSAGE'     60   'Message'(f09)       ' ' ' '.
+
+ENDFORM.                    " ALV_FIELDCAT_SET
+
+*&---------------------------------------------------------------------*
+*&      Form  ADD_FIELD
+*&---------------------------------------------------------------------*
+*       Add field to field catalog
+*----------------------------------------------------------------------*
+FORM add_field  USING    p_field
+                         p_len
+                         p_descr
+                         p_fix_column
+                         p_hotsp.
+  DATA:
+     ls_fieldcat TYPE slis_fieldcat_alv.
+
+  gv_col = gv_col + 1.
+
+  CLEAR ls_fieldcat.
+  ls_fieldcat-col_pos    = gv_col.
+  ls_fieldcat-fieldname  = p_field.
+  ls_fieldcat-outputlen  = p_len.
+  ls_fieldcat-seltext_l  = p_descr.
+  ls_fieldcat-seltext_m  = p_descr.
+  ls_fieldcat-seltext_s  = p_descr.
+  ls_fieldcat-fix_column = p_fix_column.
+*  ls_fieldcat-emphasize  = 'X'.
+  ls_fieldcat-hotspot    = p_hotsp.
+
+* Suppress leading zeros for the material number
+  IF p_field = 'MATNR'.
+    ls_fieldcat-edit_mask = '==MATN1'.
+  ENDIF.
+
+  APPEND ls_fieldcat TO gt_fieldcat.
+
+ENDFORM.                    " ADD_FIELD
+
+*&---------------------------------------------------------------------*
+*&      Form  ALV_LAYOUT_SET
+*&---------------------------------------------------------------------*
+*       LAYOUT set
+*----------------------------------------------------------------------*
+FORM alv_layout_set .
+
+  CLEAR: gs_layout.
+  gs_layout-zebra = gc_x.               "ALV lines cross-color display
+  gs_layout-colwidth_optimize = gc_x.   "Auto optimize column width
+  gs_layout-detail_popup = gc_x.        "Show detail screen
+
+ENDFORM.                    " ALV_LAYOUT_SET
+
+*&---------------------------------------------------------------------*
+*&      Form  ALV_OTHERS_SET
+*&---------------------------------------------------------------------*
+*       USER_COMMAND
+*----------------------------------------------------------------------*
+FORM user_command USING u_ucomm     LIKE sy-ucomm           "#EC CALLED
+                        p_selfield  TYPE slis_selfield.
+
+  DATA: ls_alv_output TYPE ty_alv_output.
+  CASE u_ucomm.
+    WHEN '&IC1'.        " SAP standard code for double-clicking
+      READ TABLE gt_alv_output INTO ls_alv_output
+        INDEX p_selfield-tabindex.
+      IF p_selfield-fieldname = 'BELNR'.
+        IF p_selfield-value IS NOT INITIAL.
+          SET PARAMETER ID 'BLN' FIELD p_selfield-value.
+          SET PARAMETER ID 'BUK' FIELD ls_alv_output-bukrs.
+          SET PARAMETER ID 'GJR' FIELD ls_alv_output-gjahr.
+          CALL TRANSACTION 'FB03' AND SKIP FIRST SCREEN.
+        ENDIF.
+      ELSEIF p_selfield-fieldname = 'NBELNR'.
+        IF p_selfield-value IS NOT INITIAL.
+          SET PARAMETER ID 'BLN' FIELD p_selfield-value.
+          SET PARAMETER ID 'BUK' FIELD ls_alv_output-bukrs.
+          SET PARAMETER ID 'GJR' FIELD ls_alv_output-gjahr.
+          CALL TRANSACTION 'FB03' AND SKIP FIRST SCREEN.
+        ENDIF.
+
+      ENDIF.
+    WHEN OTHERS.
+  ENDCASE.
+
+ENDFORM.                    " USER_COMMAND
+*&---------------------------------------------------------------------*
+*&      Form  FRM_SCREEN_CHECK
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM frm_screen_check .
+  IF s_budat-high IS INITIAL.
+    SET CURSOR FIELD 'S_BUDAT-HIGH'.
+    MESSAGE e001(00) WITH text-e72.
+  ENDIF.
+ENDFORM.                    " FRM_SCREEN_CHECK

@@ -1,0 +1,776 @@
+*&---------------------------------------------------------------------*
+*& Report  YSE_AUTOMON_VT_SAP_PARTS
+*&
+*&---------------------------------------------------------------------*
+*&
+*& Monitoring tool VisiTour vs. SAP (Spareparts)
+*&
+*&---------------------------------------------------------------------*
+*  Author                : Geert Rutten
+*  Date                  : 12.07.2013
+*  Change Request Number : CR2276
+*  Transport request Nr. : CD1K976872
+*----------------------------------------------------------------------*
+*                                                                      *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD.NR. |   DATE     | NAME               | CORRECT. NR| CHANGE REF. *
+*----------------------------------------------------------------------*
+* MOD-001 | 01.01.9999 |                    | CD1K9..... | CR....      *
+*----------------------------------------------------------------------*
+
+************************************************************************
+
+REPORT  yse_automon_vt_sap_parts.
+
+TABLES: aufk, afih, jest.
+
+* ALV grid
+TYPE-POOLS: slis.
+
+* Types
+TYPES: BEGIN OF ty_aufk,
+         aufnr        TYPE aufnr,
+         objnr        TYPE j_objnr,
+         iwerk        TYPE iwerk,
+       END OF ty_aufk.
+
+TYPES: BEGIN OF ty_jest,
+         objnr        TYPE j_objnr,
+         status       TYPE j_status,
+       END OF ty_jest.
+
+* Internal tables
+
+DATA : BEGIN OF i_prev OCCURS 0,
+
+*        text1        TYPE string,
+         text1(13)        TYPE c,
+*        servtype     TYPE yservtype,
+       END OF i_prev.
+
+DATA: BEGIN OF it_vtin  OCCURS 0,
+        line(50)   TYPE c,
+      END OF it_vtin.
+
+DATA: BEGIN OF it_vt  OCCURS 0,
+        aufnr        TYPE aufnr,
+        servtype     TYPE yservtype,
+      END OF it_vt.
+
+DATA: BEGIN OF it_out  OCCURS 0,
+        aufnr        TYPE aufnr,
+        status_vt    TYPE yservtype,
+        stat_apav    TYPE xfeld,
+        status_sap   TYPE j_stext,
+        status_usr   TYPE j_stext,
+        selkz        TYPE xfeld,
+        zzcol        TYPE col_code,
+      END OF it_out.
+
+DATA: it_aufk  TYPE HASHED TABLE OF ty_aufk
+                    WITH UNIQUE KEY aufnr
+                    WITH HEADER LINE.
+
+DATA: it_jest  TYPE HASHED TABLE OF ty_jest
+                    WITH UNIQUE KEY objnr
+                    WITH HEADER LINE.
+
+DATA: p_retcd  like sy-subrc.                  " return code
+
+* ALV
+DATA: xv_variant         LIKE disvariant,
+      xv_variant_flag    TYPE c,
+      xv_sd_alv_variant  LIKE disvariant,
+      xt_fcat            TYPE slis_t_fieldcat_alv,
+      ls_fcat            LIKE LINE OF xt_fcat,
+      xt_alv_sort        TYPE slis_t_sortinfo_alv,
+      xv_user_command    TYPE slis_formname  VALUE 'USER_COMMAND',
+      xv_variant_save    TYPE c              VALUE 'U',
+      xv_layout          TYPE slis_layout_alv,
+      xv_grid            TYPE lvc_s_glay,
+      xt_events          TYPE slis_t_event,
+      ls_events          TYPE slis_alv_event,
+      xt_event_exits     TYPE slis_t_event_exit,
+      gv_error           TYPE xfeld.
+
+* Variables
+DATA: gv_status          TYPE usrflag,
+      gv_stat_line       TYPE j_stext,
+      gv_stat_line_usr   TYPE j_stext,
+      gv_count           TYPE sytabix,
+      gv_col(10)         TYPE n,
+      gv_repid           LIKE sy-repid,
+      gv_answer          TYPE c,
+      gv_text            TYPE char80,
+      gv_stat_apav       TYPE xfeld,
+      gv_flag            TYPE xfeld,
+      gv_objnr           TYPE j_objnr,
+      gv_aufpl           TYPE co_aufpl,
+      wa_jest            TYPE jest,
+      gv_cnt_sent        TYPE i,
+      gv_mode(1)         TYPE c  VALUE 'N'.
+
+DATA: g_directory TYPE EPSF-EPSDIRNAM VALUE '/var/load/xxx/UK/read/',
+      g_ofile         LIKE /sapdmc/lsoinp-filename,
+      p_logsys        LIKE tbdlst-logsys,
+      g_pfile  like      EPSF-EPSFILNAM.
+
+* Constants
+CONSTANTS:  c_e                         VALUE 'E',
+            c_s                         VALUE 'S',
+            c_x                         VALUE 'X',
+            c_msgty_e                   VALUE 'E',
+            c_msgty_s                   VALUE 'S',
+            c_msgty_w                   VALUE 'W',
+            c_blank                     VALUE ' ',
+            c_0010(4)                   VALUE '0010',
+            c_stat_apav  TYPE j_status  VALUE 'E0010',
+            c_stat_clsd  TYPE j_status  VALUE 'I0046'.
+
+
+*&---------------------------------------------------------------------*
+*&  Selection screen                                                   *
+*&---------------------------------------------------------------------*
+* Input file
+PARAMETERS: p_infile TYPE  epsfilnam LOWER CASE OBLIGATORY,
+*                 DEFAULT 'C:\VT.MONITOR_PARTS.xls'.
+            p_mdate     TYPE  filemoddat DEFAULT sy-datum OBLIGATORY.
+
+
+* Get the filename
+*  PERFORM get_filename USING p_infile.
+
+
+*&---------------------------------------------------------------------*
+*&  Main program                                                       *
+*&---------------------------------------------------------------------*
+START-OF-SELECTION.
+
+* Read input file from Visitour
+  PERFORM read_file.
+
+* Get SAP data
+  PERFORM get_sap_data.
+
+* Compare input from VisiTour with SEO in SAP
+  PERFORM compare_data.
+
+* Display differences
+  IF it_out[] IS INITIAL.
+*    MESSAGE i001(00) WITH 'No differences found'(i01).
+  ELSE.
+     PERFORM send_parts_vt.
+*    PERFORM alv_fcat.
+*    PERFORM alv_layout.
+*    PERFORM alv_events.
+*    PERFORM alv_display.
+  ENDIF.
+
+*&---------------------------------------------------------------------*
+*&  Forms                                                              *
+*&---------------------------------------------------------------------*
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_FILENAME
+*&---------------------------------------------------------------------*
+*       Get the filename
+*----------------------------------------------------------------------*
+*      -->P_INFILE : Input file
+*----------------------------------------------------------------------*
+FORM get_filename  USING    p_infile.
+
+  CALL FUNCTION 'WS_FILENAME_GET'
+    EXPORTING
+      def_path         = 'C:\'
+      mask             = ',*.TXT.'
+    IMPORTING
+      filename         = p_infile
+    EXCEPTIONS
+      inv_winsys       = 1
+      no_batch         = 2
+      selection_cancel = 3
+      selection_error  = 4
+      OTHERS           = 5.
+
+  IF sy-subrc <> 0.
+  ENDIF.
+
+ENDFORM.                    " GET_FILENAME
+
+*&---------------------------------------------------------------------*
+*&      Form  READ_FILE
+*&---------------------------------------------------------------------*
+*       Read input file
+*----------------------------------------------------------------------*
+FORM read_file .
+
+* Logical system
+  CALL FUNCTION 'OWN_LOGICAL_SYSTEM_GET'
+    IMPORTING
+      own_logical_system             = p_logsys
+    EXCEPTIONS
+      own_logical_system_not_defined = 1
+      OTHERS                         = 2.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE 'E' NUMBER sy-msgno
+         WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+    STOP.
+  ENDIF.
+
+  REPLACE 'xxx' IN g_directory WITH p_logsys(3).
+  CONCATENATE g_directory p_infile into g_pfile.
+
+* Check the date of the file
+  PERFORM check_date.
+  IF NOT gv_error IS INITIAL.
+    STOP.
+  ENDIF.
+
+* FILE READ FROM APPLICATION SERVER
+  PERFORM get_from_appl TABLES  i_prev
+                        USING   g_pfile
+                                p_retcd.
+
+
+** Read EXCEL file
+*  CALL FUNCTION 'FAA_FILE_UPLOAD_EXCEL'
+*    EXPORTING
+*      i_filename                 = p_infile
+**      I_TEST                     =
+**      I_UCOMM                    =
+**      I_MAXCOLS                  =
+*      i_delimiter                = '|'
+*    TABLES
+*      et_filecontent             = it_vtin
+*    EXCEPTIONS
+*      error_accessing_file       = 1
+*      OTHERS                     = 2
+*            .
+*  IF sy-subrc <> 0.
+**   MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+**           WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+*  ENDIF.
+*
+* Store in an internal table
+
+  LOOP AT i_prev.
+    CLEAR it_vt.
+    SPLIT i_prev AT cl_abap_char_utilities=>horizontal_tab  INTO it_vt-aufnr it_vt-servtype.
+    PERFORM add_zeros USING it_vt-aufnr.
+    APPEND it_vt.
+  ENDLOOP.
+
+  SORT it_vt BY aufnr.
+
+ENDFORM.                    " READ_FILE
+
+*&---------------------------------------------------------------------*
+*&      Form  ADD_ZEROS
+*&---------------------------------------------------------------------*
+*       Add leading zeros
+*----------------------------------------------------------------------*
+*      -->P_FIELD : field
+*----------------------------------------------------------------------*
+FORM add_zeros  USING    p_field.
+
+  CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+    EXPORTING
+      input  = p_field
+    IMPORTING
+      output = p_field.
+
+ENDFORM.                    " ADD_ZEROS
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_SAP_DATA
+*&---------------------------------------------------------------------*
+*       Get SAP data for Service Orders
+*----------------------------------------------------------------------*
+FORM get_sap_data .
+
+* Get Service Order Header data
+  SELECT s~aufnr s~objnr h~iwerk INTO TABLE it_aufk
+         FROM aufk AS s
+         INNER JOIN afih AS h
+                         ON h~aufnr = s~aufnr
+         FOR ALL ENTRIES IN it_vt
+         WHERE s~aufnr = it_vt-aufnr.
+
+  CHECK NOT it_aufk[] IS INITIAL.
+
+* Get Status data (for status 'Closed')
+  SELECT objnr stat INTO TABLE it_jest
+         FROM jest
+         FOR ALL ENTRIES IN it_aufk
+         WHERE objnr = it_aufk-objnr
+           AND stat  = c_stat_clsd
+           AND inact = ' '.
+
+ENDFORM.                    " GET_SAP_DATA
+
+*&---------------------------------------------------------------------*
+*&      Form  COMPARE_DATA
+*&---------------------------------------------------------------------*
+*       Compare input from VisiTour with SEO in SAP
+*----------------------------------------------------------------------*
+FORM compare_data .
+
+  LOOP AT it_vt.
+*   Progress indicator
+    gv_text = 'Order & is being processed'(i02).
+    REPLACE '&' WITH it_vt-aufnr INTO gv_text.
+    CONDENSE gv_text.
+    CALL FUNCTION 'SAPGUI_PROGRESS_INDICATOR'
+      EXPORTING
+        text = gv_text.
+
+*   Get Service Order Header data (SAP)
+    CLEAR it_aufk.
+    READ TABLE it_aufk WITH TABLE KEY aufnr = it_vt-aufnr.
+    CHECK sy-subrc = 0.
+    gv_objnr = it_aufk-objnr.
+
+*   Get status 'Closed'
+    CLEAR it_jest.
+    READ TABLE it_jest WITH TABLE KEY objnr = gv_objnr.
+    CHECK sy-subrc NE 0.
+
+*   Get status 'All parts available'
+    PERFORM get_stat_apav.
+    IF NOT gv_stat_apav IS INITIAL.
+*     Get status line (System)
+      PERFORM get_status_line.
+*     Fill internal table for output
+      PERFORM fill_output.
+    ENDIF.
+
+  ENDLOOP.
+
+ENDFORM.                    " COMPARE_DATA
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_STAT_APAV
+*&---------------------------------------------------------------------*
+*       Get status 'All parts available'
+*----------------------------------------------------------------------*
+FORM get_stat_apav .
+
+  CLEAR gv_stat_apav.
+
+* Get status APAV (All parts available)
+  CALL FUNCTION 'STATUS_CHECK'
+    EXPORTING
+      objnr             = gv_objnr
+      status            = c_stat_apav
+    EXCEPTIONS
+      object_not_found  = 1
+      status_not_active = 2
+      OTHERS            = 3.
+
+  IF sy-subrc = 0.
+    gv_stat_apav = 'X'.
+    RETURN.
+  ELSE.
+*    MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*            WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+  ENDIF.
+
+ENDFORM.                    " GET_STAT_APAV
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_STATUS_LINE
+*&---------------------------------------------------------------------*
+*       Get status line (System)
+*----------------------------------------------------------------------*
+FORM get_status_line .
+
+  CLEAR: gv_stat_line,
+         gv_stat_line_usr.
+
+  CALL FUNCTION 'STATUS_TEXT_EDIT'
+    EXPORTING
+      client                  = sy-mandt
+      flg_user_stat           = 'X'
+      objnr                   = it_aufk-objnr
+      only_active             = 'X'
+      spras                   = c_e
+*      BYPASS_BUFFER           = ' '
+    IMPORTING
+*      ANW_STAT_EXISTING       =
+*      E_STSMA                 =
+      line                    = gv_stat_line
+      user_line               = gv_stat_line_usr
+*      STONR                   =
+   EXCEPTIONS
+     object_not_found        = 1
+     OTHERS                  = 2
+            .
+  IF sy-subrc <> 0.
+* MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*         WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+  ENDIF.
+
+ENDFORM.                    " GET_STATUS_LINE
+
+*&---------------------------------------------------------------------*
+*&      Form  FILL_OUTPUT
+*&---------------------------------------------------------------------*
+*       Fill internal table for output
+*----------------------------------------------------------------------*
+FORM fill_output .
+
+  it_out-aufnr      = it_vt-aufnr.
+  it_out-status_vt  = it_vt-servtype.
+  it_out-stat_apav  = gv_stat_apav.
+  it_out-status_sap = gv_stat_line.
+  it_out-status_usr = gv_stat_line_usr.
+  APPEND it_out.
+
+ENDFORM.                    " FILL_OUTPUT
+
+*&---------------------------------------------------------------------*
+*&      Form  ALV_FCAT
+*&---------------------------------------------------------------------*
+*       ALV field catalog
+*----------------------------------------------------------------------*
+*FORM alv_fcat .
+*
+*** Create Fieldcatalogue from internal table
+*** CALL FUNCTION 'REUSE_ALV_FIELDCATALOG_MERGE' ...
+*
+*  CLEAR gv_col.
+*
+** Field definitions
+*  PERFORM add_field USING 'AUFNR'      12 'Service Order'(t01)  'X'.
+*  PERFORM add_field USING 'STATUS_VT'  10 'Status VT'(t02)      ' '.
+*  PERFORM add_field USING 'STAT_APAV'  15 'Status APAV'(t03)    ' '.
+*  PERFORM add_field USING 'STATUS_SAP' 40 'Status (SAP)'(t04)   ' '.
+*  PERFORM add_field USING 'STATUS_USR' 40 'Status (User)'(t05)  ' '.
+*
+*ENDFORM.                    " ALV_FCAT
+
+*&---------------------------------------------------------------------*
+*&      Form  ADD_FIELD
+*&---------------------------------------------------------------------*
+*       Add field to field catalog
+*----------------------------------------------------------------------*
+*FORM add_field  USING    p_field
+*                         p_len
+*                         p_descr
+*                         p_key.
+*
+*  gv_col = gv_col + 1.
+*
+*  CLEAR ls_fcat.
+*  ls_fcat-col_pos    = gv_col.
+*  ls_fcat-fieldname  = p_field.
+*  ls_fcat-outputlen  = p_len.
+*  ls_fcat-seltext_l  = p_descr.
+*  ls_fcat-seltext_m  = p_descr.
+*  ls_fcat-seltext_s  = p_descr.
+*  ls_fcat-fix_column = 'X'.
+*  ls_fcat-emphasize  = 'X'.
+*  ls_fcat-hotspot    = p_key.
+*  ls_fcat-key        = p_key.
+*
+** Checkbox
+*  IF p_field = 'STAT_APAV'.
+*    ls_fcat-checkbox   = 'X'.
+*  ENDIF.
+*
+** Suppress leading zeros
+*  IF p_field = 'AUFNR'.
+*    ls_fcat-edit_mask = '==ALPHA'.
+*  ENDIF.
+*
+*  APPEND ls_fcat TO xt_fcat.
+*
+*ENDFORM.                    " ADD_FIELD
+
+*&---------------------------------------------------------------------*
+*&      Form  ALV_LAYOUT
+*&---------------------------------------------------------------------*
+*       Modify ALV layout
+*----------------------------------------------------------------------*
+*FORM alv_layout .
+*
+** Define layout
+*  xv_layout-zebra               = c_x.
+*  xv_layout-get_selinfos        = c_x.
+*  xv_layout-detail_popup        = c_x.
+*  xv_layout-box_fieldname       = 'SELKZ'.
+*  xv_layout-no_keyfix           = c_x.
+*  xv_layout-group_change_edit   = c_x.
+*  xv_layout-info_fieldname      = 'ZZCOL'.
+**  xv_layout-totals_before_items = c_x.
+**  xv_layout-key_hotspot         = c_x.
+**  xv_layout-colwidth_optimize   = c_x.
+**  xv_layout-smalltitle          = c_x.
+**  xv_layout-grid_title          = 'title'.
+*
+** Define grid settings
+*  xv_grid-coll_end_l = c_x.
+*
+*ENDFORM.                    " ALV_LAYOUT
+
+*&---------------------------------------------------------------------*
+*&      Form  ALV_EVENTS
+*&---------------------------------------------------------------------*
+*       Define ALV events
+*----------------------------------------------------------------------*
+*FORM alv_events .
+*
+** Fill events
+*  ls_events-form = ls_events-name = 'USER_COMMAND'.
+*  APPEND ls_events TO xt_events.
+*  ls_events-form = ls_events-name = 'PF_STATUS_SET'.
+*  APPEND ls_events TO xt_events.
+*
+*ENDFORM.                    " ALV_EVENTS
+
+*&---------------------------------------------------------------------*
+*&      Form  USER_COMMAND
+*&---------------------------------------------------------------------*
+*       User Command callback routine for ALV
+*----------------------------------------------------------------------*
+*FORM user_command USING r_ucomm LIKE sy-ucomm
+*                        rs_selfield TYPE slis_selfield.
+*
+*  CASE r_ucomm.
+*
+*    WHEN 'SEND_VT'.
+**     Send spareparts info to VisiTour
+*      PERFORM send_parts_vt.
+*      rs_selfield-refresh = c_x.
+*
+*    WHEN '&IC1'.
+**     Selection
+*      IF NOT rs_selfield-value IS INITIAL.
+*        CASE rs_selfield-fieldname.
+*          WHEN 'AUFNR'.
+**           Display Service Order
+*            SET PARAMETER ID 'ANR' FIELD rs_selfield-value.
+*            CALL TRANSACTION 'IW33' AND SKIP FIRST SCREEN.
+*        ENDCASE.
+*      ENDIF.
+*
+*  ENDCASE.
+*
+*ENDFORM.                    " user_command
+
+*&---------------------------------------------------------------------*
+*&      Form  PF_STATUS_SET
+*&---------------------------------------------------------------------*
+*       PF-status callback routine for ALV
+*----------------------------------------------------------------------*
+*FORM pf_status_set USING rt_extab TYPE slis_t_extab.
+*
+*  SET PF-STATUS 'YSE_MON'.
+*
+*ENDFORM.                    " PF_STATUS_SET
+
+*&---------------------------------------------------------------------*
+*&      Form  ALV_DISPLAY
+*&---------------------------------------------------------------------*
+*       Display ALV grid
+*----------------------------------------------------------------------*
+*FORM alv_display .
+*
+**  xv_sd_alv_variant = xv_variant.
+*  gv_repid = sy-repid.
+*
+*  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+*    EXPORTING
+*      i_callback_program      = gv_repid
+*      i_callback_user_command = xv_user_command
+**      i_callback_top_of_page  = 'ALV_TOP'
+*      i_grid_title            = 'Monitoring VisiTour vs. SAP (Parts)'(h01)
+*      is_layout               = xv_layout
+*      it_fieldcat             = xt_fcat
+*      i_grid_settings         = xv_grid
+*      it_events               = xt_events
+*      it_sort                 = xt_alv_sort
+*      i_default               = 'X'
+*      i_save                  = 'A'
+**      is_variant              = xv_sd_alv_variant
+*      i_screen_start_column   = 0
+*      i_screen_start_line     = 0
+*      i_screen_end_column     = 0
+*      i_screen_end_line       = 0
+*    TABLES
+*      t_outtab                = it_out
+*    EXCEPTIONS
+*      program_error           = 1
+*      OTHERS                  = 2.
+*
+*  IF sy-subrc NE 0.
+**   message id sy-msgid type sy-msgty number sy-msgno
+**           with sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+*  ENDIF.
+*
+*ENDFORM.                    " ALV_DISPLAY
+
+*&---------------------------------------------------------------------*
+*&      Form  SEND_PARTS_VT
+*&---------------------------------------------------------------------*
+*       (Re)Send spareparts info to VisiTour
+*----------------------------------------------------------------------*
+FORM send_parts_vt .
+
+* Records selected ?
+*  LOOP AT it_out WHERE selkz = c_x.
+*    EXIT.
+*  ENDLOOP.
+*  CHECK sy-subrc = 0.
+*
+** Confirm reprocessing
+*  CALL FUNCTION 'POPUP_TO_CONFIRM'
+*    EXPORTING
+*      titlebar              = text-h01
+*      text_question         = text-q01
+*      icon_button_1         = 'ICON_OKAY'
+*      icon_button_2         = 'ICON_CANCEL'
+*      default_button        = '2'
+*      display_cancel_button = space
+*    IMPORTING
+*      answer                = gv_answer
+*    EXCEPTIONS
+*      text_not_found        = 1
+*      OTHERS                = 2.
+*  IF sy-subrc <> 0.
+*    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+*            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+*  ENDIF.
+*
+*  CHECK gv_answer = '1'.
+*
+*  CLEAR gv_cnt_sent.
+
+* Loop on the selected records
+  LOOP AT it_out.
+
+*   Progress indicator
+    gv_text = 'Order & is being processed'(i02).
+    REPLACE '&' WITH it_out-aufnr INTO gv_text.
+    CONDENSE gv_text.
+    CALL FUNCTION 'SAPGUI_PROGRESS_INDICATOR'
+      EXPORTING
+        text = gv_text.
+
+*   Get SAP data
+    READ TABLE it_aufk WITH TABLE KEY aufnr = it_vt-aufnr.
+    CHECK sy-subrc = 0.
+
+*   (Re)Send data to VisiTour
+    CALL FUNCTION 'YSE_VT_OUT_CALL'
+      EXPORTING
+        im_trtyp = c_s
+        im_aufnr = it_out-aufnr
+        im_vornr = c_0010
+        im_plant = it_aufk-iwerk
+      IMPORTING
+        ex_flag  = gv_flag.
+
+*   Send OK ?
+    IF gv_flag = 'X'.
+*     Count
+      gv_cnt_sent = gv_cnt_sent + 1.
+*     Remove from table
+      DELETE it_out.
+    ENDIF.
+
+  ENDLOOP.
+
+  MESSAGE i001(00) WITH 'Number of Orders sent to VisiTour :'(i03)
+                        gv_cnt_sent.
+
+ENDFORM.                    " SEND_PARTS_VT
+*
+FORM get_from_appl TABLES i_infile STRUCTURE i_prev
+                   USING p_infile p_subrc.
+
+  OPEN DATASET p_infile FOR INPUT IN TEXT MODE ENCODING DEFAULT.
+  IF sy-subrc <> 0.
+    write: / text-e03, p_infile.
+    p_subrc = 4.
+    exit.
+  ENDIF.
+
+  refresh i_infile.
+
+  DO.
+    READ DATASET p_infile INTO i_infile.
+    IF sy-subrc <> 0.
+      EXIT.
+    ENDIF.
+    APPEND i_infile.
+  ENDDO.
+  CLOSE DATASET p_infile.
+
+ENDFORM.                    " GET_FROM_APPL
+
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_DATE
+*&---------------------------------------------------------------------*
+*       Check the date of the file
+*----------------------------------------------------------------------*
+FORM check_date .
+
+  DATA: ls_epsf     TYPE epsf,
+        lv_mtime    TYPE p  DECIMALS 0,
+        lv_time(10) TYPE c,
+        lv_mdate    TYPE sydatum.
+
+  CLEAR gv_error.
+
+  CALL FUNCTION 'EPS_GET_FILE_ATTRIBUTES'
+    EXPORTING
+      file_name                    = p_infile
+      dir_name                     = g_directory
+    IMPORTING
+      file_mtime                   = lv_mtime
+    EXCEPTIONS
+      read_directory_failed        = 1
+      read_attributes_failed       = 2
+      OTHERS                       = 3
+            .
+  IF sy-subrc <> 0.
+*    MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*            WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+  ENDIF.
+
+  PERFORM p6_to_date_time_tz IN PROGRAM rstr0400
+                             USING lv_mtime
+                                   lv_time
+                                   lv_mdate.
+
+  IF lv_mdate NE p_mdate.
+    MESSAGE ID 'YSE_GENERAL' TYPE 'E' NUMBER '000'
+            WITH 'Wrong date of input file'(e02) lv_mdate.
+    gv_error = c_x.
+  ENDIF.
+
+ENDFORM.                    " CHECK_DATE
+
+*Text symbol text£º
+*002:Remarks
+*C01:* If started in background, files are stored on the application server
+*C02:* /var/load/xxx/UK/read/
+*C03:* xxx = logical system
+*E02:Wrong date of input file
+*H01:Monitoring VisiTour vs. SAP (Parts)
+*I01:No differences found
+*I02:Order & is being processed
+*I03:Number of Orders sent to VisiTour :
+*Q01:You are about send the selected Service Orders to VisiTour. Are you sure to continue ?
+*T01:Service Order
+*T02:Status VT
+*T03:Status APAV
+*T04:Status (SAP)
+
+*T05:Status (User)
+*Selection text£º
+*P_INFILE:        Input fileName
+*P_MDATE:        Date of last change

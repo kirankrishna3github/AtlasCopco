@@ -1,0 +1,546 @@
+report YAM_UPD_EQUIPM_USERSTAT_BTCI
+       NO STANDARD PAGE HEADING
+       LINE-SIZE 270
+       MESSAGE-ID yam_dc.
+*----------------------------------------------------------------------*
+* PROGRAM ID           : YAM_UPD_EQUIPM_USERSTAT_BTCI                  *
+* PROGRAM TITLE        : AM: Equipment update userstatuses             *
+* AUTHOR               : Luc Mertens                                   *
+* DATE                 : 14/06/2006                                    *
+* DEVELOPMENT ID       : ES-CR001                                      *
+*                                                                      *
+* CHANGE REQUEST NUMBER: CD1K905836                                    *
+*                                                                      *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME     |CORRECTION NUMBER| CHANGE REFERENCE # *
+*----------------------------------------------------------------------*
+* MOD-001 | xxxx.xx.xx | xxxxxxxxxxxxxxxxx |xxxxxxxxxx |xxxxxxxxxxxxx| *
+************************************************************************
+* Program Description:  Update userstatuses, manufacturer and cust.    *
+*                       warranty enddate                               *
+*                       all equipments on inputfile will be updated !! *
+************************************************************************
+*---------------------------------------------------------------------*
+* TABLE DECLARATION
+*---------------------------------------------------------------------*
+Tables: /sapdmc/lsmemory,     " DEFAULT VALUES FOR PROJ,SUBPROJ,OBJECT
+        yd035.
+
+*---------------------------------------------------------------------*
+* CONSTANTS                                                           *
+*---------------------------------------------------------------------*
+CONSTANTS: c_filetype(10)   TYPE c VALUE 'ASC',     " FILE TYPE
+           c_rb_pre         TYPE c VALUE  ' ',      " SPACE
+           c_stat_znos(4)   type c value 'ZNOS',    " Status ZNOS
+           c_stat_ztem(4)   type c value 'ZTEM',    " Status ZTEM
+           c_x              TYPE c VALUE 'X'.       " CHECKED
+
+*---------------------------------------------------------------------*
+* CONSTANT DECLARATIONS FOR BDC
+*
+*---------------------------------------------------------------------*
+CONSTANTS : c_group     LIKE apqi-groupid VALUE 'Y_IE02_STATU',
+            c_trans     LIKE tstc-tcode   VALUE 'IE02'.
+
+*---------------------------------------------------------------------*
+* TYPES                                                               *
+*---------------------------------------------------------------------*
+TYPES: BEGIN OF ty_upload,
+         v_text(500)   TYPE c,            " FILE UPLOAD TEXT
+       END OF ty_upload.
+
+*---------------------------------------------------------------------*
+* INTERNAL TABLES                                                     *
+*---------------------------------------------------------------------*
+DATA: gt_upload TYPE STANDARD TABLE OF ty_upload
+                INITIAL SIZE 0 WITH HEADER LINE.
+
+data: begin of gt_irec occurs 0.
+        include structure yd035.
+data:  end of gt_irec.
+
+DATA: i_bdcdata LIKE bdcdata OCCURS 0 WITH HEADER LINE,
+      struct_bdcdata TYPE bdcdata.
+
+DATA : begin of gt_stat occurs 0,
+         equnr   type equnr,
+         zzequi_stat  like yd035-zzequi_stat,
+       end of gt_stat.
+
+*---------------------------------------------------------------------*
+* VARIABLES                                                           *
+*---------------------------------------------------------------------*
+DATA: p_infile      LIKE /sapdmc/lsoinp-filename, " FILE
+      g_scr_fld(20) TYPE c,
+      g_gwlen       type d,                     " date in user format
+      g_inbdt       type d,                     " date in user format
+      g_pos(2)      type n.                     " position of user stat
+
+
+*- START_OF_SELECTION   -----------------------------------------------*
+start-of-selection.
+
+* - GET THE FILENAME OF THE CONVERT FILE AND
+* - IMPORT /SAPDMC/LSMEMORY FROM MEMORY ID '/SAPDMC/LSMW'.
+
+  IMPORT /sapdmc/lsmemory FROM MEMORY ID '/SAPDMC/LSMW'.
+
+  PERFORM get_lsmw IN PROGRAM yam_common_routines
+                    USING  /sapdmc/lsmemory-project
+                           /sapdmc/lsmemory-subproj
+                           /sapdmc/lsmemory-object
+                           c_x
+                   CHANGING p_infile.
+
+  IF sy-subrc <> 0.
+    MESSAGE e007.
+  ENDIF.
+
+* - READ INPUT FILE FROM PRES/APPL SERVER INTO INTERNAL TABLE
+  PERFORM get_input_file.
+
+* - MOVE INTERNAL TABLE RECORDS INTO FINAL RECORDS
+  PERFORM fill_rec.
+
+*---------------------------------------------------------------------*
+* END-OF-SELECTION               - END OF DATABASE ACCESS             *
+*---------------------------------------------------------------------*
+END-OF-SELECTION.
+
+*&---------------------------------------------------------------------*
+*&      FORM  GET_INPUT_FILE
+*&---------------------------------------------------------------------*
+*       TEXT
+*----------------------------------------------------------------------*
+*  -->  P1        TEXT
+*  <--  P2        TEXT
+*----------------------------------------------------------------------*
+FORM get_input_file .
+
+  IF c_rb_pre = c_x.
+* FILE READ FROM PRESENTATION SERVER
+    PERFORM get_from_pres IN PROGRAM yam_common_routines
+                                    TABLES  gt_upload
+                                    USING   p_infile
+                                            c_filetype
+                                            c_x.
+  ELSE.
+* - FILE READ FROM APPLICATION SERVER
+    PERFORM get_from_appl IN PROGRAM yam_common_routines
+                                     TABLES gt_upload
+                                     USING  p_infile.
+
+  ENDIF.
+
+ENDFORM.                    " GET_INPUT_FILE
+
+*&---------------------------------------------------------------------*
+*&      FORM  FILL_REC
+*&---------------------------------------------------------------------*
+*   MOVE DATA INTO FINAL FILES
+*----------------------------------------------------------------------*
+*  -->  P1        TEXT
+*  <--  P2        TEXT
+*----------------------------------------------------------------------*
+FORM fill_rec.
+
+* - PASS THE RECORDS FROM FILE TO A COMMON INTERNAL TABLE
+  LOOP AT gt_upload.
+    move gt_upload-v_text+00(18) to gt_irec-equnr.
+    move gt_upload-v_text+18(30) to gt_irec-herst.
+    move gt_upload-v_text+48(08) to gt_irec-gwlen_o.
+    move gt_upload-v_text+56(04) to gt_irec-zzequi_stat.
+    move gt_upload-v_text+60(08) to gt_irec-stsma.
+    move gt_upload-v_text+68(08) to gt_irec-inbdt.
+    APPEND gt_irec.
+
+* - PASS THE RECORDS FROM FILE TO THE STATUS INTERNAL TABLE
+    move-corresponding gt_irec to gt_stat.
+    append gt_stat.
+    clear gt_stat.
+  endloop.
+
+* - SORT THE HEADER INTERNAL TABLE AND DELETE THE DUPLICATES
+  SORT gt_irec BY equnr.
+  DELETE ADJACENT DUPLICATES FROM gt_irec COMPARING equnr.
+
+* - sort internal table with statuses
+  sort gt_stat by equnr zzequi_stat.
+
+* - CHECK IF HEADER IS NOT BLANK
+  IF NOT gt_irec[] IS INITIAL.
+
+    perform open_group.
+
+    LOOP AT gt_irec.
+
+* -   CHECK FOR THE EXISTING SERVICE CONTRACTS
+      PERFORM change_equipm.
+
+    ENDLOOP.
+
+    perform close_group.
+
+  ENDIF.
+
+ENDFORM.                    " FILL_REC
+
+*&---------------------------------------------------------------------*
+*&   FORM CHANGE_EQUIPM
+*&---------------------------------------------------------------------*
+*       TEXT
+*----------------------------------------------------------------------*
+*  -->  P1        TEXT
+*  <--  P2        TEXT
+*----------------------------------------------------------------------*
+FORM change_equipm.
+
+  PERFORM bdc_filldata.
+  perform bdc_transaction using c_trans.
+  refresh i_bdcdata.
+
+ENDFORM.            "change_equipm.
+
+*&---------------------------------------------------------------------*
+*&      Form  bdc_filldata
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM bdc_filldata .
+
+* first screen
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                     USING: 'SAPMIEQ0' '0100' 'X' ' ' ' '
+                     CHANGING struct_bdcdata.
+
+  APPEND struct_bdcdata TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                     USING: '' '' '' 'RM63E-EQUNR' gt_irec-equnr
+                     CHANGING struct_bdcdata.
+
+  APPEND struct_bdcdata TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                      USING: '' '' '' 'BDC_OKCODE' '/00'
+                      CHANGING struct_bdcdata.
+
+  APPEND struct_bdcdata TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+* second screen - general data
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                     USING: 'SAPMIEQ0' '0101' 'X' ' ' ' '
+                     CHANGING struct_bdcdata.
+
+  APPEND struct_bdcdata TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  if NOT gt_irec-inbdt is initial.
+    write gt_irec-inbdt to g_inbdt.
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                   USING: '' '' '' 'ITOB-INBDT' g_inbdt
+                    CHANGING struct_bdcdata.
+
+    APPEND struct_bdcdata TO i_bdcdata.
+    CLEAR  struct_bdcdata.
+  endif.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                     USING: '' '' '' 'ITOB-HERST' gt_irec-herst
+                     CHANGING struct_bdcdata.
+
+  APPEND struct_bdcdata TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                      USING: '' '' '' 'BDC_OKCODE' '=T\05'
+                      CHANGING struct_bdcdata.
+
+  APPEND struct_bdcdata TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+* 3rd screen - partner & warranty
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                     USING: 'SAPMIEQ0' '0101' 'X' ' ' ' '
+                     CHANGING struct_bdcdata.
+
+  APPEND struct_bdcdata TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  if NOT gt_irec-gwlen_o is initial.
+    write gt_irec-gwlen_o to g_gwlen.
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                   USING: '' '' '' 'WCHECK_V_H-GWLEN_O' g_gwlen
+                    CHANGING struct_bdcdata.
+
+    APPEND struct_bdcdata TO i_bdcdata.
+    CLEAR  struct_bdcdata.
+  endif.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                      USING: '' '' '' 'BDC_OKCODE' '=SU'
+                      CHANGING struct_bdcdata.
+
+  APPEND struct_bdcdata TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+* 4th screen - status
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                     USING: 'SAPLBSVA' '0300' 'X' ' ' ' '
+                     CHANGING struct_bdcdata.
+
+  APPEND struct_bdcdata TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                  USING: '' '' '' 'JOSTD-STSMA' gt_irec-stsma
+                  CHANGING struct_bdcdata.
+
+  APPEND struct_bdcdata TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                      USING: '' '' '' 'BDC_OKCODE' '/00'
+                      CHANGING struct_bdcdata.
+
+  APPEND struct_bdcdata TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+* popup - confirm status profile change
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                     USING: 'SAPLSPO1' '0500' 'X' ' ' ' '
+                     CHANGING struct_bdcdata.
+
+  APPEND struct_bdcdata TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                      USING: '' '' '' 'BDC_OKCODE' '=OPT1'
+                      CHANGING struct_bdcdata.
+
+  APPEND struct_bdcdata TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+* 4th screen - status
+  loop at gt_stat where
+               equnr eq gt_irec-equnr.
+
+    if gt_stat-zzequi_stat > c_stat_znos.
+
+      PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                         USING: 'SAPLBSVA' '0300' 'X' ' ' ' '
+                         CHANGING struct_bdcdata.
+
+      APPEND struct_bdcdata TO i_bdcdata.
+      CLEAR  struct_bdcdata.
+
+      PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                      USING: '' '' '' 'BDC_CURSOR' 'JOSTD-STSMA'
+                      CHANGING struct_bdcdata.
+
+      APPEND struct_bdcdata TO i_bdcdata.
+      CLEAR  struct_bdcdata.
+
+      PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                          USING: '' '' '' 'BDC_OKCODE' '=O+'
+                          CHANGING struct_bdcdata.
+
+      APPEND struct_bdcdata TO i_bdcdata.
+      CLEAR  struct_bdcdata.
+
+      if gt_stat-zzequi_stat > c_stat_ztem.
+
+        PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                           USING: 'SAPLBSVA' '0300' 'X' ' ' ' '
+                           CHANGING struct_bdcdata.
+
+        APPEND struct_bdcdata TO i_bdcdata.
+        CLEAR  struct_bdcdata.
+
+        PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                        USING: '' '' '' 'BDC_CURSOR' 'JOSTD-STSMA'
+                        CHANGING struct_bdcdata.
+
+        APPEND struct_bdcdata TO i_bdcdata.
+        CLEAR  struct_bdcdata.
+
+        PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                            USING: '' '' '' 'BDC_OKCODE' '=O+'
+                            CHANGING struct_bdcdata.
+
+        APPEND struct_bdcdata TO i_bdcdata.
+        CLEAR  struct_bdcdata.
+
+      endif.
+
+    endif.
+
+    perform determine_pos_stat.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                       USING: 'SAPLBSVA' '0300' 'X' ' ' ' '
+                       CHANGING struct_bdcdata.
+
+    APPEND struct_bdcdata TO i_bdcdata.
+    CLEAR  struct_bdcdata.
+
+    clear g_scr_fld.
+    concatenate 'J_STMAINT-ANWSO(' g_pos ')' into g_scr_fld.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                       USING: '' '' '' g_scr_fld 'X'
+                       CHANGING struct_bdcdata.
+
+    APPEND struct_bdcdata TO i_bdcdata.
+    CLEAR  struct_bdcdata.
+
+  endloop.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                      USING: '' '' '' 'BDC_OKCODE' '=BACK'
+                      CHANGING struct_bdcdata.
+
+  APPEND struct_bdcdata TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+* save changes
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                     USING: 'SAPMIEQ0' '0101' 'X' ' ' ' '
+                     CHANGING struct_bdcdata.
+
+  APPEND struct_bdcdata TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                      USING: '' '' '' 'BDC_OKCODE' '=BU'
+                      CHANGING struct_bdcdata.
+
+  APPEND struct_bdcdata TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+ENDFORM.        "bdc_filldata
+
+*&---------------------------------------------------------------------*
+*&      FORM  DETERMINE_POS_STAT
+*&---------------------------------------------------------------------*
+*       TEXT
+*----------------------------------------------------------------------*
+*  -->  P1        TEXT
+*  <--  P2        TEXT
+*----------------------------------------------------------------------*
+FORM DETERMINE_POS_STAT.
+
+* test user status
+  case gt_stat-ZZEQUI_STAT.
+    when 'ZDMA' or 'ZNOW'.
+      g_pos = 1.
+    when 'ZEXP' or 'ZOOO'.
+      g_pos = 2.
+    when 'ZIMP' or 'ZSCR'.
+      g_pos = 3.
+    when 'ZIND' or 'ZSHA'.
+      g_pos = 4.
+    when 'ZNOC' or 'ZSTO' or 'ZUNK'.
+      g_pos = 5.
+    when 'ZNOS' or 'ZTEM' or 'ZWWC'.
+      g_pos = 6.
+    when others.
+      g_pos = 1.
+  endcase.
+
+ENDFORM.                    " DETERMINE_POS_STAT
+*&---------------------------------------------------------------------*
+*&      Form  BDC_TRANSACTION
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_C_TRANS  text
+*----------------------------------------------------------------------*
+FORM bdc_transaction USING p_c_trans.
+
+  CALL FUNCTION 'BDC_INSERT'
+    EXPORTING
+      tcode            = p_c_trans
+    TABLES
+      dynprotab        = i_bdcdata
+    EXCEPTIONS
+      internal_error   = 1
+      not_open         = 2
+      queue_error      = 3
+      tcode_invalid    = 4
+      printing_invalid = 5
+      posting_invalid  = 6
+      OTHERS           = 7.
+
+  IF sy-subrc <> 0.
+    MESSAGE e014.
+  ENDIF.
+
+ENDFORM.                    " BDC_TRANSACTION
+
+*&---------------------------------------------------------------------*
+*&      Form  open_group
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM open_group .
+
+  CALL FUNCTION 'BDC_OPEN_GROUP'
+    EXPORTING
+      client = sy-mandt
+      group  = c_group
+      user   = sy-uname
+      keep   = ' '.
+
+  IF sy-subrc <> 0.
+    MESSAGE e013. " OPEN SESSION FAILED
+  ENDIF.
+
+ENDFORM.                    " open_group
+
+*&---------------------------------------------------------------------*
+*&      Form  close_group
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM close_group .
+
+  CALL FUNCTION 'BDC_CLOSE_GROUP'.
+
+ENDFORM.                    " close_group
+
+*Text symbol text£º
+*E00:Error opening dataset, return code:
+*I01:Session name
+*I02:Open session
+*I03:Insert transaction
+*I04:Close Session
+*I05:Return code =
+*I06:Error session created
+*S01:Session name
+*S02:User
+*S03:Keep session
+*S04:Lock date
+*S05:Processing Mode
+*S06:Update Mode
+*S07:Generate session
+*S08:Call transaction
+*S09:Error sessn
+
+*S10:Nodata indicator
+*Selection text£º
+*P_INFILE:        Input filename

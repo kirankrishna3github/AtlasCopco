@@ -1,0 +1,406 @@
+*----------------------------------------------------------------------*
+* PROGRAM ID           : YSE_VT_CHECK_STATUS                           *
+* PROGRAM TITLE        : Visitour: check status fixed but not released *
+* AUTHOR               : Marc Jacobs                                   *
+* DATE                 : 08/10/1009                                    *
+*                                                                      *
+* CHANGE REQUEST NUMBER:  CR1063 : CD1K950864                          *
+*                                                                      *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME                 |CORRNUMBER|CHANGE REF.    *
+*----------------------------------------------------------------------*
+* MOD-001 |          |                      |          |               *
+************************************************************************
+
+REPORT yse_vt_check_status MESSAGE-ID yam_re.
+
+*.................. Tables definitions................................ *
+TABLES: viauf_afvc.
+
+*.................. Variable definitions.............................. *
+TYPE-POOLS: slis.
+
+TYPES: BEGIN OF ty_caufv.
+TYPES: aufnr LIKE viauf_afvc-aufnr,
+       vornr LIKE viauf_afvc-vornr,
+       status(40) TYPE c,
+       aufpl LIKE viauf_afvc-aufpl,
+       aplzl LIKE viauf_afvc-aplzl,
+       usr10 LIKE afvu-usr10,
+       usr11 LIKE afvu-usr11,
+       selkz TYPE selkz_list,
+       END   OF ty_caufv.
+
+*.. Global variables
+DATA: gt_caufv    TYPE STANDARD TABLE OF ty_caufv WITH HEADER LINE.
+
+DATA: BEGIN OF gt_aufnr OCCURS 0,
+        aufnr TYPE aufnr,
+      END OF gt_aufnr.
+
+DATA: gt_errmsg  TYPE TABLE OF bdcmsgcoll,
+      wa_errmsg  LIKE LINE OF gt_errmsg.
+
+DATA: BEGIN OF h_status_tab OCCURS 20.
+        INCLUDE STRUCTURE jstat.
+DATA: END OF h_status_tab.
+
+DATA: lt_fieldcat TYPE slis_t_fieldcat_alv.
+DATA: gv_txt04(4) TYPE c,
+      gv_rel(1) TYPE c,
+      gv_objnr LIKE jest-objnr,
+      gv_usr10 LIKE afvu-usr10,
+      gv_usr11 LIKE afvu-usr11.
+
+*.. Global constants
+CONSTANTS: c_x(1)      TYPE c            VALUE 'X',
+           c_zco3(4)   TYPE c            VALUE 'ZCO3'.
+
+*.................. Layout selection screen........................... *
+PARAMETERS:
+  p_iwerk TYPE iwerk OBLIGATORY.
+
+SELECT-OPTIONS:
+  s_plgrp  FOR viauf_afvc-ingpr,
+  s_aufnr  FOR viauf_afvc-aufnr,
+  s_fsavd  FOR viauf_afvc-fsavd.
+
+*.................. Selection screen validations...................... *
+
+*.................. Main program...................................... *
+INITIALIZATION.
+**.. Prepare field catalog
+  PERFORM build_field_catlog CHANGING lt_fieldcat.
+
+START-OF-SELECTION.
+
+  PERFORM select_service_orders.
+
+  IF NOT gt_caufv[] IS INITIAL.
+    PERFORM output_list_serv.
+  ELSE.
+    MESSAGE i001(00) WITH text-i01.
+  ENDIF.
+
+*&---------------------------------------------------------------------*
+*&      Form  select_service_orders
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM select_service_orders .
+
+  REFRESH: gt_aufnr.
+
+  SELECT aufnr INTO TABLE gt_aufnr FROM afih
+    WHERE aufnr IN s_aufnr
+      AND ingpr IN s_plgrp
+      AND iwerk EQ p_iwerk
+      and iphas < '2'.
+
+  IF NOT gt_aufnr[] IS INITIAL.
+
+    REFRESH: gt_caufv.
+* select order data
+    SELECT aufnr vornr aufpl aplzl
+          INTO CORRESPONDING FIELDS OF TABLE gt_caufv
+          FROM viauf_afvc
+          FOR ALL ENTRIES IN gt_aufnr
+          WHERE aufnr EQ gt_aufnr-aufnr
+          AND   fsavd IN s_fsavd
+          AND   steus EQ c_zco3.
+
+* only order with status fixed (=field USR11 = X)
+    LOOP AT gt_caufv.
+      CLEAR : gv_usr10, gv_usr11.
+      SELECT SINGLE usr10 usr11 INTO (gv_usr10, gv_usr11)
+        FROM afvu
+        WHERE aufpl = gt_caufv-aufpl
+          AND aplzl = gt_caufv-aplzl.
+      IF gv_usr11 EQ c_x.
+        gt_caufv-usr10 = gv_usr10.
+        gt_caufv-usr11 = gv_usr11.
+
+        REFRESH: h_status_tab.
+        CLEAR gv_rel.
+        CONCATENATE 'OR' gt_caufv-aufnr INTO gv_objnr.
+        REFRESH: h_status_tab.
+*--- get active order statusses
+        CALL FUNCTION 'STATUS_READ'
+          EXPORTING
+            objnr       = gv_objnr
+            only_active = 'X'
+          TABLES
+            status      = h_status_tab
+          EXCEPTIONS
+            OTHERS      = 01.
+        CHECK sy-subrc = 0.
+*--- get order status descriptions
+        LOOP AT h_status_tab WHERE stat+0(1) = 'I'.
+          CALL FUNCTION 'STATUS_NUMBER_CONVERSION'
+            EXPORTING
+              language      = sy-langu
+              objnr         = gv_objnr
+              status_number = h_status_tab-stat
+            IMPORTING
+              txt04         = gv_txt04
+            EXCEPTIONS
+              OTHERS        = 01.
+          IF sy-subrc = 0.
+            IF gv_txt04 = 'REL'.
+              gv_rel = 'X'.
+            ELSE.
+              IF gt_caufv-status IS INITIAL.
+                gt_caufv-status = gv_txt04.
+              ELSE.
+                CONCATENATE gt_caufv-status gv_txt04 INTO gt_caufv-status
+                 SEPARATED BY ' '.
+              ENDIF.
+            ENDIF.
+          ENDIF.
+        ENDLOOP.
+        IF gv_rel = 'X'.
+          DELETE gt_caufv.
+        ELSE.
+          MODIFY gt_caufv.
+        ENDIF.
+      ELSE.
+        DELETE gt_caufv.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+* sorting output-table
+  SORT gt_caufv BY aufnr vornr.
+
+ENDFORM.                    "select_service_orders
+
+*&---------------------------------------------------------------------*
+*&      Form  output_list_serv
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM output_list_serv.
+
+*.. Local variables
+  DATA: ls_layout TYPE slis_layout_alv,
+        ls_grid   TYPE lvc_s_glay,
+        ls_events TYPE slis_alv_event.
+
+  DATA: lt_events TYPE slis_t_event,
+        lt_event_exits TYPE slis_t_event_exit.
+
+*.. Fill events
+  REFRESH lt_events.
+  ls_events-name = 'USER_COMMAND'.
+  ls_events-form = 'USER_COMMAND_SERV'.
+  APPEND ls_events TO lt_events.
+  ls_events-name = 'PF_STATUS_SET'.
+  ls_events-form = 'PF_STATUS_SET_SERV'.
+  APPEND ls_events TO lt_events.
+  ls_events-name = 'TOP_OF_PAGE'.
+  ls_events-form = 'TOP_OF_PAGE_SERV'.
+  APPEND ls_events TO lt_events.
+
+*.. Define layout
+  CLEAR ls_layout.
+  ls_layout-get_selinfos      = c_x.
+  ls_layout-colwidth_optimize = c_x.
+  ls_layout-detail_popup      = c_x.
+  ls_layout-box_fieldname     = 'SELKZ'.
+  ls_layout-no_keyfix         = c_x.
+  ls_layout-info_fieldname    = 'ZZCOL'.
+
+*.. Define grid settings
+  ls_grid-coll_end_l = c_x.
+
+*.. Call ALV grid output
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+    EXPORTING
+      i_callback_program = 'YSE_VT_CHECK_STATUS'
+      i_save             = 'A'
+      it_fieldcat        = lt_fieldcat
+      it_events          = lt_events
+    TABLES
+      t_outtab           = gt_caufv
+    EXCEPTIONS
+      program_error      = 1
+      OTHERS             = 2.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+ENDFORM.                    "output_list_cont_mplans
+*&---------------------------------------------------------------------*
+*&      Form  build_field_catlog
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->PT_FIELDCAT  text
+*----------------------------------------------------------------------*
+FORM build_field_catlog  CHANGING lt_fieldcat TYPE slis_t_fieldcat_alv.
+
+  DATA : ls_fcat TYPE slis_fieldcat_alv.
+*------------ Service Order--------------*
+  ls_fcat-fieldname = 'AUFNR'.
+  ls_fcat-seltext_l = 'Service Order'.
+  ls_fcat-outputlen = '12'.
+  ls_fcat-no_zero = c_x.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*------------ Operation -------------*
+  ls_fcat-fieldname = 'VORNR'.
+  ls_fcat-seltext_l = 'Operation'.
+  ls_fcat-outputlen = '8'.
+  ls_fcat-no_zero = c_x.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*------------ Confirmed -------------*
+  ls_fcat-fieldname = 'USR10'.
+  ls_fcat-seltext_l = 'Confirmed'.
+  ls_fcat-outputlen = '8'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*------------ Fixed -------------*
+  ls_fcat-fieldname = 'USR11'.
+  ls_fcat-seltext_l = 'Fixed'.
+  ls_fcat-outputlen = '5'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*------------ Confirmed -------------*
+  ls_fcat-fieldname = 'STATUS'.
+  ls_fcat-seltext_l = 'Order Status'.
+  ls_fcat-outputlen = '40'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+
+ENDFORM.                    " build_field_catlog
+
+*&---------------------------------------------------------------------*
+*&      Form  user_command_serv
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->R_UCOMM      text
+*      -->RS_SELFIELD  text
+*----------------------------------------------------------------------*
+FORM user_command_serv USING r_ucomm LIKE sy-ucomm
+                        rs_selfield TYPE slis_selfield.
+
+  CASE r_ucomm.
+    WHEN 'ORDE'.
+      READ TABLE gt_caufv INDEX rs_selfield-tabindex.
+      IF sy-subrc = 0.
+        gt_caufv-selkz = c_x.
+        MODIFY gt_caufv INDEX rs_selfield-tabindex.
+      ENDIF.
+      PERFORM display_service_order.
+  ENDCASE.
+
+ENDFORM.                    "user_command_serv
+
+
+*&---------------------------------------------------------------------*
+*&      Form  pf_status_set_serv
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->RT_EXTAB   text
+*----------------------------------------------------------------------*
+FORM pf_status_set_serv USING rt_extab TYPE slis_t_extab.
+
+  SET PF-STATUS 'YAM_SERV'.
+
+ENDFORM.                    "pf_status_set_serv
+
+
+*&---------------------------------------------------------------------*
+*&      Form  top_of_page_cont
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM top_of_page_serv.
+
+*.. Local variables
+  DATA: lt_comment TYPE slis_t_listheader,
+        ls_comment TYPE slis_listheader.
+
+*.. Header
+  ls_comment-typ  = 'H'.
+  ls_comment-info = text-h00.
+  APPEND ls_comment TO lt_comment.
+  CLEAR ls_comment.
+
+*.. Selection
+
+  ls_comment-typ  = 'S'.
+  ls_comment-key  = text-h01.
+  ls_comment-info = p_iwerk.
+  APPEND ls_comment TO lt_comment.
+  CLEAR ls_comment.
+
+  IF NOT s_plgrp IS INITIAL.
+    ls_comment-typ  = 'S'.
+    ls_comment-key  = text-h02.
+    CONCATENATE s_plgrp-low s_plgrp-high INTO ls_comment-info SEPARATED
+           BY space.
+    APPEND ls_comment TO lt_comment.
+    CLEAR ls_comment.
+  ENDIF.
+
+  IF NOT s_aufnr IS INITIAL.
+    ls_comment-typ  = 'S'.
+    ls_comment-key  = text-h03.
+    CONCATENATE s_aufnr-low s_aufnr-high INTO ls_comment-info SEPARATED
+           BY space.
+    APPEND ls_comment TO lt_comment.
+    CLEAR ls_comment.
+  ENDIF.
+
+  IF NOT s_fsavd IS INITIAL.
+    ls_comment-typ  = 'S'.
+    ls_comment-key  = text-h04.
+    CONCATENATE s_fsavd-low s_fsavd-high INTO ls_comment-info SEPARATED
+           BY space.
+    APPEND ls_comment TO lt_comment.
+    CLEAR ls_comment.
+  ENDIF.
+
+  CALL FUNCTION 'REUSE_ALV_COMMENTARY_WRITE'
+    EXPORTING
+      it_list_commentary = lt_comment.
+
+ENDFORM.                    "top_of_page_serv
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  display_service_order
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM display_service_order.
+
+  LOOP AT gt_caufv WHERE selkz EQ c_x.
+    SET PARAMETER ID 'ANR' FIELD gt_caufv-aufnr.
+    CALL TRANSACTION 'IW33' AND SKIP FIRST SCREEN.
+    CLEAR gt_caufv-selkz.
+    MODIFY gt_caufv TRANSPORTING selkz.
+    EXIT.
+  ENDLOOP.
+ENDFORM.                    "display_service_order
+
+*Text symbol text£º
+*H00:Visitour: Status fixed but not released
+*H01:Plant:
+*H02:Planner group:
+*H03:Service order:
+*H04:Scheduled start date
+
+*I01:No service orders in this selection
+*Selection text£º
+*P_IWERK:D       .
+*S_AUFNR:        Service order
+*S_FSAVD:        Earliest start date
+*S_PLGRP:D       .

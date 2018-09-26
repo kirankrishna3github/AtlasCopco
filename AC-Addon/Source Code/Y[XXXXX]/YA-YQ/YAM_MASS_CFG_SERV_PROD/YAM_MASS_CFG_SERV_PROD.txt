@@ -1,0 +1,501 @@
+*----------------------------------------------------------------------
+* PROGRAM ID           : YAM_MASS_CFG_SERV_PROD                        *
+* PROGRAM TITLE        : Update program FOR CONFIG. OBJECT             *
+* AUTHOR               : Geert Rutten                                  *
+* DATE                 : 11/07/2013                                    *
+* DEVELOPMENT ID       :                                               *
+* CHANGE REQUEST NUMBER: CD1K976862                                    *
+* PROGRAM DESCRIPTION  : THIS IS A program to create the config.       *
+*                        Object                                        *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME     |CORRECTION NUMBER| CHANGE REFERENCE #
+*----------------------------------------------------------------------*
+*
+************************************************************************
+REPORT yam_upd_serv_contr_itemcat
+       NO STANDARD PAGE HEADING
+       LINE-SIZE 270
+       MESSAGE-ID yam_dc.
+
+tables: vbak, vbap, cuco.
+*---------------------------------------------------------------------*
+* PARAMETER DECLARATION
+*---------------------------------------------------------------------*
+
+SELECTION-SCREEN BEGIN OF BLOCK b0 WITH FRAME TITLE text-028.
+PARAMETERS:     p_file RADIOBUTTON GROUP 01 DEFAULT 'X'  USER-COMMAND flg,
+                p_sel  RADIOBUTTON GROUP 01 .
+SELECTION-SCREEN END OF BLOCK b0.
+
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE text-027.
+SELECT-OPTIONS: S_MATNR     for vbap-matnr MODIF ID in2.
+SELECT-OPTIONS: S_VBELN     for vbak-vbeln MODIF ID in2.
+SELECT-OPTIONS: S_VKORG     for vbak-vkorg obligatory memory id VKO MODIF ID in2.
+SELECT-OPTIONS: S_PSTYV     for vbap-pstyv MODIF ID in2.
+SELECT-OPTIONS: S_AUART     for vbak-auart MODIF ID in2.
+SELECTION-SCREEN END OF BLOCK b1.
+
+SELECTION-SCREEN BEGIN OF BLOCK b2 WITH FRAME TITLE text-026.
+PARAMETERS: p_infile  LIKE /sapdmc/lsoinp-filename  LOWER CASE MODIF ID ind.. " FILE
+SELECTION-SCREEN END OF BLOCK b2 .
+
+*---------------------------------------------------------------------*
+* TYPE DEFINITIONS
+*---------------------------------------------------------------------*
+* - DECLARATION FOR STRUCTURE TO READ THE FLAT FILE STRING PER STRING
+TYPES: BEGIN OF ty_upload,
+          matnr     LIKE mara-matnr,            " FILE UPLOAD TEXT
+       END OF ty_upload.
+
+
+TYPES: BEGIN OF ty_matnr,
+         matnr     LIKE vbap-matnr,
+       END OF ty_matnr.
+
+*---------------------------------------------------------------------*
+* WORK AREA DECLARATIONS                                              *
+*---------------------------------------------------------------------*
+DATA : wa_contractheaderc TYPE  bapisdh1.  " WORK AREA CONTRACT HEADER
+DATA : wa_contractheaderx TYPE  bapisdh1x. " WORK AREA CONTRACT UPDATE
+DATA : wa_contractitemsc  TYPE  bapisditm. " WORK AREA CONTRACT ITEMS
+DATA : wa_contractitemsx  TYPE  bapisditmx." WORK AREA ITEMS UPDATE
+DATA : wa_bapiret2        TYPE  bapiret2.  " WORK AREA CREATE RETURN
+
+DATA: i_bdcdata      LIKE bdcdata OCCURS 0 WITH HEADER LINE,
+      struct_bdcdata TYPE bdcdata,
+      gt_err         LIKE bdcmsgcoll OCCURS 0 WITH HEADER LINE.
+
+DATA: wa_clientdata TYPE bapi_mara.
+DATA: wa_headdata TYPE bapimathead.
+DATA : wa_return        LIKE bapiret2.
+
+DATA:  gv_mode(1)        TYPE c VALUE 'N'.
+
+
+CONSTANTS:  c_transmat     LIKE tstc-tcode   VALUE 'MM02'.
+*---------------------------------------------------------------------*
+* INTERNAL TABLE DECLARATIONS                                         *
+*---------------------------------------------------------------------*
+* - INTERNAL TABLE FOR THE FILE UPLOAD FOR CONTRACTS
+DATA : i_upload TYPE STANDARD TABLE OF ty_upload
+                       INITIAL SIZE 0 WITH HEADER LINE.
+
+DATA : i_matnr  TYPE STANDARD TABLE OF ty_matnr
+                       INITIAL SIZE 0 WITH HEADER LINE.
+
+* - INTERNAL TABLE FOR THE BAPI STRUCTUE OF THE RETURN DATA
+DATA : i_bapiret2 TYPE STANDARD TABLE OF bapiret2
+                      INITIAL SIZE 0 WITH HEADER LINE.
+
+*---------------------------------------------------------------------*
+* VARIABLE DECLARATIONS                                               *
+*---------------------------------------------------------------------*
+DATA : g_filename TYPE string.
+
+*---------------------------------------------------------------------*
+* CONSTANT DECLARATIONS                                               *
+*---------------------------------------------------------------------*
+CONSTANTS : c_filetype(10)   TYPE c VALUE 'ASC',     " FILE TYPE
+            c_x(1)           TYPE c VALUE 'X',
+            c_1(1)           TYPE c VALUE '1',
+            c_error          LIKE bapiret2-type VALUE 'E',
+            c_d(1)           TYPE c VALUE 'D',       " BAPI DELETE FLAG
+            c_u(1)           TYPE c VALUE 'U',       " BAPI UPDATE FLAG
+            c_blank          TYPE c VALUE ' '.
+
+*---------------------------------------------------------------------*
+* CONSTANT DECLARATIONS FOR BDC
+*
+*---------------------------------------------------------------------*
+CONSTANTS : c_group     LIKE apqi-groupid VALUE 'Y_VA42',
+            c_trans     LIKE tstc-tcode   VALUE 'VA42'.
+
+*- AT selection-screen  ----------------------------------------------*
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_infile.
+
+  CALL FUNCTION 'WS_FILENAME_GET'
+    EXPORTING
+      def_path = 'C:\SAP\'
+      mask     = ',*,*.txt.'
+    IMPORTING
+      filename = p_infile
+    EXCEPTIONS
+      OTHERS   = 5.
+
+AT SELECTION-SCREEN OUTPUT.
+*.. Adapt selection screen to split indexation or not.
+  LOOP AT SCREEN.
+    CASE screen-group1.
+      WHEN 'IND'.
+        IF p_file EQ 'X'.
+          screen-active = 1.
+        ELSE.
+          screen-active = 0.
+        ENDIF.
+      WHEN 'IN2'.
+        IF p_sel = 'X'.
+          screen-active = 1.
+        ELSE.
+          screen-active = 0.
+        ENDIF.
+    ENDCASE.
+    MODIFY SCREEN.
+  ENDLOOP.
+*--------- S T A R T   O F   M A I N   P R O C E S S I N G -----------*
+
+*---------------------------------------------------------------------*
+* START-OF-SELECTION                                                  *
+*---------------------------------------------------------------------*
+START-OF-SELECTION.
+
+* - READ INPUT FILE FROM PRES SERVER INTO INTERNAL TABLE
+   if p_sel = 'X'.
+
+    SELECT b~matnr
+          INTO corresponding fields of table i_upload
+          FROM VBAK as a inner join VBAP as b
+          ON a~vbeln eq b~vbeln
+          WHERE a~vbeln in s_vbeln AND
+                a~vkorg in s_vkorg AND
+                b~pstyv in s_pstyv AND
+                b~matnr in s_matnr AND
+                a~auart in s_auart.
+     SORT i_upload.
+     DELETE ADJACENT DUPLICATES FROM i_upload.
+   else.
+     PERFORM get_input_file.
+   endif.
+
+* -
+  LOOP AT i_upload.
+
+    PERFORM upd_mat_flag.
+
+    PERFORM bapi_create_function.
+
+  ENDLOOP.
+*  PERFORM write_errorlist.
+
+*----------------------------------------------------------------------*
+* END-OF-SELECTION                                                     *
+*----------------------------------------------------------------------*
+END-OF-SELECTION.
+
+*&---------------------------------------------------------------------*
+*&      FORM  GET_INPUT_FILE
+*&---------------------------------------------------------------------*
+*       TEXT
+*----------------------------------------------------------------------*
+*  -->  P1        TEXT
+*  <--  P2        TEXT
+*----------------------------------------------------------------------*
+FORM get_input_file .
+
+* - FILE READ FROM PRESENTATION SERVER
+  MOVE p_infile TO g_filename.
+  PERFORM get_from_pres IN PROGRAM yam_common_routines
+                                   TABLES  i_upload
+                                   USING   g_filename
+                                           c_filetype
+                                           c_blank.
+
+ENDFORM.                    " GET_INPUT_FILE
+
+*&---------------------------------------------------------------------*
+*&      Form  upd_mat_flag
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM upd_mat_flag.
+
+
+  DATA: lv_matnr type matnr,
+        lv_kzkfg type kzkfg.
+
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+      EXPORTING
+        input  = i_upload-matnr
+      IMPORTING
+        output = lv_matnr.
+
+select single kzkfg from mara into lv_kzkfg
+  where matnr = lv_matnr.
+
+  clear gt_err[].
+  if lv_kzkfg <> 'X'.
+   CLEAR i_bdcdata[].
+   PERFORM bdc_filldata_mat.
+   CALL TRANSACTION c_transmat USING i_bdcdata
+                MODE gv_mode UPDATE 'S' MESSAGES INTO gt_err.
+   LOOP AT gt_err WHERE msgtyp = 'E' OR
+                       msgtyp = 'A'.
+           write: 8 'Material', i_upload-matnr,' configuration material is not flagged'.
+              skip.
+
+   ENDLOOP.
+  endif.
+
+
+ENDFORM.                    "upd_mat_flag
+
+*&---------------------------------------------------------------------*
+*&      Form  bdc_filldata_mat
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM bdc_filldata_mat.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    'SAPLMGMM'  '0060'  'X'  ''  ''
+          CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    ''  ''  ''  'RMMG1-MATNR'   i_upload-matnr
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    ''  ''  ''  'BDC_OKCODE'  '=ENTR'
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+         USING    'SAPLMGMM'  '0070'  'X'  ''  ''
+         CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+              USING    ''  ''  ''  'BDC_CURSOR'  'MSICHTAUSW-DYTXT(02)'
+              CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    ''  ''  ''  'MSICHTAUSW-KZSEL(02)'   'X'
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    ''  ''  ''  'BDC_OKCODE'  '=ENTR'
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    'SAPLMGMM'  '4004'  'X'  ''  ''
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    ''  ''  ''  'MARA-KZKFG'  'X'
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    ''  ''  ''  'BDC_OKCODE'  '=BU'
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+ENDFORM.                    "bdc_filldata_mat
+
+*&---------------------------------------------------------------------*
+*&   FORM SALES_CONTRACT_DOC
+*&---------------------------------------------------------------------*
+*       TEXT
+*----------------------------------------------------------------------*
+*  -->  P1        TEXT
+*  <--  P2        TEXT
+*----------------------------------------------------------------------*
+
+*&---------------------------------------------------------------------*
+*&      Form  bapi_change_function
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM bapi_create_function .
+
+
+  DATA: t_object_key LIKE object_key OCCURS 0 WITH HEADER LINE,
+        t_attrib LIKE cpro_attr OCCURS 0 WITH HEADER LINE,
+        t_obj_key2 TYPE TABLE OF api_ob_key WITH HEADER LINE.
+
+
+ DATA: lv_matnr type matnr.
+
+
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+      EXPORTING
+        input  = i_upload-matnr
+      IMPORTING
+        output = lv_matnr.
+
+
+  select single *
+    from cuco
+    where obtab = 'MARA' and objek = lv_matnr and klart = '300' and status = '1'.
+  if sy-subrc <> 0.
+
+* fill material number
+  t_object_key-key_feld = 'MATNR'.
+  t_object_key-kpara_valu = i_upload-matnr.
+  APPEND t_object_key.
+* Fill configuration/class data
+  t_attrib-c_profile = 'CONTRACT ITEM CONFIG PROFILE'.
+  t_attrib-classtype = '300'.
+  t_attrib-status = '1'.
+  APPEND t_attrib.
+
+  CALL FUNCTION 'CAMA_CON_PROFILE_MAINTAIN'
+    EXPORTING
+      object_type                          = 'MARA'
+*   CHANGE_NO                            =
+*   FLDELETE                             = ' '
+*   INTERNAL_FORMAT                      = ' '
+    TABLES
+      con_object_key                       = t_object_key
+      con_pro_attributes                   = t_attrib
+*   CON_PRO_DEPENDENCY_DATA              =
+*   CON_PRO_DEPENDENCY_DESCR             =
+*   CON_PRO_DEPENDENCY_ORDER             =
+*   CON_PRO_DEPENDENCY_SOURCE            =
+*   CON_PRO_DEPENDENCY_DOC               =
+*   CON_PRO_DEPENDENCY_PREC_DATA         =
+*   CON_PRO_DEPENDENCY_PREC_DESCR        =
+*   CON_PRO_DEPENDENCY_PREC_ORDER        =
+*   CON_PRO_DEPENDENCY_PREC_SOURCE       =
+*   CON_PRO_DEPENDENCY_PREC_DOC          =
+   EXCEPTIONS
+     error                                = 1
+     OTHERS                               = 2
+            .
+  IF sy-subrc <> 0.
+         write: 8 'Material', i_upload-matnr,' configuration update is not processed succefully:'.
+              skip.
+  ELSE.
+
+    t_obj_key2-field = 'MATNR'.
+    t_obj_key2-value = i_upload-matnr.
+    APPEND t_obj_key2.
+
+    CALL FUNCTION 'CACL_OBJECT_ALLOCATION_MAINT'
+      EXPORTING
+*   OBJECT                      =
+        object_type                 = 'MARA'
+        class                       = 'CONTRACTDATA'
+        class_type                  = '300'
+        status                      = '1'
+*   STANDARD_CLASS              =
+*   DELETE_ALLOCATION           =
+*   CHANGE_NO                   =
+*   I_OBJ_NOT_CHK               = ' '
+*   I_DATUV                     =
+*   I_NO_DEFAULTS               = ' '
+*   I_CHECK_SYDATE              =
+      TABLES
+        object_identification       = t_obj_key2
+     EXCEPTIONS
+       error                       = 1
+       warning                     = 2
+       OTHERS                      = 3
+              .
+    IF sy-subrc <> 0.
+      MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+              WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+    ELSE.
+      CALL FUNCTION 'CACL_CLASSIFICATION_SAVE'
+       EXPORTING
+          i_commit            = 'X'
+          i_wait              = 'X'
+*     I_NO_UPD_TASK       = ' '
+*     I_NO_CHECK          = ' '
+*   EXCEPTIONS
+*     ERROR               = 1
+*     WARNING             = 2
+*     OTHERS              = 3
+                .
+      IF sy-subrc <> 0.
+           write: 8 'Material', i_upload-matnr,' configuration update is not processed succefully:'.
+              skip.
+      ENDIF.
+
+    ENDIF.
+
+  ENDIF.
+  endif.
+
+    select single *
+    from cuco
+    where obtab = 'MARA' and objek = lv_matnr and klart = '300' and status = '2'.
+    IF sy-subrc = 0.
+           write: 8 'Material', i_upload-matnr,' configuration update is processed succefully BUT LOCKED:'.
+              skip.
+    ENDIF.
+
+ENDFORM.                    " bapi_change_function
+
+*&---------------------------------------------------------------------*
+*&      Form  write_errorlist
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+*FORM write_errorlist.
+*
+*
+*  LOOP AT i_bapiret2 WHERE type = c_error.
+*    write: / i_head-vbeln.
+*    WRITE: /001 i_bapiret2-type,
+*            006 i_bapiret2-id,
+*            028 i_bapiret2-number,
+*            035 i_bapiret2-message,
+*            074 i_bapiret2-log_no,
+*
+*  ENDLOOP.
+*  WRITE: /001 sy-uline.
+*
+
+*ENDFORM.                    " write_errorlist
+*Text symbol text£º
+*009:BAPI Error Log
+*010:Message Type
+*011:Message Class
+*012:Message Number
+*013:Error Message
+*014:Application Log Number
+*015:Application Message Number
+*016:Message variable1
+*017:Message Variable2
+*018:Message Variable3
+*019:Message Variable4
+*020:Parameter Name
+*021:Line in Parameter
+*022:Field in Parameter
+*023:Error !!! Service Contract already exists for this entry
+*024:Error !!! Multiple Service Contracts found for this entry
+
+*025:No printer setting defined for user
+*Selection text£º
+*P_FILE:        Selection via File
+*P_INFILE:        Input filename
+*P_SEL:        Selection via Screen fields
+*S_AUART:        Sales Doc. Type
+*S_MATNR:        Material Number
+*S_PSTYV:        Item Categories
+*S_VBELN:        Sales Document
+*S_VKORG:        Sales Organisation

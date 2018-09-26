@@ -1,0 +1,396 @@
+************************************************************************
+* Program ID           : YSE_EWA_LOST_IN_SME                           *
+* Program title        : Lost SME records without database counterpart *
+* Author               : Erik Walravens                                *
+* Date                 : 12.02.2007                                    *
+* Development Number   : Internal                                      *
+* Change Request Number: Local object                                  *
+* Description          : This report lists all records from the SME    *
+*                        table for corresponding records in the data   *
+*                        base. It allows deleting each individual rec. *
+************************************************************************
+REPORT  yse_ewa_lost_in_sme.
+
+********************************************************************
+* FIELD-SYMBOLS                                                    *
+********************************************************************
+FIELD-SYMBOLS: <fieldcat>   TYPE lvc_s_fcat.
+
+********************************************************************
+* OBJECTS                                                          *
+********************************************************************
+DATA : obj_container     TYPE REF TO cl_gui_docking_container.
+DATA : obj_alv           TYPE REF TO cl_gui_alv_grid .
+
+************************************************************************
+* TABLES                                                               *
+************************************************************************
+TABLES: vbak, vbap, likp, caufv, yse_rent_sme.
+
+************************************************************************
+* TYPE-POOLS                                                           *
+************************************************************************
+TYPE-POOLS: slis.
+
+************************************************************************
+* INTERNAL TYPES                                                       *
+************************************************************************
+TYPES: BEGIN OF str_docs,
+         vbeln     TYPE vbak-vbeln,
+       END OF str_docs.
+
+TYPES: BEGIN OF str_caufv,
+         aufnr     TYPE caufv-aufnr,
+       END OF str_caufv.
+
+************************************************************************
+* INTERNAL TABLES                                                      *
+************************************************************************
+DATA:  it_docs     TYPE TABLE OF str_docs  WITH HEADER LINE,
+       it_caufv    TYPE TABLE OF str_caufv WITH HEADER LINE,
+       it_fieldcat TYPE lvc_t_fcat         WITH HEADER LINE,
+       it_rows     TYPE lvc_t_row          WITH HEADER LINE.
+
+DATA  BEGIN OF it_sme OCCURS 0.
+  INCLUDE STRUCTURE yse_rent_sme.
+DATA  END OF it_sme.
+
+DATA  wa_sme LIKE LINE OF it_sme.
+
+************************************************************************
+* CONSTANTS                                                            *
+************************************************************************
+CONSTANTS: gc_true  TYPE char1       VALUE 'X',    " true
+           gc_engl  LIKE tvagt-spras VALUE 'E'.    " english
+
+************************************************************************
+* VARIABLES                                                            *
+************************************************************************
+* ALV grid handling
+DATA:  gs_layout       TYPE lvc_s_layo,     " ALV grid layout
+       okcode          LIKE sy-ucomm.       " return param screen 100
+* Process
+DATA:  lv_index        TYPE sy-tabix,       " table index
+       lv_caufnr       TYPE caufv-aufnr.    " vbeln convertor
+
+************************************************************************
+* SELECTION SCREEN                                                     *
+************************************************************************
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE text-s01.
+SELECT-OPTIONS: o_vbeln FOR vbak-vbeln,   " Document nr
+                o_posnr FOR vbap-posnr,   " Document item
+                o_vkorg FOR vbak-vkorg,   " Sales organization
+                o_vkbur FOR vbak-vkbur.   " Sales Office
+SELECTION-SCREEN END OF BLOCK b1.
+
+************************************************************************
+* INITIALIZATION                                                       *
+************************************************************************
+INITIALIZATION.
+
+************************************************************************
+* START OF SELECTION                                                   *
+************************************************************************
+START-OF-SELECTION.
+
+* Load all 'loose' SME data
+  PERFORM load_data.
+
+* Display the result
+  CALL SCREEN 100.
+
+
+************************************************************************
+* Module STATUS_0100 OUTPUT                                            *
+************************************************************************
+MODULE status_0100 OUTPUT.
+  SET TITLEBAR 'TITLE100' .
+  SET PF-STATUS 'STATUS100'.
+ENDMODULE.                 " STATUS_0100  OUTPUT
+
+************************************************************************
+* Module USER_COMMAND_0100 INPUT                                       *
+************************************************************************
+MODULE user_command_0100 INPUT.
+
+  CASE okcode.
+    WHEN 'BACK'.
+      LEAVE TO SCREEN 0.
+    WHEN 'EXIT'.
+      LEAVE TO SCREEN 0.
+    WHEN 'DELETE'.
+      CLEAR it_rows.
+      CALL METHOD obj_alv->get_selected_rows
+        IMPORTING
+          et_index_rows = it_rows[].
+      LOOP AT it_rows.
+        lv_index = it_rows-index.
+        READ TABLE it_sme INDEX lv_index INTO wa_sme.
+        IF sy-subrc = 0.
+          DELETE yse_rent_sme FROM wa_sme.
+        ENDIF.
+      ENDLOOP.  " it_rows
+      PERFORM load_data.
+*     display new data
+      CALL METHOD obj_alv->refresh_table_display.
+  ENDCASE.
+ENDMODULE.                 " USER_COMMAND_0100 INPUT
+
+************************************************************************
+* Module PREPARE_SCREEN OUTPUT                                         *
+************************************************************************
+MODULE prepare_screen OUTPUT.
+
+  IF obj_container IS INITIAL.
+
+*   Create the container
+    CREATE OBJECT obj_container
+      EXPORTING
+        repid           =  sy-repid
+        dynnr           =  sy-dynnr
+        lifetime        =  cntl_lifetime_dynpro
+*        ratio           =  90.
+        extension       =  5000.
+
+*   Create the ALV control
+    CREATE OBJECT obj_alv
+      EXPORTING
+        i_parent  =  obj_container.
+
+    PERFORM build_alv.
+
+  ENDIF.    " obj_container IS INITIAL
+ENDMODULE.                 " PREPARE_SCREEN  OUTPUT
+
+
+************************************************************************
+* Form LOAD_DATA                                                       *
+************************************************************************
+* No arguments                                                         *
+************************************************************************
+* Loads all recors from YSE_RENT_SME table in an internal table and    *
+* discards the ones that exist in standard SAP database tables.        *
+************************************************************************
+FORM load_data.
+
+* Select all YSE_RENT_SME records
+  SELECT *
+      FROM yse_rent_sme
+      INTO CORRESPONDING FIELDS OF TABLE it_sme
+     WHERE vkorg IN o_vkorg
+       AND vkbur IN o_vkbur
+       AND vbeln IN o_vbeln
+       AND posnr IN o_posnr.
+
+  SORT it_sme BY vbeln.
+
+* Read sales documents in VBAK
+  SELECT vbeln
+      FROM vbak
+      INTO CORRESPONDING FIELDS OF TABLE it_docs
+       FOR ALL ENTRIES IN it_sme
+     WHERE vbeln EQ it_sme-vbeln.
+
+* Delete them from SME records
+  LOOP AT it_docs.
+    DELETE it_sme WHERE vbeln = it_docs-vbeln.
+  ENDLOOP.  " it_vbak
+
+* Alternative: more efficient selection - to be tested
+*  SELECT vbeln
+*      INTO TABLE it_sme
+*      FROM yse_rent_sme
+*     INNER JOIN vbak
+*        ON yse_rent_sme~vbeln EQ vbak~vbeln
+*     WHERE vkorg IN o_vkorg
+*       AND vkbur IN o_vkbur
+*       AND vbeln IN o_vbeln
+*       AND posnr IN o_posnr.
+*
+*  SELECT *
+*      INTO table it_notvbak
+*      FROM vbak
+*       FOR ALL ENTRIES IN it_sme
+*     WHERE vbeln NE it_vbak-vbeln.
+*
+*  DELETE ...
+
+  CLEAR it_docs.
+  REFRESH it_docs.
+
+* Select all delivery documents in LIKP
+  SELECT vbeln
+      FROM likp
+      INTO CORRESPONDING FIELDS OF TABLE it_docs
+       FOR ALL ENTRIES IN it_sme
+     WHERE vbeln EQ it_sme-vbeln.
+
+* Delete them from SME records
+  LOOP AT it_docs.
+    DELETE it_sme WHERE vbeln = it_docs-vbeln.
+  ENDLOOP.  " it_vbak
+
+* Select all notifications in CAUFV
+  LOOP AT it_sme INTO wa_sme.
+    lv_caufnr+2 = wa_sme-vbeln.
+    lv_caufnr(2) = '00'.
+    SELECT aufnr
+        APPENDING TABLE it_caufv
+        FROM caufv
+       WHERE aufnr EQ lv_caufnr.
+    CLEAR lv_caufnr.
+  ENDLOOP.
+
+* Delete them from SME records
+  LOOP AT it_caufv.
+    DELETE it_sme WHERE vbeln = it_caufv-aufnr+2(10).
+  ENDLOOP.  " it_vbak
+ENDFORM.    " load data
+
+
+************************************************************************
+* Form BUILD_ALV                                                       *
+************************************************************************
+* No arguments                                                         *
+************************************************************************
+* Builds the field catalog, sets display parameters and calls the      *
+* method to display the results on screen.                             *
+************************************************************************
+FORM build_alv.
+
+  PERFORM build_field_catalog.
+
+*  gs_layout-no_toolbar = lc_true.
+  gs_layout-sel_mode   = 'D'.
+
+  CALL METHOD obj_alv->set_table_for_first_display
+                EXPORTING
+                    i_save        =  'A'
+                    is_layout     =  gs_layout
+                CHANGING
+                    it_outtab         =  it_sme[]
+                    it_fieldcatalog   =  it_fieldcat[].
+
+ENDFORM.  " build alv
+
+
+************************************************************************
+* Form BUILD_FIELD_CATALOG                                             *
+************************************************************************
+* No arguments                                                         *
+************************************************************************
+* Builds the ALV grid's field catalog.                                 *
+************************************************************************
+FORM build_field_catalog.
+
+  CLEAR it_fieldcat.
+
+*   Field: Sales org
+    it_fieldcat-fieldname = 'VKORG'.
+    it_fieldcat-outputlen = 5.
+    it_fieldcat-coltext = 'VKORG'.
+    it_fieldcat-tooltip = 'Sales Organisation'.
+*    it_fieldcat-fix_column = 'X'.
+*    it_fieldcat-emphasize = 'X'.
+    APPEND it_fieldcat.
+
+*   Field: Distribution channel
+    it_fieldcat-fieldname = 'VTWEG'.
+    it_fieldcat-outputlen = 5.
+    it_fieldcat-coltext = 'VTWEG'.
+    it_fieldcat-tooltip = 'Distribution channel'.
+    APPEND it_fieldcat.
+
+*   Field: Sales office
+    it_fieldcat-fieldname = 'VKBUR'.
+    it_fieldcat-outputlen = 5.
+    it_fieldcat-coltext = 'VKBUR'.
+    it_fieldcat-tooltip = 'Sales office'.
+    APPEND it_fieldcat.
+
+*   Field: Sales document type
+    it_fieldcat-fieldname = 'AUART'.
+    it_fieldcat-outputlen = 5.
+    it_fieldcat-coltext = 'AUART'.
+    it_fieldcat-tooltip = 'Sales document type'.
+    APPEND it_fieldcat.
+
+*   Field: Sales document number
+    it_fieldcat-fieldname = 'VBELN'.
+    it_fieldcat-outputlen = 12.
+    it_fieldcat-coltext = 'VBELN'.
+    it_fieldcat-tooltip = 'Sales document number'.
+    APPEND it_fieldcat.
+
+*   Field: Sales document item
+    it_fieldcat-fieldname = 'POSNR'.
+    it_fieldcat-outputlen = 5.
+    it_fieldcat-coltext = 'POSNR'.
+    it_fieldcat-tooltip = 'Sales document item'.
+    APPEND it_fieldcat.
+
+*   Field: Material number
+    it_fieldcat-fieldname = 'MATNR'.
+    it_fieldcat-outputlen = 12.
+    it_fieldcat-coltext = 'MATNR'.
+    it_fieldcat-tooltip = 'Material number'.
+    APPEND it_fieldcat.
+
+*   Field: Equipment number
+    it_fieldcat-fieldname = 'ZZEQUNR'.
+    it_fieldcat-outputlen = 12.
+    it_fieldcat-coltext = 'ZZEQUNR'.
+    it_fieldcat-tooltip = 'Equipment number'.
+    APPEND it_fieldcat.
+
+*   Field: Serial number
+    it_fieldcat-fieldname = 'ZZSERNR'.
+    it_fieldcat-outputlen = 12.
+    it_fieldcat-coltext = 'ZZSERNR'.
+    it_fieldcat-tooltip = 'Serial number'.
+    APPEND it_fieldcat.
+
+*   Field: Order quantity
+    it_fieldcat-fieldname = 'KWMENG'.
+    it_fieldcat-outputlen = 5.
+    it_fieldcat-coltext = 'KWMENG'.
+    it_fieldcat-tooltip = 'Order quantity'.
+    APPEND it_fieldcat.
+
+*   Field: Sales unit
+    it_fieldcat-fieldname = 'VRKME'.
+    it_fieldcat-outputlen = 5.
+    it_fieldcat-coltext = 'VRKME'.
+    it_fieldcat-tooltip = 'Sales unit'.
+    APPEND it_fieldcat.
+
+*   Field: Start date
+    it_fieldcat-fieldname = 'ANGDT'.
+    it_fieldcat-outputlen = 10.
+    it_fieldcat-coltext = 'ANGDT'.
+    it_fieldcat-tooltip = 'Start date'.
+    APPEND it_fieldcat.
+
+*   Field: End date
+    it_fieldcat-fieldname = 'BNDDT'.
+    it_fieldcat-outputlen = 10.
+    it_fieldcat-coltext = 'BNDDT'.
+    it_fieldcat-tooltip = 'End date'.
+    APPEND it_fieldcat.
+
+*   Field: Location
+    it_fieldcat-fieldname = 'ZZSE_LOC'.
+    it_fieldcat-outputlen = 10.
+    it_fieldcat-coltext = 'ZZSE_LOC'.
+    it_fieldcat-tooltip = 'location'.
+    APPEND it_fieldcat.
+ENDFORM.  " build field catalog
+
+*Text symbol text£º
+
+*S01:Select options
+*Selection text£º
+*O_POSNR:        Document item
+*O_VBELN:        Document number
+*O_VKBUR:        Sales office
+*O_VKORG:        Sales organisation

@@ -1,0 +1,480 @@
+*&---------------------------------------------------------------------*
+*& Report  YAM_PRCTR_SIM                                               *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+*&                                                                     *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+
+REPORT  yam_prctr_sim                           .
+
+DATA: gd_prctr TYPE prctr.
+
+SELECTION-SCREEN BEGIN OF BLOCK b01 WITH FRAME TITLE text-b01.
+PARAMETERS: p_vbeln TYPE vbeln.
+SELECTION-SCREEN END   OF BLOCK b01.
+
+SELECTION-SCREEN BEGIN OF BLOCK b02 WITH FRAME TITLE text-b02.
+PARAMETERS: p_aufnr TYPE aufnr.
+SELECTION-SCREEN END   OF BLOCK b02.
+
+SELECTION-SCREEN BEGIN OF BLOCK b03 WITH FRAME TITLE text-b03.
+PARAMETERS: p_mblnr TYPE mblnr,
+            p_mjahr TYPE mjahr.
+SELECTION-SCREEN END   OF BLOCK b03.
+
+SELECTION-SCREEN BEGIN OF BLOCK b04 WITH FRAME TITLE text-b04.
+PARAMETERS: p_rueck TYPE co_rueck,
+            p_rmzhl TYPE co_rmzhl.
+SELECTION-SCREEN END   OF BLOCK b04.
+
+START-OF-SELECTION.
+  PERFORM initialize.
+
+*.. Perform sales document simulation
+  IF NOT p_vbeln IS INITIAL.
+    PERFORM simul_sd.
+  ENDIF.
+
+*.. Perform service order simulation
+  IF NOT p_aufnr IS INITIAL.
+    PERFORM simul_aufnr.
+  ENDIF.
+
+*.. Perform goods movement simulation
+  IF NOT p_mblnr IS INITIAL AND
+     NOT p_mjahr IS INITIAL.
+    PERFORM simul_mov.
+  ENDIF.
+
+*.. Perform confirmation simulation
+  IF NOT p_rueck IS INITIAL AND
+     NOT p_rmzhl IS INITIAL.
+    PERFORM simul_conf.
+  ENDIF.
+
+  FREE MEMORY ID 'PRCTR_SIMUL'.
+
+*eject
+*&---------------------------------------------------------------------*
+*&      Form  simul_sd
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM simul_sd .
+  DATA: ls_vbak TYPE vbak,
+        ls_vbkd TYPE vbkd,
+        ls_vbap TYPE vbap,
+        ls_marc TYPE marc,
+        ls_cobl TYPE cobl.
+
+  DATA: lt_posnr TYPE STANDARD TABLE OF posnr INITIAL SIZE 10
+          WITH HEADER LINE.
+
+*.. Read document header data
+  CALL FUNCTION 'SD_SALES_DOCUMENT_READ'
+    EXPORTING
+      document_number                  = p_vbeln
+*       PROCESSING_MODIFICATION          = ' '
+*       PROCESSING_BUFFERREAD            = ' '
+*       RESULTS_INSERT                   = ' '
+*       SUPPRESS_AVAILIBILITY_DIA        = 'X'
+*       SUPPRESS_TEXT_POPUP              = 'X'
+*       I_BLOCK                          = 'X'
+*       STATUS_BUFFER_REFRESH            = 'X'
+*       REQUISITION_BUFFER_REFRESH       = 'X'
+*       CALL_ACTIVE                      = ' '
+*       I_NO_AUTHORITY_CHECK             = ' '
+*       I_CALL_BAPI                      = ' '
+*       I_CRM_LOCK_MODE                  = ' '
+    IMPORTING
+*       EKUAGV                           =
+*       EKURGV                           =
+*       EKUWEV                           =
+      evbak                            = ls_vbak
+*       EVBAKKOM                         =
+      evbkd                            = ls_vbkd
+*       ETVAK                            =
+            .
+
+  SELECT posnr
+  INTO TABLE lt_posnr
+  FROM vbap
+  WHERE vbeln EQ p_vbeln.
+
+  FORMAT COLOR COL_TOTAL.
+  WRITE: / 'Sales document:', ls_vbak-vbeln, /.
+  FORMAT COLOR COL_NORMAL.
+
+  LOOP AT lt_posnr.
+
+    CALL FUNCTION 'SD_SALES_ITEM_READ'
+      EXPORTING
+        item_number               = lt_posnr
+      IMPORTING
+        evbap                     = ls_vbap
+*     EVBAPKOM                  =
+        evbkd                     = ls_vbkd
+*     ETVAP                     =
+*     EVBAPD                    =
+*   EXCEPTIONS
+*     ITEM_NUMBER_MISSING       = 1
+*     OTHERS                    = 2
+              .
+    IF sy-subrc <> 0.
+* MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*         WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+    ENDIF.
+
+    PERFORM cobl_fuellen(sapfv45p) USING ls_vbak
+                                         ls_vbap
+                                         ls_vbkd
+                                         ls_cobl.
+
+*.... Call profit centre substitution logic
+    CALL METHOD yam_cl_prctr_derivation=>substitution
+      EXPORTING
+        i_cobl  = ls_cobl
+      IMPORTING
+        e_prctr = gd_prctr.
+    .
+
+*.... If no prctr found, the assign the material profit centre
+    CALL FUNCTION 'MARC_SINGLE_READ'
+      EXPORTING
+        matnr                   = ls_vbap-matnr
+        werks                   = ls_vbap-werks
+      IMPORTING
+        wmarc                   = ls_marc
+*       EXCEPTIONS
+*         LOCK_ON_MARC            = 1
+*         LOCK_SYSTEM_ERROR       = 2
+*         WRONG_CALL              = 3
+*         NOT_FOUND               = 4
+*         OTHERS                  = 5
+              .
+    IF sy-subrc <> 0.
+* MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*         WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+    ENDIF.
+
+*.... Output result
+    WRITE: / 'Item:', ls_vbap-posnr,
+             'Material:', ls_vbap-matnr,
+             'Plant:', ls_vbap-werks,
+             'Accounting Ind:', ls_vbkd-bemot,
+           / 'Derived PRCTR:', gd_prctr,
+           / 'Material PRCTR:', ls_marc-prctr, /.
+  ENDLOOP.
+ENDFORM.                    " simul_sd
+
+*eject
+*&---------------------------------------------------------------------*
+*&      Form  simul_aufnr
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM simul_aufnr .
+  DATA: ls_caufvd TYPE caufvd,
+        lt_afvgdget TYPE afvgdget OCCURS 10 WITH HEADER LINE,
+        lt_resbd    TYPE resbd_tab WITH HEADER LINE.
+
+  DATA: ls_header       TYPE cobai_s_header,
+        ls_component    TYPE cobai_s_component,
+        ls_operation    TYPE cobai_s_operation,
+        ld_prctr        TYPE prctr.
+
+  DATA: lt_header     TYPE cobai_t_header,
+        lt_operations TYPE cobai_t_operation,
+        lt_components TYPE cobai_t_component.
+
+
+*.. Select the order header information
+  CALL FUNCTION 'IBAPI_H_ORDER_READ'
+    EXPORTING
+      iv_aufnr               = p_aufnr
+*     IV_ENQUEUE_ORDER       = 'X'
+    IMPORTING
+*     EV_AUFPL               =
+      es_caufvd              = ls_caufvd
+*     ES_AFFLD               =
+*     ES_PMSDO               =
+*   EXCEPTIONS
+*     ORDER_LOCKED           = 1
+*     ORDER_READ_ERROR       = 2
+*     OTHERS                 = 3
+            .
+  IF sy-subrc <> 0.
+* MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*         WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+  ENDIF.
+
+*.. Read order operations
+  CALL FUNCTION 'CO_BO_OPR_OF_ORDER_GET'
+    EXPORTING
+      aufnr_imp           = p_aufnr
+*     CHECK_DELETED       = ' '
+*     GET_OLD             = ' '
+*     FLG_STATUS          = ' '
+*     FLG_WORK            = ' '
+*     SORT_BY_SEQ         = ' '
+*     GET_ALT_SEQ         = 'X'
+*     FLG_PROV            = ' '
+*     FLG_QUAL            = ' '
+*     FLG_CONV            = ' '
+*     FLG_OPROLL          = 'X'
+    TABLES
+      afvgd_get           = lt_afvgdget
+*     AFVGT_OLD           =
+            .
+
+*.. Read order components
+  CALL FUNCTION 'IBAPI_C_COMPONENT_GETLIST'
+    EXPORTING
+*     IV_INIT_LOG              = CC_X
+      is_caufvd                = ls_caufvd
+*     IS_AFVGD                 =
+    IMPORTING
+*     ET_MESSAGES              =
+      et_resbd                 = lt_resbd[]
+    EXCEPTIONS
+*     LOG_ERROR                = 1
+      NO_COMPONENT_FOUND       = 2
+*     OTHERS                   = 3
+            .
+  IF sy-subrc <> 0.
+* MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*         WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+  ENDIF.
+
+
+*.. Convert types
+  MOVE-CORRESPONDING ls_caufvd TO ls_header.
+  APPEND ls_header TO lt_header.
+
+  LOOP AT lt_afvgdget.
+    MOVE-CORRESPONDING lt_afvgdget TO ls_operation.
+    APPEND ls_operation TO lt_operations.
+  ENDLOOP.
+
+  LOOP AT lt_resbd.
+    MOVE-CORRESPONDING lt_resbd TO ls_component.
+    APPEND ls_component TO lt_components.
+  ENDLOOP.
+
+*.. Output results
+  FORMAT COLOR COL_TOTAL.
+  WRITE: / 'Service order:', ls_caufvd-aufnr,
+           'Order type:', ls_caufvd-auart,
+           'Accounting Ind:', ls_caufvd-bemot,
+         / 'Derived PRCTR:', ls_caufvd-prctr, /.
+  FORMAT COLOR COL_NORMAL.
+
+*.. Call the Profit center derivation applicable for a service order
+  CALL METHOD yam_cl_prctr_derivation=>service_order
+    CHANGING
+      it_header     = lt_header
+      it_operations = lt_operations
+      it_components = lt_components.
+
+  LOOP AT lt_operations INTO ls_operation.
+    WRITE: / 'Operation:', ls_operation-vornr,
+           / 'Derived PRCTR:', ls_operation-prctr.
+  ENDLOOP.
+
+  SKIP.
+
+  LOOP AT lt_components INTO ls_component.
+    WRITE: / 'Component:', ls_component-matnr,
+             'Plant:', ls_component-werks,
+           / 'Derived PRCTR:', ls_component-zzprctr.
+  ENDLOOP.
+ENDFORM.                    " simul_aufnr
+
+*eject
+*&---------------------------------------------------------------------*
+*&      Form  simul_mov
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM simul_mov .
+  DATA: ls_cobl TYPE cobl,
+        ls_mkpf TYPE mkpf,
+        lt_mseg TYPE STANDARD TABLE OF mseg INITIAL SIZE 2 WITH HEADER
+LINE,
+        ls_marc TYPE marc.
+
+*.. Read the header
+  SELECT SINGLE *
+  FROM mkpf
+  INTO ls_mkpf
+  WHERE mblnr EQ p_mblnr
+    AND mjahr EQ p_mjahr.
+
+*.. Read the items
+  SELECT *
+  FROM mseg
+  INTO TABLE lt_mseg
+  WHERE mblnr EQ p_mblnr
+    AND mjahr EQ p_mjahr.
+
+*.. Populate cobl structure
+  MOVE-CORRESPONDING ls_mkpf TO ls_cobl.
+  ls_cobl-vorgn = 'RMRU'.
+
+  SKIP.
+
+  FORMAT COLOR COL_TOTAL.
+  WRITE: / 'Movement:', ls_mkpf-mblnr, ls_mkpf-mjahr.
+  FORMAT COLOR COL_NORMAL.
+
+  SKIP.
+
+  LOOP AT lt_mseg.
+    MOVE-CORRESPONDING lt_mseg TO ls_cobl.
+*.... Call profit centre substitution logic
+    CLEAR gd_prctr.
+    CALL METHOD yam_cl_prctr_derivation=>substitution
+      EXPORTING
+        i_cobl  = ls_cobl
+      IMPORTING
+        e_prctr = gd_prctr.
+    .
+
+*.... If no prctr found, then assign the material profit centre
+    CALL FUNCTION 'MARC_SINGLE_READ'
+      EXPORTING
+        matnr                   = ls_cobl-matnr
+        werks                   = ls_cobl-werks
+      IMPORTING
+        wmarc                   = ls_marc
+*       EXCEPTIONS
+*         LOCK_ON_MARC            = 1
+*         LOCK_SYSTEM_ERROR       = 2
+*         WRONG_CALL              = 3
+*         NOT_FOUND               = 4
+*         OTHERS                  = 5
+              .
+    IF sy-subrc <> 0.
+* MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*         WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+    ENDIF.
+
+*.... Output result
+    WRITE: / 'Item:', lt_mseg-zeile,
+             'Material:', lt_mseg-matnr,
+             'Plant:', lt_mseg-werks,
+             'Accounting Ind:', lt_mseg-bemot,
+           / 'Derived PRCTR:', gd_prctr,
+           / 'Material PRCTR:', ls_marc-prctr, /.
+  ENDLOOP.
+
+ENDFORM.                    " simul_mov
+
+*eject
+*&---------------------------------------------------------------------*
+*&      Form  initialize
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM initialize .
+*.. Output the external accounting indicators
+  DATA: ld_bemot TYPE bemot,
+        ld_simul TYPE c VALUE 'X'.
+
+  EXPORT ld_simul TO MEMORY ID 'PRCTR_SIMUL'.
+
+  WRITE: / 'External accounting indicators'.
+
+  SELECT bemot
+  INTO ld_bemot
+  FROM zaccind.
+    WRITE: / ld_bemot.
+  ENDSELECT.
+
+  SKIP.
+
+ENDFORM.                    " initialize
+
+*eject
+*&---------------------------------------------------------------------*
+*&      Form  simul_conf
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM simul_conf .
+  DATA: ls_confdet TYPE bapi_alm_confirmation,
+        ls_header  TYPE bapi_alm_order_header_e,
+        ld_equinr  TYPE equinr.
+
+*.. Get the specified confirmation details
+  CALL FUNCTION 'BAPI_ALM_CONF_GETDETAIL'
+    EXPORTING
+      confirmation              = p_rueck
+      confirmationcounter       = p_rmzhl
+    IMPORTING
+*     RETURN                    =
+      conf_detail               = ls_confdet
+*   TABLES
+*     GOODSMOVEMENTS            =
+*     FAILEDGMOVES              =
+            .
+
+*.. Get some order information
+  CALL FUNCTION 'IBAPI_ALM_ORDERHEAD_READ'
+    EXPORTING
+      iv_orderid          = ls_confdet-orderid
+    IMPORTING
+      es_header           = ls_header
+*     ES_SRVDAT           =
+*   TABLES
+*     ET_MESSAGES         =
+*   CHANGING
+*     CT_TEXT             =
+*     CT_TEXT_LINES       =
+            .
+
+  FORMAT COLOR COL_TOTAL.
+  WRITE: / 'Confirmation:', p_rueck, p_rmzhl.
+  FORMAT COLOR COL_NORMAL.
+
+*.. Perform derivation for the confirmation
+  CALL METHOD yam_cl_prctr_derivation=>confirmation
+    EXPORTING
+      i_conf_detail = ls_confdet
+      i_equnr       = ls_header-equipment
+      i_kdauf       = ls_header-sales_ord
+      i_auart       = ls_header-order_type
+    IMPORTING
+      e_prctr       = gd_prctr.
+
+*.... Output result
+  WRITE: / 'Accounting Ind:', ls_confdet-calc_motive,
+         / 'Derived PRCTR:', gd_prctr,
+         / 'Order PRCTR:', ls_header-profit_ctr,
+         / 'Order AI:', ls_header-calc_motive, /.
+
+ENDFORM.                    " simul_conf
+
+*Selection text£º
+*P_AUFNR:D       Order
+*P_MBLNR:D       Material Document
+*P_MJAHR:D       Material Doc. Year
+*P_RMZHL:D       Counter
+*P_RUECK:D       Confirmation
+*P_VBELN:D       Sales document

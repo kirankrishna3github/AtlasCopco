@@ -1,0 +1,258 @@
+report zrsarfcer.
+include <sys000>.
+
+tables:  arfcsstate, arfcsdata, arfcrstate, tbtco.  "#EC *
+
+data: nfill   like sy-dbcnt,
+      arfctid like arfctid,
+      sl_entry(96).
+
+data: jobtab like tbtco occurs 0 with header line,
+      tidtab like arfctid occurs 0 with header line,
+      sstate like arfcsstate occurs 0 with header line,
+      mstate like arfcsstate occurs 0 with header line.
+
+* Internal Tabelle f¨¹r registrierte Destinationen
+data: begin of active_log occurs 0,
+         arfcdest like destlog-dest,
+      end of active_log.
+
+constants:deleted  like arfcrstate-arfcstate value 'DELETED'.
+
+select-options day for arfcsstate-arfcdatum
+                        default sy-datum to sy-datum
+                        option bt.
+select-options dest for arfcsstate-arfcdest
+                        default '*'
+                        option cp.
+select-options owner for arfcsstate-arfcuser
+                         default sy-uname
+                         option eq.
+selection-screen uline.
+PARAMETERS : p_packet  TYPE i DEFAULT 10000 OBLIGATORY.
+
+selection-screen skip 2.
+
+selection-screen comment 1(20) text-001.
+
+selection-screen skip 1.
+
+parameters cpic as checkbox.
+parameters rec  as checkbox.
+parameters fail as checkbox.
+parameters sent as checkbox.
+parameters exec as checkbox default 'X'.
+parameters load as checkbox.
+parameters retry   as checkbox.
+parameters noretry as checkbox.
+
+initialization.
+  authority-check object 'S_ADMI_FCD'
+           id 'S_ADMI_FCD' field 'NADM'.
+  if sy-subrc <> 0.
+    message e149(00) with 'S_ADMI_FCD / NADM'(ath).
+  endif.
+
+* Only delete what is required!!!
+*  owner-low = '*'. append owner.
+*  dest-low = '*'. append dest.
+
+start-of-selection.
+
+  data: nofield like arfcsstate-arfcstate.
+  ranges status for nofield.
+  if cpic = 'X'.
+    status-low = 'CPICERR'.
+    status-option = 'EQ'. status-sign = 'I'.
+    append status.
+  endif.
+  if rec = 'X'.
+    status-low = 'RECORDED'.
+    status-option = 'EQ'. status-sign = 'I'.
+    append status.
+    status-low = 'VBRECORD'.
+    status-option = 'EQ'. status-sign = 'I'.
+    append status.
+    status-low = 'CONFAIL'.
+    status-option = 'EQ'. status-sign = 'I'.
+    append status.
+  endif.
+  if sent = 'X'.
+    status-low = 'SENDED'.
+    status-option = 'EQ'. status-sign = 'I'.
+    append status.
+  endif.
+  if fail = 'X'.
+    status-low = 'SYSFAIL'.
+    status-option = 'EQ'. status-sign = 'I'.
+    append status.
+  endif.
+  if exec = 'X'.
+    status-low = 'EXECUTED'.
+    status-option = 'EQ'. status-sign = 'I'.
+    append status.
+  endif.
+  if load = 'X'.
+    status-low = 'SYSLOAD'.
+    status-option = 'EQ'. status-sign = 'I'.
+    append status.
+  endif.
+  if retry = 'X'.
+    status-low = 'RETRY'.
+    status-option = 'EQ'. status-sign = 'I'.
+    append status.
+    status-low = 'ARETRY'.
+    status-option = 'EQ'. status-sign = 'I'.
+    append status.
+  endif.
+  if noretry = 'X'.
+    status-low = 'ANORETRY'.
+    status-option = 'EQ'. status-sign = 'I'.
+    append status.
+  endif.
+
+  clear sl_entry.
+  move sy-uname to sl_entry.
+  call 'C_WRITE_SYSLOG_ENTRY' id 'TYP'  field space
+                              id 'KEY'  field 'Q2B'
+                              id 'DATA' field sl_entry.
+
+  select * from arfcsstate up to p_packet rows
+    into table sstate
+    where arfcdatum in day
+      and arfcdest  in dest
+      and arfcuser  in owner
+      and arfcstate in status
+      and arfcreturn = space.
+  if sy-dbcnt = 0.
+    message s368(00) with 'Eintr#ge gel#scht: '(002) sy-dbcnt.
+    stop.
+  endif.
+
+* Holen die registrierte Destination f¨¹r Log
+* dann werden LUWs der Destination in ARFCLOG geschrieben.
+  select dest from destlog
+    into table active_log
+    where type = 'L'.
+
+* qRFC-LUWs nicht l#schen
+  loop at sstate.
+* "Mischbetrieb" (qRFC and tRFC in one LUW)
+   select single * from arfcsstate           "#EC *
+       where arfcipid   = sstate-arfcipid
+         and arfcpid    = sstate-arfcpid
+         and arfctime   = sstate-arfctime
+         and arfctidcnt = sstate-arfctidcnt
+         and arfcreturn <> space.
+    if sy-subrc = 0.
+      delete sstate.
+      continue.
+    endif.
+    tidtab = sstate(24).
+    collect tidtab.
+  endloop.
+
+  loop at tidtab.
+    delete from arfcsdata
+      where arfcipid   = tidtab-arfcipid
+        and arfcpid    = tidtab-arfcpid
+        and arfctime   = tidtab-arfctime
+        and arfctidcnt = tidtab-arfctidcnt.
+
+    delete from arfcsstate
+      where arfcipid   = tidtab-arfcipid
+        and arfcpid    = tidtab-arfcpid
+        and arfctime   = tidtab-arfctime
+        and arfctidcnt = tidtab-arfctidcnt.
+
+* Log in ARFCLOG.
+    if sy-subrc = 0.
+      loop at active_log.
+        read table sstate
+          with key arfcipid   = tidtab-arfcipid
+                   arfcpid    = tidtab-arfcpid
+                   arfctime   = tidtab-arfctime
+                   arfctidcnt = tidtab-arfctidcnt
+                   arfcdest   = active_log-arfcdest.
+        if sy-subrc = 0.
+          loop at sstate into mstate
+            where arfcipid  = sstate-arfcipid
+            and   arfcpid   = sstate-arfcpid
+            and   arfctime  = sstate-arfctime
+            and   arfctidcnt = sstate-arfctidcnt.
+            mstate-arfcstate = deleted.
+            mstate-arfcuzeit = sy-uzeit.
+            mstate-arfcdatum = sy-datum.
+            mstate-arfcuser  = sy-uname.
+            mstate-arfctcode = sy-tcode.
+            mstate-arfcrhost = sy-host.
+            concatenate deleted ' in: '
+                        sy-cprog ' by: '
+                        sy-uname
+              into mstate-arfcmsg.
+            insert arfclog from mstate.
+          endloop.
+          exit.
+        endif.
+      endloop.
+    endif.
+
+    delete from arfcrstate
+      where arfcipid   = tidtab-arfcipid
+        and arfcpid    = tidtab-arfcpid
+        and arfctime   = tidtab-arfctime
+        and arfctidcnt = tidtab-arfctidcnt.
+
+    commit work.
+    refresh: mstate.
+  endloop.
+
+* Evtl. Batchjobs l#schen
+  describe table sstate lines nfill.
+  if nfill = 0. exit. endif.
+
+  select * from tbtco
+    into table jobtab
+    where jobname like 'ARFC:%'.
+
+  loop at jobtab.
+    arfctid = jobtab-jobname+5(24).
+    read table sstate
+      with key arfcipid   = arfctid-arfcipid
+               arfcpid    = arfctid-arfcpid
+               arfctime   = arfctid-arfctime
+               arfctidcnt = arfctid-arfctidcnt.
+    if sy-subrc = 0.
+      %_reserv = sstate-arfcreserv.   "#EC *
+      if %_reserv-batchpla = 'X'.
+        call function 'BP_JOB_DELETE'
+             exporting
+                  forcedmode = 'X'
+                  jobcount   = jobtab-jobcount
+                  jobname    = jobtab-jobname
+             exceptions
+                  others     = 0.
+      endif.
+    endif.
+  endloop.
+
+  message s368(00) with 'Eintr#ge gel#scht: '(002) nfill.
+
+*Text symbol text£º
+*001:Status:
+*002:Entries deleted:
+
+*ATH:S_ADMI_FCD / NADM
+*Selection text£º
+*CPIC:        Connection error
+*DAY:        Date
+*DEST:        Destination
+*EXEC:        Already Executed
+*FAIL:        System Error
+*LOAD:        Terminated Due to Overload
+*NORETRY:        Serious Application Errors
+*OWNER:        User Name
+*P_PACKET:        packet size
+*REC:        Recorded
+*RETRY:        Temporary Application Errors
+*SENT:        Being executed

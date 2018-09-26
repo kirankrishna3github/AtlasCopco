@@ -1,0 +1,329 @@
+REPORT sdcorrect .
+
+INCLUDE rvdirekt.
+
+TABLES: vbap,
+        vbfa,
+        veda,
+        vbak,
+        vbkd.
+
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE text-b01.
+SELECT-OPTIONS: s_vkorg FOR vbak-vkorg,
+                s_vtweg FOR vbak-vtweg,
+                s_spart FOR vbak-spart,
+                s_vbeln FOR vbak-vbeln obligatory,
+                s_auart FOR vbak-auart.
+SELECTION-SCREEN END   OF BLOCK b1.
+
+*parameters: perform like t185-nmodul,
+*            in_prog like t185-nprog default 'SAPMV45A',
+SELECTION-SCREEN BEGIN OF BLOCK b2 WITH FRAME TITLE text-b02.
+PARAMETERS: showmsg AS CHECKBOX DEFAULT 'X',
+            p_delete AS CHECKBOX DEFAULT space,
+            p_bill   AS CHECKBOX DEFAULT space.
+SELECTION-SCREEN END   OF BLOCK b2.
+
+SELECTION-SCREEN BEGIN OF BLOCK b3 WITH FRAME TITLE text-b03.
+PARAMETERS: p_rrrel TYPE vbkd-rrrel DEFAULT 'A',
+            p_acdatv TYPE vbkd-acdatv DEFAULT 'B',
+            p_revsp TYPE vbkd-revsp DEFAULT 'C',
+            p_debug TYPE c DEFAULT space AS CHECKBOX.
+SELECTION-SCREEN END   OF BLOCK b3.
+
+
+CONSTANTS: roms1_null LIKE vbep-roms1 VALUE IS INITIAL.
+
+DATA: BEGIN OF liste OCCURS 0,
+  vbeln LIKE vbep-vbeln,
+  posnr LIKE vbep-posnr,
+      END OF liste,
+  liste_wa LIKE liste,
+  vbeln_old LIKE vbep-vbeln,
+  da_posnr LIKE vbap-posnr,
+  next_tabix LIKE sy-tabix,
+  error_flag.
+
+DATA: ld_count TYPE i,
+      ld_valid TYPE dd07v-ddtext,
+      ld_msgno TYPE t100-msgnr,
+      ld_mestx TYPE string,
+      ld_value TYPE dd07v-domvalue_l.
+
+* Basic loop on data - prepare list
+CLEAR liste[].
+
+SELECT * FROM vbak WHERE vbeln IN s_vbeln
+                     AND auart IN s_auart
+                     AND vkorg IN s_vkorg
+                     AND vtweg IN s_vtweg
+                     AND spart IN s_spart
+                     AND vbtyp EQ 'G'.
+
+  SELECT * FROM vbap
+  APPENDING CORRESPONDING FIELDS OF TABLE liste
+  WHERE vbeln EQ vbak-vbeln.
+
+ENDSELECT.
+
+
+* Loop on the list - correct the sales documents
+error_flag = space.
+LOOP AT liste.
+
+  next_tabix = sy-tabix + 1.
+* Document number has changed
+  IF liste-vbeln NE vbeln_old.
+*.... Check document flow for already created billing documents
+    IF p_bill EQ 'X'.
+      WRITE: / 'Billing document items: '.
+      SELECT *
+      FROM vbfa
+      WHERE vbelv = liste-vbeln
+        AND vbtyp_n IN ('M', 'N').
+        WRITE: / vbfa-vbeln, vbfa-posnn.
+        UPDATE vbrp SET rrrel = space WHERE vbeln = vbfa-vbeln
+                                             AND posnr = vbfa-posnn.
+        IF sy-subrc EQ 0.
+          WRITE: 'successfully updated' COLOR COL_POSITIVE.
+        ELSE.
+          WRITE: 'not updated' COLOR COL_NEGATIVE.
+        ENDIF.
+      ENDSELECT.
+    ENDIF.
+
+*.... Delete VBREV* tables for current document
+    IF p_delete = 'X'.
+      DELETE FROM vbreve WHERE vbeln EQ liste-vbeln.
+      DELETE FROM vbrevk WHERE vbeln EQ liste-vbeln.
+      DELETE FROM vbrevr WHERE vbeln EQ liste-vbeln.
+      COMMIT WORK AND WAIT.
+    ENDIF.
+
+*.... Read sales document header
+    CALL FUNCTION 'SD_SALES_DOCUMENT_READ'
+      EXPORTING
+        document_number = liste-vbeln
+        i_block         = 'X'
+      EXCEPTIONS
+        OTHERS          = 1.
+    IF sy-subrc EQ 0.
+      error_flag = space.
+      vbeln_old = liste-vbeln.
+    ELSE.
+      ld_msgno = sy-msgno.
+      CALL FUNCTION 'RH_MESSAGE_GET'
+        EXPORTING
+*         SPRSL                   = SY-LANGU
+          arbgb                   = sy-msgid
+          msgnr                   = ld_msgno
+          msgv1                   = sy-msgv1
+          msgv2                   = sy-msgv2
+          msgv3                   = sy-msgv3
+          msgv4                   = sy-msgv4
+        IMPORTING
+          msgtext                 = ld_mestx
+        EXCEPTIONS
+          message_not_found       = 1
+          OTHERS                  = 2
+                .
+      IF sy-subrc <> 0.
+      ENDIF.
+      FORMAT COLOR COL_NORMAL.
+      WRITE: / liste-vbeln, liste-posnr.
+      FORMAT COLOR COL_NEGATIVE.
+      WRITE: ld_mestx.
+      error_flag = 'X'.
+    ENDIF.
+  ELSE.
+    CHECK error_flag = space.
+  ENDIF.
+
+  CHECK p_bill EQ space.
+
+*.. Read the sales document item
+  CALL FUNCTION 'SD_SALES_ITEM_READ'
+    EXPORTING
+      item_number   = liste-posnr
+    EXCEPTIONS
+      error_message = 1
+      OTHERS        = 2.
+  IF sy-subrc <> 0.
+    ld_msgno = sy-msgno.
+    CALL FUNCTION 'RH_MESSAGE_GET'
+      EXPORTING
+*         SPRSL                   = SY-LANGU
+        arbgb                   = sy-msgid
+        msgnr                   = ld_msgno
+        msgv1                   = sy-msgv1
+        msgv2                   = sy-msgv2
+        msgv3                   = sy-msgv3
+        msgv4                   = sy-msgv4
+      IMPORTING
+        msgtext                 = ld_mestx
+      EXCEPTIONS
+        message_not_found       = 1
+        OTHERS                  = 2
+              .
+    IF sy-subrc <> 0.
+    ENDIF.
+    FORMAT COLOR COL_NORMAL.
+    WRITE: / liste-vbeln, liste-posnr.
+    FORMAT COLOR COL_NEGATIVE.
+    WRITE: ld_mestx.
+    error_flag = 'X'.
+  ENDIF.
+
+* The essential change is done inside the module pool
+
+*... Update the revenue recognition status & customizing info for the
+*... sales doc
+  PERFORM zz_rev_rec_status_set(sapmv45a) USING p_rrrel p_acdatv
+                                                p_revsp p_debug.
+
+*... Call the actual Revenue recognition logic
+*   perform rev_rec_update(sapmv45A) using liste-vbeln space.
+*  call function 'SD_SALES_DOCUMENT_PERFORM'
+*       exporting
+*            perform       = perform
+*            in_program    = in_prog
+*       exceptions
+*            error_message = 1
+*            others        = 2.
+  IF sy-subrc NE 0.
+    ld_msgno = sy-msgno.
+    CALL FUNCTION 'RH_MESSAGE_GET'
+      EXPORTING
+*         SPRSL                   = SY-LANGU
+        arbgb                   = sy-msgid
+        msgnr                   = ld_msgno
+        msgv1                   = sy-msgv1
+        msgv2                   = sy-msgv2
+        msgv3                   = sy-msgv3
+        msgv4                   = sy-msgv4
+      IMPORTING
+        msgtext                 = ld_mestx
+      EXCEPTIONS
+        message_not_found       = 1
+        OTHERS                  = 2
+              .
+    IF sy-subrc <> 0.
+    ENDIF.
+    FORMAT COLOR COL_NORMAL.
+    WRITE: / liste-vbeln, liste-posnr.
+    FORMAT COLOR COL_NEGATIVE.
+    WRITE: ld_mestx.
+    error_flag = 'X'.
+  ENDIF.
+
+*.. Last item of a document - then save
+  READ TABLE liste INTO liste_wa
+                   INDEX next_tabix.
+  IF sy-subrc NE 0 OR liste_wa-vbeln NE liste-vbeln.
+    CHECK error_flag = space.
+
+
+    CALL FUNCTION 'SD_SALES_DOCUMENT_SAVE'
+      EXPORTING
+        synchron                   = 'X'
+        status_buffer_refresh      = 'X'
+        requisition_buffer_refresh = 'X'
+      EXCEPTIONS
+        error_message              = 1
+        OTHERS                     = 2.
+    IF sy-subrc NE 0.
+      ld_msgno = sy-msgno.
+      CALL FUNCTION 'RH_MESSAGE_GET'
+        EXPORTING
+*         SPRSL                   = SY-LANGU
+          arbgb                   = sy-msgid
+          msgnr                   = ld_msgno
+          msgv1                   = sy-msgv1
+          msgv2                   = sy-msgv2
+          msgv3                   = sy-msgv3
+          msgv4                   = sy-msgv4
+        IMPORTING
+          msgtext                 = ld_mestx
+        EXCEPTIONS
+          message_not_found       = 1
+          OTHERS                  = 2
+                .
+      IF sy-subrc <> 0.
+      ENDIF.
+      FORMAT COLOR COL_NORMAL.
+      WRITE: / liste-vbeln, liste-posnr.
+      FORMAT COLOR COL_NEGATIVE.
+      WRITE: ld_mestx.
+    ELSE.
+      COMMIT WORK AND WAIT.
+
+*...... Check result
+      SELECT *
+      FROM vbkd
+      WHERE vbeln EQ liste-vbeln
+        AND posnr NE '000000'.
+        FORMAT COLOR COL_NORMAL.
+        WRITE: / vbkd-vbeln, vbkd-posnr, vbkd-rrrel, vbkd-acdatv,
+                 vbkd-revsp.
+*........ Select contract start/end date
+        SELECT SINGLE *
+        FROM veda
+        WHERE vbeln EQ vbkd-vbeln
+          AND vposn EQ vbkd-posnr.
+        IF sy-subrc NE 0.
+          SELECT SINGLE *
+          FROM veda
+          WHERE vbeln EQ vbkd-vbeln
+            AND vposn EQ '000000'.
+        ENDIF.
+        IF sy-subrc EQ 0.
+          ld_value = veda-vlauez.
+          CALL FUNCTION 'DOMAIN_VALUE_GET'
+            EXPORTING
+              i_domname  = 'KDZEH'
+              i_domvalue = ld_value
+            IMPORTING
+              e_ddtext   = ld_valid
+            EXCEPTIONS
+              not_exist  = 1
+              OTHERS     = 2.
+          WRITE: veda-vbegdat, veda-venddat, veda-vlaufz, ld_valid.
+        ENDIF.
+*........ Count number of VBREVE entries
+        SELECT COUNT(*)
+        INTO ld_count
+        FROM vbreve
+        WHERE vbeln EQ vbkd-vbeln
+          AND posnr EQ vbkd-posnr.
+        IF sy-subrc EQ 0.
+          FORMAT COLOR COL_POSITIVE.
+          WRITE: 'Number of VBREVE entries:', ld_count.
+        ELSE.
+          FORMAT COLOR COL_NEGATIVE.
+          WRITE: 'No VBREVE entries found'.
+          CONTINUE.
+        ENDIF.
+        FORMAT COLOR OFF.
+      ENDSELECT.
+    ENDIF.
+  ENDIF.
+ENDLOOP.
+
+*Text symbol text£º
+*B01:Document selection
+*B02:Options
+
+*B03:Update settings
+*Selection text£º
+*P_ACDATV:D       Acc. period start date rule
+*P_BILL:        Update billing documents
+*P_DEBUG:        Debug run
+*P_DELETE:        Delete VBREV* entries
+*P_REVSP:D       revenue distribution type
+*P_RRREL:D       Rev. recognition cat.
+*SHOWMSG:        Display Message Log
+*S_AUART:D       Sales document type
+*S_SPART:D       Division
+*S_VBELN:D       Sales document
+*S_VKORG:D       Sales Organization
+*S_VTWEG:D       Distribution Channel

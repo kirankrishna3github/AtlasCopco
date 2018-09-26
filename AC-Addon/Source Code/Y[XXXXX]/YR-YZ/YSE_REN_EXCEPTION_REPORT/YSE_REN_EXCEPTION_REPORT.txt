@@ -1,0 +1,417 @@
+************************************************************************
+* Program ID           : YSE_REN_EXCEPTION_REPORT                      *
+* Program Title        : REN: Exception report                         *
+* Author               : Luc Mertens      USG Innotiv                  *
+* Date                 : 03.09.2008                                    *
+* Development number   : D411                                          *
+* Change Request Number: CD1K942707                                    *
+* Description          : Exception report                              *
+************************************************************************
+* Change History Log                                                   *
+*----------------------------------------------------------------------*
+* Mod. no.|  Date    | Name           | Correction Number | Change Ref *
+*----------------------------------------------------------------------*
+*                                                                      *
+************************************************************************
+REPORT  yse_ren_exception_report.
+
+************************************************************************
+* TABLES                                                               *
+************************************************************************
+TABLES: likp,
+        lips,
+*       vbup,
+        vbap.
+*       vbak.
+
+************************************************************************
+* TYPE-POOLS                                                           *
+************************************************************************
+TYPE-POOLS slis.
+
+************************************************************************
+* CONSTANTS                                                            *
+************************************************************************
+CONSTANTS:
+  gc_true        TYPE c           VALUE 'X',
+  gc_lr          type lfart       value 'LR  ',
+  gc_h           type vbtyp_v     value 'H',       " Returns
+  gc_c           type vbtyp_v     value 'C'.       " Order
+
+************************************************************************
+* DATA                                                                 *
+************************************************************************
+* Own data
+DATA:
+  gv_repid        LIKE sy-repid.
+* ALV
+DATA:
+  gv_layout       TYPE slis_layout_alv,            " ALV grid layout
+  gt_fieldcat     TYPE slis_t_fieldcat_alv.
+
+************************************************************************
+* INTERNAL TABLES                                                      *
+************************************************************************
+DATA: begin of gt_exc occurs 0,
+        contr_nr    like vbap-vbeln,
+        contr_it    like vbap-posnr,
+        contr_qty   like vbap-kwmeng,
+        calloff_nr  like vbap-vbeln,
+        calloff_it  like vbap-posnr,
+        calloff_qty like vbap-kwmeng,
+        inbdel_nr   like lips-vbeln,
+        inbdel_it   like lips-posnr,
+        inbdel_qty  like lips-lfimg,
+        lfdat       like likp-lfdat,
+        matnr       like vbap-matnr,
+        arktx       like vbap-arktx,
+      end of gt_exc.
+
+DATA: begin of gt_del occurs 0,
+        vbeln       like lips-vbeln,
+        posnr       like lips-posnr,
+        lfdat       like likp-lfdat,
+        lfimg       like lips-lfimg,
+      end of gt_del.
+
+DATA: begin of gt_ctr occurs 0,
+        vbeln       like vbfa-vbeln,
+        posnn       like vbfa-posnn,
+        vbtyp_v     like vbfa-vbtyp_v,
+        vbelv       like vbfa-vbelv,
+        posnv       like vbfa-posnv,
+        kwmeng      like vbap-kwmeng,
+        matnr       like vbap-matnr,
+        arktx       like vbap-arktx,
+      end of gt_ctr.
+
+DATA: begin of gt_off occurs 0,
+        vbeln       like vbfa-vbeln,
+        posnn       like vbfa-posnn,
+        vbelv       like vbfa-vbelv,
+        posnv       like vbfa-posnv,
+        kwmeng      like vbap-kwmeng,
+      end of gt_off.
+
+************************************************************************
+* SELECTION SCREEN                                                     *
+************************************************************************
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE text-s01.
+PARAMETERS:
+            p_vkorg LIKE likp-vkorg OBLIGATORY MEMORY ID VKO.
+SELECT-OPTIONS:
+            s_vbeln for likp-vbeln,
+            s_wadat for likp-wadat_ist OBLIGATORY.
+SELECTION-SCREEN END OF BLOCK b1.
+
+************************************************************************
+* AT SELECTION SCREEN                                                  *
+************************************************************************
+AT SELECTION-SCREEN.
+
+  PERFORM check_authorization.
+
+************************************************************************
+* INITIALIZATION                                                       *
+************************************************************************
+INITIALIZATION.
+
+  gv_repid = sy-repid.
+
+************************************************************************
+* START OF SELECTION                                                   *
+************************************************************************
+START-OF-SELECTION.
+
+* Select inbound deliveries
+  select a~vbeln b~posnr a~lfdat b~lfimg
+      into corresponding fields of table gt_del
+      from likp as a
+      inner join lips as b
+        on a~vbeln eq b~vbeln
+            where a~vbeln     in s_vbeln
+              and a~vkorg     eq p_vkorg
+              and a~lfart     eq gc_lr
+              and a~wadat_ist in s_wadat.
+
+  if gt_del[] is initial.
+    MESSAGE s072(yse_rental).        "no data to display
+  ENDIF.
+
+  sort gt_del by vbeln posnr.
+
+* Search for contracts and call-off contracts linked to the inb.deliveries
+  loop at gt_del.
+    select a~vbeln a~posnn a~vbelv a~posnv b~kwmeng a~vbtyp_v b~matnr b~arktx
+        appending corresponding fields of table gt_ctr
+        from vbfa as a
+        inner join vbap as b
+          on a~vbelv eq b~vbeln and
+             a~posnv eq b~posnr
+            where a~vbeln   eq gt_del-vbeln
+              and a~posnn   eq gt_del-posnr
+              and a~vbtyp_v in (gc_h, gc_c).
+  endloop.
+
+  sort gt_ctr by vbeln posnn.
+
+* Copy call-off contracts into another int.table
+  loop at gt_ctr where vbtyp_v = gc_h.
+    move-corresponding gt_ctr to gt_off.
+    append gt_off.
+    clear gt_off.
+  endloop.
+
+  sort gt_off by vbeln posnn.
+
+* Build the final internal table
+  loop at gt_ctr where vbtyp_v = gc_c.
+    move gt_ctr-vbelv   to gt_exc-contr_nr.
+    move gt_ctr-posnv   to gt_exc-contr_it.
+    move gt_ctr-kwmeng  to gt_exc-contr_qty.
+    move gt_ctr-matnr   to gt_exc-matnr.
+    move gt_ctr-arktx   to gt_exc-arktx.
+
+*.. get call-off contract data
+    read table gt_off with key vbeln = gt_ctr-vbeln
+                               posnn = gt_ctr-posnn
+             binary search.
+
+    if sy-subrc = 0.
+      move gt_off-vbelv   to gt_exc-calloff_nr.
+      move gt_off-posnv   to gt_exc-calloff_it.
+      move gt_off-kwmeng  to gt_exc-calloff_qty.
+    endif.
+
+*.. get inbound delivery data
+    read table gt_del with key vbeln = gt_ctr-vbeln
+                               posnr = gt_ctr-posnn
+             binary search.
+
+    if sy-subrc = 0.
+      move gt_del-vbeln   to gt_exc-inbdel_nr.
+      move gt_del-posnr   to gt_exc-inbdel_it.
+      move gt_del-lfimg   to gt_exc-inbdel_qty.
+      move gt_del-lfdat   to gt_exc-lfdat.
+    endif.
+
+    if gt_exc-inbdel_qty < gt_exc-calloff_qty.
+      append gt_exc.
+      clear gt_exc.
+    endif.
+  endloop.
+
+  sort gt_exc by contr_nr contr_it.
+
+* Display data in alv grid
+  PERFORM build_field_catlog CHANGING gt_fieldcat.
+  PERFORM build_alv.
+
+*&---------------------------------------------------------------------*
+*&      Form  BUILD_ALV                                                *
+*&---------------------------------------------------------------------*
+FORM build_alv.
+
+  gv_layout-colwidth_optimize = gc_true.
+
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+    EXPORTING
+         i_background_id          = 'ALV_BACKGROUND'
+         i_callback_program       = gv_repid
+*         I_CALLBACK_USER_COMMAND  = 'ALV_USER_COMMAND'
+         i_callback_top_of_page   = 'TOP-OF-PAGE'
+*        i_structure_name         = 'YSE_REN_ATP'
+         it_fieldcat              = gt_fieldcat[]
+         is_layout                = gv_layout
+         i_save                   = 'A'
+    TABLES
+         t_outtab = gt_exc
+    EXCEPTIONS
+         program_error = 1
+         OTHERS        = 2.
+
+  IF sy-subrc <> 0.
+*   MESSAGE ...
+  ENDIF.
+
+ENDFORM.                    "build_alv
+
+*-------------------------------------------------------------------*
+* Form  TOP-OF-PAGE                                                 *
+*-------------------------------------------------------------------*
+* ALV Report Header                                                 *
+*-------------------------------------------------------------------*
+FORM top-of-page.
+
+*ALV Header declarations
+  DATA: lt_header     TYPE slis_t_listheader,
+        wa_header     TYPE slis_listheader,
+        lt_line1      LIKE wa_header-info,
+        lt_line2      LIKE wa_header-info.
+
+* Sales organisation
+  wa_header-typ  = 'S'.
+  wa_header-key = 'Sales org: '.
+  wa_header-info = p_vkorg.
+  APPEND wa_header TO lt_header.
+  CLEAR wa_header.
+
+* Period
+  wa_header-typ  = 'S'.
+  wa_header-key = 'Period: '.
+  CONCATENATE  s_wadat-low+6(2) '.'
+               s_wadat-low+4(2) '.'
+               s_wadat-low(4)
+         INTO  lt_line1.
+
+  CONCATENATE  s_wadat-high+6(2) '.'
+               s_wadat-high+4(2) '.'
+               s_wadat-high(4)
+         INTO lt_line2.
+
+  CONCATENATE lt_line1 'until' lt_line2
+         INTO wa_header-info
+    SEPARATED BY space.
+
+  APPEND wa_header TO lt_header.
+  CLEAR: wa_header.
+
+* Blank line
+  wa_header-typ  = 'S'.
+  wa_header-key = space.
+  wa_header-info = space.
+  APPEND wa_header TO lt_header.
+  CLEAR wa_header.
+
+  CALL FUNCTION 'REUSE_ALV_COMMENTARY_WRITE'
+    EXPORTING
+      it_list_commentary = lt_header.
+
+ENDFORM.                    "top-of-page
+
+*&---------------------------------------------------------------------*
+*&      Form  check_authorization
+*&---------------------------------------------------------------------*
+form check_authorization .
+
+  AUTHORITY-CHECK OBJECT 'V_VBAK_VKO'
+                      ID 'VKORG' FIELD p_vkorg
+                      ID 'VTWEG' DUMMY
+                      ID 'SPART' DUMMY
+                      ID 'ACTVT' DUMMY.
+
+  IF sy-subrc = 4.
+*   No authorisation to display data from Sales Organisation p_vkorg
+    MESSAGE ID 'YSE_RENTAL' TYPE 'E' NUMBER '049' WITH p_vkorg.
+  ELSEIF sy-subrc <> 0.
+*   Error checking authorization.
+    MESSAGE ID 'YSE_RENTAL' TYPE 'E' NUMBER '046'.
+  ENDIF.
+
+endform.                    " check_authorization
+
+*&---------------------------------------------------------------------*
+*&      Form  build_field_catlog
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_GT_FIELDCAT  text
+*----------------------------------------------------------------------*
+FORM build_field_catlog  CHANGING pt_fieldcat TYPE slis_t_fieldcat_alv.
+
+  DATA : ls_fcat TYPE slis_fieldcat_alv.
+
+*--------------------------Contract nr.----------------------*
+  ls_fcat-fieldname = 'CONTR_NR'.
+  ls_fcat-outputlen = '10'.
+  ls_fcat-seltext_m = text-i01.
+* ls_fcat-no_convext = 'X'.
+  ls_fcat-no_zero = 'X'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+*--------------------------Contract item---------------------*
+  ls_fcat-fieldname = 'CONTR_IT'.
+  ls_fcat-outputlen = '04'.
+  ls_fcat-seltext_m = text-i02.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+*--------------------------Contract qty----------------------*
+  ls_fcat-fieldname = 'CONTR_QTY'.
+  ls_fcat-outputlen = '06'.
+  ls_fcat-seltext_m = text-i03.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+*--------------------------Call-off nr.----------------------*
+  ls_fcat-fieldname = 'CALLOFF_NR'.
+  ls_fcat-outputlen = '10'.
+  ls_fcat-seltext_m = text-i04.
+  ls_fcat-no_zero = 'X'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+*--------------------------Call-off item---------------------*
+  ls_fcat-fieldname = 'CALLOFF_IT'.
+  ls_fcat-outputlen = '04'.
+  ls_fcat-seltext_l = text-i05.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+*--------------------------Call-off qty----------------------*
+  ls_fcat-fieldname = 'CALLOFF_QTY'.
+  ls_fcat-outputlen = '06'.
+  ls_fcat-seltext_l = text-i06.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+*--------------------------Inbound delivery nr.--------------*
+  ls_fcat-fieldname = 'INBDEL_NR'.
+  ls_fcat-outputlen = '10'.
+  ls_fcat-seltext_m = text-i07.
+  ls_fcat-no_zero = 'X'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+*--------------------------Inbound delivery item-------------*
+  ls_fcat-fieldname = 'INBDEL_IT'.
+  ls_fcat-outputlen = '04'.
+  ls_fcat-seltext_m = text-i08.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+*--------------------------Inbound delivery qty--------------*
+  ls_fcat-fieldname = 'INBDEL_QTY'.
+  ls_fcat-outputlen = '06'.
+  ls_fcat-seltext_m = text-i09.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+*--------------------------Delivery date---------------------*
+  ls_fcat-fieldname = 'LFDAT'.
+  ls_fcat-rollname = 'LFDAT_V'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+*--------------------------Material number-------------------*
+  ls_fcat-fieldname = 'MATNR'.
+  ls_fcat-rollname = 'MATNR'.
+  ls_fcat-no_zero = 'X'.
+  ls_fcat-no_convext = 'X'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+*--------------------------Material description--------------*
+  ls_fcat-fieldname = 'ARKTX'.
+  ls_fcat-rollname = 'MAKTX'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+
+ENDFORM.                    " build_field_catlog
+
+*Text symbol text£º
+*I01:Contract nr.
+*I02:Item contract
+*I03:Qty contract
+*I04:Call-off nr.
+*I05:Item call-off contract
+*I06:Qty call-off contract
+*I07:Inbound delivery nr.
+*I08:Item inb.delivery
+*I09:Qty inb.delivery
+
+*S01:Selection criteria
+*Selection text£º
+*P_VKORG:D       .
+*S_VBELN:        Inbound Delivery
+*S_WADAT:D       .

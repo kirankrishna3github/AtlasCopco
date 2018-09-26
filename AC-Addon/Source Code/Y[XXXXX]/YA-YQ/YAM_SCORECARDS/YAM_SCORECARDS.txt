@@ -1,0 +1,403 @@
+*----------------------------------------------------------------------
+* PROGRAM ID           : YAM_SCORECARDS                                *
+* PROGRAM TITLE        : AM: Create files for BO to generate scorecards*
+* AUTHOR               : Luc Mertens                                   *
+* DATE                 : 07/03/2006                                    *
+* DEVELOPMENT ID       :                                               *
+* CHANGE REQUEST NUMBER: CD1K904979                                    *
+* PROGRAM DESCRIPTION  : Create files with info about orders, status,  *
+*                        confirmations and stockmovements for BO.      *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME     |CORRECTION NUMBER| CHANGE REFERENCE #
+*----------------------------------------------------------------------*
+* MOD-001 |2006.11.09|Luc Mertens      |CD1K907385|
+*        - unicode file can not be processed by BO
+*----------------------------------------------------------------------*
+* MOD-002 |2008.10.13|Luc Mertens      |CD1K943991|
+*        - unicode file can not be processed by BO: confirmations-file
+*----------------------------------------------------------------------*
+* MOD-003 |2008.11.07|Luc Mertens      |CD1K944501|
+*        - unicode file can now be processed by BO
+*----------------------------------------------------------------------*
+REPORT  YAM_SCORECARDS.
+
+*- Tables -------------------------------------------------------------*
+
+
+*- Variables ----------------------------------------------------------*
+DATA: g_directory(25) TYPE c VALUE '/var/load/xxx/UK/read/',
+      g_ofile         LIKE /sapdmc/lsoinp-filename,
+      p_logsys        LIKE tbdlst-logsys.
+
+
+*- Constants ----------------------------------------------------------*
+CONSTANTS: c_variant_o_a    type rsvar-variant  value 'SC_ORDER_ADD',
+           c_variant_o_c    type rsvar-variant  value 'SC_ORDER_CHG',
+           c_variant_c      type rsvar-variant  value 'SC_CONF',
+           c_rec_o(13)      TYPE c              VALUE 'YAM_SC_ORDERS',
+           c_rec_c(11)      TYPE c              VALUE 'YAM_SC_CONF',
+           c_rec_m(11)      TYPE c              VALUE 'YAM_SC_MVTS',
+           c_rec_s(13)      TYPE c              VALUE 'YAM_SC_STATUS',
+           c_x(1)           type c              value 'X'.
+
+*- Internal tables ----------------------------------------------------*
+DATA:
+  gt_ord_list_a TYPE STANDARD TABLE OF rihaufk_list WITH HEADER LINE,
+  gt_ord_list_c TYPE STANDARD TABLE OF rihaufk_list WITH HEADER LINE,
+  gt_conf_list  TYPE STANDARD TABLE OF rihafvr WITH HEADER LINE,
+  gt_stat       type standard table of jcds with header line,
+  gt_conf_out   type standard table of yam_rihafvr with header line,
+  gt_ord_out   type standard table of yam_rihaufk_list with header line.
+
+DATA: begin of gt_mvts occurs 0,
+        mblnr      type mblnr,
+        mjahr      type mjahr,
+        zeile      type mblpo,
+        bldat      type bldat,
+        budat      type budat,
+        bwart      type bwart,
+        matnr      type matnr,
+        werks      type werks_d,
+        lgort      type lgort_d,
+        menge      type menge_d,
+        meins      type meins,
+        erfmg      type erfmg,
+        erfme      type erfme,
+        aufnr      type aufnr,
+      end of gt_mvts.
+
+DATA: begin of gt_mvts_out occurs 0,
+        mblnr      type mblnr,
+        mjahr      type mjahr,
+        zeile      type mblpo,
+        bldat      type bldat,
+        budat      type budat,
+        bwart      type bwart,
+        matnr      type matnr,
+        werks      type werks_d,
+        lgort      type lgort_d,
+        menge(17)  type c,
+        meins      type meins,
+        erfmg(17)  type c,
+        erfme      type erfme,
+        aufnr      type aufnr,
+      end of gt_mvts_out.
+
+*- Selection-screen ---------------------------------------------------*
+PARAMETERS: p_init(1)        type c   default ' ',
+            p_days(3)        type c   default '07-' obligatory.
+
+*- Ranges -------------------------------------------------------------*
+RANGES: s_period    for jcds-udate.
+
+*- Initialization -----------------------------------------------------*
+INITIALIZATION.
+
+  CALL FUNCTION 'OWN_LOGICAL_SYSTEM_GET'
+    IMPORTING
+      own_logical_system             = p_logsys
+    EXCEPTIONS
+      own_logical_system_not_defined = 1
+      OTHERS                         = 2.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+         WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+
+*- Start-of-selection -------------------------------------------------*
+START-OF-SELECTION.
+
+* fill period for selection of status in JCDS
+  if p_init = 'X'.
+    s_period-low  = '00010101'.
+    s_period-high = sy-datum.
+  else.
+    s_period-high = sy-datum.
+
+    CALL FUNCTION 'RELATIVE_DATE_CALCULATE'
+      EXPORTING
+        DAYS        = p_days
+        MONTHS      = '0'
+        START_DATE  = sy-datum
+        YEARS       = '0'
+      IMPORTING
+        RESULT_DATE = s_period-low.
+  endif.
+  s_period-sign = 'I'.
+  s_period-option = 'BT'.
+  append s_period.
+
+* Submit order selection program and return selected orders in
+* internal table
+  perform select_orders.
+
+* Select stock movements
+  perform select_movements.
+
+* Submit confirmation selection program and return selected
+* confirmations in internal table
+  perform select_confirmations.
+
+* Select status info
+  perform select_status_info.
+
+
+*- End-of-selection ---------------------------------------------------*
+END-OF-SELECTION.
+
+* In case there are structures with 'non-character' fields (C,N,D,T)
+* these need to be converted before writing them to the outputfile
+  loop at gt_ord_list_a.
+    move-corresponding gt_ord_list_a to gt_ord_out.
+    append gt_ord_out.
+    clear gt_ord_out.
+  endloop.
+
+  loop at gt_ord_list_c.
+    move-corresponding gt_ord_list_c to gt_ord_out.
+    append gt_ord_out.
+    clear gt_ord_out.
+  endloop.
+
+  sort gt_ord_out.
+  delete adjacent duplicates from gt_ord_out comparing aufnr.
+
+  loop at gt_conf_list.
+
+*   get origf which is not foreseen in the output structure of RIAFRU20
+    select single origf
+       into gt_conf_out-origf
+       from afru
+       where rueck = gt_conf_list-rueck
+         and rmzhl = gt_conf_list-rmzhl.
+
+    move-corresponding gt_conf_list to gt_conf_out.
+
+*   move 'G' in case the 'origf' is not filled in
+    if gt_conf_out-origf ne 'M' and
+       gt_conf_out-origf ne 'G'.
+      move 'G' to gt_conf_out-origf.
+    endif.
+    append gt_conf_out.
+    clear gt_conf_out.
+  endloop.
+
+  loop at gt_mvts.
+    move-corresponding gt_mvts to gt_mvts_out.
+    append gt_mvts_out.
+    clear gt_mvts_out.
+  endloop.
+
+* Create outputfiles
+  REPLACE 'xxx' IN g_directory WITH p_logsys(3).
+  CONCATENATE g_directory c_rec_o INTO g_ofile.
+
+* orders
+* begin of change MOD-001
+* OPEN DATASET g_ofile FOR OUTPUT IN TEXT MODE ENCODING DEFAULT.
+* begin of change MOD_003
+* OPEN DATASET g_ofile FOR OUTPUT IN TEXT MODE ENCODING non-unicode.
+  OPEN DATASET g_ofile FOR OUTPUT IN TEXT MODE ENCODING DEFAULT.
+* end of change MOD-003
+* end of change MOD-001
+  IF sy-subrc <> 0.
+    WRITE: / text-e03, g_ofile.
+    EXIT.
+  ENDIF.
+
+  loop at gt_ord_out.
+* begin of insert MOD-001
+    CATCH SYSTEM-EXCEPTIONS CONVT_CODEPAGE = 1.
+* end of insert MOD-001
+    transfer gt_ord_out to g_ofile.
+* begin of insert MOD-001
+    ENDCATCH.
+    if sy-subrc = 1.
+      clear: gt_ord_out-ktext,
+             gt_ord_out-zzrem,
+             gt_ord_out-zzcom.
+      transfer gt_ord_out to g_ofile.
+    endif.
+* end of insert MOD-001
+  endloop.
+
+  CLOSE DATASET g_ofile.
+  IF sy-subrc <> 0.
+    WRITE: / text-e04, g_ofile.
+    EXIT.
+  ENDIF.
+
+* confirmations
+  CONCATENATE g_directory c_rec_c INTO g_ofile.
+
+* begin of change MOD-002
+* OPEN DATASET g_ofile FOR OUTPUT IN TEXT MODE ENCODING DEFAULT.
+* begin of change MOD-003
+* OPEN DATASET g_ofile FOR OUTPUT IN TEXT MODE ENCODING non-unicode.
+  OPEN DATASET g_ofile FOR OUTPUT IN TEXT MODE ENCODING DEFAULT.
+* end of change MOD-003
+* end of change MOD-001
+  IF sy-subrc <> 0.
+    WRITE: / text-e03, g_ofile.
+    EXIT.
+  ENDIF.
+
+  loop at gt_conf_out.
+* begin of insert MOD-002
+    CATCH SYSTEM-EXCEPTIONS CONVT_CODEPAGE = 1.
+* end of insert MOD-002
+    transfer gt_conf_out to g_ofile.
+* begin of insert MOD-002
+    ENDCATCH.
+    if sy-subrc = 1.
+      clear: gt_conf_out-ltxa1,
+             gt_conf_out-name.
+      transfer gt_conf_out to g_ofile.
+    endif.
+* end of insert MOD-002
+  endloop.
+
+  CLOSE DATASET g_ofile.
+  IF sy-subrc <> 0.
+    WRITE: / text-e04, g_ofile.
+    EXIT.
+  ENDIF.
+
+* movements
+  CONCATENATE g_directory c_rec_m INTO g_ofile.
+
+  OPEN DATASET g_ofile FOR OUTPUT IN TEXT MODE ENCODING DEFAULT.
+  IF sy-subrc <> 0.
+    WRITE: / text-e03, g_ofile.
+    EXIT.
+  ENDIF.
+
+  loop at gt_mvts_out.
+    transfer gt_mvts_out to g_ofile.
+  endloop.
+
+  CLOSE DATASET g_ofile.
+  IF sy-subrc <> 0.
+    WRITE: / text-e04, g_ofile.
+    EXIT.
+  ENDIF.
+
+* status info
+  CONCATENATE g_directory c_rec_s INTO g_ofile.
+
+  OPEN DATASET g_ofile FOR OUTPUT IN TEXT MODE ENCODING DEFAULT.
+  IF sy-subrc <> 0.
+    WRITE: / text-e03, g_ofile.
+    EXIT.
+  ENDIF.
+
+  loop at gt_stat.
+    transfer gt_stat to g_ofile.
+  endloop.
+
+  CLOSE DATASET g_ofile.
+  IF sy-subrc <> 0.
+    WRITE: / text-e04, g_ofile.
+    EXIT.
+  ENDIF.
+
+
+*- Subroutines --------------------------------------------------------
+*&---------------------------------------------------------------------*
+*&      Form  select_orders
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM select_orders .
+
+  DATA: sel_tab TYPE STANDARD TABLE OF rihaufk_list WITH HEADER LINE.
+
+* select new creations
+  SUBMIT riaufk20 USING SELECTION-SET c_variant_o_a
+    WITH dy_selm = 'D' AND RETURN.
+
+  IMPORT sel_tab FROM MEMORY ID 'RIAUFK20'.
+  gt_ord_list_a[] = sel_tab[].
+
+* select changed orders
+  SUBMIT riaufk20 USING SELECTION-SET c_variant_o_c
+    WITH dy_selm = 'D' AND RETURN.
+
+  IMPORT sel_tab FROM MEMORY ID 'RIAUFK20'.
+  gt_ord_list_c[] = sel_tab[].
+
+ENDFORM.                    " select_orders
+
+*&---------------------------------------------------------------------*
+*&      Form  select_confirmations
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM select_confirmations .
+
+  DATA: sel_tab LIKE rihafvr OCCURS 0 WITH HEADER LINE.
+
+  SUBMIT riafru20 USING SELECTION-SET c_variant_c
+    WITH dy_selm = 'D' AND RETURN.
+
+  IMPORT sel_tab FROM MEMORY ID 'RIAFRU20'.
+  gt_conf_list[] = sel_tab[].
+
+ENDFORM.                    " select_confirmations
+
+*&---------------------------------------------------------------------*
+*&      Form  select_movements
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM select_movements .
+
+  SELECT a~aufnr a~werks a~lgort a~matnr a~bwart a~erfmg a~erfme
+         a~mblnr a~mjahr a~zeile a~bldat a~budat a~menge a~meins
+                      INTO corresponding fields of TABLE gt_mvts
+                      FROM aufm as a inner join mkpf as b
+                      ON        a~mblnr = b~mblnr
+                      AND       a~mjahr = b~mjahr
+                      WHERE     b~cpudt IN s_period.
+
+ENDFORM.                    " select_movements
+
+*&---------------------------------------------------------------------*
+*&      Form  select_status_info
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM select_status_info .
+
+  select * from jcds
+    into table gt_stat
+    where objnr like 'OR%'
+      and stat  in ('I0009', 'I0010', 'I0045', 'I0046')
+      and chgnr eq '001'
+      and udate in s_period.
+
+ENDFORM.                    " select_status_info
+
+*Text symbol text£º
+*E01:Execute only in Background !!
+*E03:Open dataset failed for :
+
+*E04:Close dataset failed for :
+*Selection text£º
+*P_DAYS:        Current date +/- ? days
+*P_INIT:        Initial load ? X=yes

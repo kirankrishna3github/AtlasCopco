@@ -1,0 +1,901 @@
+*&---------------------------------------------------------------------*
+*&  Include           YSE_REN_FLEET_ORUA_FORMS                         *
+*&---------------------------------------------------------------------*
+
+*&---------------------------------------------------------------------*
+*&      Form  SET_DATE_TO_MONTH
+*&---------------------------------------------------------------------*
+FORM set_date_to_month.
+
+  DATA:
+    lv_days         TYPE p.        " Days in month of provided enddate
+
+* Make sure P_ABDAT has a date which is the start of a month
+  p_abdat+6(2) = '01'.
+
+* Get the end of month of the date provided as enddate (P_ENDAT)
+  CALL FUNCTION 'HR_E_NUM_OF_DAYS_OF_MONTH'
+    EXPORTING
+      p_fecha        = p_endat
+    IMPORTING
+      number_of_days = lv_days.
+* Set enddate to the end of month
+  p_endat+6(2) = '01'.
+  p_endat = p_endat + lv_days - 1.
+
+ENDFORM.                    " GET_DEPOTS
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_DEPOTS
+*&---------------------------------------------------------------------*
+FORM get_depots.
+
+  CLEAR:
+    it_depots,
+    it_depots[].
+
+* Get the rental depots (and their funct. location, cust nr, etc...)
+  IF p_vkbur IS INITIAL.
+    SELECT * FROM yse_rent_depot
+         INTO TABLE it_depots
+        WHERE vkorg = p_vkorg.
+    IF sy-subrc <> 0.
+      MESSAGE e020 WITH p_vkorg 'YSE_RENT_DEPOT'.
+    ENDIF.
+  ELSE.
+    SELECT * FROM yse_rent_depot
+         INTO TABLE it_depots
+        WHERE vkorg = p_vkorg
+          AND vkbur = p_vkbur.
+    IF sy-subrc <> 0.
+      MESSAGE e021 WITH p_vkorg p_vkbur 'YSE_RENT_DEPOT'.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    " GET_DEPOTS
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_DATA
+*&---------------------------------------------------------------------*
+* Search Equipment Master View (like ITOB)
+*----------------------------------------------------------------------*
+FORM get_data .
+
+  RANGES:
+    lr_werks    FOR it_depots-werks.
+  DATA:
+*    BEGIN OF it_equi_temp OCCURS 0,
+*      equnr TYPE equnr,
+*      matnr TYPE matnr,
+*      sernr TYPE gernr,
+*      shtxt TYPE ktx01,
+*      eqlfn TYPE eqlfn,
+*      iloan TYPE iloan,
+*      anlnr TYPE anln1,
+*      anlun TYPE anln2,
+*      werks TYPE werks_d,
+*    END OF it_equi_temp,
+    BEGIN OF it_equi_ren OCCURS 0,
+      equnr TYPE equnr,
+    END OF it_equi_ren.
+
+* Move the found plants from YSE_RENT_DEPOT into a range.
+*  IF NOT ( it_depots IS INITIAL ).
+  IF NOT ( it_depots[] IS INITIAL ).
+    lr_werks-sign   = 'I'.
+    lr_werks-option = 'EQ'.
+    LOOP AT it_depots.
+      MOVE it_depots-werks TO lr_werks-low.
+      APPEND lr_werks.
+    ENDLOOP.
+  ENDIF.
+
+* Select equinrs which are "Rental" into internal table (based on equipment category)
+  SELECT equnr INTO TABLE it_equi_ren
+               FROM equi
+              WHERE eqtyp = 'Y'
+                 OR eqtyp = 'X'.
+
+* Get additional data for the rental equipments
+  SELECT      equi~equnr
+              equi~matnr
+              equi~sernr
+              eqkt~eqktx  AS shtxt
+              equz~eqlfn
+              equz~iloan
+              iloa~anlnr
+              iloa~anlun
+              eqbs~b_werk AS werks
+         FROM equi
+         JOIN eqkt
+           ON equi~equnr = eqkt~equnr
+         JOIN equz
+           ON equi~equnr = equz~equnr
+         JOIN iloa
+           ON equz~iloan = iloa~iloan
+*               JOIN eqbs
+         LEFT JOIN eqbs
+           ON equi~equnr = eqbs~equnr
+         INTO TABLE IT_EQUI_TEMP
+          FOR ALL ENTRIES IN it_equi_ren
+        WHERE equi~equnr EQ it_equi_ren-equnr
+          AND eqkt~spras EQ 'EN'
+          AND equz~datbi EQ '99991231'
+          AND iloa~bukrs EQ p_bukrs
+          AND NOT EXISTS  ( SELECT * FROM jest
+                         WHERE objnr EQ equi~objnr
+                         AND  stat EQ 'I0076'
+                         AND  inact EQ ' ' ) .
+* Remove entries which don't have a material number
+  DELETE it_equi_temp WHERE matnr EQ space.
+
+* sold and scrap items don't have a plant, in the history determine the plant
+  PERFORM fill_missing_plant TABLES it_equi_temp.
+
+* Build IT_EQUI based on temp table (leaving out some rec's based on selparam's)
+  LOOP AT it_equi_temp.
+*   If the plant is not part of the depots
+    IF NOT ( it_equi_temp-werks IN lr_werks ).
+      CONTINUE.
+    ENDIF.
+*   Move from temp to final table (WERKS is dropped)
+    MOVE-CORRESPONDING it_equi_temp TO it_equi.
+    APPEND it_equi.
+  ENDLOOP.
+
+* Sort the equipment table and remove duplicates
+  SORT it_equi.
+  DELETE ADJACENT DUPLICATES FROM it_equi.
+
+* Get the acquisition values of the equipments (currency can be retrieved from T093B)
+  SELECT      anln1
+              anln2
+              answl
+              kansw
+         INTO TABLE it_anlc
+         FROM anlc
+          FOR ALL ENTRIES IN it_equi
+        WHERE bukrs EQ p_bukrs
+          AND anln1 EQ it_equi-anlnr
+          AND gjahr EQ p_abdat(4)
+* begin of change MOD-002
+*          AND afabe EQ '30'
+          and afabe eq '01'
+* end of change MOD-002
+          AND zujhr EQ ''
+          AND zucod EQ ''.
+
+* Get the acquisition / deactivation date of the equipments
+  SELECT      anln1
+              anln2
+              zugdt
+              deakt
+         INTO TABLE it_anla
+         FROM anla
+          FOR ALL ENTRIES IN it_equi
+        WHERE bukrs EQ p_bukrs
+          AND anln1 EQ it_equi-anlnr.
+
+* Get the SME data
+  SELECT      *
+         INTO TABLE it_sme
+         FROM yse_rent_sme
+          FOR ALL ENTRIES IN it_equi
+        WHERE zzequnr EQ it_equi-equnr
+          AND (    (      angdt GE p_abdat
+                      AND angdt LE p_endat )
+                OR (      bnddt GE p_abdat
+                      AND bnddt LE p_endat )
+                OR (      angdt LT p_abdat
+                      AND bnddt GT p_endat ) ).
+
+ENDFORM.                    " GET_DATA
+
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_PERIOD
+*&---------------------------------------------------------------------*
+FORM check_period .
+
+  IF p_abdat GT p_endat.
+    MESSAGE e047.
+  ENDIF.
+
+ENDFORM.                    " CHECK_PERIOD
+
+*&---------------------------------------------------------------------*
+*&      Form  PROCESS_DATA
+*&---------------------------------------------------------------------*
+FORM process_data .
+
+  PERFORM build_eom_list.
+
+  PERFORM build_equi_cal.
+
+  PERFORM calc_util.
+
+ENDFORM.                    " PROCESS_DATA
+
+*&---------------------------------------------------------------------*
+*&      Form  BUILD_EQUI_CAL
+*&---------------------------------------------------------------------*
+FORM build_equi_cal .
+
+  DATA:
+    lv_datum TYPE datum.
+
+  RANGES:
+    lr_auart_or FOR it_sme-auart,
+    lr_auart_ua FOR it_sme-auart.
+
+* Sort tables to be read
+  SORT it_anla BY anln1 anln2.
+  SORT it_anlc BY anln1 anln2.
+
+* Prepare range of doc types for "On Rent"
+  lr_auart_or-sign   = 'I'.
+  lr_auart_or-option = 'EQ'.
+  lr_auart_or-low    = gc_auart_zqp.
+  APPEND lr_auart_or.
+  lr_auart_or-low    = gc_auart_zqp1.
+  APPEND lr_auart_or.
+  lr_auart_or-low    = gc_auart_zqp2.
+  APPEND lr_auart_or.
+  lr_auart_or-low    = gc_auart_zrib.
+  APPEND lr_auart_or.
+
+* Prepare range of doc types for "Unavailable"
+  lr_auart_ua-sign  = 'I'.
+  lr_auart_ua-option = 'EQ'.
+  lr_auart_ua-low    = gc_auart_zlf.
+  APPEND lr_auart_ua.
+  lr_auart_ua-low    = gc_auart_lr.
+  APPEND lr_auart_ua.
+  lr_auart_ua-low    = gc_auart_zam1.
+  APPEND lr_auart_ua.
+
+* For every equipment in the fleet
+  LOOP AT it_equi.
+
+*   Find acquis/deact data
+    READ TABLE it_anla WITH KEY anln1 = it_equi-anlnr
+                                anln2 = it_equi-anlun
+                       BINARY SEARCH.
+*   Don't process equipment if detail not found
+    IF sy-subrc NE 0.
+      CONTINUE.
+    ENDIF.
+
+*   Find acquis value
+    READ TABLE it_anlc WITH KEY anln1 = it_equi-anlnr
+                                anln2 = it_equi-anlun
+                       BINARY SEARCH.
+*   Don't process equipment if detail not found
+    IF sy-subrc NE 0.
+      CONTINUE.
+    ENDIF.
+
+*   Analyze day per day for the current equipment
+    lv_datum = p_abdat.
+    WHILE NOT lv_datum GT p_endat.
+
+*     Clear target areas
+      CLEAR:
+        it_equi_cal, it_out.
+
+*     Start filling target fields
+      it_out-datum      = lv_datum.
+      it_equi_cal-datum = lv_datum.
+      it_equi_cal-equnr = it_equi-equnr.
+      IF lv_datum LE it_anla-deakt AND NOT it_anla-deakt IS INITIAL.
+        it_equi_cal-kansw = it_anlc-kansw.
+      ELSE.
+        it_equi_cal-kansw = it_anlc-answl + it_anlc-kansw.
+      ENDIF.
+
+*     If current date falls between acq and deact date
+      if     LV_DATUM ge IT_ANLA-ZUGDT
+         AND (    lv_datum LE it_anla-deakt
+               OR it_anla-deakt IS INITIAL ).
+*        Set INFLT flag
+        it_equi_cal-inflt = 'X'.
+*        Accumulate acq value to tot fleet of the day (through "COLLECT" statement)
+         it_out-fl_tot     = it_equi_cal-kansw.
+
+
+*        Check if current equipment is on rent for this date
+        LOOP AT it_sme WHERE zzequnr EQ it_equi-equnr
+                         AND auart IN lr_auart_or
+                         AND angdt LE lv_datum
+                         AND bnddt GE lv_datum.
+        ENDLOOP.
+*        If on rent
+        IF sy-subrc EQ 0.
+*          Set OR flag
+          it_equi_cal-orua = 'OR'.
+*          If "Fleet on rent" is requested
+          IF p_rbor NE space.
+*            Accum acq value to fleet on rent (through "COLLECT" statement)
+            it_out-fl_or     = it_equi_cal-kansw.
+          ENDIF.
+*        If not on rent
+        ELSE.
+*          Check if current equipment is unavail for this date
+          LOOP AT it_sme WHERE zzequnr EQ it_equi-equnr
+                           AND auart IN lr_auart_ua
+                           AND angdt LE lv_datum
+                           AND bnddt GE lv_datum.
+          ENDLOOP.
+*          If unavailable
+          IF sy-subrc EQ 0.
+
+*            Set UA flag
+            it_equi_cal-orua = 'UA'.
+*            If "Fleet unavail" is requested
+            IF p_rbua NE space.
+*              Accum acq value to fleet on rent (or unavail) (through "COLLECT" statement)
+              it_out-fl_or   = it_equi_cal-kansw.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+
+      ENDIF.
+
+*     Create new equipment day line
+      APPEND it_equi_cal.
+
+*     Collect values for fleet on rent and total fleet for this day
+      COLLECT it_out.
+
+*     Go to next day
+      lv_datum = lv_datum + 1.
+
+    ENDWHILE.
+
+  ENDLOOP.
+
+ENDFORM.                    " BUILD_EQUI_CAL
+
+*&---------------------------------------------------------------------*
+*&      Form  CALC_UTIL
+*&---------------------------------------------------------------------*
+FORM calc_util.
+
+  DATA:
+    lv_wotnrc TYPE wotnr,
+    lv_wotnrp TYPE p,
+    lv_dayctr TYPE i,
+    lt_t246   TYPE t246   OCCURS 0 WITH HEADER LINE,
+    ls_out    LIKE LINE OF it_out.
+
+* Get the day number of the start date
+  CALL FUNCTION 'DAY_IN_WEEK'
+    EXPORTING
+      datum = p_abdat
+    IMPORTING
+      wotnr = lv_wotnrp.
+  lv_wotnrc = lv_wotnrp.
+
+* Get the description of the days
+  SELECT *
+         FROM t246
+         INTO TABLE lt_t246
+        WHERE sprsl EQ sy-langu.
+
+  SORT it_out  BY datum.
+  SORT lt_t246 BY wotnr.
+
+* Complete every output line
+  LOOP AT it_out.
+
+*   Get description of the day
+    READ TABLE lt_t246 WITH KEY wotnr = lv_wotnrc.
+    it_out-daytx = lt_t246-langt.
+*   Advance to next day number (used in next loop entry)
+    lv_wotnrc = lv_wotnrc + 1.
+    IF lv_wotnrc EQ '8'.
+      lv_wotnrc = '1'.
+    ENDIF.
+
+*   Calculate Utilization (Financial)
+    IF NOT it_out-fl_tot EQ 0.
+      it_out-util = it_out-fl_or / it_out-fl_tot.
+    ENDIF.
+
+*   If month has changed since previous line, reset day counter and subtotals
+    IF it_out-datum+4(2) NE ls_out-datum+4(2).
+      lv_dayctr = 1.
+      ls_out-fl_or_mtd = it_out-fl_or.
+      ls_out-fl_mtd    = it_out-fl_tot.
+*   If month has not changed, add todays figures to the subtotals (of the month)
+    ELSE.
+      lv_dayctr = lv_dayctr + 1.
+      ls_out-fl_or_mtd = ls_out-fl_or_mtd + it_out-fl_or.
+      ls_out-fl_mtd    = ls_out-fl_mtd    + it_out-fl_tot.
+    ENDIF.
+    ls_out-datum = it_out-datum.
+
+*   Set MTD values
+    it_out-fl_or_mtd   = ls_out-fl_or_mtd / lv_dayctr.
+    it_out-fl_mtd      = ls_out-fl_mtd / lv_dayctr.
+    IF NOT it_out-fl_mtd EQ 0.
+      it_out-util_mtd  = it_out-fl_or_mtd / it_out-fl_mtd.
+    ENDIF.
+
+    MODIFY it_out.
+
+  ENDLOOP.
+
+ENDFORM.                    " CALC_UTIL
+
+*&---------------------------------------------------------------------*
+*&      Form  9001_BUILD_ALV
+*&---------------------------------------------------------------------*
+FORM 9001_build_alv .
+
+  DATA:
+    lv_outstruc  TYPE tabname,
+    ls_layout    TYPE lvc_s_layo,
+    ls_cellcolor TYPE lvc_s_scol.
+  DATA:  lv_off TYPE INT4.
+
+
+  CALL METHOD cl_gui_alv_grid=>offline
+      RECEIVING
+      e_offline = lv_off.
+
+  IF lv_off IS INITIAL.
+      IF OBJ_CONT_OV IS INITIAL .
+          CREATE OBJECT OBJ_CONT_OV
+                   EXPORTING CONTAINER_NAME = 'OVERVIEW' .
+      ENDIF.
+  ENDIF.
+  IF OBJ_ALV_OV IS INITIAL.
+      CREATE OBJECT OBJ_ALV_OV
+                EXPORTING I_PARENT = OBJ_CONT_OV.
+
+      CREATE OBJECT OBJ_EVENT_HNDL_OV.
+
+*     Enable Line Selection And Double-Clicking
+      SET HANDLER OBJ_EVENT_HNDL_OV->HANDLE_DOUBLE_CLICK FOR OBJ_ALV_OV.
+  ENDIF.
+
+* Clear the field catalog table
+  REFRESH: it_fieldcat_ov.
+
+* Determine the output structure to be used
+  IF p_rbor NE space.
+    lv_outstruc = 'YSE_REN_FLEET_OR_OUT'.
+  ELSE.
+    lv_outstruc = 'YSE_REN_FLEET_UA_OUT'.
+  ENDIF.
+
+* Fetch the field catalog for structure YSE_RENT_EHRSP_OUTPUT
+  CALL FUNCTION 'LVC_FIELDCATALOG_MERGE'
+    EXPORTING
+      i_buffer_active  = ' '
+      i_structure_name = lv_outstruc
+    CHANGING
+      ct_fieldcat      = it_fieldcat_ov.
+
+* Modify some of the fields
+  LOOP AT it_fieldcat_ov ASSIGNING <gs_fieldcat>.
+    CASE <gs_fieldcat>-fieldname.
+      WHEN 'WAERS'.
+        <gs_fieldcat>-no_out = gc_char_x.
+*      WHEN 'EQUNR'.
+*        <FIELDCAT>-OUTPUTLEN = 10.
+*      WHEN 'EHSTA' OR 'BDSTA'.
+*        <FIELDCAT>-OUTPUTLEN = 5.
+*        <FIELDCAT>-ICON      = GC_CHAR_X.
+    ENDCASE.
+  ENDLOOP.
+
+* Define the column name in which the color code can be found
+  ls_layout-ctab_fname = 'CLR'.
+* Set the colors in new output table
+* LS_CELLCOLOR-FIELDNAME = 'DATUM'.
+  ls_cellcolor-color-col = '0004'.
+  ls_cellcolor-color-int = '1'.
+  LOOP AT it_out.
+    CLEAR it_out_col.
+    MOVE-CORRESPONDING it_out TO it_out_col.
+    IF it_out-datum IN gr_eom.
+      APPEND ls_cellcolor TO it_out_col-clr.
+    ENDIF.
+    APPEND it_out_col.
+  ENDLOOP.
+
+* Display the grid
+  CALL METHOD obj_alv_ov->set_table_for_first_display
+    EXPORTING
+      i_structure_name              = lv_outstruc
+      i_save                        = 'A'
+      is_layout                     = ls_layout
+    CHANGING
+      it_outtab                     = it_out_col[]
+      it_fieldcatalog               = it_fieldcat_ov
+    EXCEPTIONS
+      invalid_parameter_combination = 1
+      program_error                 = 2
+      too_many_lines                = 3
+      OTHERS                        = 4.
+
+  IF sy-subrc <> 0.
+*     MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*     WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+  ENDIF.
+
+ENDFORM.                    " 9001_BUILD_ALV
+
+*&---------------------------------------------------------------------*
+*&      Form  9002_BUILD_ALV
+*&---------------------------------------------------------------------*
+FORM 9002_build_alv .
+
+  DATA:
+    lv_outstruc    TYPE tabname,
+    ls_layout      TYPE lvc_s_layo,
+    ls_cellcolor   TYPE lvc_s_scol,
+    ls_fieldcat_dt LIKE LINE OF it_fieldcat_dt.
+
+  FIELD-SYMBOLS:
+    <ls_out_dt>,
+    <ls_tab_clr> TYPE lvc_t_scol.
+
+* Set the output structure to be used
+  lv_outstruc = 'YSE_REN_FLEET_DT_OUT'.
+  ls_layout-cwidth_opt = 'X'.
+** Define the column name in which the color code can be found
+*  LS_LAYOUT-CTAB_FNAME = 'CLR'.
+** Set the colors in new output table
+** LS_CELLCOLOR-FIELDNAME = 'DATUM'.
+*  LS_CELLCOLOR-COLOR-COL = '0004'.
+*  LS_CELLCOLOR-COLOR-INT = '1'.
+*  READ TABLE <GS_OUT_DT> ASSIGNING <LS_OUT_DT> INDEX 1.
+*  IF SY-SUBRC EQ 0.
+*    ASSIGN COMPONENT 3 OF STRUCTURE <LS_OUT_DT> TO <LS_TAB_CLR>.
+*    APPEND LS_CELLCOLOR TO <LS_TAB_CLR>.
+*  ENDIF.
+
+* Display the grid
+  CALL METHOD obj_alv_dt->set_table_for_first_display
+    EXPORTING
+*      i_structure_name              = lv_outstruc
+      i_save                        = 'A'
+      is_layout                     = ls_layout
+    CHANGING
+      it_outtab                     = <gs_out_dt>
+      it_fieldcatalog               = it_fieldcat_dt
+    EXCEPTIONS
+      invalid_parameter_combination = 1
+      program_error                 = 2
+      too_many_lines                = 3
+      OTHERS                        = 4.
+
+  IF sy-subrc <> 0.
+*     MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*     WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+  ENDIF.
+
+ENDFORM.                    " 9002_BUILD_ALV
+
+*&---------------------------------------------------------------------*
+*&      Form  BUILD_EOM_LIST
+*&---------------------------------------------------------------------*
+FORM build_eom_list .
+
+  DATA:
+    lv_datum TYPE datum.
+
+* Build list with the dates of the last day of every month in the range
+  gr_eom-sign   = 'I'.
+  gr_eom-option = 'EQ'.
+* Assume the P_ENDAT is the last day of the last month (is guaranteed by at-selection-screen)
+  lv_datum = p_endat.
+  WHILE lv_datum GT p_abdat.
+    gr_eom-low = lv_datum.
+    APPEND gr_eom.
+    lv_datum+6(2) = '01'.
+    lv_datum = lv_datum - 1.
+  ENDWHILE.
+
+ENDFORM.                    " BUILD_EOM_LIST
+
+*&---------------------------------------------------------------------*
+*&      Form  SHOW_DETAIL_9001
+*&---------------------------------------------------------------------*
+FORM show_detail_9001 USING p_row
+                            p_column
+                            p_row_no STRUCTURE lvc_s_roid.
+
+* Get the line which was doubleclicked
+  CHECK p_row_no-row_id GT 0.
+  READ TABLE it_out INDEX p_row_no-row_id.
+  CHECK sy-subrc EQ 0.
+
+* Create dynamic table
+  PERFORM dyntab_create.
+* Fill dynamic table
+  PERFORM dyntab_fill.
+
+  CALL SCREEN 9002.
+
+ENDFORM.                    " SHOW_DETAIL_9001
+
+*&---------------------------------------------------------------------*
+*&      Form  SHOW_DETAIL_9002
+*&---------------------------------------------------------------------*
+FORM show_detail_9002 USING p_row
+                            p_column
+                            p_row_no STRUCTURE lvc_s_roid.
+
+* Get the line which was doubleclicked
+  CHECK p_row_no-row_id EQ 0.
+  CHECK p_column NE 0.
+
+  SET PARAMETER ID 'EQN' FIELD p_column.
+  CALL TRANSACTION 'IE03' AND SKIP FIRST SCREEN.
+
+
+ENDFORM.                    " SHOW_DETAIL_9002
+
+*&---------------------------------------------------------------------*
+*&      Form  DYNTAB_CREATE
+*&---------------------------------------------------------------------*
+FORM dyntab_create.
+
+  DATA:
+    lv_equnr      TYPE equnr,
+    ls_fieldcat   TYPE lvc_s_fcat,
+    lv_outstruc   TYPE tabname VALUE 'YSE_REN_FLEET_DT_OUT'.
+
+* Clear the Field Catalog
+  CLEAR: it_fieldcat_dt, it_fieldcat_dt[].
+
+* Fetch the field catalog
+  CALL FUNCTION 'LVC_FIELDCATALOG_MERGE'
+    EXPORTING
+      i_buffer_active  = ' '
+      i_structure_name = lv_outstruc
+    CHANGING
+      ct_fieldcat      = it_fieldcat_dt.
+
+* Set 'Currency' to no display
+  LOOP AT it_fieldcat_dt INTO ls_fieldcat.
+    CASE ls_fieldcat-fieldname.
+      WHEN 'WAERS'.
+        ls_fieldcat-no_out = 'X'.
+      WHEN 'DAYTX' OR 'DATUM'.
+        ls_fieldcat-key = 'X'.
+    ENDCASE.
+    MODIFY it_fieldcat_dt FROM ls_fieldcat INDEX sy-tabix.
+  ENDLOOP.
+
+* Read the template column for every equipment
+  READ TABLE it_fieldcat_dt INTO ls_fieldcat WITH KEY fieldname = 'TEMPLATE'.
+  CHECK sy-subrc EQ 0.
+  DELETE it_fieldcat_dt WHERE fieldname = 'TEMPLATE'.
+
+* Set the number of key columns: day, date, color, currency
+  gv_keycols = 4.
+  ls_fieldcat-col_pos = gv_keycols.
+
+* Add the extra columns (one for each equipment)
+  LOOP AT it_equi.
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+      EXPORTING
+        input  = it_equi-equnr
+      IMPORTING
+        output = lv_equnr.
+    CLEAR: ls_fieldcat-tabname,
+           ls_fieldcat-ref_table.
+    ls_fieldcat-col_pos    = ls_fieldcat-col_pos + 1.
+    ls_fieldcat-reptext    = lv_equnr.
+    ls_fieldcat-fieldname  = lv_equnr.
+    ls_fieldcat-coltext    = lv_equnr.
+    ls_fieldcat-scrtext_l  = lv_equnr.
+    ls_fieldcat-scrtext_m  = lv_equnr.
+    ls_fieldcat-scrtext_s  = lv_equnr.
+    APPEND ls_fieldcat TO it_fieldcat_dt.
+  ENDLOOP.
+
+* If next method call dumps, check the generated code by putting a break point at
+* LSKBHF06, form fb_table_create, line 547: "generate subroutine pool lt_source..."
+  CALL METHOD cl_alv_table_create=>create_dynamic_table
+    EXPORTING
+      it_fieldcatalog = it_fieldcat_dt
+    IMPORTING
+      ep_table        = gp_out_dt.
+
+  ASSIGN gp_out_dt->* TO <gs_out_dt>.
+
+ENDFORM.                    " DYNTAB_CREATE
+
+*&---------------------------------------------------------------------*
+*&      Form  DYNTAB_FILL
+*&---------------------------------------------------------------------*
+FORM dyntab_fill .
+
+* Local variables
+  FIELD-SYMBOLS: <ls_line>,
+                 <ls_field>.
+  DATA:
+    lv_comp   TYPE i,
+    lv_equnr  TYPE equnr,
+    lv_datum  TYPE datum,
+    lv_abdat  TYPE datum,
+    lv_endat  TYPE datum,
+    lv_wotnrc TYPE wotnr,
+    lv_wotnrp TYPE p,
+    lv_dayctr TYPE i,
+    lt_t246   TYPE t246   OCCURS 0 WITH HEADER LINE,
+    ls_fcat   LIKE LINE OF it_fieldcat_dt.
+
+* Determin the period to be displayed
+  lv_abdat = it_out-datum.
+  lv_abdat+6(2) = '01'.
+  CALL FUNCTION 'RE_ADD_MONTH_TO_DATE'
+    EXPORTING
+      months  = 1
+      olddate = lv_abdat
+    IMPORTING
+      newdate = lv_endat.
+  lv_endat = lv_endat - 1.
+
+* Get the day number of the start date
+  CALL FUNCTION 'DAY_IN_WEEK'
+    EXPORTING
+      datum = lv_abdat
+    IMPORTING
+      wotnr = lv_wotnrp.
+  lv_wotnrc = lv_wotnrp.
+
+* Get the description of the days
+  SELECT *
+         FROM t246
+         INTO TABLE lt_t246
+        WHERE sprsl EQ sy-langu.
+  SORT lt_t246 BY wotnr.
+
+* Get working area for output table of details
+  ASSIGN LOCAL COPY OF INITIAL LINE OF <gs_out_dt> TO <ls_line>.
+
+  SORT it_equi_cal BY equnr datum.
+
+* Build a line for every date in the range
+  lv_datum = lv_abdat.
+  WHILE lv_datum LE lv_endat.
+
+    CLEAR <ls_line>.
+*   Get description of the day
+    READ TABLE lt_t246 WITH KEY wotnr = lv_wotnrc.
+*   Advance to next day number (used in next loop entry)
+    lv_wotnrc = lv_wotnrc + 1.
+    IF lv_wotnrc EQ '8'. lv_wotnrc = '1'.  ENDIF.
+*   Fill date and day in output table
+    ASSIGN COMPONENT 1 OF STRUCTURE <ls_line> TO <ls_field>.
+    <ls_field> = lt_t246-langt.
+    ASSIGN COMPONENT 2 OF STRUCTURE <ls_line> TO <ls_field>.
+    <ls_field> = lv_datum.
+
+*   Use the fieldcatalog table for detail to run through all equipments for that day
+    LOOP AT it_fieldcat_dt INTO ls_fcat WHERE col_pos GT 4.
+*     Convert field name to equipment number
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+        EXPORTING
+          input  = ls_fcat-fieldname
+        IMPORTING
+          output = lv_equnr.
+*     Convert column position to component to be filled in LS_LINE
+      lv_comp = ls_fcat-col_pos - 1.
+*     Find the equi-cal entry for that day and equipment
+      READ TABLE it_equi_cal WITH KEY equnr = lv_equnr
+                                      datum = lv_datum
+                             BINARY SEARCH.
+      IF sy-subrc EQ 0.
+
+        IF p_rbor NE space AND it_equi_cal-orua = 'OR'.
+          ASSIGN COMPONENT lv_comp OF STRUCTURE <ls_line> TO <ls_field>.
+          <ls_field> = it_equi_cal-kansw.
+        ELSEIF p_rbua NE space AND it_equi_cal-orua = 'UA'.
+          ASSIGN COMPONENT lv_comp OF STRUCTURE <ls_line> TO <ls_field>.
+          <ls_field> = it_equi_cal-kansw.
+        ENDIF.
+
+      ENDIF.
+
+    ENDLOOP.
+
+    APPEND <ls_line> TO <gs_out_dt>.
+    lv_datum = lv_datum + 1.
+
+  ENDWHILE.
+
+ENDFORM.                    " DYNTAB_FILL
+
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_AUTH
+*&---------------------------------------------------------------------*
+FORM check_auth .
+
+  AUTHORITY-CHECK OBJECT 'V_VBAK_VKO'
+                      ID 'VKORG' FIELD p_vkorg
+                      ID 'VTWEG' FIELD p_vtweg
+                      ID 'SPART' DUMMY
+                      ID 'ACTVT' DUMMY.
+
+  IF sy-subrc = 4.
+*   No authorisation to display data from Sales Organisation p_vkorg
+    MESSAGE ID 'YSE_RENTAL' TYPE 'E' NUMBER '041' WITH p_vkorg p_vtweg.
+  ELSEIF sy-subrc <> 0.
+*   Error checking authorization.
+    MESSAGE ID 'YSE_RENTAL' TYPE 'E' NUMBER '046'.
+  ENDIF.
+
+ENDFORM.                    " CHECK_AUTH
+
+*&---------------------------------------------------------------------*
+*&      Form  FILL_MISSING_PLANT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_IT_EQUI_TEMP  text
+*----------------------------------------------------------------------*
+FORM fill_missing_plant  TABLES   l_i_equi_tmp STRUCTURE it_equi_temp.
+
+  DATA:
+       l_matnr  LIKE riserx1-matnr,
+       l_sernr  LIKE riserx1-sernr,
+       l_equi_nr LIKE riserx1-equnr.
+
+  DATA: BEGIN OF da_sertab OCCURS 1.
+          INCLUDE STRUCTURE riserx1.
+  DATA: END OF da_sertab.
+
+  DATA: BEGIN OF intobjk OCCURS 30.
+          INCLUDE STRUCTURE objk.
+  DATA: END  OF intobjk.
+  DATA: BEGIN OF it_ser03 OCCURS 999.
+          INCLUDE STRUCTURE ser03.
+  DATA: END OF it_ser03.
+
+  LOOP AT l_i_equi_tmp WHERE werks IS INITIAL.
+    CALL FUNCTION 'SERIAL_NOT_UNIQUE'
+      EXPORTING
+        material  = l_i_equi_tmp-matnr
+        serial    = l_i_equi_tmp-sernr
+      IMPORTING
+        serial    = l_sernr
+        equipment = l_equi_nr
+      EXCEPTIONS
+        not_found = 01.
+
+    CHECK sy-subrc = 0.
+    CHECK NOT l_equi_nr IS INITIAL.
+
+* Es werden alle Objektlisten zur Serialnummer selektiert.
+    CLEAR intobjk[].
+    SELECT *
+    FROM objk
+    INTO TABLE intobjk
+    WHERE equnr = l_equi_nr
+    AND taser EQ 'SER03'.
+    IF sy-subrc EQ 0.
+      SELECT *
+      INTO TABLE it_ser03
+      FROM ser03
+      FOR ALL ENTRIES IN intobjk
+      WHERE obknr = intobjk-obknr
+      AND ( bwart EQ '601' OR bwart EQ '551' ).
+      IF sy-subrc EQ 0.
+        LOOP AT it_ser03.
+          MOVE it_ser03-werk TO l_i_equi_tmp-werks.
+          MODIFY l_i_equi_tmp.
+          EXIT.
+        ENDLOOP.
+      ENDIF.
+    ENDIF.
+
+  ENDLOOP.
+
+ENDFORM.                    " FILL_MISSING_PLANT

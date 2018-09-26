@@ -1,0 +1,431 @@
+*----------------------------------------------------------------------*
+* PROGRAM ID           : YSE_CONV_FOR_NEWGL_MARC                       *
+* PROGRAM TITLE        : SEED: conversion for NEWGL                    *
+* AUTHOR               : Marc Jacobs                                   *
+* DATE                 : 09/02/2009                                    *
+* DEVELOPMENT ID       :                                               *
+* CHANGE REQUEST NUMBER: CD1K946155                                    *
+* PROGRAM DESCRIPTION  : NEWGL:Program that updates MARC profit center *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME     |CORRECTION NUMBER| CHANGE REFERENCE # *
+*----------------------------------------------------------------------*
+*                                                                      *
+* Maintain an entry in yam_sel_partner with dummy company code OOO1    *
+* in order to derive the sending partner.  e.g. below                  *
+* Company Code Message Type                   Partner no.              *
+* 0001         YSE_POPIC_UPDATE               SQ0500PI                 *
+*                                                                      *
+*----------------------------------------------------------------------*
+
+REPORT  yse_conv_for_newgl_marc2    NO STANDARD PAGE HEADING
+                                    LINE-SIZE 160
+                                    LINE-COUNT 80.
+
+*- Tables -------------------------------------------------------------*
+TABLES: mara,                   "Material Client level
+        mvke.                   "Sales Data for Material
+
+*- Internal tables ----------------------------------------------------*
+* Control report data
+DATA: BEGIN OF g_output OCCURS 0,
+        matnr LIKE mara-matnr,
+        werks LIKE marc-werks,
+        prctr LIKE marc-prctr,
+        errflg(1),
+        text(100).
+DATA: END OF g_output.
+
+DATA: BEGIN OF i_mara OCCURS 0,
+        matnr  TYPE matnr,
+        prdha  TYPE prodh_d,
+      END   OF i_mara.
+
+DATA: BEGIN OF i_marc OCCURS 0,
+        matnr  TYPE matnr,
+        werks  TYPE werks_d,
+        prctr  TYPE prctr,
+      END   OF i_marc.
+
+DATA: BEGIN OF t_marc,
+        matnr  TYPE matnr,
+        werks  TYPE werks_d,
+        prctr  TYPE prctr,
+      END   OF t_marc.
+
+* MATERIAL_MAINTAIN_DARK interface tables
+* General Data for Material
+DATA: BEGIN OF gt_mara OCCURS 0.
+        INCLUDE STRUCTURE mara_ueb.
+DATA: END   OF gt_mara.
+
+* Plant Data for Material
+DATA: BEGIN OF gt_marc OCCURS 0.
+        INCLUDE STRUCTURE marc_ueb.
+DATA: END   OF gt_marc.
+
+* Messages
+DATA: BEGIN OF gt_messtab OCCURS 0.
+        INCLUDE STRUCTURE merrdat.
+DATA: END   OF gt_messtab,
+      t_messtab LIKE gt_messtab.
+
+
+*- Variables ----------------------------------------------------------*
+DATA: g_errors TYPE bierrnum,
+      g_msg_no TYPE msgnr,
+      g_cnt_tranc  TYPE i VALUE 1,
+      g_cnt_d_ind  TYPE i VALUE 1.
+
+
+*- Constants ----------------------------------------------------------*
+CONSTANTS: c_mm02  LIKE sy-tcode   VALUE 'MM02'.  " Transaction code
+
+CONSTANTS :c_mestyp      LIKE edidc-mestyp VALUE 'YSE_POPIC_UPDATE' ,
+           c_idoc_type   LIKE edidc-idoctp VALUE 'YSE_POPIC_UPDATE' ,
+           c_segment(19) TYPE c VALUE 'YSE_E1_POPIC_UPDATE',
+           c_x(1)        TYPE c VALUE 'X',
+           c_ls(2)       VALUE 'LS'.
+
+DATA: i_edidc_control_comm LIKE edidc OCCURS 1 WITH HEADER LINE ,
+      i_edidd_data LIKE edidd OCCURS 0 WITH HEADER LINE ,
+      wa_edidc LIKE edidc ,
+      p_logsys LIKE tbdlst-logsys .
+
+DATA: BEGIN OF wa_idoc_fields,
+        matnr    TYPE matnr,
+        rppgc(4) TYPE c,
+        vendor    TYPE lifnr,
+  END OF wa_idoc_fields .
+
+
+DATA: gv_prdha TYPE prodh_d,
+      gv_prctrold TYPE prctr,
+      gv_prctrnew TYPE prctr,
+      gv_vendor TYPE lifnr,
+      gv_mtart LIKE mara-mtart,
+      gv_idoc_sent(1) TYPE c.
+
+
+*- Select-options / Parameters ----------------------------------------*
+SELECTION-SCREEN BEGIN OF BLOCK block1 WITH FRAME TITLE text-010.
+SELECT-OPTIONS: s_matnr FOR mara-matnr,
+*                s_werks for marc-werks obligatory ,
+                s_mtart FOR mara-mtart,
+                s_vkorg FOR mvke-vkorg  NO INTERVALS.
+SELECTION-SCREEN END OF BLOCK block1.
+
+
+*- Start-of-selection -------------------------------------------------*
+START-OF-SELECTION.
+
+* select data from MARA
+  IF s_vkorg[] IS INITIAL.
+    SELECT matnr prdha FROM mara
+        INTO CORRESPONDING FIELDS OF TABLE i_mara
+        WHERE matnr IN s_matnr
+          AND mtart IN s_mtart
+          and lvorm <> c_x.
+    SORT i_mara BY matnr.
+  ELSE.
+    SELECT mara~matnr mara~prdha
+           INTO CORRESPONDING FIELDS OF TABLE i_mara
+           FROM mara
+           JOIN mvke ON mara~matnr = mvke~matnr
+        WHERE mara~matnr IN s_matnr
+          AND mara~mtart IN s_mtart
+          and mara~lvorm <> c_x
+          AND mvke~vkorg IN s_vkorg.
+    SORT i_mara BY matnr.
+    DELETE ADJACENT DUPLICATES FROM i_mara
+           COMPARING matnr.
+  ENDIF.
+
+  IF i_mara[] IS INITIAL.
+    WRITE: / text-e10.                " no materials selected
+    EXIT.
+  ELSE.
+*   get logical system
+    CALL FUNCTION 'OWN_LOGICAL_SYSTEM_GET'
+      IMPORTING
+        own_logical_system             = p_logsys
+      EXCEPTIONS
+        own_logical_system_not_defined = 1
+        OTHERS                         = 2.
+************************************************************************
+*CHECK IF IDOC CONFIGURATION IS READY AND IDOC CAN BE PROCESSED.       *
+************************************************************************
+    CALL FUNCTION 'ALE_MODEL_DETERMINE_IF_TO_SEND'
+      EXPORTING
+        message_type           = c_mestyp
+      IMPORTING
+        idoc_must_be_sent      = gv_idoc_sent
+      EXCEPTIONS
+        own_system_not_defined = 1
+        OTHERS                 = 2.
+    IF sy-subrc <> 0.
+      EXIT.
+    ENDIF.
+
+*   create_idoc.
+    CLEAR : i_edidc_control_comm,
+            wa_edidc.
+
+    SELECT SINGLE parnum INTO wa_edidc-rcvprn
+     FROM yam_sel_partner
+     WHERE msgtyp = c_mestyp.
+
+    CONCATENATE 'SAP' sy-sysid INTO wa_edidc-rcvpor.
+    wa_edidc-rcvprt =  c_ls.
+    wa_edidc-sndprn = p_logsys.
+    wa_edidc-sndpor = p_logsys.
+    wa_edidc-sndprt = c_ls.
+    wa_edidc-mestyp =  c_mestyp.
+    wa_edidc-idoctp =  c_idoc_type.
+    wa_edidc-serial = sy-datum.
+    wa_edidc-serial+8 = sy-uzeit.
+    wa_edidc-direct = '2'.
+
+    LOOP AT i_mara.
+      CLEAR: wa_idoc_fields,
+             i_edidd_data.
+      REFRESH i_edidd_data.
+
+      wa_idoc_fields-matnr = i_mara-matnr.
+      wa_idoc_fields-rppgc = i_mara-prdha+4(4).
+*      wa_idoc_fields-vendor = gv_vendor.
+
+      CLEAR i_edidd_data[] .
+      i_edidd_data-segnam  = c_segment .
+      i_edidd_data-sdata   = wa_idoc_fields .
+      APPEND i_edidd_data .
+
+      CALL FUNCTION 'IDOC_WRITE_AND_START_INBOUND'
+        EXPORTING
+          i_edidc                             = wa_edidc
+*             DO_COMMIT                           = 'X'
+*           IMPORTING
+*             DOCNUM                              =
+*             ERROR_BEFORE_CALL_APPLICATION       =
+        TABLES
+          i_edidd                             = i_edidd_data
+*           EXCEPTIONS
+*             IDOC_NOT_SAVED                      = 1
+*             OTHERS                              = 2
+                .
+      IF sy-subrc <> 0.
+        MESSAGE e025(yam_inf) WITH i_edidc_control_comm-docnum.
+      ENDIF.
+    ENDLOOP.
+
+*    select matnr werks prctr from marc
+*        into corresponding fields of table i_marc
+*        for all entries in i_mara
+*        where matnr eq i_mara-matnr.
+**          and werks in s_werks.
+*
+*    sort i_marc by matnr werks.
+*
+*    loop at i_marc.
+*          read table i_mara with key
+*                       matnr = i_marc-matnr
+*                       binary search.
+*      if sy-subrc = 0.
+*        t_marc-matnr = i_marc-matnr.
+*        t_marc-werks = i_marc-werks.
+*        t_marc-prctr = i_mara-prdha+4(4).
+*        perform update_material.
+*        clear t_marc.
+*      endif.
+*    endloop.
+  ENDIF.
+
+*- End-of-selection ---------------------------------------------------*
+END-OF-SELECTION.
+
+*  perform write_output.
+
+  SKIP.
+  WRITE: / 'End of Proces'(001).
+
+*- Top-of-page --------------------------------------------------------*
+TOP-OF-PAGE.
+
+  WRITE: sy-title, 85 sy-datum, 100 sy-uzeit, 115 sy-pagno.
+  ULINE.
+  SKIP.
+
+*- forms --------------------------------------------------------------*
+*&---------------------------------------------------------------------
+*&      Form  UPDATE_MATERIAL
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM update_material.
+
+* General Material Data
+  gt_mara-mandt = sy-mandt.
+  gt_mara-tcode = c_mm02.
+  gt_mara-tranc = g_cnt_tranc.
+  gt_mara-d_ind = g_cnt_d_ind.
+
+  gt_mara-matnr = t_marc-matnr.
+  APPEND gt_mara.
+
+* Plant Data for Material
+  gt_marc-mandt = sy-mandt.
+  gt_marc-tranc = g_cnt_tranc.
+  gt_marc-d_ind = g_cnt_d_ind.
+
+  gt_marc-matnr = t_marc-matnr.
+  gt_marc-werks = t_marc-werks.
+  gt_marc-prctr = t_marc-prctr.
+  APPEND gt_marc.
+
+  PERFORM change_material USING t_marc-matnr t_marc-werks t_marc-prctr.
+
+ENDFORM.                    "update_material
+
+*&---------------------------------------------------------------------*
+*&      Form  CHANGE_MATERIAL
+*&---------------------------------------------------------------------*
+*       Call DI FM 'MATERIAL_MAINTAIN_DARK' to change the Material
+*----------------------------------------------------------------------*
+FORM change_material USING r_matnr r_werks r_prctr.
+
+* Change Material
+  CALL FUNCTION 'MATERIAL_MAINTAIN_DARK'
+    EXPORTING
+      p_kz_no_warn              = 'N'
+      kz_prf                    = 'W'
+    IMPORTING
+      number_errors_transaction = g_errors
+    TABLES
+      amara_ueb                 = gt_mara
+      amarc_ueb                 = gt_marc
+      amerrdat                  = gt_messtab
+    EXCEPTIONS
+      kstatus_empty             = 1
+      tkstatus_empty            = 2
+      t130m_error               = 3
+      internal_error            = 4
+      too_many_errors           = 5
+      update_error              = 6
+      OTHERS                    = 7.
+
+  IF sy-subrc EQ 0.
+    IF g_errors NE 0.
+* Add messages to output table
+      LOOP AT gt_messtab.
+        t_messtab = gt_messtab.
+        CLEAR g_output.
+        IF gt_messtab-msgty EQ 'E' OR gt_messtab-msgty EQ 'A'.
+          MOVE 'X' TO g_output-errflg.
+        ENDIF.
+
+        AT NEW msgno.
+          MOVE r_matnr TO g_output-matnr.
+          MOVE r_werks TO g_output-werks.
+          MOVE r_prctr TO g_output-prctr.
+
+          PERFORM prepare_message_text USING    t_messtab
+                                       CHANGING g_output-text.
+          APPEND g_output.
+        ENDAT.
+      ENDLOOP.
+    ELSE.
+      COMMIT WORK AND WAIT.
+      CLEAR g_output.
+      MOVE r_matnr TO g_output-matnr.
+      MOVE r_werks TO g_output-werks.
+      MOVE r_prctr TO g_output-prctr.
+      APPEND g_output.
+    ENDIF.
+  ELSE.
+    ROLLBACK WORK.
+* Add message to output table
+    CLEAR g_output.
+    MOVE 'X'      TO g_output-errflg.
+    MOVE r_matnr  TO g_output-matnr.
+    MOVE r_werks  TO g_output-werks.
+    MOVE r_prctr TO g_output-prctr.
+    MOVE text-e04 TO g_output-text.
+    APPEND g_output.
+  ENDIF.
+
+* Refresh interface tables
+  CLEAR: gt_mara, gt_marc, gt_messtab, g_errors.
+  REFRESH: gt_mara, gt_marc, gt_messtab.
+
+ENDFORM.                    "change_material
+
+*&---------------------------------------------------------------------*
+*&      Form  PREPARE_MESSAGE_TEXT
+*&---------------------------------------------------------------------*
+*       Format message with variables
+*----------------------------------------------------------------------*
+*  -->  P_MESSTAB  Messages table header line
+*  <--  R_TEXT     Message text
+*----------------------------------------------------------------------*
+FORM prepare_message_text USING    p_messtab LIKE merrdat
+                          CHANGING r_text.
+
+  CLEAR r_text.
+  g_msg_no = p_messtab-msgno.       "Type conflict!
+  CALL FUNCTION 'MESSAGE_PREPARE'
+    EXPORTING
+      language               = sy-langu
+      msg_id                 = p_messtab-msgid
+      msg_no                 = g_msg_no
+      msg_var1               = p_messtab-msgv1
+      msg_var2               = p_messtab-msgv2
+      msg_var3               = p_messtab-msgv3
+      msg_var4               = p_messtab-msgv4
+    IMPORTING
+      msg_text               = r_text
+    EXCEPTIONS
+      function_not_completed = 1
+      message_not_found      = 2
+      OTHERS                 = 3.
+
+  IF sy-subrc NE 0.
+    CONCATENATE p_messtab-msgty p_messtab-msgid p_messtab-msgno
+                INTO r_text SEPARATED BY space.
+  ELSE.
+    CONCATENATE p_messtab-msgty p_messtab-msgid p_messtab-msgno r_text
+                INTO r_text SEPARATED BY space.
+  ENDIF.
+
+ENDFORM.                    " PREPARE_MESSAGE_TEXT
+
+*&---------------------------------------------------------------------*
+*&      Form  WRITE_OUTPUT
+*&---------------------------------------------------------------------*
+*       Output the control report
+*----------------------------------------------------------------------*
+FORM write_output.
+
+  SORT g_output BY matnr werks.
+
+* Output
+  LOOP AT g_output WHERE errflg EQ 'X'.
+
+    WRITE:/ g_output-matnr NO-ZERO, 14 g_output-werks, g_output-prctr,
+            g_output-text.
+  ENDLOOP.
+
+ENDFORM.                    " WRITE_OUTPUT
+
+*Text symbol text£º
+*001:End of Proces
+*010:Selection
+*E04:Update material failed !!!
+*E10:No materials selected
+
+*Z99:Obsolete program - not New GL compliant -Do not run!
+*Selection text£º
+*S_MATNR:D       .
+*S_MTART:D       .
+*S_VKORG:D       .
+*S_WERKS:D       .

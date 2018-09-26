@@ -1,0 +1,432 @@
+REPORT ZOPSECRE .
+
+************************************************************************
+* repair program for production and process orders without operations  *
+* and sequences. Both are generated ( including a status object )      *
+* if necessary.                                         (CR 27.7.2000) *
+************************************************************************
+
+TABLES: CAUFV, CAUFVD, T399X, TCO41, TCA01, AFFL, AFVGD, AFVC,
+        AFVV, AFVU, RCR01, T430, JSTO, JEST, RESB.
+
+DATA: NUMBERS(10) TYPE C VALUE '0123456789'.
+DATA: FLG_JSTO,
+      FLG_JEST.
+DATA: L_VORNR LIKE AFVGD-VORNR,
+      L_ERROR TYPE C,
+      DEF_AUART like CAUFVD-AUART,
+      DEF_PLNTY like T399X-PLNTY.
+* Initial status for objects ('Created')
+DATA: BEGIN OF INIT_TAB OCCURS 1.
+        INCLUDE STRUCTURE JSTAT.
+DATA: END OF INIT_TAB.
+* Insert table jsto
+DATA: BEGIN OF JSTO_TAB OCCURS 0.
+        INCLUDE STRUCTURE JSTO.
+DATA: END OF JSTO_TAB.
+* Insert table resb
+DATA: BEGIN OF RESB_TAB OCCURS 0.
+        INCLUDE STRUCTURE RESB.
+DATA: END OF RESB_TAB.
+
+
+PARAMETERS: ORDER LIKE AFKO-AUFNR.
+PARAMETERS: TESTMODE DEFAULT 'X'.
+
+
+SELECT SINGLE * FROM CAUFV
+                   WHERE AUFNR EQ ORDER.
+IF NOT SY-SUBRC IS INITIAL.
+  WRITE: / 'Order',order,'does not exist'.
+  exit.
+ENDIF.
+* CHECK SY-SUBRC IS INITIAL.             " Auftrag vorhanden ?
+
+MOVE-CORRESPONDING CAUFV TO CAUFVD.
+
+IF CAUFVD-AUTYP = '10'.
+  DEF_AUART = 'PP01'.
+  DEF_PLNTY = 'N'.
+  WRITE: / 'Checking Production Order:', CAUFVD-AUFNR.
+ELSEIF CAUFVD-AUTYP = '40'.
+  DEF_AUART = 'PI01'.
+  DEF_PLNTY = '2'.
+  WRITE: / 'Checking Process Order:', CAUFVD-AUFNR.
+ELSE.
+  WRITE: / 'This report repairs only production or processorders'.
+  WRITE: '(type 10 or 40).'.
+  WRITE: / 'But order' , CAUFVD-AUFNR , 'is of type' , CAUFVD-autyp.
+  exit.
+ENDIF.
+
+*--> Steuertabellen f¨¹llen,  Fill control tables .
+* Werksparameter lesen
+CALL FUNCTION 'CO_TA_T399X_READ'
+     EXPORTING
+          AUART  = CAUFVD-AUART
+          WERKS  = CAUFVD-WERKS
+     IMPORTING
+          STRUCT = T399X.
+
+* TCO41 (Profil Vorgangsgenerierung)
+CALL FUNCTION 'CO_TA_TCO41_READ'
+     EXPORTING
+          TCO41_AUART = CAUFVD-AUART
+          TCO41_WERK  = CAUFVD-WERKS
+     IMPORTING
+          TCO41WA     = TCO41
+     EXCEPTIONS
+          NOT_FOUND   = 1
+          OTHERS      = 2.
+
+* Wenn f¨¹r vorliegende Auftragsart kein Profil vorhanden, dann
+* mit Standardtyp versuchen
+* If no profile is found with current order type, try with
+* standard type.
+IF NOT SY-SUBRC IS INITIAL.
+  CALL FUNCTION 'CO_TA_TCO41_READ'
+       EXPORTING
+            TCO41_AUART = DEF_AUART
+            TCO41_WERK  = CAUFVD-WERKS
+       IMPORTING
+            TCO41WA     = TCO41
+     EXCEPTIONS
+          NOT_FOUND   = 1
+          OTHERS      = 2.
+
+* Customizing entry is missing
+  IF NOT SY-SUBRC IS INITIAL.
+    WRITE: / 'Please maintain an entry in transaction OPJG for'.
+    WRITE: / 'Plant:',CAUFVD-WERKS,'and Order Type:',CAUFVD-AUART.
+    exit.
+  ENDIF.
+ENDIF.
+
+* Wenn Plantyp nicht bekannt, Standard Typ verwenden.
+* No initial routing type
+IF T399X-PLNTY IS INITIAL.
+  T399X-PLNTY = DEF_PLNTY.
+ENDIF.
+
+CALL FUNCTION 'CO_TA_TCA01_READ'
+     EXPORTING
+          PLNTY  = T399X-PLNTY
+     IMPORTING
+          STRUCT = TCA01.
+
+* initialize initial status to be set
+INIT_TAB-STAT  = 'I0001'.
+INIT_TAB-INACT = SPACE.
+APPEND INIT_TAB.
+
+* Gibt es bereits eine Folge (also die Stammfolge) ?
+* Does a sequence exist (master sequence) ?
+*=======================================================================
+
+SELECT SINGLE * FROM AFFL WHERE AUFPL EQ CAUFVD-AUFPL
+                            AND FLGAT EQ '0'.
+IF SY-SUBRC  <> 0.
+  WRITE:/ '-> No sequence found'.
+  WRITE:/ '   Sequence is generated...'.
+  L_ERROR = 'X'.
+* Stammfolge generieren und dazu Profil lesen
+* Generate sequence and read profile.
+*=======================================================================
+  MOVE: TCA01-PLNAW  TO CAUFVD-PLNAW,
+        TCO41-VERWE TO CAUFVD-PVERW,
+        T399X-PLNTY TO CAUFVD-PLNTY.
+
+  CLEAR AFFL.
+*  Felder in AFFL f¨¹llen
+*  Fill fields of AFFL.
+*=======================================================================
+  MOVE: T399X-PLNTY      TO AFFL-PLNTY,
+        '000000'         TO AFFL-PLNFL,
+        '0'              TO AFFL-FLGAT,
+        '2'              TO AFFL-AUSCHL,
+        CAUFVD-AUFPL     TO AFFL-AUFPL,
+        '00000001'       TO AFFL-APLZL,
+        '99999999'       TO AFFL-LOSBS,
+        SY-MANDT         TO AFFL-MANDT.
+
+*  Statusobjekt anlegen, falls n#tig
+*  Create status object, if necessary.
+*=======================================================================
+  AFFL-OBJNR    = 'OS'.
+  AFFL-OBJNR+2  = AFFL-AUFPL.
+  AFFL-OBJNR+12 = AFFL-APLZL.
+  PERFORM CHECK_STATUS_EXISTS USING AFFL-OBJNR
+                                    FLG_JSTO
+                                    FLG_JEST.
+  IF TESTMODE IS INITIAL.
+    PERFORM REPAIR_STATUS_OBJECT USING AFFL-OBJNR
+                                     'OSF'
+                                     CAUFV-AUFNR
+                                     TESTMODE
+                                     FLG_JSTO
+                                     FLG_JEST.
+  ENDIF.
+
+* Folgentabelle updaten
+* Update table of sequences.
+  IF TESTMODE IS INITIAL.
+    INSERT AFFL FROM AFFL.
+  ENDIF.
+ELSE.
+  WRITE: / 'Valid sequence was found, no action needs to be taken'.
+ENDIF.
+
+* Vorg#nge
+* Operations
+
+SELECT SINGLE * FROM AFVC WHERE AUFPL EQ CAUFVD-AUFPL.
+
+IF SY-SUBRC <> 0.
+  WRITE:/ '-> No operation was found'.
+  WRITE:/ 'operation is generated...'.
+  L_ERROR = 'X'.
+  MOVE-CORRESPONDING TCO41 TO AFVGD.
+*  Falls Arbeitsplatz zum Aufl#sungszeitpunkt ung¨¹ltig: l#schen
+*  If resource is invalid: delete.
+*=======================================================================
+  IF NOT TCO41-ARBPL IS INITIAL.
+    CLEAR RCR01.
+    CALL FUNCTION 'CR_WORKSTATION_READ_ROUTING'
+         EXPORTING
+              ARBPL            = TCO41-ARBPL
+              WERKS            = CAUFVD-WERKS
+              PLNTY            = CAUFVD-PLNTY
+              DATE             = CAUFVD-AUFLD
+              VGWKZ            = 'X'
+         IMPORTING
+              WORKS            = RCR01
+         EXCEPTIONS
+              NOT_FOUND        = 1
+              TYPE_NOT_ALLOWED = 2.
+    IF NOT SY-SUBRC IS INITIAL.
+      CLEAR TCO41-ARBPL.
+      CLEAR AFVGD-ARBID.
+    ELSE.
+      AFVGD-ARBID = RCR01-ARBID.
+      CLEAR: AFVGD-STEUS.
+      CALL FUNCTION 'CO_DI_AFVGD_RCR01_REF_FILL'
+           EXPORTING
+                AFVGD_IMP = AFVGD
+                RCR01_IMP = RCR01
+           IMPORTING
+                AFVGD_EXP = AFVGD
+           EXCEPTIONS
+                OTHERS    = 1.
+      CALL FUNCTION 'CO_DI_AFVGD_RCR01_DEF_FILL'
+           EXPORTING
+                AFVGD_IMP = AFVGD
+                RCR01_IMP = RCR01
+           IMPORTING
+                AFVGD_EXP = AFVGD.
+    ENDIF.
+  ENDIF.
+*  aus TCO41 den Dummy-Vorgang f¨¹llen
+*  Fill dummy-operation from table TCO41.
+*=======================================================================
+  MOVE CAUFVD-GMEIN    TO AFVGD-MEINH.
+  IF NOT T399X-VORNR_DEL IS INITIAL AND
+         T399X-VORNR_DEL CO NUMBERS.
+    MOVE T399X-VORNR_DEL TO AFVGD-VORNR.
+    MOVE T399X-VORNR_DEL TO L_VORNR.
+  ELSE.
+    MOVE TCO41-IVORNR        TO AFVGD-VORNR.
+    MOVE TCO41-IVORNR        TO L_VORNR.
+  ENDIF.
+  MOVE CAUFVD-AUFPL        TO AFVGD-AUFPL.
+  AFVGD-APLZL = '00000001'.
+  MOVE CAUFVD-WERKS        TO AFVGD-WERKS.
+  MOVE '000000'            TO AFVGD-APLFL.
+  MOVE '000000'            TO AFVGD-PLNFL.
+  MOVE CAUFVD-PLNTY        TO AFVGD-PLNTY.
+
+  AFVGD-BMSCH = 1.
+  AFVGD-MGVRG = 1.
+  IF AFVGD-STEUS IS INITIAL.
+    WRITE DEF_AUART TO AFVGD-STEUS.
+  ENDIF.
+
+  IF AFVGD-VORNR IS INITIAL.
+    WRITE '10' TO AFVGD-VORNR.
+  ENDIF.
+
+  IF AFVGD-UMREN IS INITIAL.
+    AFVGD-UMREN = 1.
+  ENDIF.
+
+  IF AFVGD-UMREZ IS INITIAL.
+    AFVGD-UMREZ = 1.
+  ENDIF.
+
+  SY-SUBRC = 0.
+  IF T430-STEUS NE AFVGD-STEUS.
+    SELECT SINGLE * FROM T430 WHERE PLNAW = '*'
+                              AND   STEUS = AFVGD-STEUS.
+  ENDIF.
+
+  IF  SY-SUBRC IS INITIAL
+  AND NOT T430-KALKZ IS INITIAL.
+    MOVE 'X' TO AFVGD-SELKZ.
+  ENDIF.
+
+  CLEAR AFVC.
+  CLEAR AFVV.
+  CLEAR AFVU.
+  MOVE-CORRESPONDING AFVGD TO AFVC.
+  MOVE-CORRESPONDING AFVGD TO AFVU.
+  MOVE-CORRESPONDING AFVGD TO AFVV.
+
+* Statusobjekt anlegen
+* Create status object.
+*=======================================================================
+  AFVC-OBJNR    = 'OV'.
+  AFVC-OBJNR+2  = AFVC-AUFPL.
+  AFVC-OBJNR+12 = AFVC-APLZL.
+  PERFORM CHECK_STATUS_EXISTS USING AFVC-OBJNR
+                                    FLG_JSTO
+                                    FLG_JEST.
+  IF TESTMODE IS INITIAL.
+    PERFORM REPAIR_STATUS_OBJECT USING AFVC-OBJNR
+                                     'OVG'
+                                     CAUFV-AUFNR
+                                     TESTMODE
+                                     FLG_JSTO
+                                     FLG_JEST.
+  ENDIF.
+* Vorgangstabellen updaten
+* update operations
+  IF TESTMODE IS INITIAL.
+    INSERT AFVC FROM AFVC.
+    INSERT AFVV FROM AFVV.
+    INSERT AFVU FROM AFVU.
+    WRITE:/ 'Operation', AFVC-VORNR, 'created'.
+  ENDIF.
+
+* Nun noch alle Komponenten auf ersten Vorgang zeigen lassen
+* Let components point to the first operation.
+  SELECT * FROM RESB INTO TABLE RESB_TAB
+                     WHERE RSNUM = CAUFVD-RSNUM.
+  LOOP AT RESB_TAB WHERE APLZL NE '00000001'
+                      OR AUFPL NE CAUFVD-AUFPL.
+    RESB_TAB-APLZL = '00000001'.
+    RESB_TAB-AUFPL = CAUFVD-AUFPL.
+    RESB_TAB-VORNR = L_VORNR.
+    RESB_TAB-PLNFL = '000000'.
+    MODIFY RESB_TAB.
+  ENDLOOP.
+  UPDATE RESB FROM TABLE RESB_TAB.
+  WRITE:/ 'Components were updated'.
+
+ELSE.
+  WRITE:/ 'Valid operation was found, no action needs to be taken'.
+ENDIF.
+
+IF L_ERROR IS INITIAL.
+  WRITE:/ 'Order is ok or cannot be repaired with this report!'.
+  EXIT.
+ELSEIF NOT TESTMODE IS INITIAL.
+  WRITE:/ 'Order needs to be repaired. Please run report without'.
+  WRITE: 'testmode.'.
+  EXIT.
+ENDIF.
+
+IF TESTMODE IS INITIAL.
+* Statustabellen updaten
+* Update status tables.
+  IF NOT JSTO_TAB[] IS INITIAL.
+    INSERT JSTO FROM TABLE JSTO_TAB.
+  ENDIF.
+  COMMIT WORK.
+ENDIF.
+
+* Erfolgsmeldung
+* Success message.
+IF SY-SUBRC IS INITIAL.
+  WRITE:/ 'order fixed'.
+ELSE.
+  WRITE:/ 'error occurred while updating order'.
+ENDIF.
+
+
+************************************************************************
+* check_status_exists: checks which parts of the status object
+*                      already exists
+************************************************************************
+FORM CHECK_STATUS_EXISTS USING OBJNR_IMP   LIKE JSTO-OBJNR
+                               JSTO_EXISTS
+                               JEST_EXISTS.
+
+  CLEAR JSTO_EXISTS.
+  CLEAR JEST_EXISTS.
+
+  SELECT SINGLE * FROM JSTO WHERE OBJNR EQ OBJNR_IMP.
+  IF SY-SUBRC IS INITIAL.
+*.. Jsto entry exists
+    JSTO_EXISTS = 'X'.
+  ENDIF.
+
+  SELECT SINGLE * FROM JEST WHERE OBJNR EQ OBJNR_IMP
+                              AND STAT  EQ 'I0001'.
+  IF SY-SUBRC IS INITIAL.
+*.. initial jest entry exists
+    JEST_EXISTS = 'X'.
+  ENDIF.
+
+ENDFORM.
+
+
+************************************************************************
+* repair_status_object: repairs the status object
+************************************************************************
+
+FORM REPAIR_STATUS_OBJECT USING OBJNR_IMP LIKE JSTO-OBJNR
+                                OBTYP_IMP LIKE JSTO-OBTYP
+                                ORDER_IMP LIKE CAUFV-AUFNR
+                                TESTMODE_IMP
+                                JSTO_EXISTS
+                                JEST_EXISTS.
+
+
+
+* 1. status object does completely not exist
+  IF     JSTO_EXISTS IS INITIAL AND
+         JEST_EXISTS IS INITIAL.
+*.. Create status object completely
+    CALL FUNCTION 'STATUS_OBJECT_CREATE'
+         EXPORTING
+              OBJNR = OBJNR_IMP
+              OBTYP = OBTYP_IMP.
+  ENDIF.
+
+* 2. no entry in jsto but in jest
+  IF     JSTO_EXISTS IS INITIAL AND
+     NOT JEST_EXISTS IS INITIAL.
+*.. only create an entry in jsto
+    CLEAR JSTO_TAB.
+    JSTO_TAB-OBJNR = OBJNR_IMP.
+    JSTO_TAB-OBTYP = OBTYP_IMP.
+    APPEND JSTO_TAB.
+  ENDIF.
+
+* 3. no entry in jest but in jsto
+  IF NOT JSTO_EXISTS IS INITIAL AND
+         JEST_EXISTS IS INITIAL.
+*.. only set initial status for object in table jest
+    CALL FUNCTION 'STATUS_CHANGE_INTERN'
+         EXPORTING
+              OBJNR  = OBJNR_IMP
+         TABLES
+              STATUS = INIT_TAB.
+  ENDIF.
+
+* 4. both exist -> nothing to be done
+
+ENDFORM.
+
+*Selection text£º
+*ORDER:D       .
+*TESTMODE:        Testmode

@@ -1,0 +1,285 @@
+*&---------------------------------------------------------------------*
+*&
+*& Report  YSE_CHANGE_IDOCSTATUS_67
+*&
+*&---------------------------------------------------------------------*
+*&                                                                     *
+*& Change IDoc-status from 51 to 67 (for GR based invoicing)           *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+*  Author                : Jules Smets
+*  Date                  : 29.04.2010
+*  Change Request Number : CR1295
+*  Transport request Nr. : CD1K956232
+*----------------------------------------------------------------------*
+*                                                                      *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME     |CORRECTION NUMBER| CHANGE REFERENCE # *
+*----------------------------------------------------------------------*
+* MOD-001 |01.01.9999|          |CD1K9.....       |(Description)       *
+*----------------------------------------------------------------------*
+
+************************************************************************
+
+REPORT  yse_change_idocstatus_67.
+
+TABLES: edidc,
+        edids,
+        balhdr,
+        baldat.
+
+* Internal table with IDocs
+DATA: BEGIN OF it_idoc  OCCURS 0,
+        docnum      TYPE edi_docnum,
+        logdat      TYPE edi_logdat,
+        logtim      TYPE edi_logtim,
+        appl_log    TYPE edi_alog,
+        stamid      TYPE edi_stamid,
+        stamno      TYPE edi_stamno,
+        log_handle  TYPE balloghndl,
+      END OF it_idoc.
+
+* Internal table for Log messages
+DATA: BEGIN OF it_logm  OCCURS 0,
+        msg_handle  TYPE balmsghndl,
+      END OF it_logm.
+
+* Internal table with Log handle
+DATA: t_logh        TYPE bal_t_logh.
+
+* Internal table with IDoc status counter
+DATA: BEGIN OF it_count  OCCURS 0,
+        docnum      TYPE edi_docnum,
+        countr      TYPE edi_countr,
+      END OF it_count.
+
+* Internal table with IDoc status
+DATA: it_edids      TYPE TABLE OF edids.
+
+* Variables
+DATA: h_msg         TYPE bal_s_msg,
+      h_show        TYPE bal_s_show,
+      h_error       TYPE xfeld,
+      wa_edids      TYPE edids.
+
+* Constants
+CONSTANTS: c_invoic   TYPE edi_mestyp   VALUE 'INVOIC',
+           c_51       TYPE edi_status   VALUE '51',
+           c_67       TYPE edi_status   VALUE '67',
+           c_ea       TYPE edi_stamid   VALUE 'EA',
+           c_me       TYPE edi_stamid   VALUE 'ME',
+           c_066      TYPE edi_stamno   VALUE '066',
+           c_708      TYPE edi_stamno   VALUE '708',
+           c_al       TYPE indx_relid   VALUE 'AL'.
+
+RANGES: r_docnum      FOR edidc-docnum.
+
+* Selections
+SELECTION-SCREEN  BEGIN OF BLOCK sel  WITH FRAME  TITLE text-s01.
+SELECT-OPTIONS: s_docnum  FOR edidc-docnum,           "IDoc number
+                s_logdat  FOR edids-logdat,           "Creation date
+                s_logtim  FOR edids-logtim.           "Creation time
+SELECTION-SCREEN  END OF BLOCK sel.
+
+
+*&---------------------------------------------------------------------*
+*&  Main program                                                       *
+*&---------------------------------------------------------------------*
+START-OF-SELECTION.
+
+* Get IDocs
+  PERFORM select_data.
+* Check log for error EA-066
+  PERFORM check_log.
+* Change status
+  PERFORM change_status.
+
+
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_DATA
+*&---------------------------------------------------------------------*
+*       Get IDocs to be processed
+*----------------------------------------------------------------------*
+FORM select_data .
+
+* Select all data
+  SELECT c~docnum s~logdat s~logtim s~appl_log
+         s~stamid s~stamno h~log_handle
+         INTO TABLE it_idoc
+         FROM edids AS s
+         INNER JOIN edidc AS c
+               ON c~docnum = s~docnum  AND
+                  c~status = s~status
+         LEFT OUTER JOIN balhdr AS h
+               ON h~lognumber = s~appl_log
+         WHERE s~logdat   IN s_logdat
+           AND s~logtim   IN s_logtim
+           AND s~docnum   IN s_docnum
+           AND ( ( s~stamid = c_me AND s~stamno = c_708 )    OR
+                 ( s~stamid = c_ea AND s~stamno = c_066 ) )
+           AND c~status   =  c_51
+           AND c~mestyp   =  c_invoic.
+
+* Keep the latest lognumber per IDoc
+  SORT it_idoc BY docnum   ASCENDING
+                  logdat DESCENDING logtim DESCENDING.
+
+  DELETE ADJACENT DUPLICATES FROM it_idoc
+         COMPARING docnum.
+
+  CHECK NOT it_idoc[] IS INITIAL.
+
+* Get status counters for IDocs
+  SELECT docnum countr INTO TABLE it_count
+         FROM edids
+         FOR ALL ENTRIES IN it_idoc
+         WHERE docnum = it_idoc-docnum.
+
+* Keep the latest status counter
+  SORT it_count BY docnum ASCENDING
+                   countr DESCENDING.
+
+  DELETE ADJACENT DUPLICATES FROM it_count
+         COMPARING docnum.
+
+ENDFORM.                    " SELECT_DATA
+
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_LOG
+*&---------------------------------------------------------------------*
+*       Check log for error EA-066
+*----------------------------------------------------------------------*
+FORM check_log .
+
+* Get Log handle
+  LOOP AT it_idoc WHERE stamid = c_ea
+                    AND log_handle NE space.
+    INSERT it_idoc-log_handle INTO TABLE t_logh.
+  ENDLOOP.
+
+  CHECK sy-subrc = 0.
+
+* Reload messages of an application log
+  CALL FUNCTION 'BAL_DB_RELOAD'
+    EXPORTING
+      i_t_log_handle    = t_logh
+    EXCEPTIONS
+      no_logs_specified = 1
+      log_not_found     = 2
+      OTHERS            = 3.
+  IF sy-subrc <> 0.
+*   MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*           WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+  ENDIF.
+
+* Check Log messages.
+  LOOP AT it_idoc WHERE stamid = c_ea.
+
+*   Get Log messages
+    REFRESH it_logm.
+    CLEAR it_logm.
+    SELECT log_handle block
+           INTO (it_logm-msg_handle-log_handle,
+                 it_logm-msg_handle-msgnumber)
+           FROM baldat
+           WHERE relid = c_al
+             AND log_handle = it_idoc-log_handle.
+      APPEND it_logm.
+    ENDSELECT.
+
+    SORT it_logm.
+    DELETE ADJACENT DUPLICATES FROM it_logm.
+
+*   Process messages
+    CLEAR h_error.
+    LOOP AT it_logm.
+      CALL FUNCTION 'BAL_LOG_MSG_READ'
+        EXPORTING
+          i_s_msg_handle  = it_logm-msg_handle
+          i_langu         = sy-langu
+        IMPORTING
+          e_s_msg         = h_msg
+          e_txt_msgty     = h_show-t_msgty
+          e_txt_msgid     = h_show-t_msgid
+          e_txt_detlevel  = h_show-t_detlevel
+          e_txt_probclass = h_show-t_probclss
+          e_txt_msg       = h_show-t_msg
+        EXCEPTIONS
+          msg_not_found   = 1
+          OTHERS          = 2.
+      IF sy-subrc = 0.
+        IF h_msg-msgid = c_me AND h_msg-msgno = c_708.
+*         OK
+        ELSE.
+          h_error = 'X'.
+          EXIT.
+        ENDIF.
+      ENDIF.
+    ENDLOOP.
+
+*   Do not process in case of other messages
+    IF NOT h_error IS INITIAL.
+      DELETE it_idoc.
+    ENDIF.
+
+  ENDLOOP.
+
+ENDFORM.                    " CHECK_LOG
+
+*&---------------------------------------------------------------------*
+*&      Form  CHANGE_STATUS
+*&---------------------------------------------------------------------*
+*       Change status from 51 to 67
+*----------------------------------------------------------------------*
+FORM change_status .
+
+  CHECK NOT it_idoc[] IS INITIAL.
+
+  r_docnum-sign   = 'I'.
+  r_docnum-option = 'EQ'.
+
+* Prepare status & control records
+  LOOP AT it_idoc.
+*   New status record (67)
+    CLEAR wa_edids.
+    wa_edids-mandt  = sy-mandt.
+    wa_edids-docnum = it_idoc-docnum.
+    wa_edids-logdat = wa_edids-credat = sy-datum.
+    wa_edids-logtim = wa_edids-cretim = sy-uzeit.
+    wa_edids-status = c_67.
+    wa_edids-uname  = sy-uname.
+    wa_edids-repid  = sy-repid.
+    wa_edids-statxt = text-m01.
+    READ TABLE it_count WITH KEY docnum = it_idoc-docnum
+                        BINARY SEARCH.
+    wa_edids-countr = it_count-countr + 1.
+    APPEND wa_edids TO it_edids.
+*   Range for control records
+    r_docnum-low = it_idoc-docnum.
+    APPEND r_docnum.
+  ENDLOOP.
+
+* Insert status records
+  INSERT edids FROM TABLE it_edids.
+  COMMIT WORK AND WAIT.
+
+* Update control records
+  CHECK NOT r_docnum[] IS INITIAL.
+
+  UPDATE edidc
+         SET status = c_67
+         WHERE docnum IN r_docnum.
+  COMMIT WORK.
+
+ENDFORM.                    " CHANGE_STATUS
+
+*Text symbol text£º
+*M01:Goods Receipt based invoicing
+
+*S01:Selection
+*Selection text£º
+*S_DOCNUM:D       .
+*S_LOGDAT:D       .
+*S_LOGTIM:D       .

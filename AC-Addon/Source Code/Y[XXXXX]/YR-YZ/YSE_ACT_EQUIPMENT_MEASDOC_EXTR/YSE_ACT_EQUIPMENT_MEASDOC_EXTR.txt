@@ -1,0 +1,398 @@
+*&---------------------------------------------------------------------*
+*& Report  YSE_ACT_EQUIPMENT_MEASDOC_EXTR
+*&
+*&---------------------------------------------------------------------*
+*&                                                                     *
+*& ACT! : Equipment Measurement Documents extraction                   *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+*  Author                : Jules Smets
+*  Date                  : 07.09.2012
+*  Change Request Number :
+*  Transport request Nr. : CD1K973206
+*----------------------------------------------------------------------*
+*                                                                      *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD. NR.|   DATE     | NAME            | CORRECTION NR.| CHANGE REF. *
+*----------------------------------------------------------------------*
+* MOD-001 | 19.03.2014 | Jules Smets     | CD1K980489    | CR1794 (Act)*
+*----------------------------------------------------------------------*
+
+************************************************************************
+
+REPORT  yse_act_equipment_measdoc_extr.
+
+TABLES: equi,
+        equz,
+        iloa,
+        jest,
+        imptt,
+        imrg,
+        cabn.
+
+TYPES: BEGIN OF ty_equi,
+         equnr      TYPE equnr,
+         objnr      TYPE j_objnr,
+      END OF ty_equi.
+
+TYPES: BEGIN OF ty_dlfl,
+         objnr      TYPE j_objnr,
+      END OF ty_dlfl.
+
+TYPES: BEGIN OF ty_mdoc,
+         mpobj      TYPE imrc_mpobj,
+         atinn      TYPE atinn,
+         point      TYPE imrc_point,
+         idate      TYPE imrc_idate,
+         itime      TYPE imrc_itime,
+         readr      TYPE imrc_readr,
+         readg      TYPE imrc_readg,
+         recdu      TYPE imrc_recdu,
+         decim      TYPE imrc_decim,
+         expon      TYPE imrc_expon,
+         psort      TYPE imrc_psort,
+       END OF ty_mdoc.
+
+TYPES: BEGIN OF ty_cabn,
+         atinn      TYPE atinn,
+         adzhl      TYPE adzhl,
+         atnam      TYPE atnam,
+      END OF ty_cabn.
+
+DATA: gt_equi  TYPE TABLE OF ty_equi
+                    WITH HEADER LINE.
+
+DATA: gt_dlfl  TYPE HASHED TABLE OF ty_dlfl
+                    WITH UNIQUE KEY objnr
+                    WITH HEADER LINE,
+      gt_dlfli TYPE TABLE OF ty_dlfl
+                    WITH HEADER LINE.
+
+DATA: gt_mdoc TYPE SORTED TABLE OF ty_mdoc
+                    WITH NON-UNIQUE KEY mpobj
+                    WITH HEADER LINE.
+
+DATA: gt_cabn  TYPE HASHED TABLE OF ty_cabn
+                    WITH UNIQUE KEY atinn
+                    WITH HEADER LINE,
+      gt_cabni TYPE TABLE OF ty_cabn
+                    WITH HEADER LINE.
+
+DATA: BEGIN OF gt_out  OCCURS 0,
+        equnr       TYPE equnr,
+        tab01(1)    TYPE c,
+        atnam       TYPE atnam,
+        tab02(1)    TYPE c,
+        point       TYPE imrc_point,
+        tab03(1)    TYPE c,
+        idate_c(10) TYPE c,
+        tab04(1)    TYPE c,
+        itime_c(8)  TYPE c,
+        tab05(1)    TYPE c,
+        readr       TYPE imrc_readr,
+        tab06(1)    TYPE c,
+        readg_c     TYPE imrc_cntrc,
+        tab07(1)    TYPE c,
+        psort       TYPE imrc_psort,
+        tab08(1)    TYPE c,
+      END OF gt_out.
+
+DATA: BEGIN OF gt_outh  OCCURS 0,
+        equnr       TYPE fieldname,
+        tab01(1)    TYPE c,
+        atnam       TYPE fieldname,
+        tab02(1)    TYPE c,
+        point       TYPE fieldname,
+        tab03(1)    TYPE c,
+        idate_c     TYPE fieldname,
+        tab04(1)    TYPE c,
+        itime_c     TYPE fieldname,
+        tab05(1)    TYPE c,
+        readr       TYPE fieldname,
+        tab06(1)    TYPE c,
+        readg_c     TYPE fieldname,
+        tab07(1)    TYPE c,
+        psort       TYPE fieldname,
+        tab08(1)    TYPE c,
+      END OF gt_outh.
+
+DATA: gv_directory(25) TYPE c VALUE '/var/load/xxx/UK/read/',
+      gv_ofile         LIKE /sapdmc/lsoinp-filename,
+      gv_logsys        LIKE tbdlst-logsys,
+      gv_error         TYPE xfeld.
+
+CONSTANTS: gc_stat_dl  TYPE j_status  VALUE 'I0076',
+           gc_stat_in  TYPE j_status  VALUE 'I0320',
+           gc_stat_scr TYPE j_status  VALUE 'E0005'.
+
+SELECTION-SCREEN  BEGIN OF BLOCK input  WITH FRAME  TITLE text-s01.
+PARAMETERS: p_bukrs  LIKE iloa-bukrs  OBLIGATORY  MEMORY ID buk.
+SELECTION-SCREEN SKIP.
+SELECT-OPTIONS: s_equnr  FOR equi-equnr,
+                s_idate  FOR imrg-idate.
+SELECTION-SCREEN  END OF BLOCK input.
+
+
+************************************************************************
+*       I N I T I A L I Z A T I O N    E V E N T                       *
+************************************************************************
+INITIALIZATION.
+
+* Logical system
+  CALL FUNCTION 'OWN_LOGICAL_SYSTEM_GET'
+    IMPORTING
+      own_logical_system             = gv_logsys
+    EXCEPTIONS
+      own_logical_system_not_defined = 1
+      OTHERS                         = 2.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+         WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+
+************************************************************************
+*       S T A R T - O F - S E L E C T I O N    E V E N T               *
+************************************************************************
+START-OF-SELECTION.
+
+* Select data
+  PERFORM select_data.
+
+* Check anything selected
+  IF gt_equi[] IS INITIAL.
+    MESSAGE ID 'YSE_GENERAL' TYPE 'S' NUMBER '000'
+            WITH 'No equipments selected'(e01).
+    RETURN.
+  ENDIF.
+
+* Build output
+  PERFORM build_output.
+
+* Save output.
+  PERFORM save_output.
+
+  IF gv_error IS INITIAL.
+    WRITE: /01 'Program ended succesfully'(i01).
+  ENDIF.
+
+
+************************************************************************
+*       S U B R O U T I N E S                                          *
+************************************************************************
+
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_DATA
+*&---------------------------------------------------------------------*
+*       Select data
+*----------------------------------------------------------------------*
+FORM select_data .
+
+* Equipment time segment
+  SELECT e~equnr e~objnr
+         INTO TABLE gt_equi
+         FROM equi AS e
+         INNER JOIN equz AS z
+                    ON z~equnr = e~equnr
+         INNER JOIN iloa AS l
+                    ON l~iloan = z~iloan
+         WHERE e~equnr IN s_equnr
+           AND z~datbi =  '99991231'
+           AND l~bukrs =  p_bukrs.
+  CHECK NOT gt_equi[] IS INITIAL.
+
+*** MOD-001 * begin ***
+** Check for deleted/scrapped equipments
+*  SELECT objnr
+*         INTO TABLE gt_dlfli
+*         FROM jest
+*         FOR ALL ENTRIES IN gt_equi
+*         WHERE objnr = gt_equi-objnr
+*           AND ( stat = gc_stat_dl   OR
+*                 stat = gc_stat_in   OR
+*                 stat = gc_stat_scr )
+*           AND inact = ' '.
+*  SORT gt_dlfli BY objnr.
+*  DELETE ADJACENT DUPLICATES FROM gt_dlfli
+*                                  COMPARING objnr.
+*  gt_dlfl[] = gt_dlfli[].
+*  FREE gt_dlfli.
+*
+*  LOOP AT gt_equi.
+*    READ TABLE gt_dlfl WITH TABLE KEY objnr = gt_equi-objnr.
+*    IF sy-subrc = 0.
+*      DELETE gt_equi.
+*    ENDIF.
+*  ENDLOOP.
+*  FREE gt_dlfl.
+*  CHECK NOT gt_equi[] IS INITIAL.
+*** MOD-001 * end ***
+
+* Measurement Document data
+  SELECT p~mpobj p~atinn p~point
+         d~idate d~itime d~readr d~readg
+         d~recdu p~decim p~expon p~psort
+         INTO TABLE gt_mdoc
+         FROM imptt AS p
+         INNER JOIN imrg AS d
+                    ON d~point = p~point
+         FOR ALL ENTRIES IN gt_equi
+         WHERE p~mpobj =  gt_equi-objnr
+           AND d~idate IN s_idate
+           AND p~inact =  ' '
+           AND d~cancl =  ' '.
+
+* Characteristics
+  SELECT atinn adzhl atnam
+         INTO TABLE gt_cabni
+         FROM cabn
+         FOR ALL ENTRIES IN gt_mdoc
+         WHERE atinn = gt_mdoc-atinn.
+  SORT gt_cabni BY atinn adzhl DESCENDING.
+  DELETE ADJACENT DUPLICATES FROM gt_cabni
+                                  COMPARING atinn.
+  gt_cabn[] = gt_cabni[].
+  FREE gt_cabni.
+
+ENDFORM.                    " SELECT_DATA
+
+*&---------------------------------------------------------------------*
+*&      Form  BUILD_OUTPUT
+*&---------------------------------------------------------------------*
+*       Build table fot output file
+*----------------------------------------------------------------------*
+FORM build_output .
+
+  LOOP AT gt_equi.
+
+    LOOP AT gt_mdoc WHERE mpobj = gt_equi-objnr.
+
+      CLEAR: gt_out.
+      MOVE '|' TO: gt_out-tab01, gt_out-tab02, gt_out-tab03,
+                   gt_out-tab04, gt_out-tab05, gt_out-tab06,
+                   gt_out-tab07, gt_out-tab08.
+      gt_out-equnr = gt_equi-equnr.
+      gt_out-point = gt_mdoc-point.
+      gt_out-readr = gt_mdoc-readr.
+      gt_out-psort = gt_mdoc-psort.
+      WRITE gt_mdoc-idate TO gt_out-idate_c.
+      WRITE gt_mdoc-itime TO gt_out-itime_c.
+      READ TABLE gt_cabn
+                 WITH TABLE KEY atinn = gt_mdoc-atinn.
+      IF sy-subrc = 0.
+        gt_out-atnam = gt_cabn-atnam.
+      ENDIF.
+      PERFORM convert_meas_read.
+      APPEND gt_out.
+
+    ENDLOOP.
+
+  ENDLOOP.
+
+ENDFORM.                    " BUILD_OUTPUT
+
+*&---------------------------------------------------------------------*
+*&      Form  CONVERT_MEAS_READ
+*&---------------------------------------------------------------------*
+*       Convert measurement reading from floating point to character
+*----------------------------------------------------------------------*
+FORM convert_meas_read .
+
+  CALL FUNCTION 'FLTP_CHAR_CONVERSION_FROM_SI'
+    EXPORTING
+      char_unit      = gt_mdoc-recdu
+      decimals       = gt_mdoc-decim
+      exponent       = gt_mdoc-expon
+      fltp_value_si  = gt_mdoc-readg
+    IMPORTING
+      char_value     = gt_out-readg_c
+    EXCEPTIONS
+      no_unit_given  = 1
+      unit_not_found = 2
+      OTHERS         = 3.
+  IF sy-subrc <> 0.
+*   MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*           WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+  ENDIF.
+
+ENDFORM.                    " CONVERT_MEAS_READ
+
+*&---------------------------------------------------------------------*
+*&      Form  SAVE_OUTPUT
+*&---------------------------------------------------------------------*
+*       Save output file
+*----------------------------------------------------------------------*
+FORM save_output .
+
+  CONCATENATE 'EQUIPMENT' 'MEAS' 'DOC' p_bukrs
+             INTO gv_ofile SEPARATED BY '_'.
+
+  REPLACE 'xxx' IN gv_directory WITH gv_logsys(3).
+  CONCATENATE gv_directory gv_ofile INTO gv_ofile.
+
+  OPEN DATASET gv_ofile FOR OUTPUT IN TEXT MODE ENCODING DEFAULT.
+  IF sy-subrc <> 0.
+    WRITE: / text-e02, gv_ofile.
+    gv_error = 'X'.
+    EXIT.
+  ENDIF.
+
+* Fill header
+  PERFORM fill_header.
+  LOOP AT gt_outh.
+    TRANSFER gt_outh TO gv_ofile.
+  ENDLOOP.
+
+* Fill output
+  LOOP AT gt_out.
+    TRANSFER gt_out TO gv_ofile.
+  ENDLOOP.
+
+ENDFORM.                    " SAVE_OUTPUT
+
+*&---------------------------------------------------------------------*
+*&      Form  FILL_HEADER
+*&---------------------------------------------------------------------*
+*       Fill header
+*----------------------------------------------------------------------*
+FORM fill_header .
+
+  CLEAR: gt_outh.
+  MOVE '|' TO: gt_outh-tab01, gt_outh-tab02, gt_outh-tab03,
+               gt_outh-tab04, gt_outh-tab05, gt_outh-tab06,
+               gt_outh-tab07, gt_outh-tab08.
+
+  gt_outh-equnr    = 'EQUNR'.
+  gt_outh-atnam    = 'ATNAM'.
+  gt_outh-point    = 'IMRC_POINT'.
+  gt_outh-idate_c  = 'IMRC_IDATE'.
+  gt_outh-itime_c  = 'IMRC_ITIME'.
+  gt_outh-readr    = 'IMRC_READR'.
+  gt_outh-readg_c  = 'IMRC_CNTRC'.
+  gt_outh-psort    = 'IMRC_PSORT'.
+  APPEND gt_outh.
+
+  gt_outh-equnr    = 'Equipment'.
+  gt_outh-atnam    = 'Charact. Name'.
+  gt_outh-point    = 'Measuring Point'.
+  gt_outh-idate_c  = 'Meas. Date'.
+  gt_outh-itime_c  = 'Meas. Time'.
+  gt_outh-readr    = 'Read by'.
+  gt_outh-readg_c  = 'Measurement Reading'.
+  gt_outh-psort    = 'Position Measuring Point'.
+  APPEND gt_outh.
+
+ENDFORM.                    " FILL_HEADER
+
+*Text symbol text£º
+*E01:No equipments selected
+*E02:Could not open output file
+*I01:Program ended succesfully
+
+*S01:Selection
+*Selection text£º
+*P_BUKRS:D       .
+*S_EQUNR:D       .
+*S_IDATE:        Date of the Measurement

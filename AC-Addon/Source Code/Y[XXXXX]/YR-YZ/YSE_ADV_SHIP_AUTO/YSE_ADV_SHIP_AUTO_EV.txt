@@ -1,0 +1,411 @@
+*&---------------------------------------------------------------------*
+*&  Include           YSE_ADV_SHIP_AUTO_EV                             *
+*&---------------------------------------------------------------------*
+
+*&---------------------------------------------------------------------*
+*& Wouter Deplancke - 28/08/2009 - CD1K949461
+*& Revoke of previous active version
+*& The last versions never reached CP1 ( CD1K943751 & CD1K943729)
+*& Open for almost 1 year now!
+*& Seems no one needs the change --> returned to the current version
+*& of CP1 to avoid inconsistencies during backward copies.
+*& Will only be imported in CQ1
+*&---------------------------------------------------------------------*
+
+
+start-of-selection.
+*Declarations for SO change and getting link
+  data: lv_objkey type SWO_TYPEID,
+        lt_vbeln TYPE VBELN_VA OCCURS 0 WITH HEADER LINE,
+        lt_comp_add type standard table of resb,
+        ls_comp_add type resb,
+        ls_headerx type BAPISDH1X,
+        lt_item_in type standard table of BAPISDITM,
+        ls_item_in type BAPISDITM,
+        lt_item_inx type standard table of BAPISDITMx,
+        ls_item_inx type BAPISDITMx,
+        lt_sched_in type standard table of BAPISCHDL,
+        ls_sched_in type BAPISCHDL,
+        lt_sched_inx type standard table of BAPISCHDLx,
+        ls_sched_inx type BAPISCHDLx,
+        lt_return type standard table of BAPIRET2,
+        ls_return type BAPIRET2,
+        lv_posnr type POSNR_VA,
+        lv_lines type i,
+        lv_loop type I.
+
+
+*Declarations for GM
+  data: ls_header type BAPI2017_GM_HEAD_01,
+        ls_code type BAPI2017_GM_CODE,
+        lt_gm type standard table of BAPI2017_GM_ITEM_CREATE,
+        ls_gm type BAPI2017_GM_ITEM_CREATE,
+        lt_sernr type standard table of BAPI2017_GM_SERIALNUMBER,
+        ls_sernr type BAPI2017_GM_SERIALNUMBER.
+**
+*Declaration for linking the comp of SEO to adv ship items
+  data: ls_link type YSE_ADV_COMP_LIN,
+        lt_link type standard table of YSE_ADV_COMP_LIN.
+**This is replaced with custom fields on vbap, so these fields will now be copied over to vbap via extensionin
+  types:  begin of cust.
+          include structure BAPE_VBAP.
+  types:  end of cust.
+  types:  begin of custx.
+            include structure BAPE_VBAPx.
+  types:  end of custx.
+  data: it_ext type standard table of BAPIPAREX with header line,
+        cust_data  type cust,
+        cust_datax type custx.
+
+
+
+**
+*START of possible selections
+
+*First select all relevant SEO (Released but not yet closed)
+  clear gt_aufnr[].
+
+  select aufk~aufnr aufk~werks afko~rsnum aufk~auart aufk~kdauf aufk~kdpos aufk~bemot
+      into table gt_aufnr from aufk inner join afko
+      on aufk~aufnr = afko~aufnr
+      where aufk~bukrs in so_bukrs  "Company code
+      and aufk~idat1 gt 0           "Released
+      and aufk~idat2 eq 0           "Not yet TECO
+      and aufk~aufnr in so_aufnr        "SEO nr (for testing)
+      and aufk~werks in so_werks.
+
+*Now select all reservations that are not yet included in an Adv. Ship. SO
+* with it's matnr, quan, plant etc to create the line item
+
+  clear gt_resb[].
+
+  select * from resb into table gt_resb
+    for all entries in gt_aufnr
+    where rsnum = gt_aufnr-rsnum
+    and xloek ne 'X'    "No deletion indc
+    and vorab_sm = ' '  "Not yet in aso
+    and NFPKZ    = ' '. "Not superceeded
+
+*START of checking and processing the found components
+
+*Select all settings for the auto components copying per plant
+  select * from yse_auto_aso_com into table lt_adv_werks order by werks.
+
+*Get all plant types
+  select * from YSE_EM_PLANT into table lt_plants order by werks.
+
+***Now loop over all found service orders
+  loop at gt_aufnr into gs_aufnr.
+
+
+*Here we will check if the components are available to be used in the adv shipment per SEO
+    clear: lt_comp_add[].
+    loop at gt_resb assigning <fs_resb> where aufnr eq gs_aufnr-aufnr.
+*---Exclude already issued components
+      check <fs_resb>-ENMNG = 0.
+
+***irst check if the components need to be copied over, YSE_AUTO_ASO_COM steers this
+    read table lt_adv_werks into ls_adv_werks
+      with key werks = gs_aufnr-werks
+      binary search.
+
+    check sy-subrc eq 0.  "If no setting found for plant don't copy the component
+
+    read table lt_plants into ls_plants
+      with key werks = ls_adv_werks-werks
+      binary search.
+
+    check sy-subrc eq 0.  "If no setting found for plant don't copy the component
+
+      if <fs_resb>-sobkz is initial and ls_adv_werks-stock = 'X'.      "This means 'Reservation for Order'-> from stock and aso comp auto copy active for stock
+        append <fs_resb> to lt_comp_add.
+        continue.
+      elseif <fs_resb>-sobkz = 'E'.    "Means has to come from SO stock
+        clear gv_so_stock.
+        perform check_so_stock.
+        if gv_so_stock = 'X'.
+          if ( ls_adv_werks-dtc = 'X' and ls_plants-WHTYPE = 'D' ).  "Means purchased, DTC and aso comp auto copy active for DTC
+            move: gs_mska-lgort to <fs_resb>-lgort.
+            append <fs_resb> to lt_comp_add.
+            continue.
+          elseif ( ls_adv_werks-semi_dtc = 'X' and ls_plants-WHTYPE <> 'D' ).  "Means purchased, semi-DTC and aso comp auto copy active for semi-DTC
+            move: gs_mska-lgort to <fs_resb>-lgort.
+            append <fs_resb> to lt_comp_add.
+            continue.
+          endif.
+        endif.
+      endif.
+    endloop.  "at gt_resb assigning <fs_resb> where aufnr eq gs_aufnr.
+
+    describe table lt_comp_add lines lv_lines.
+    check lv_lines > 0.
+
+*Next get the (binary) link of the SEO to the Adv Ship SO
+    move: gs_aufnr-aufnr to lv_objkey.
+
+    clear: lt_vbeln[], lt_vbeln.
+
+    CALL FUNCTION 'ISM4_GET_EXISTING_LINK'
+      EXPORTING
+        OBJECTKEY_IMP = lv_objkey
+        AUART_IMP     = gs_aufnr-auart
+      TABLES
+        VBELN_EXP     = lt_vbeln
+      EXCEPTIONS
+        NONSENSE      = 1
+        OTHERS        = 2.
+
+    check sy-subrc eq 0.
+*Check if a SO nr has been returned
+    loop at lt_vbeln.
+    endloop.
+    check sy-subrc eq 0.
+
+*Add the components to the adv ship SO that was already created
+**Fill the structures and tables for the bapi
+
+***First get the current highest item to make sure we don't overwrite existing ones
+    select max( posnr ) from vbap into lv_posnr where vbeln = lt_vbeln.
+    if sy-subrc eq 0.
+      add 10 to lv_posnr.
+    else.
+      lv_posnr = 10.
+    endif.
+
+*We're updating the SO
+    ls_headerx-updateflag = 'U'.
+
+
+*Add all items required
+    clear: lt_item_in[], lt_item_inx[], lt_sched_in[], lt_sched_inx[], lt_return[], lt_link[].
+
+    loop at lt_comp_add into ls_comp_add.
+      clear: ls_item_in, ls_item_inx, ls_sched_in, ls_sched_inx, ls_link.
+**Item number
+      ls_item_in-itm_number = lv_posnr.
+      ls_item_inx-itm_number = lv_posnr.
+      ls_item_inx-updateflag = 'I'.
+
+**Material
+      ls_item_in-material = ls_comp_add-matnr.
+      ls_item_inx-material = 'X'.
+**Plant
+      ls_item_in-plant = ls_comp_add-werks.
+      ls_item_inx-plant = 'X'.
+**Storage location
+      ls_item_in-store_loc = ls_comp_add-lgort.
+      ls_item_inx-store_loc = 'X'.
+
+**Acc Ind
+      ls_item_in-calc_motive = gs_aufnr-bemot.
+      ls_item_inx-calc_motive = 'X'.
+
+**SEO nr
+      ls_item_in-orderid = gs_aufnr-aufnr.
+      ls_item_inx-orderid = 'X'.
+
+**Item category
+      if ls_comp_add-sobkz = 'E'.
+        ls_item_in-ITEM_CATEG = 'ZAS2'.
+      else.
+        ls_item_in-item_categ = 'ZAS1'.
+      endif.
+        ls_item_inx-item_categ = 'X'.
+
+
+***Weight
+*      ls_item_in-gross_wght = 10.
+*      ls_item_inx-gross_wght = 'X'.
+*      ls_item_in-UNTOF_WGHT = 'KG'.
+*      ls_item_inx-UNTOF_WGHT = 'X'.
+
+**Ref doc -> preceding SDI
+
+      ls_item_in-ref_doc = gs_aufnr-kdauf.
+      ls_item_inx-ref_doc = 'X'.
+
+      ls_item_in-ref_doc_it = gs_aufnr-kdpos.
+      ls_item_inx-ref_doc_it = 'X'.
+
+**Schedule line for quantity
+      ls_sched_in-itm_number = lv_posnr.
+      ls_sched_inx-itm_number = lv_posnr.
+      ls_sched_inx-updateflag = 'I'.
+
+      ls_sched_in-req_qty = ls_comp_add-bdmng.
+      ls_sched_inx-req_qty = 'X'.
+
+      append ls_item_in to lt_item_in.
+      append ls_item_inx to lt_item_inx.
+
+      append ls_sched_in to lt_sched_in.
+      append ls_sched_inx to lt_sched_inx.
+****keep track if link component/adv ship SO item and SO item for stock transfer if any
+      move: ls_comp_add-rsnum to ls_link-rsnum,
+            ls_comp_add-rspos to ls_link-rspos,
+            ls_comp_add-aufnr to ls_link-aufnr,
+            lt_vbeln          to ls_link-vbeln_adv,
+            lv_posnr          to ls_link-posnr_adv,
+            ls_comp_add-kdauf to ls_link-vbeln_sdi,
+            ls_comp_add-kdpos to ls_link-posnr_sdi.
+
+      append ls_link to lt_link.
+
+*****
+*------rsnum and rspos are passed on to the bapi via extensionin to be copied over to vbap
+      cust_data-vbeln = lt_vbeln.
+      cust_data-posnr = lv_posnr.
+      cust_data-zz_aso_rsnum  = ls_comp_add-rsnum.
+      cust_data-zz_aso_rspos  = ls_comp_add-rspos.
+
+
+      move: cust_data   to it_ext-valuepart1,      "#EC ENHOK
+            'BAPE_VBAP' to it_ext-structure.       "#EC ENHOK
+
+      append it_ext.
+
+      cust_datax-vbeln = lt_vbeln.
+      cust_datax-posnr = lv_posnr.
+      cust_datax-zz_aso_rsnum  = 'X'.
+      cust_datax-zz_aso_rspos  = 'X'.
+
+      move: cust_datax   to it_ext-valuepart1,      "#EC ENHOK
+            'BAPE_VBAPX' to it_ext-structure .      "#EC ENHOK
+
+      append it_ext.
+
+*------
+      add 10 to lv_posnr.
+    endloop.    "at lt_comp_add into ls_comp_add
+
+    CALL FUNCTION 'BAPI_SALESORDER_CHANGE'
+      EXPORTING
+        SALESDOCUMENT    = lt_vbeln
+        ORDER_HEADER_INX = ls_headerx
+      TABLES
+        RETURN           = lt_return
+        ORDER_ITEM_IN    = lt_item_in
+        ORDER_ITEM_INX   = lt_item_inx
+        SCHEDULE_LINES   = lt_sched_in
+        SCHEDULE_LINESX  = lt_sched_inx
+
+        extensionin      = it_ext.
+
+    loop at lt_return into ls_return where type = 'E'.
+    endloop.
+    if sy-subrc eq 0.  "An error occured
+*      write: /, 'Adding of component ', gs_resb-matnr, ' for adv ship sales order ', lt_vbeln, ' unsuccesfull'.
+      continue.
+    else.
+*      write: /, 'Adding of component ', gs_resb-matnr, ' for adv ship sales order ', lt_vbeln, ' succesfull'.
+*      commit work and wait.
+    endif.
+
+*Now set the required indicators of table RESB
+
+    loop at lt_comp_add assigning <fs_resb>.
+      clear <fs_resb>-schgt.
+      clear <fs_resb>-XWAOK.
+      <fs_resb>-vorab_sm = 'X'.
+      clear <fs_resb>-VMENG.
+      clear <fs_resb>-XFEHL.
+      <fs_resb>-no_disp = '1'.
+    endloop.    "at lt_comp_add assigning <fs_resb>.
+
+*Update the resb table with the new values
+    update resb from table lt_comp_add.      "It's not a nice solution I know but I checked the trace for the manual TC
+    " and I'm pretty sure this is the only update that happens together with the status update
+
+*Also set the status for the components so we can't GI them anymore from the SEO
+    data: lt_stat type standard table of JSTAT,
+          ls_stat type JSTAT.
+    move: 'I0416' to ls_stat-stat.
+
+    append ls_stat to lt_stat.
+
+    loop at lt_comp_add assigning <fs_resb>.
+      CALL FUNCTION 'STATUS_CHANGE_INTERN'
+        EXPORTING
+          OBJNR  = <fs_resb>-objnr
+        TABLES
+          STATUS = lt_stat.
+*      commit work and wait.
+    endloop.    "at lt_comp_add assigning <fs_resb>
+*    insert YSE_ADV_COMP_LIN from table lt_link.
+
+    commit work and wait.
+
+*Check if there are goods movements to do from sales order to adv ship sales order stock
+    ls_header-PSTNG_DATE = sy-datum.
+    ls_header-doc_date = sy-datum.
+
+    ls_code-gm_code = '04'.
+
+    sort lt_link by rsnum rspos.
+    sort gt_sernr by rsnum rspos.
+
+    clear: lt_gm[], lt_return[], lv_loop.
+    loop at lt_comp_add assigning <fs_resb> where sobkz eq 'E'.
+      add 1 to lv_loop.
+
+      ls_gm-material = <fs_resb>-matnr.
+      ls_gm-plant = <fs_resb>-werks.
+      ls_gm-stge_loc = <fs_resb>-lgort.
+      ls_gm-move_type = '413'.
+      ls_gm-spec_stock = 'E'.
+
+      read table lt_link into ls_link
+        with key rsnum = <fs_resb>-rsnum
+                 rspos = <fs_resb>-rspos
+                 binary search.
+
+*      ls_gm-SALES_ORD = ls_link-vbeln_sdi.
+*      ls_gm-s_ord_item = ls_link-posnr_sdi.
+
+      ls_gm-ENTRY_QNT = <fs_resb>-bdmng.
+
+      ls_gm-VAL_SALES_ORD = ls_link-vbeln_sdi.
+      ls_gm-VAL_S_ORD_ITEM = ls_link-posnr_sdi.
+*
+*      append ls_gm to lt_gm.
+
+      ls_gm-SALES_ORD = ls_link-vbeln_adv.
+      ls_gm-s_ord_item = ls_link-posnr_adv.
+
+      ls_gm-MOVE_MAT  = <fs_resb>-matnr.
+      ls_gm-move_plant = <fs_resb>-werks.
+      ls_gm-move_stloc = <fs_resb>-lgort.
+
+      append ls_gm to lt_gm.
+
+      read table gt_sernr assigning <fs_sernr>
+        with key rsnum = <fs_resb>-rsnum
+                 rspos = <fs_resb>-rspos
+                 binary search.
+      IF sy-subrc eq 0.
+        move: lv_loop          to ls_sernr-matdoc_itm,
+              <fs_sernr>-sernr to ls_sernr-SERIALNO.
+        append ls_sernr to lt_sernr.
+      ENDIF.
+
+      endloop.    "at lt_comp_add assigning <fs_resb> where sobkz eq 'E'
+      CALL FUNCTION 'BAPI_GOODSMVT_CREATE'
+        EXPORTING
+          GOODSMVT_HEADER             = ls_header
+          GOODSMVT_CODE               = ls_code
+        TABLES
+          GOODSMVT_ITEM               = lt_gm
+          GOODSMVT_SERIALNUMBER       = lt_sernr
+          RETURN                      = lt_return
+            .
+      loop at lt_return into ls_return.
+      endloop.
+      if sy-subrc ne 0.
+        commit work and wait.
+      endif.
+
+
+
+
+
+    endloop.    "at gt_aufnr into gs_aufnr

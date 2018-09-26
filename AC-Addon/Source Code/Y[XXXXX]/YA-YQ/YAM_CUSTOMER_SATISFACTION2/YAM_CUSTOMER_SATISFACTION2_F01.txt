@@ -1,0 +1,877 @@
+*&---------------------------------------------------------------------*
+*&  Include           YAM_CUSTOMER_SATISFACTION_F01                    *
+*&---------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  select TECO orders
+*----------------------------------------------------------------------*
+*       Select the relevant maintenance plans
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM select_teco_orders.
+
+* select teco or completed orders
+
+  SELECT aufnr bemot werks bukrs objnr
+    INTO CORRESPONDING FIELDS OF TABLE gt_orde
+
+***MOD-006 begin
+*  FROM aufk WHERE werks IN s_werks
+
+  FROM aufk WHERE aufnr GT '004000279511'         "All before Closed since long time
+            AND werks IN s_werks
+            AND auart IN s_auart                  "to be able to exclude ZSM5
+***MOD-006 end
+            AND  ( phas2 EQ c_charx OR
+            phas3 EQ c_charx ).
+
+* first teco date
+
+  LOOP AT gt_orde.
+
+    CONCATENATE 'OR' gt_orde-aufnr INTO gv_objnr.
+    SELECT SINGLE * FROM jcds WHERE objnr EQ gv_objnr
+                              AND stat EQ c_i0045
+                              AND chgnr EQ c_001.
+    IF sy-subrc IS INITIAL AND jcds-udate IN s_tecoda.
+      MOVE jcds-udate TO gt_orde-teco_date.
+      MODIFY gt_orde.
+    ELSE.
+      DELETE gt_orde.
+    ENDIF.
+
+  ENDLOOP.
+
+
+*.. Add additional fields to internal table
+
+  LOOP AT gt_orde.
+
+    CLEAR gv_adrnr.
+    CLEAR gv_tplnr.
+    CLEAR: gv_gewrk, gv_objid_up.
+    CLEAR gv_arbpl.
+    CLEAR gv_equnr.
+    CLEAR gv_vkorg.
+    CLEAR gv_vtweg.
+    CLEAR gv_spart.
+    CLEAR gv_vkorg2.
+    CLEAR gv_yordlim.
+    CLEAR gv_cocur.
+
+    REFRESH gt_pmco.
+
+* Determine if limit value > total actual cost
+    SELECT SINGLE vkorg INTO gv_vkorg2
+      FROM pmsdo WHERE objnr = gt_orde-objnr.
+
+    SELECT SINGLE yordlim cocur
+      INTO (gv_yordlim, gv_cocur)
+      FROM yse_cem_orderval WHERE vkorg = gv_vkorg2.
+
+    IF sy-subrc = 0.
+      SELECT objnr wrt11
+        INTO CORRESPONDING FIELDS OF TABLE gt_pmco
+        FROM pmco WHERE objnr = gt_orde-objnr
+                    AND cocur = gv_cocur
+                    AND wrttp = '4'.           " Actual
+
+      CLEAR gv_tot_actcost.
+      LOOP AT gt_pmco.
+        gv_tot_actcost = gv_tot_actcost + gt_pmco-wrt11.
+      ENDLOOP.
+
+      IF gv_yordlim > gv_tot_actcost.
+        CONTINUE.
+      ENDIF.
+    ENDIF.
+
+* Determine if company is a CT-AM company
+    SELECT SINGLE bukrs INTO gv_cc
+      FROM yam_ctam_ccodes WHERE bukrs = gt_orde-bukrs.
+
+    IF sy-subrc = 0.
+      gv_ctam = c_charx.
+    ELSE.
+      CLEAR gv_ctam.
+    ENDIF.
+
+    MOVE gt_orde-bukrs(3) TO gt_orde-fam_code.
+* begin of insertion MOD-002
+    IF gt_orde-bukrs = 'MRUA'.
+      MOVE gt_orde-bukrs+1(3) TO gt_orde-fam_code.
+    ENDIF.
+* end of insertion MOD-002
+*** MOD-005 * begin ***
+    IF gt_orde-bukrs = 'HKGA'.
+      CONCATENATE gt_orde-bukrs+0(2) gt_orde-bukrs+3(1)
+                  INTO gt_orde-fam_code.
+    ENDIF.
+*** MOD-005 * end ***
+
+    SELECT SINGLE * FROM afih WHERE aufnr = gt_orde-aufnr.
+    IF sy-subrc IS INITIAL.
+      MOVE afih-iloan TO gv_iloan.
+      MOVE afih-equnr TO gv_equnr.
+      MOVE afih-gewrk TO gv_gewrk.
+
+      IF gv_ctam = ' '.                      " SEED
+        SELECT SINGLE * FROM crhd WHERE objid = gv_gewrk
+         AND objty = 'A'.
+
+        IF sy-subrc = 0.
+*........ Get branch code
+          gv_arbpl_6 = crhd-arbpl(6).
+          SELECT SINGLE * FROM crhd WHERE arbpl = gv_arbpl_6
+                                      AND objty = 'A'.
+
+          IF sy-subrc IS INITIAL.
+            MOVE gv_arbpl_6 TO gt_orde-branch_code.
+
+            SELECT SINGLE * FROM crtx WHERE objty = c_a AND
+                 objid = crhd-objid AND spras = c_e.
+
+            IF sy-subrc IS INITIAL.
+              MOVE crtx-ktext TO gt_orde-branch.
+            ENDIF.
+*** MOD-004 * begin insert ***
+          ELSE.
+            CLEAR: gv_arbpl.
+            MOVE crhd-arbpl TO gv_arbpl.
+            MOVE gv_arbpl TO gt_orde-branch_code.
+
+            SELECT SINGLE * FROM crtx WHERE objty = c_a AND
+                 objid = crhd-objid AND spras = c_e.
+
+            IF sy-subrc IS INITIAL.
+              MOVE crtx-ktext TO gt_orde-branch.
+            ENDIF.
+*** MOD-004 * end   insert ***
+          ENDIF.
+        ENDIF.
+      ELSE.                                  " CTAM
+        SELECT SINGLE * FROM crhd WHERE objty = c_a
+             AND objid = gv_gewrk.
+
+        IF sy-subrc = 0.
+*........ Check length of work center
+          gv_len = STRLEN( crhd-arbpl ).
+          IF gv_len = 8.
+*.......... Look for superior workcenter (= branch)
+            SELECT SINGLE objid_up INTO gv_objid_up
+              FROM crhs WHERE objid_ho = gv_gewrk
+                          AND objty_ho = 'A'.
+
+            IF sy-subrc = 0.
+              SELECT SINGLE * FROM crhd WHERE objty = c_a
+                   AND objid = gv_objid_up.
+
+              IF sy-subrc = 0.
+                MOVE crhd-arbpl TO gv_arbpl.
+                MOVE gv_arbpl TO gt_orde-branch_code.
+
+                SELECT SINGLE * FROM crtx WHERE objty = c_a AND
+                     objid = gv_objid_up AND spras = c_e.
+
+                IF sy-subrc IS INITIAL.
+                  MOVE crtx-ktext TO gt_orde-branch.
+                ENDIF.
+*** MOD-004 * begin insert ***
+              ELSE.
+                CLEAR: gv_arbpl.
+                MOVE crhd-arbpl TO gv_arbpl.
+                MOVE gv_arbpl TO gt_orde-branch_code.
+                SELECT SINGLE * FROM crtx WHERE objty = c_a AND
+                     objid = gv_gewrk AND spras = c_e.
+
+                IF sy-subrc IS INITIAL.
+                  MOVE crtx-ktext TO gt_orde-branch.
+                ENDIF.
+*** MOD-004 * end   insert ***
+              ENDIF.
+*** MOD-004 * begin insert ***
+            ELSE.
+              CLEAR: gv_arbpl.
+              MOVE crhd-arbpl TO gv_arbpl.
+              MOVE gv_arbpl TO gt_orde-branch_code.
+              SELECT SINGLE * FROM crtx WHERE objty = c_a AND
+                   objid = gv_gewrk AND spras = c_e.
+
+              IF sy-subrc IS INITIAL.
+                MOVE crtx-ktext TO gt_orde-branch.
+              ENDIF.
+*** MOD-004 * end   insert ***
+            ENDIF.
+          ELSE.
+            MOVE crhd-arbpl TO gv_arbpl.
+            MOVE gv_arbpl TO gt_orde-branch_code.
+            SELECT SINGLE * FROM crtx WHERE objty = c_a AND
+                 objid = gv_gewrk AND spras = c_e.
+
+            IF sy-subrc IS INITIAL.
+              MOVE crtx-ktext TO gt_orde-branch.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+
+      SELECT SINGLE * FROM iloa WHERE iloan = gv_iloan.
+      IF sy-subrc IS INITIAL.
+
+        MOVE iloa-vkorg TO gv_vkorg.
+        MOVE iloa-vtweg TO: gt_orde-trans_type, gv_vtweg.
+        MOVE iloa-spart TO gv_spart.
+        MOVE iloa-tplnr TO gv_tplnr.
+        SELECT SINGLE * FROM iflo WHERE tplnr = gv_tplnr.
+        IF sy-subrc IS INITIAL.
+          MOVE iflo-adrnr TO gv_adrnr.
+          SELECT SINGLE * FROM adrc WHERE addrnumber = gv_adrnr.
+          IF sy-subrc IS INITIAL.
+            MOVE adrc-street TO gt_orde-site_stras.
+            MOVE adrc-post_code1 TO gt_orde-site_pstlz.
+            MOVE adrc-city1 TO gt_orde-site_ort01.
+            MOVE adrc-name2 TO gt_orde-site_contact.
+            MOVE adrc-tel_number TO gt_orde-tel_number.
+            SELECT SINGLE * FROM adr6 WHERE addrnumber = gv_adrnr.
+            IF sy-subrc IS INITIAL.
+              MOVE adr6-smtp_addr TO gt_orde-smtp_addr.
+            ENDIF.
+            SELECT SINGLE * FROM t002 WHERE spras = adrc-langu.
+            IF sy-subrc IS INITIAL.
+              MOVE t002-laiso TO gt_orde-laiso.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+*** MOD-003 * begin comment ***
+
+** bill-to number info
+*
+*    CONCATENATE 'OR' gt_orde-aufnr INTO gv_objnr.
+*    SELECT SINGLE parnr INTO gt_orde-cust_accnr
+*    FROM ihpa WHERE objnr =
+*    gv_objnr AND parvw = c_billto.
+
+*** MOD-003 * end comment ***
+
+*** MOD-003 * begin insert ***
+
+    CONCATENATE 'OR' gt_orde-aufnr INTO gv_objnr.
+* bill-to number info
+    SELECT SINGLE parnr
+    INTO gt_orde-cust_accnr
+    FROM ihpa
+    WHERE objnr    EQ gv_objnr
+    AND   parvw    EQ c_billto
+    AND   kzloesch EQ ' '.
+
+    IF sy-subrc NE 0.
+* sold-to number info
+      SELECT SINGLE parnr
+      INTO gt_orde-cust_accnr
+      FROM ihpa
+      WHERE objnr  EQ gv_objnr
+      AND parvw    EQ c_soldto
+      AND kzloesch EQ ' '.
+    ENDIF.
+
+*** MOD-003 * end insert ***
+
+    SELECT SINGLE * FROM kna1 WHERE kunnr = gt_orde-cust_accnr.
+    IF sy-subrc IS INITIAL.
+      MOVE kna1-name1 TO gt_orde-cust_name.
+      MOVE kna1-stras TO gt_orde-cust_stras.
+      MOVE kna1-pstlz TO gt_orde-cust_pstlz.
+      MOVE kna1-ort01 TO gt_orde-cust_ort01.
+      IF gv_ctam = c_charx.
+        MOVE kna1-sortl TO gt_orde-cust_accnr.
+      ENDIF.
+      SELECT SINGLE kdgrp INTO gt_orde-chan_code
+        FROM knvv WHERE kunnr = kna1-kunnr
+                    AND vkorg = gv_vkorg
+                    AND vtweg = gv_vtweg
+                    AND spart = gv_spart.
+    ENDIF.
+
+* equipment info
+
+    SELECT SINGLE * FROM v_equi WHERE equnr = gv_equnr
+                                  AND eqart EQ c_eqart
+                                  AND spras EQ sy-langu
+                                  AND datbi EQ c_99991231.
+    IF sy-subrc IS INITIAL.
+      MOVE v_equi-eqktx TO gt_orde-eqktx.
+      MOVE v_equi-sernr TO gt_orde-sernr.
+      MOVE v_equi-vkbur TO gt_orde-region_code.
+      SELECT SINGLE bezei INTO gt_orde-region
+        FROM tvkbt WHERE vkbur = v_equi-vkbur.
+    ENDIF.
+
+*  profitcenter + gac
+
+    CLEAR gv_prctr.
+    SELECT SINGLE * FROM caufv WHERE aufnr EQ gt_orde-aufnr.
+    IF sy-subrc IS INITIAL.
+      IF gv_ctam = c_charx.
+        WRITE caufv-prctr      TO gt_orde-prctr NO-ZERO.
+        WRITE caufv-prctr+2(4) TO gt_orde-gac NO-ZERO.
+        WRITE caufv-prctr+6(4) TO gt_orde-pgc NO-ZERO.
+      ELSE.
+        SELECT SINGLE prctr INTO gv_prctr
+          FROM vbap WHERE vbeln = caufv-kdauf
+                      AND posnr = caufv-kdpos.
+
+        IF sy-subrc = 0.
+          WRITE gv_prctr TO gt_orde-prctr NO-ZERO.
+          SELECT ww006 ww007
+            UP TO 1 ROWS
+            INTO (gt_orde-gac, gt_orde-pgc)
+            FROM ce11000 WHERE paledger = '02'
+                           AND vrgar    = c_a
+                           AND kaufn    = caufv-kdauf
+                           AND kdpos    = caufv-kdpos.
+          ENDSELECT.
+        ENDIF.
+      ENDIF.
+*.... Check tasklist group = 'GMCOMMIS', then change service_type
+      IF caufv-plnnr = 'GMCOMMIS'.
+        gt_orde-bemot = 'IE'.
+      ENDIF.
+    ENDIF.
+
+*   Service technician code + name
+    CLEAR gv_arbid.
+    CLEAR gv_arbpl2.
+
+    SELECT arbid INTO gv_arbid
+      FROM afru
+      UP TO 1 ROWS
+         WHERE aufnr = gt_orde-aufnr
+           AND vornr = '0010'.
+    ENDSELECT.
+
+    IF sy-subrc IS INITIAL.
+      SELECT SINGLE * FROM crtx WHERE objty = c_a AND
+           objid = gv_arbid AND spras = c_e.
+
+      IF sy-subrc IS INITIAL.
+        MOVE crtx-ktext TO gt_orde-techn.
+      ENDIF.
+      SELECT SINGLE * FROM crhd WHERE objid = gv_arbid
+       AND objty = c_a.
+
+      IF sy-subrc IS INITIAL.
+        MOVE crhd-arbpl TO gv_arbpl2.
+      ENDIF.
+      MOVE gv_arbpl2 TO gt_orde-techn_code.
+    ENDIF.
+
+*   Delete leading zeroes in ordernumber
+    MOVE gt_orde-aufnr TO gv_aufnr.
+    WRITE gv_aufnr TO gt_orde-aufnr NO-ZERO.
+    MODIFY gt_orde.
+
+  ENDLOOP.
+
+  SORT gt_orde BY aufnr.
+
+ENDFORM.                    "select_teco_orders
+
+
+*eject
+*&---------------------------------------------------------------------*
+*&      Form  output_list_teco_orders
+*&---------------------------------------------------------------------*
+*       Output the teco orders list
+*----------------------------------------------------------------------*
+FORM output_list_teco_orders.
+
+*.. Local variables
+  DATA: ls_layout TYPE slis_layout_alv,
+        ls_grid   TYPE lvc_s_glay,
+        ls_events TYPE slis_alv_event.
+
+  DATA: lt_events TYPE slis_t_event,
+        lt_event_exits TYPE slis_t_event_exit,
+        lt_fieldcat TYPE slis_t_fieldcat_alv.
+
+*.. Fill events
+  REFRESH lt_events.
+  ls_events-name = 'USER_COMMAND'.
+  ls_events-form = 'USER_COMMAND_ORDE'.
+  APPEND ls_events TO lt_events.
+  ls_events-name = 'PF_STATUS_SET'.
+  ls_events-form = 'PF_STATUS_SET_ORDE'.
+  APPEND ls_events TO lt_events.
+  ls_events-name = 'TOP_OF_PAGE'.
+  ls_events-form = 'TOP_OF_PAGE_ORDE'.
+  APPEND ls_events TO lt_events.
+
+*.. Define layout
+  CLEAR ls_layout.
+  ls_layout-get_selinfos      = c_charx.
+  ls_layout-colwidth_optimize = c_charx.
+  ls_layout-detail_popup      = c_charx.
+  ls_layout-box_fieldname     = 'SELKZ'.
+  ls_layout-no_keyfix         = c_charx.
+  ls_layout-info_fieldname    = 'ZZCOL'.
+
+*.. Define grid settings
+  ls_grid-coll_end_l = c_charx.
+
+*.. Prepare field catalog
+  PERFORM build_field_catlog CHANGING lt_fieldcat.
+
+*.. Call ALV grid output
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+  EXPORTING
+    i_callback_program = 'YAM_CUSTOMER_SATISFACTION2'
+*     i_structure_name   = 'YAM_CR308_ORDE'
+    i_grid_settings    = ls_grid
+    is_layout          = ls_layout
+    i_save             = 'A'
+    it_fieldcat        = lt_fieldcat[]
+    it_events          = lt_events[]
+  TABLES
+    t_outtab           = gt_orde
+  EXCEPTIONS
+    program_error      = 1
+    OTHERS             = 2.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+ENDFORM.                    "output_list_teco_orders
+
+*&---------------------------------------------------------------------*
+*&      Form  build_field_catlog
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_GT_FIELDCAT  text
+*----------------------------------------------------------------------*
+FORM build_field_catlog  CHANGING lt_fieldcat TYPE slis_t_fieldcat_alv.
+
+
+*-------------------- Customer_Center_FAM_code -------------------------*
+  ls_fcat-fieldname = 'FAM_CODE'.
+  ls_fcat-outputlen = '3'.
+  ls_fcat-seltext_l = 'Customer_Center_FAM_code'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*-------------------- Customer_Account_Number -------------------------*
+  ls_fcat-fieldname = 'CUST_ACCNR'.
+  ls_fcat-outputlen = '10'.
+  ls_fcat-seltext_l = 'Customer_Account_Number'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*-------------- Customer_Name  -----------------*
+  ls_fcat-fieldname = 'CUST_NAME'.
+  ls_fcat-outputlen = '30'.
+  ls_fcat-seltext_l = 'Customer_Name'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*-------------- Customer_Site_Street -----------------*
+  ls_fcat-fieldname = 'SITE_STRAS'.
+  ls_fcat-outputlen = '30'.
+  ls_fcat-seltext_l = 'Customer_Site_Street'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*-------------- Customer_Site_Post_Code -----------------*
+  ls_fcat-fieldname = 'SITE_PSTLZ'.
+  ls_fcat-outputlen = '10'.
+  ls_fcat-seltext_l = 'Customer_Site_Post_Code'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*-------------- Customer_Site_City -----------------*
+  ls_fcat-fieldname = 'SITE_ORT01'.
+  ls_fcat-outputlen = '25'.
+  ls_fcat-seltext_l = 'Customer_Site_City'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*-------------- Customer_Street -----------------*
+  ls_fcat-fieldname = 'CUST_STRAS'.
+  ls_fcat-outputlen = '30'.
+  ls_fcat-seltext_l = 'Customer_Street'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*-------------- Customer_Post_Code  -----------------*
+  ls_fcat-fieldname = 'CUST_PSTLZ'.
+  ls_fcat-outputlen = '10'.
+  ls_fcat-seltext_l = 'Customer_Post_Code'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*-------------- Customer_City -----------------*
+  ls_fcat-fieldname = 'CUST_ORT01'.
+  ls_fcat-outputlen = '25'.
+  ls_fcat-seltext_l = 'Customer_City'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*-----------  Contact_Language --------------*
+  ls_fcat-fieldname = 'LAISO'.
+  ls_fcat-outputlen = '2'.
+  ls_fcat-seltext_l = 'Contact_Language'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*-------------- Contact_Full_Name -----------------*
+  ls_fcat-fieldname = 'SITE_CONTACT'.
+  ls_fcat-outputlen = '40'.
+  ls_fcat-seltext_l = 'Contact_Full_Name'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*-------------- Contact_Email_Address-----------------*
+  ls_fcat-fieldname = 'SMTP_ADDR'.
+  ls_fcat-outputlen = '20'.
+  ls_fcat-seltext_l = 'Contact_Email_Address'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*-------------- Contact_Tel_Nr-----------------*
+  ls_fcat-fieldname = 'TEL_NUMBER'.
+  ls_fcat-outputlen = '30'.
+  ls_fcat-seltext_l = 'Contact_Tel_Nr'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*-------------- Contact_Job_Title-----------------*
+  ls_fcat-fieldname = 'JOB_TITLE'.
+  ls_fcat-outputlen = '40'.
+  ls_fcat-seltext_l = 'Contact_Job_Title'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*-------------- Contact_Influence_Level-----------------*
+  ls_fcat-fieldname = 'INFL_LEVEL'.
+  ls_fcat-outputlen = '30'.
+  ls_fcat-seltext_l = 'Contact_Influence_Level'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*-------------- Service_Branch_Code -----------------*
+  ls_fcat-fieldname = 'BRANCH_CODE'.
+  ls_fcat-outputlen = '8'.
+  ls_fcat-seltext_l = 'Service_Branch_Code'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*-------------- Service_Branch -----------------*
+  ls_fcat-fieldname = 'BRANCH'.
+  ls_fcat-outputlen = '40'.
+  ls_fcat-seltext_l = 'Service_Branch'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*-------------- Sales region_code -----------------*
+  ls_fcat-fieldname = 'REGION_CODE'.
+  ls_fcat-outputlen = '4'.
+  ls_fcat-seltext_l = 'Sales region_code'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*-------------- Sales region description -----------------*
+  ls_fcat-fieldname = 'REGION'.
+  ls_fcat-outputlen = '40'.
+  ls_fcat-seltext_l = 'Sales region description'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*-------------- Sales_Engineer_code -----------------*
+  ls_fcat-fieldname = 'ENGIN_CODE'.
+  ls_fcat-outputlen = '2'.
+  ls_fcat-seltext_l = 'Sales_Engineer_code'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*-------------- Sales_Engineer -----------------*
+  ls_fcat-fieldname = 'ENGIN'.
+  ls_fcat-outputlen = '40'.
+  ls_fcat-seltext_l = 'Sales_Engineer'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*-------------- Service_Technician_Code -----------------*
+  ls_fcat-fieldname = 'TECHN_CODE'.
+  ls_fcat-outputlen = '8'.
+  ls_fcat-seltext_l = 'Service_Technician_Code'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*-------------- Service_Technician -----------------*
+  ls_fcat-fieldname = 'TECHN'.
+  ls_fcat-outputlen = '40'.
+  ls_fcat-seltext_l = 'Service_Technician'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*-------------- Order_Number -----------------*
+  ls_fcat-fieldname = 'AUFNR'.
+  ls_fcat-outputlen = '12'.
+  ls_fcat-seltext_l = 'Order_Number '.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*-------------- Serial_Number -----------------*
+  ls_fcat-fieldname = 'SERNR'.
+  ls_fcat-outputlen = '18'.
+  ls_fcat-seltext_l = 'Serial_Number'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*-------------- Equipment_Description -----------------*
+  ls_fcat-fieldname = 'EQKTX'.
+  ls_fcat-outputlen = '40'.
+  ls_fcat-seltext_l = 'Equipment_Description'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*------- Profit center ----------*
+  ls_fcat-fieldname = 'PRCTR'.
+  ls_fcat-outputlen = '10'.
+  ls_fcat-seltext_l = 'Profit center'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*-------------- GAC -----------------*
+  ls_fcat-fieldname = 'GAC'.
+  ls_fcat-outputlen = '10'.
+  ls_fcat-seltext_l = 'GAC'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*-------------- PGC -----------------*
+  ls_fcat-fieldname = 'PGC'.
+  ls_fcat-outputlen = '10'.
+  ls_fcat-seltext_l = 'PGC'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*-------------- Service_Type-----------------*
+  ls_fcat-fieldname = 'BEMOT'.
+  ls_fcat-outputlen = '2'.
+  ls_fcat-seltext_l = 'Service_Type'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*-------------- Type of transactions -----------------*
+  ls_fcat-fieldname = 'TRANS_TYPE'.
+  ls_fcat-outputlen = '2'.
+  ls_fcat-seltext_l = 'Type of transactions'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*-------------- Trigger Date -----------------*
+  ls_fcat-fieldname = 'TECO_DATE'.
+  ls_fcat-outputlen = '8'.
+  ls_fcat-seltext_l = 'Trigger Date'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+*-------------- Sales_Channel_code -----------------*
+  ls_fcat-fieldname = 'CHAN_CODE'.
+  ls_fcat-outputlen = '2'.
+  ls_fcat-seltext_l = 'Sales_Channel_code'.
+  APPEND ls_fcat TO lt_fieldcat.
+  CLEAR ls_fcat.
+
+ENDFORM.                    "build_field_catlog
+
+*&---------------------------------------------------------------------*
+*&      Form  output_file_teco_orders
+*&---------------------------------------------------------------------*
+*       creation output file
+*----------------------------------------------------------------------*
+FORM output_file_teco_orders.
+
+*** MOD-001 * begin comment ***
+** write outputfile to application server
+*  CLEAR g_retcd.
+*
+*  CONCATENATE sy-datum c_project
+*            INTO g_ofile SEPARATED BY c_underscore.
+*  REPLACE 'xxx' IN g_directory WITH p_logsys(3).
+*  CONCATENATE g_directory g_ofile INTO g_ofile.
+*** MOD-001 * end comment ***
+
+  REPLACE 'xxx' IN g_directory WITH p_logsys(3).            "MOD-001
+
+  PERFORM write_outputfile.
+
+
+ENDFORM.                    "output_file_teco_orders
+*&---------------------------------------------------------------------*
+*&      Form  write_outputfile
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM write_outputfile.
+
+*** MOD-001 * begin comment ***
+*  OPEN DATASET g_ofile FOR OUTPUT IN TEXT MODE ENCODING DEFAULT.
+*  IF sy-subrc <> 0.
+*    WRITE: / text-e03, g_ofile.
+**   message e011(YAM_DC).                      "Open dataset failed
+*    g_retcd = 4.
+*    EXIT.
+*  ENDIF.
+*
+*  SORT gt_orde BY fam_code cust_accnr.
+*
+** write header-line
+*  IF NOT gt_orde[] IS INITIAL.
+*    CONCATENATE 'Customer_Center_FAM_code'
+*                'Customer_Account_Number'
+*                'Customer_Name'
+*                'Customer_Site_Street'
+*                'Customer_Site_Post_Code'
+*                'Customer_Site_City'
+*                'Customer_Street'
+*                'Customer_Post_Code'
+*                'Customer_City'
+*                'Contact_Language'
+*                'Contact_Full_Name'
+*                'Contact_Email_Address'
+*                'Contact_Tel_Nr'
+*                'Contact_Job_Title'
+*                'Contact_Influence_Level'
+*                'Service_Branch_Code'
+*                'Service_Branch'
+*                'Sales region_code'
+*                'Sales region description'
+*                'Sales_Engineer_code'
+*                'Sales_Engineer'
+*                'Service_Technician_Code'
+*                'Service_Technician'
+*                'Order_Number'
+*                'Serial_Number'
+*                'Equipment_Description'
+*                'Profit center'
+*                'GAC'
+*                'PGC'
+*                'Service_Type'
+*                'Type of transactions'
+*                'Trigger Date'
+*                'Sales_Channel_code'
+*         INTO g_outrec SEPARATED BY con_tab.
+*
+*    TRANSFER g_outrec(600) TO g_ofile.
+*  ENDIF.
+*** MOD-001 * end comment ***
+
+  SORT gt_orde BY fam_code cust_accnr.                      "MOD-001
+
+  LOOP AT gt_orde.
+
+*** MOD-001 * begin insert ***
+    AT NEW fam_code.
+*     File per FAM code
+      PERFORM new_file.
+*      IF g_retcd = 4.
+*        EXIT.
+*      ENDIF.
+    ENDAT.
+*** MOD-001 * end insert ***
+
+*   Detail (if file open)
+    IF g_retcd IS INITIAL.                                  "MOD-001
+
+      REPLACE ALL OCCURRENCES OF ';' IN gt_orde WITH ' '.
+
+      CONCATENATE gt_orde-fam_code
+                  gt_orde-cust_accnr
+                  gt_orde-cust_name
+                  gt_orde-site_stras
+                  gt_orde-site_pstlz
+                  gt_orde-site_ort01
+                  gt_orde-cust_stras
+                  gt_orde-cust_pstlz
+                  gt_orde-cust_ort01
+                  gt_orde-laiso
+                  gt_orde-site_contact
+                  gt_orde-smtp_addr
+                  gt_orde-tel_number
+                  gt_orde-job_title
+                  gt_orde-infl_level
+                  gt_orde-branch_code
+                  gt_orde-branch
+                  gt_orde-region_code
+                  gt_orde-region
+                  gt_orde-engin_code
+                  gt_orde-engin
+                  gt_orde-techn_code
+                  gt_orde-techn
+                  gt_orde-aufnr
+                  gt_orde-sernr
+                  gt_orde-eqktx
+                  gt_orde-prctr
+                  gt_orde-gac
+                  gt_orde-pgc
+                  gt_orde-bemot
+                  gt_orde-trans_type
+                  gt_orde-teco_date
+                  gt_orde-chan_code
+           INTO g_outrec SEPARATED BY con_tab.
+
+      TRANSFER g_outrec(600) TO g_ofile.
+
+    ENDIF.                                                  "MOD-001
+
+*** MOD-001 * begin insert ***
+    AT END OF fam_code.
+      IF g_retcd IS INITIAL.
+*       Close file
+        CLOSE DATASET g_ofile.
+        IF sy-subrc <> 0.
+          WRITE: / text-e05, g_ofile.
+        ENDIF.
+      ENDIF.
+    ENDAT.
+*** MOD-001 * end insert ***
+
+  ENDLOOP.
+
+ENDFORM.                    "write_outputfile
+
+*&---------------------------------------------------------------------*
+*&      Form  NEW_FILE                           "MOD-001
+*&---------------------------------------------------------------------*
+*       New file (per FAM code)
+*----------------------------------------------------------------------*
+FORM new_file .
+
+  CLEAR g_retcd.
+
+* Filename
+  CONCATENATE gt_orde-fam_code sy-datum c_project
+              INTO g_ofile SEPARATED BY c_underscore.
+  CONCATENATE g_directory g_ofile INTO g_ofile.
+
+* Open file
+  OPEN DATASET g_ofile FOR OUTPUT IN TEXT MODE ENCODING DEFAULT.
+  IF sy-subrc <> 0.
+    WRITE: / text-e03, g_ofile.
+    g_retcd = 4.
+    EXIT.
+  ENDIF.
+
+* Header-line
+  CONCATENATE 'Customer_Center_FAM_code'
+              'Customer_Account_Number'
+              'Customer_Name'
+              'Customer_Site_Street'
+              'Customer_Site_Post_Code'
+              'Customer_Site_City'
+              'Customer_Street'
+              'Customer_Post_Code'
+              'Customer_City'
+              'Contact_Language'
+              'Contact_Full_Name'
+              'Contact_Email_Address'
+              'Contact_Tel_Nr'
+              'Contact_Job_Title'
+              'Contact_Influence_Level'
+              'Service_Branch_Code'
+              'Service_Branch'
+              'Sales region_code'
+              'Sales region description'
+              'Sales_Engineer_code'
+              'Sales_Engineer'
+              'Service_Technician_Code'
+              'Service_Technician'
+              'Order_Number'
+              'Serial_Number'
+              'Equipment_Description'
+              'Profit center'
+              'GAC'
+              'PGC'
+              'Service_Type'
+              'Type of transactions'
+              'Trigger Date'
+              'Sales_Channel_code'
+       INTO g_outrec SEPARATED BY con_tab.
+
+  TRANSFER g_outrec(600) TO g_ofile.
+
+ENDFORM.                    " NEW_FILE

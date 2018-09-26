@@ -1,0 +1,518 @@
+*********************************************************************
+* Report  : YSE_AM_RESERV_CHECK                                     *
+*-------------------------------------------------------------------*
+* Author  : Peter Dud¨¢s, Joost Claerhout                            *
+* Company : Atlas Copco                                             *
+* Created : 2008.04.01                                              *
+* Dev.nbr :                                                         *
+*-------------------------------------------------------------------*
+* Get data on reservations to check if ok                           *
+*********************************************************************
+
+REPORT  YSE_AM_LOG1                     .
+
+TABLES: resb, rsdbs, aufk.
+*-------------------------------------------------------------------*
+* Type declarations                                                 *
+*-------------------------------------------------------------------*
+
+
+
+*TYPES: BEGIN OF xtyp_out,
+*         rsnum LIKE resb-rsnum,
+*         rspos LIKE resb-rspos,
+*         xloek LIKE resb-xloek,
+*         xwaok LIKE resb-xwaok,  " MVT
+*         kzear LIKE resb-kzear,  " FLS
+*         matnr LIKE resb-matnr,
+*         werks LIKE resb-werks,
+*         lgort LIKE resb-lgort,
+*         sobkz LIKE resb-sobkz,  " S
+*         aufnr LIKE resb-aufnr,
+*         postp LIKE resb-aufnr,  " Ict
+*         bdter LIKE resb-bdter,  " req date
+*         bdmng LIKE resb-bdmng,
+** Report 2 parts from RSDBS
+*         banfn LIKE rsdbs-banfn,   " PR nr
+*         bnfpo LIKE rsdbs-bnfpo,   " PR item
+*         ebeln LIKE rsdbs-ebeln,   " PO
+*         ebelp LIKE rsdbs-ebelp,   " PO item nr
+*       END OF xtyp_out.
+
+TYPES: BEGIN OF xtyp_data,
+        rsart LIKE resb-rsart.
+include type yse_am_reserv_check.
+TYPES: END OF xtyp_data.
+
+
+*-------------------------------------------------------------------*
+*   CLASS STUFF                                                     *
+*-------------------------------------------------------------------*
+
+CLASS lcl_event_handler DEFINITION .
+  PUBLIC SECTION.
+    METHODS:
+      handle_double_click FOR EVENT double_click OF cl_gui_alv_grid
+                  IMPORTING e_row e_column es_row_no.
+  PRIVATE SECTION.
+ENDCLASS.                    "lcl_event_handler DEFINITION
+
+*-------------------------------------------------------------------*
+CLASS lcl_event_handler IMPLEMENTATION .
+
+  METHOD handle_double_click .
+*    PERFORM handle_double_click USING e_row e_column es_row_no .
+  ENDMETHOD .                    "handle_double_click
+ENDCLASS.                    "lcl_event_handler IMPLEMENTATION
+
+
+
+*-------------------------------------------------------------------*
+* Data declarations                                                 *
+*-------------------------------------------------------------------*
+
+DATA: xt_data TYPE TABLE OF xtyp_data,
+*DATA: xt_data TYPE SORTED TABLE OF xtyp_data
+*                  WITH NON-UNIQUE KEY rsnum rspos rsart,
+
+      xt_out TYPE TABLE OF YSE_AM_RESERV_CHECK,
+      xv_chars(10) TYPE c,
+      xv_i TYPE i,
+      xv_set(1) TYPE c.
+
+* ----- ALV GRID ---------------------------------------------------*
+TYPE-POOLS: SLIS.
+
+DATA:
+      xv_variant         LIKE disvariant,
+      xv_variant_flag    TYPE c,
+      xv_sd_alv_variant  LIKE disvariant,
+      xt_fcat            TYPE slis_t_fieldcat_alv,   " lvc_t_fcat,
+      xt_alv_sort        TYPE slis_t_sortinfo_alv,
+      xv_user_command    TYPE slis_formname  VALUE 'USER_COMMAND',
+      xv_variant_save    TYPE c              VALUE 'U',
+      xv_layout          TYPE SLIS_LAYOUT_ALV.    "lvc_s_layo.
+* DATA: xref_event_handler TYPE REF TO lcl_event_handler .
+
+
+FIELD-SYMBOLS:  <x_data> TYPE xtyp_data,
+                <x_any> TYPE any.
+
+
+
+
+*-------------------------------------------------------------------*
+* Selection screen                                                  *
+*-------------------------------------------------------------------*
+SELECTION-SCREEN BEGIN OF BLOCK b01 WITH FRAME TITLE text-t01.
+SELECT-OPTIONS:
+    s_rsnum FOR resb-rsnum,
+    s_werks FOR resb-werks,
+    s_sobkz FOR resb-sobkz,
+    s_bdter FOR resb-bdter,
+    s_matnr FOR resb-matnr,
+    s_aufnr FOR resb-aufnr,
+    s_awerk FOR aufk-werks.
+
+PARAMETERS:   xp_r1 TYPE xfeld RADIOBUTTON GROUP g1 DEFAULT 'X',
+              xp_r2 TYPE xfeld RADIOBUTTON GROUP g1.
+
+SELECTION-SCREEN END OF BLOCK b01.
+
+*-------------------------------------------------------------------*
+* Initialization of the selection screen                            *
+*-------------------------------------------------------------------*
+INITIALIZATION.
+
+AT SELECTION-SCREEN.
+
+  clear xv_set.
+  LOOP AT SCREEN.
+    CASE SCREEN-GROUP3.
+      WHEN 'LOW'.
+        xv_i = strlen( SCREEN-NAME ) - 4.
+        xv_chars = SCREEN-NAME+0(xv_i).
+        ASSIGN  (xv_chars) TO <x_any>.
+        IF NOT <x_any> IS INITIAL.
+          xv_set = 'X'.
+          EXIT.
+        ENDIF.
+      WHEN 'HGH'.
+    ENDCASE.
+  ENDLOOP.
+
+  IF xv_set NE 'X'.
+    MESSAGE e000(yse_sales_log)
+        WITH 'At least one select criteria must be set'.
+  ENDIF.
+
+*&---------------------------------------------------------------------*
+*&   Event top-of-page
+*&---------------------------------------------------------------------*
+TOP-OF-PAGE.
+
+************************************************************************
+* START MAIN PROGRAM                                                   *
+************************************************************************
+START-OF-SELECTION.
+  PERFORM select_data.
+  PERFORM alv_fcat.
+  PERFORM alv_layout.
+  PERFORM alv_display.
+
+END-OF-SELECTION.
+*&---------------------------------------------------------------------*
+*&      Form  select_data
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM select_data .
+  DATA: lt_rsdbs TYPE TABLE OF rsdbs,
+        lv_tabix LIKE sy-tabix,
+        lv_data LIKE LINE OF xt_data.
+
+  FIELD-SYMBOLS: <l_rsdbs> TYPE rsdbs.
+
+  SELECT resb~rsnum  resb~rspos
+*         rsart
+         resb~xloek resb~xwaok resb~kzear resb~matnr resb~werks
+         resb~lgort resb~sobkz resb~aufnr resb~postp resb~bdter resb~bdmng resb~meins
+         aufk~werks as aufwerks
+        FROM resb
+        LEFT JOIN AUFK ON aufk~aufnr = resb~aufnr
+        INTO CORRESPONDING FIELDS OF TABLE xt_data
+        WHERE resb~rsnum IN s_rsnum
+          AND resb~werks IN s_werks
+          AND resb~sobkz IN s_sobkz
+          AND resb~bdter IN s_bdter
+          AND resb~matnr IN s_matnr
+          AND resb~aufnr IN s_aufnr.
+
+
+  LOOP AT xt_data INTO lv_data.
+    lv_tabix = sy-tabix.
+    IF NOT lv_data-aufwerks IN s_awerk.
+      DELETE xt_data INDEX lv_tabix.
+    ENDIF.
+  ENDLOOP.
+
+  IF xp_r2 = 'X'.
+    SELECT rsnum rspos rsart banfn bnfpo
+*        ebeln ebelp
+        FROM rsdbs
+        INTO CORRESPONDING FIELDS OF TABLE lt_rsdbs
+        FOR ALL ENTRIES IN xt_data
+        WHERE rsnum = xt_data-rsnum
+          AND rspos = xt_data-rspos
+          AND RSINZ <> '00'
+          AND rsart = xt_data-rsart.
+
+
+    SORT lt_rsdbs BY rsnum rspos rsart.
+    SORT xt_data BY rsnum rspos rsart.
+    LOOP AT  lt_rsdbs ASSIGNING <l_rsdbs>.
+      READ TABLE xt_data ASSIGNING <x_data>
+                WITH KEY rsnum = <l_rsdbs>-rsnum
+                         rspos = <l_rsdbs>-rspos
+                         rsart = <l_rsdbs>-rsart
+           BINARY SEARCH.
+      IF sy-subrc = 0.
+        MOVE <l_rsdbs>-banfn TO <x_data>-banfn.
+        MOVE <l_rsdbs>-bnfpo TO <x_data>-bnfpo.
+      ELSE.
+        MOVE-CORRESPONDING <l_rsdbs> TO lv_data.
+        INSERT lv_data INTO xt_data INDEX lv_tabix.     "sort order!
+      ENDIF.
+
+*        IF <x_data>-ebeln IS INITIAL.
+*          MOVE-CORRESPONDING <l_rsdbs> TO <x_data>.
+*        ELSE.
+*          lv_tabix = sy-tabix.
+*          MOVE-CORRESPONDING <x_data> TO lv_data.
+*          MOVE-CORRESPONDING <l_rsdbs> TO lv_data.
+*          INSERT lv_data INTO xt_data INDEX lv_tabix. "sort order!
+*        ENDIF.
+    ENDLOOP.
+  ENDIF.
+
+ENDFORM.                    " select_data
+
+
+
+*----------------------------------------------------------------------*
+*       Form  ALV_OUTPUT                                               *
+*----------------------------------------------------------------------*
+*       text                                                           *
+*----------------------------------------------------------------------*
+FORM alv_display.
+  DATA: lv_repid LIKE sy-repid.
+
+
+* variant-report    = 'YSE_SD_SALES'.
+* variant-variant   = variant.
+  xv_sd_alv_variant = xv_variant.
+  lv_repid = sy-repid.
+
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+    EXPORTING
+      i_callback_program      = lv_repid
+      i_callback_user_command = xv_user_command " 'USER_COMMAND'
+
+*      i_callback_top_of_page  = 'ALV_TOP'
+      i_grid_title            = 'Sales reporting'
+      is_layout               = xv_layout
+      it_fieldcat             = xt_fcat
+      it_sort                 = xt_alv_sort
+      i_default               = 'X'
+      i_save                  = 'A'
+      is_variant              = xv_sd_alv_variant
+      i_screen_start_column   = 0
+      i_screen_start_line     = 0
+      i_screen_end_column     = 0
+      i_screen_end_line       = 0
+    TABLES
+      t_outtab                = xt_data
+    EXCEPTIONS
+      program_error           = 1
+      OTHERS                  = 2.
+  IF sy-subrc NE 0.
+*   message id sy-msgid type sy-msgty number sy-msgno
+*           with sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+ENDFORM.                    " ALV_OUTPUT
+
+
+*------------------------------------------------------------------*
+*   Form  VARIANT_INPUTHELP                                        *
+*------------------------------------------------------------------*
+*   F4 - help for variants                                         *
+* AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_var.                  *
+*    PERFORM variant_inputhelp USING p_var.                        *
+*------------------------------------------------------------------*
+FORM alv_variant_inputhelp USING var.
+
+*  --- Variables
+  DATA: h_exit            TYPE c.
+
+  CLEAR h_exit.
+  CLEAR xv_variant.
+
+  CALL FUNCTION 'REUSE_ALV_VARIANT_F4'
+    EXPORTING
+      is_variant    = xv_variant
+      i_save        = xv_variant_save
+    IMPORTING
+      e_exit        = h_exit
+      es_variant    = xv_variant
+    EXCEPTIONS
+      not_found     = 1
+      program_error = 2
+      OTHERS        = 3.
+
+  IF sy-subrc IS INITIAL AND h_exit IS INITIAL.
+    xv_variant-variant = xv_variant-variant.
+    var               = xv_variant-variant.
+  ENDIF.
+
+ENDFORM.                    " VARIANT_INPUTHELP
+*&---------------------------------------------------------------------*
+*&      Form  alv_fcat
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM alv_fcat .
+  DATA:
+        lv_repid LIKE sy-repid.
+
+  FIELD-SYMBOLS: <l_fcat> TYPE slis_fieldcat_alv.  "lvc_s_fcat.
+
+  clear: xt_fcat.
+  refresh: xt_fcat.
+
+  lv_repid = sy-repid.
+
+* Create Fieldcatalogue from internal table
+  CALL FUNCTION 'REUSE_ALV_FIELDCATALOG_MERGE'
+       EXPORTING
+            I_PROGRAM_NAME         = lv_repid
+*            I_INTERNAL_TABNAME     = 'XT_DATA'
+            I_STRUCTURE_NAME       = 'YSE_AM_RESERV_CHECK'
+            I_INCLNAME             = lv_repid
+       CHANGING
+            CT_FIELDCAT            = xt_fcat
+       EXCEPTIONS
+            INCONSISTENT_INTERFACE = 1
+            PROGRAM_ERROR          = 2
+            OTHERS                 = 3.
+
+* Modify it according our needs
+  LOOP at xt_fcat ASSIGNING <l_fcat>.
+    CASE <l_fcat>-fieldname.
+      WHEN 'AUFWERKS'.
+        PERFORM alv_fcat_title
+              USING   text-h01
+              CHANGING <l_fcat>.
+
+      WHEN 'RSNUM'.
+        <l_fcat>-hotspot = 'X'.
+      WHEN 'MATNR'.
+        <l_fcat>-hotspot = 'X'.
+      WHEN 'AUFNR'.
+        <l_fcat>-hotspot = 'X'.
+      WHEN 'BANFN'.
+        <l_fcat>-hotspot = 'X'.
+        <l_fcat>-no_OUT = xp_r1.
+      WHEN 'BNFPO'.
+        <l_fcat>-no_OUT = xp_r1.
+      WHEN 'EBELN'.
+        <l_fcat>-hotspot = 'X'.
+        <l_fcat>-no_OUT = xp_r1.
+      WHEN 'EBELP'.
+        <l_fcat>-no_OUT = xp_r1.
+
+*      WHEN 'XX'.
+*          PERFORM alv_fcat_title USING 'nev'
+*                                  CHANGING <l_fcat>.
+*          <l_fcat>-no_OUT = 'X'.
+*          <l_fcat>-currency = 'HUF'.
+*          <l_fcat>-do_sum = 'X'.
+*          <l_fcat>-emphasize = 'X'.
+    ENDCASE.
+  ENDLOOP.
+
+ENDFORM.                    " alv_fcat
+
+
+*----------------------------------------------------------------------*
+*   Form  ALV_FCAT_CHANGE                                              *
+*----------------------------------------------------------------------*
+*   .....                                                              *
+*----------------------------------------------------------------------*
+
+FORM alv_fcat_title USING p_title TYPE string
+                     CHANGING p_fieldcat TYPE slis_fieldcat_alv
+                      .
+  p_fieldcat-seltext_s    = p_title.
+  p_fieldcat-seltext_m    = p_title.
+  p_fieldcat-seltext_l    = p_title.
+  p_fieldcat-reptext_ddic = p_title.
+ENDFORM.                    " alv_fcat_change
+
+*----------------------------------------------------------------------*
+*   Form  ALV_LAYOUT                                                   *
+*----------------------------------------------------------------------*
+*   .....                                                              *
+*----------------------------------------------------------------------*
+
+FORM alv_layout.
+
+*  xv_layout-zebra = ''.
+*  xv_layout-smalltitle = 'X'.
+*  xv_layout-grid_title = 'title'.
+
+ENDFORM.                    "alv_layout
+
+
+*----------------------------------------------------------------------*
+*       Form  PREPARE_SORT                                             *
+*----------------------------------------------------------------------*
+*       text                                                           *
+*----------------------------------------------------------------------*
+FORM alv_prepare_sort.
+  DATA:  lv_sort          TYPE slis_sortinfo_alv.
+* lv_sort-spos      = '1'.
+* lv_sort-fieldname = 'PRCTR'.
+* lv_sort-up        = 'X'.
+* append lv_sort to xt_alv_sort.
+
+ENDFORM.                    " PREPARE_SORT
+
+*&---------------------------------------------------------------------*
+*&      Form  ALV_TOP
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM alv_top.
+
+*
+** ALV header declarations
+*  DATA: lt_header      TYPE slis_t_listheader,
+*        lv_header     TYPE slis_listheader,
+**       T_LINE        LIKE WA_HEADER-INFO,
+*        lv_lines      TYPE i,
+*        lv_linesc(10) TYPE c.
+*
+** Nr of records
+*  DESCRIBE TABLE xt_data LINES lv_lines.
+*  lv_linesc = lv_lines.
+*
+*  lv_header-typ  = 'S'.
+*  lv_header-key  = 'Nr of lines:'(101).
+*  lv_header-info = lv_linesc.
+*  APPEND lv_header TO lt_header.
+*  CLEAR: lv_header. ", T_LINE.
+*
+*  CALL FUNCTION 'REUSE_ALV_COMMENTARY_WRITE'
+*    EXPORTING
+*      it_list_commentary = lt_header
+*      i_logo             = 'GANESH_LOGO'.
+
+ENDFORM.                    "ALV_TOP
+
+
+
+*------------------------------------------------------------------*
+*   Form  USER_COMMAND                                             *
+*------------------------------------------------------------------*
+*   --> R_UCOMM                                                    *
+*   --> RS_SELFIELD                                                *
+*------------------------------------------------------------------*
+FORM user_command USING ucomm    LIKE sy-ucomm
+                        selfield TYPE slis_selfield.
+
+*-- Check function code
+  CASE ucomm.
+    WHEN '&IC1'.
+      IF NOT selfield-value IS INITIAL.
+        CASE selfield-fieldname.
+          WHEN 'MATNR'.
+            SET PARAMETER ID 'MAT' FIELD selfield-value.
+            CALL TRANSACTION 'MM03' AND SKIP FIRST SCREEN.
+          WHEN 'BANFN'.
+            SET PARAMETER ID 'BAN' FIELD selfield-value.
+            CALL TRANSACTION 'ME53N' AND SKIP FIRST SCREEN.
+          WHEN 'AUFNR'.
+            SET PARAMETER ID 'ANR' FIELD selfield-value.
+            CALL TRANSACTION 'IW33' AND SKIP FIRST SCREEN.
+          WHEN 'EBELN'.
+            SET PARAMETER ID 'BES' FIELD selfield-value.
+            CALL TRANSACTION 'ME23N' AND SKIP FIRST SCREEN.
+          WHEN 'RSNUM'.
+            SET PARAMETER ID 'RES' FIELD selfield-value.
+            CALL TRANSACTION 'MB23' AND SKIP FIRST SCREEN.
+        ENDCASE.
+      ENDIF.
+  ENDCASE.
+ENDFORM.                    " USER_COMMAND
+
+*Text symbol text£º
+*H01:Maint.Plant
+
+*T01:Special stock indicator check
+*Selection text£º
+*S_AUFNR:D       .
+*S_AWERK:        Maintenance plant
+*S_BDTER:D       .
+*S_MATNR:D       .
+*S_RSNUM:D       .
+*S_SOBKZ:D       .
+*S_WERKS:D       .
+*XP_R1:        Only reservations
+*XP_R2:        With Purchasing data

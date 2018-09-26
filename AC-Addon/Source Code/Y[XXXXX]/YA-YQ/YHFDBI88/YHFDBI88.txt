@@ -1,0 +1,1966 @@
+***********************************************************************
+*           Copyright(c) 2003 Deutsche Bank AG
+* All rights reserved. This Software is proprietary to Deutsche Bank AG
+* and is protected by copyright law and international treaties. Under no
+* circumstances are you permitted to make any attempt to alter, decrypt
+* or reverse engineer this software, and any unauthorised reproduction
+* of this software or any portion thereof may result in severe civil and
+* criminal penalties, and will be prosecuted to the maximum extent
+* possible under the law.
+************************************************************************
+REPORT YHDFBI88 LINE-SIZE 132 LINE-COUNT 65
+                NO STANDARD PAGE HEADING
+                MESSAGE-ID 00.
+************************************************************************
+*  Author       :  Deutsche Bank AG
+*  Date         :  Apr/2003
+*  Description  : This program performs the following functions :
+*  a) write the payment records to the payment files in the required
+*     format. The format is taken from the mapping tables.
+*  c) print payment summary
+*  d) call program yhfdbi89 to compute the checksum and print checksum
+*     list.
+************************************************************************
+** DDIC-Customized Objects ********************************************
+TABLES:  REGUH, REGUP, T012K, T001, BNKA, T042Z, T042I, T042N, T012D.
+TABLES:  BKPF, BSEG, TCURX, USR01, T005, T005T, YHFAPPLC.
+TABLES:  LFBK, LFA1, LFB1, KNBK, KNA1, KNB1, BSEC, TCURC.
+TABLES:  ADRC, TSAD3T, WITH_ITEM, T015W, PAYR, ADR6, TIBAN, T005U.
+INFOTYPES: 0001.
+** Selection screen parameters *****************************************
+PARAMETERS: P_EMID LIKE REGUH-SRTF2.
+SELECT-OPTIONS: W_LAUFI FOR REGUH-LAUFI NO INTERVALS.
+SELECTION-SCREEN BEGIN OF BLOCK CRITERIA WITH FRAME TITLE
+TEXT-001.
+PARAMETERS:
+   CO_CODE       LIKE  REGUH-ZBUKR OBLIGATORY.
+SELECT-OPTIONS:
+   HBK_KEY       FOR  REGUH-HBKID OBLIGATORY,
+   ACCT_ID       FOR  REGUH-HKTID NO-EXTENSION,
+   PAY_METH      FOR  REGUH-RZAWE NO-EXTENSION OBLIGATORY. "paym
+PARAMETERS:
+   DBD_PAY LIKE YHFHELP-YHDBDPY.
+PARAMETERS: FALLBACK   LIKE RFPDO1-F170XCRE.
+PARAMETERS: KATAKANA   LIKE RFPDO1-F170XCRE.
+SELECTION-SCREEN SKIP 1.
+SELECTION-SCREEN BEGIN OF LINE.
+PARAMETERS:
+   YHTEST         LIKE YHFHELP-YHTEST RADIOBUTTON GROUP 1.
+SELECTION-SCREEN:
+  COMMENT 03(50) TEXT-005 FOR FIELD YHTEST,
+  END OF LINE.
+SELECTION-SCREEN BEGIN OF LINE.
+PARAMETERS:
+  YHLIVE          LIKE YHFHELP-YHLIVE RADIOBUTTON GROUP 1.
+SELECTION-SCREEN:
+  COMMENT 03(50) TEXT-006 FOR FIELD YHLIVE,
+  END OF LINE.
+SELECTION-SCREEN END OF BLOCK CRITERIA.
+
+SELECTION-SCREEN BEGIN OF BLOCK CHEQUE WITH FRAME TITLE
+TEXT-003.
+PARAMETERS:
+   PAYPROG(50) TYPE C.
+
+SELECTION-SCREEN BEGIN OF LINE.
+PARAMETERS: REF1 RADIOBUTTON GROUP RAD.
+SELECTION-SCREEN COMMENT 4(50) TEXT-010 .
+SELECTION-SCREEN END OF LINE.
+
+SELECTION-SCREEN BEGIN OF LINE.
+PARAMETERS: REF2 RADIOBUTTON GROUP RAD.
+SELECTION-SCREEN COMMENT 4(50) TEXT-011 .
+SELECTION-SCREEN END OF LINE.
+
+SELECTION-SCREEN BEGIN OF LINE.
+PARAMETERS: REF3 RADIOBUTTON GROUP RAD.
+SELECTION-SCREEN COMMENT 4(50) TEXT-009 .
+SELECTION-SCREEN END OF LINE.
+
+SELECTION-SCREEN END OF BLOCK CHEQUE.
+
+SELECTION-SCREEN BEGIN OF BLOCK WTXRUN WITH FRAME TITLE
+TEXT-004.
+PARAMETERS: WTXPROG(50) TYPE C.
+SELECT-OPTIONS: S_WITHT FOR WITH_ITEM-WITHT NO INTERVALS.
+SELECTION-SCREEN END OF BLOCK WTXRUN.
+** Subroutine includes ***********************************************
+INCLUDE YHFDBI86.
+** Global fields *******************************************************
+** Global constants ****************************************************
+DATA: DBD_PATH LIKE RLGRAP-FILENAME,
+             V_CHECK_FILE(270), V_WTXFILE(270),
+             V_PDL(500), V_CLEAR_CODE(100), V_CLEAR_TYPE(100),
+             V_MEMAIL(300), V_IB_CLEAR_CODE(100), V_IB_CLEAR_TYPE(100),
+            W_RZAWE LIKE REGUH-RZAWE, V_FMT_AMT(16) TYPE P DECIMALS 2,
+            V_PROGNAME LIKE SY-REPID,  FLAG(1),
+            WS_WARN_ACC_LENGTH(1),
+            WS_WARN_NO_VALUE_DATE(1),
+            WS_WARN_NO_AUTHORITY(1),
+            WS_WARN_FN_ERR(1),
+            V_DWC_LIST LIKE YHFPARMI-PARM_VAL,
+            CONVERT_TYPE(1) TYPE C, ERRSTR(100) TYPE C,
+            V_DWC_FLAG(1), V_CONVERT_LIST LIKE YHFPARMI-PARM_VAL,
+            V_INV_CHR(1), V_SGTXT(100), V_ABSBU LIKE REGUH-ABSBU,
+            PAY_ERR_FLAG(1), DBD_PAY1(270), V_FLD(100),
+            V_COUNTRIES2 LIKE YHFPARMI-PARM_VAL, V_CK_ACCT(35),
+            V_COUNTRIES1 LIKE YHFPARMI-PARM_VAL, V_ACCT_REF(35).
+
+data: it_incomplete_reguh like reguh occurs 1 with header line.
+data: flag_inc_pay.
+DATA : V_SKIP_PARM1 LIKE YHFPARMI-PARM_VAL.       "PP01
+DATA : C_Y(1) TYPE C VALUE 'Y'.                   "PP01
+DATA : V_HR_PARM LIKE YHFPARMI-PARM_VAL.          "PP01
+
+** Global arrays and internal tables ***********************************
+DATA: BEGIN OF SELTAB OCCURS 5.
+        INCLUDE STRUCTURE RSPARAMS.
+DATA: END OF SELTAB.
+
+DATA: BEGIN OF BNKAI.
+        INCLUDE STRUCTURE BNKA.
+DATA: END OF BNKAI.
+*data: test1 like WITH_ITEM-WT_QSSHB.
+
+DATA: BEGIN OF MASTER_ITAB OCCURS 5000,
+        VALUE_DATE          LIKE REGUH-VALUT,               "<Skey1>
+        REC_AC_NAME         LIKE REGUH-ZNME1,
+        REC_BANK_CD         LIKE REGUH-ZBNKY,
+        REC_BR              LIKE REGUH-ZBNKY,
+        REC_AC_NO(34)                       ,               "<Skey2>
+        TR_CD               LIKE T042N-BKTCP,
+         PAYMENT_AMT        LIKE REGUH-RWBTR,
+*        PAYMENT_AMT(13)     TYPE P DECIMALS 2,
+*        PAY_AMT_LOCAL      LIKE REGUH-RWBTR,
+        PAY_AMT_LOCAL(13)   TYPE P DECIMALS 2,
+        PAYMENT_DOC_NO      LIKE REGUH-VBLNR, "payment doc no <Skey4>
+        COUNTRY_KEY         LIKE REGUH-LAND1,
+        PAY_METHOD          LIKE REGUH-RZAWE, "payment method
+        BANK_KEY            LIKE REGUH-HBKID, "house bank key
+        ACCOUNT_ID          LIKE REGUH-HKTID, "account id
+        BANK_AC_NO          LIKE REGUH-UBKNT, "our account number
+        PAY_CURR            LIKE REGUH-WAERS, "currency key
+        BANK_NUMBER         LIKE REGUH-UBNKL,
+        BENE_NUMBER         LIKE REGUH-LIFNR, "vendor number
+        PAYMENT_MODE(3)     TYPE C,                         "<Skey3>
+        WTX_INCLUD          LIKE YHFFMTXR-YPAYDTL,
+        LAUFI               LIKE REGUH-LAUFI,
+      END OF MASTER_ITAB.
+
+DATA: BEGIN OF REVERSE_PTAB OCCURS 200,
+        VBLNR         LIKE REGUH-VBLNR,"document number
+        WAERS         LIKE REGUH-WAERS,"pay currency
+        RWBTR         LIKE REGUH-RWBTR,"pay amount
+      END OF REVERSE_PTAB.
+
+DATA: ITAB_ADR6 LIKE ADR6 OCCURS 0 WITH HEADER LINE.
+
+DATA: T_TELFX LIKE REGUH-ZTLFX.
+
+DATA: BEGIN OF ITAB OCCURS 10,
+        PAY_MODE(3) TYPE C,
+        YHFFMTXR LIKE YHFFMTXR,
+        REGUH LIKE REGUH,
+      END OF ITAB.
+FIELD-SYMBOLS: <FIELDX>.
+
+PARAMETERS: PAYDET LIKE YHFHELP-YHPAYFILE.
+
+* Report heading.
+TOP-OF-PAGE.
+  WRITE: /1 'REF: YHFDBI87', 50 'DEUTSCHE BANK AG'
+         , 107 SY-DATUM, SY-TIMLO.
+  WRITE: /1 SY-UNAME,   48 'AUTO PAYMENT SUMMARY'
+         , 107 'PAGE: ', SY-PAGNO.
+  ULINE.
+************************************************************************
+*                        main program
+************************************************************************
+START-OF-SELECTION.
+  MOVE SY-REPID TO V_PROGNAME.
+  CALL FUNCTION 'RS_REFRESH_FROM_SELECTOPTIONS'
+       EXPORTING
+            CURR_REPORT     = V_PROGNAME
+       TABLES
+            SELECTION_TABLE = SELTAB
+       EXCEPTIONS
+            NOT_FOUND       = 1
+            NO_REPORT       = 2
+            OTHERS          = 3.
+
+**FOR 4.7
+
+  SELECT PARM_VAL INTO LO_DATA_CONV FROM YHFPARMI
+                  WHERE BUKRS = CO_CODE
+                  AND   PARM1 = 'LDC'
+                  AND   PARM2 = SPACE.
+  ENDSELECT.
+
+
+**END 4.7
+** File names generation***** ***********************************
+  PERFORM GET_FILENAMES.
+
+  IF YHLIVE <> SPACE.
+
+*FOR 4.6
+*    OPEN DATASET V_PAYFILE FOR OUTPUT IN TEXT MODE.
+*FOR 4.6
+
+**FOR 4.7
+    IF LO_DATA_CONV = SPACE.
+      OPEN DATASET V_PAYFILE FOR OUTPUT IN TEXT MODE ENCODING DEFAULT.
+    ELSE.
+      OPEN DATASET V_PAYFILE FOR OUTPUT IN BINARY MODE.
+    ENDIF.
+**END 4.7
+
+    IF SY-SUBRC <> 0.
+      WRITE:/ 'Cannot open output file ', V_PAYFILE.
+      EXIT.
+    ENDIF.
+
+*FOR 4.6
+*    OPEN DATASET V_ERRFILE FOR OUTPUT IN TEXT MODE.
+*END 4.6
+
+*FOR 4.7
+    OPEN DATASET V_ERRFILE FOR OUTPUT IN TEXT MODE ENCODING DEFAULT.
+*END 4.7
+
+    IF SY-SUBRC <> 0.
+      WRITE:/ 'Cannot open error file ', V_ERRFILE.
+      EXIT.
+    ENDIF.
+    V_PAYPROG = PAYPROG.
+    IF PAYPROG NE SPACE.
+      PERFORM EXTENDED_DETAILS.
+    ENDIF.
+    IF WTXPROG NE SPACE.
+      PERFORM EXTENDED_WTX_DETAILS.
+    ENDIF.
+  ENDIF.
+  PERFORM GET_PAYMENT.
+
+  SELECT SINGLE * FROM YHFPARMI WHERE BUKRS = SPACE
+                    AND PARM1 = 'WDN'
+                    AND PARM2 = 'EXP'.
+  IF SY-SUBRC EQ 0.
+    MOVE YHFPARMI-PARM_VAL TO DBD_PATH.
+  ELSE.
+    SELECT SINGLE * FROM YHFPARMI WHERE BUKRS = CO_CODE
+                      AND PARM1 = 'WDN'
+                      AND PARM2 = 'EXP'.
+    IF SY-SUBRC EQ 0.
+      MOVE YHFPARMI-PARM_VAL TO DBD_PATH.
+    ENDIF.
+  ENDIF.
+
+  IF DBD_PATH NE SPACE.
+    SELECT SINGLE * FROM YHFPARMI WHERE BUKRS = SPACE
+                      AND PARM1 = 'WDN'
+                      AND PARM2 = 'EAP'.
+    IF SY-SUBRC EQ 0.
+      MOVE YHFPARMI-PARM_VAL TO WS_PC_DOWNLOAD.
+    ELSE.
+      SELECT SINGLE * FROM YHFPARMI WHERE BUKRS = CO_CODE
+                        AND PARM1 = 'WDN'
+                        AND PARM2 = 'EAP'.
+      IF SY-SUBRC EQ 0.
+        MOVE YHFPARMI-PARM_VAL TO WS_PC_DOWNLOAD.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+*  IF WS_PC_DOWNLOAD EQ 'Y'.
+  EXPORT V_ERRFILE TO MEMORY ID 'V_ERRFILE'.
+*    PERFORM DOWN_LOAD_PC.
+*  ENDIF.
+  EXPORT WS_PC_DOWNLOAD  TO MEMORY ID 'WS_PC_DOWNLOAD'.
+
+  CLOSE DATASET V_PAYFILE.
+  PERFORM PRINT_SUMMARY_LIST.
+
+  IF YHLIVE NE SPACE.
+******************************************************************PP01
+* Changed by : Purna Chandra
+* Date       : 08\06\2007
+* To skip the spool pop-up box
+
+    PERFORM SKIP_SPOOL1.
+
+*SUBMIT YHFDBI89 TO SAP-SPOOL
+*              AND RETURN
+*              WITH SELECTION-TABLE SELTAB
+*
+*              IMMEDIATELY ' '
+*              SAP COVER PAGE ' '
+*              COVER TEXT 'Deutsche Bank AG - Auto Payment Checksum'.
+  ENDIF.
+
+*---------------------------------------------------------------------*
+*       FORM GET_FILENAMES                                            *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+FORM GET_FILENAMES.
+  IMPORT V_PAYFILE FROM MEMORY ID 'PAYFILE'.
+  IMPORT V_CHECK_FILE FROM MEMORY ID 'CHECKFILE'.
+  IMPORT  DBD_PAY1 FROM  MEMORY ID 'DBD_PAY1'.
+  IF DBD_PAY1 NE SPACE.
+    CONCATENATE DBD_PAY1 'DBERROR.TXT' INTO V_ERRFILE.
+  ELSE.
+    CONCATENATE DBD_PAY 'DBERROR.TXT' INTO V_ERRFILE.
+  ENDIF.
+  EXPORT V_PAYFILE TO MEMORY ID 'PAYFILE'.
+  EXPORT V_CHECK_FILE TO MEMORY ID 'CHECKFILE'.
+ENDFORM.
+
+*---------------------------------------------------------------------*
+*       FORM GET_PAYMENT                                              *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+FORM GET_PAYMENT.
+  DATA: PERNR LIKE P0008-PERNR.
+*  DATA: V_PAY_AMT_LOCAL LIKE REGUH-RBETR.
+  DATA: V_PAY_AMT_LOCAL(16) type p decimals 2.
+  DATA: V_ROWCNT TYPE I.
+  data: flag_incomplete_pay.
+  data: flag_one_time1.
+  data: flag_one_time2.
+  DATA: LV_ZW_LAUFD(10).
+  DATA: LV_ZW_LAUFI(6).
+
+
+  PERFORM GET_PARAM.
+  IMPORT ITAB FROM MEMORY ID 'ITAB'.
+  SORT ITAB BY REGUH-VALUT REGUH-UBKNT PAY_MODE REGUH-VBLNR.
+  LOOP AT ITAB.
+    CLEAR: V_PDL, V_CLEAR_CODE, V_IB_CLEAR_CODE.
+
+    MOVE-CORRESPONDING ITAB-REGUH TO REGUH.
+    MOVE-CORRESPONDING ITAB-YHFFMTXR TO YHFFMTXR.
+
+*start DGLK9A1CQT
+*02.05.2007 * Yupinto
+*pop up a warning if any of paydoc (reguh-vblnr) is empty
+
+    if flag_one_time2 eq space.
+
+      select single * from yhfparmi where
+                      ( bukrs = co_code or bukrs = space )
+                      and parm1 = 'INC'
+                      and parm2 = 'PAY'.
+      if sy-subrc eq 0.
+
+        move yhfparmi-parm_val to flag_inc_pay.
+
+      endif.
+
+     flag_one_time2 = 'Y'.
+
+    endif.
+
+    if flag_inc_pay eq 'Y'.
+
+    if reguh-vblnr eq space.
+
+      if flag_one_time1 eq space.
+
+        flag_one_time1 = 'Y'. "make sure this popup only appear once.
+
+          call function 'POPUP_TO_CONFIRM_STEP'
+             exporting
+                  titel     = 'Payment Run Incomplete'
+                  textline1 = 'Only completed payments will be'
+                  textline2 = 'extracted. Do you wish to continue?'
+             importing
+                  answer    = flag_incomplete_pay.
+       endif.
+
+       if ( flag_incomplete_pay eq 'N' or flag_incomplete_pay eq 'A' ).
+           set screen 0. leave screen.
+
+       elseif ( flag_incomplete_pay eq 'J' or flag_one_time1 eq 'Y' ).
+           it_incomplete_reguh = reguh.
+           append it_incomplete_reguh.
+           delete itab index sy-tabix.
+           continue.
+
+        endif.
+
+      endif.
+
+    endif.
+
+*end DGLK9A1CQT
+
+    PERFORM GET_ADD_INFO.
+
+    IF BKPF-STBLG = SPACE.    "not reverse
+      IF REGUH-LAUFI+5(1) = 'P'.
+        PERNR = REGUH-LIFNR.
+        CALL FUNCTION 'HR_CHECK_AUTHORITY_INFTY'
+             EXPORTING
+                  TCLAS            = 'A'
+                  PERNR            = PERNR
+                  INFTY            = '0008'
+                  SUBTY            = '0000'
+                  BEGDA            = REGUH-LAUFD
+                  ENDDA            = REGUH-LAUFD
+             EXCEPTIONS
+                  NO_AUTHORIZATION = 1
+                  OTHERS           = 2.
+        IF SY-SUBRC NE '0'.
+*-- if no authority, skips the record and read the next record
+          MOVE 'Y' TO WS_WARN_NO_AUTHORITY.
+          CLEAR ERRSTR.
+          CONCATENATE REGUH-LIFNR
+                     ':No authorization to this payroll staff'
+                      INTO ERRSTR SEPARATED BY SPACE.
+          TRANSFER ERRSTR TO V_ERRFILE.
+          CONTINUE.
+        ENDIF.
+      ELSE.
+      "------------------------------------------------------------
+      " To restrict Payroll users from accessing Finance data. i.e
+      " Restrict payroll usres to finance using Authorisation object:
+      " F_REGU_BUK. It is triggered if parameter is set. In the absence
+      " of parmeter entry it will be a standard check.
+      "
+      " -By Srini  28-Sep-2006
+      "------------------------------------------------------------
+        SELECT SINGLE * FROM YHFPARMI
+                     WHERE ( BUKRS = SPACE OR BUKRS = REGUH-ZBUKR )
+                        AND PARM1 = 'AUT'
+                        AND PARM2 = 'FI'.
+        IF SY-SUBRC EQ 0.
+       AUTHORITY-CHECK OBJECT YHFPARMI-PARM_VAL
+      ID 'BUKRS' FIELD REGUH-ZBUKR
+      ID 'FBTCH' FIELD '03'.
+
+     IF SY-SUBRC <> 0.
+      CONCATENATE REGUH-LIFNR
+             ':Not authorized to : ' YHFPARMI-PARM_VAL
+        INTO ERRSTR SEPARATED BY SPACE.
+
+        TRANSFER ERRSTR TO V_ERRFILE.
+             CONTINUE.
+     ENDIF.
+        ENDIF.
+      ENDIF.
+
+      PERFORM CHEQUE_NUMBER_VAL.
+      PERFORM GET_CONVERT_TYPE.
+      MOVE ZW_LAUFD TO LV_ZW_LAUFD.
+      MOVE ZW_LAUFI TO LV_ZW_LAUFI.
+
+      PERFORM WRITE_PAYMENT USING
+                        YHFFMTXR-YHFNO
+                        YHFFMTXR-YPAYDTL
+                        V_PAYFILE
+                        REGUH-RZAWE
+                        REGUH-ZBUKR
+                        REGUH-VBLNR
+                        ' '
+                        CONVERT_TYPE
+                        LV_ZW_LAUFD
+                        LV_ZW_LAUFI
+                        ' '.
+
+      IF YHFFMTXR-YPAYDTL NE SPACE.
+        PERFORM INSERT_WTX_DETAILS USING REGUH-VBLNR.
+      ENDIF.
+      MASTER_ITAB-PAYMENT_DOC_NO = REGUH-VBLNR.
+      MASTER_ITAB-TR_CD = T042N-BKTCP.
+
+* Display correct value of Local Amt
+*  13 Feb 2004
+      SELECT SINGLE * FROM T001 WHERE BUKRS = REGUH-ZBUKR.
+      IF T001-WAERS NE   REGUH-WAERS.
+        PERFORM FN_TA(YHFDBIFN)
+           USING
+                REGUH-RBETR
+                 T001-WAERS
+           CHANGING
+                V_PAY_AMT_LOCAL.
+      ELSE.
+* Change done on 14.02.2005 for Tony req.
+*        V_PAY_AMT_LOCAL = REGUH-RBETR.
+*        V_PAY_AMT_LOCAL = REGUH-RWBTR.
+        PERFORM FN_TA(YHFDBIFN)
+           USING
+                REGUH-RWBTR
+                 T001-WAERS
+           CHANGING
+                V_PAY_AMT_LOCAL.
+      ENDIF.
+      MASTER_ITAB-PAY_AMT_LOCAL = ABS( V_PAY_AMT_LOCAL ).
+      MASTER_ITAB-COUNTRY_KEY = REGUH-LAND1.
+      MASTER_ITAB-PAY_METHOD = REGUH-RZAWE.
+      MASTER_ITAB-BANK_KEY = REGUH-HBKID.
+      MASTER_ITAB-ACCOUNT_ID = REGUH-HKTID.
+      MASTER_ITAB-BANK_NUMBER = REGUH-UBNKL.
+      MASTER_ITAB-PAYMENT_MODE = ITAB-PAY_MODE.
+      MASTER_ITAB-WTX_INCLUD = YHFFMTXR-YPAYDTL.
+      MASTER_ITAB-LAUFI = REGUH-LAUFI.
+      IF REGUH-LIFNR NE SPACE.
+        MASTER_ITAB-BENE_NUMBER = REGUH-LIFNR.
+      ELSE.
+        MASTER_ITAB-BENE_NUMBER = REGUH-KUNNR.
+      ENDIF.
+      APPEND MASTER_ITAB.
+    ELSE.
+*      FLAG = 'Y'.
+      PERFORM FN_TA(YHFDBIFN)
+         USING
+              REGUH-RBETR
+              REGUH-WAERS
+         CHANGING
+              V_FMT_AMT.
+      MOVE-CORRESPONDING ITAB-REGUH TO REVERSE_PTAB.
+      REVERSE_PTAB-RWBTR = V_FMT_AMT.
+      APPEND REVERSE_PTAB.
+    ENDIF.
+  ENDLOOP.
+  EXPORT MASTER_ITAB TO MEMORY ID 'MASTER_ITAB'.
+  EXPORT ITAB_WTXDET TO MEMORY ID 'WTX_ITAB'.
+ENDFORM.
+
+*---------------------------------------------------------------------*
+*       FORM GET_ADD_INFO                                             *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+FORM GET_ADD_INFO.
+  DATA: W_EMPFG(11) TYPE C.
+  DATA: W_ADRNR LIKE ADRC-ADDRNUMBER.
+  DATA: W_SIZE TYPE I.
+  DATA: V_CC_VBLNR LIKE REGUH-VBLNR, V_CC_BVORG LIKE
+BKPF-BVORG.
+  DATA: V_CC_BKPF LIKE BKPF.
+
+  CLEAR: T001, BKPF.
+* get country info
+  SELECT SINGLE * FROM T001
+         WHERE BUKRS = REGUH-ZBUKR.
+* get payment header
+  SELECT * FROM BKPF
+         WHERE BELNR = REGUH-VBLNR
+         AND   BUKRS = REGUH-ZBUKR.
+    IF BKPF-BUDAT EQ REGUH-ZALDT.
+      EXIT.
+    ENDIF.
+  ENDSELECT.
+
+  CLEAR: BNKAI, BNKA.
+* store intermediary bank to view BNKAI for mapping
+  IF REGUH-BNKS1 NE SPACE.
+    SELECT SINGLE * FROM BNKA WHERE BANKS = REGUH-BNKS1 "bk ctry
+                              AND   BANKL = REGUH-BNKL1."bk key
+    MOVE-CORRESPONDING BNKA TO BNKAI.
+  ENDIF.
+
+  CLEAR: BNKA.
+* get housebank
+  SELECT SINGLE * FROM BNKA
+         WHERE BANKS = REGUH-ZBNKS "bk ctry key
+         AND   BANKL = REGUH-ZBNKY."bk key
+
+  CLEAR: LFA1, LFB1, KNA1, KNB1, TSAD3T, W_ADRNR, ADRC.
+* get partner info
+  IF NOT REGUH-EMPFG IS INITIAL.
+    CLEAR W_EMPFG.
+    W_EMPFG = REGUH-EMPFG.
+    SHIFT W_EMPFG BY 1 PLACES.
+    CONDENSE W_EMPFG.
+  ENDIF.
+  IF REGUH-LIFNR NE SPACE.
+    SELECT SINGLE * FROM LFA1 WHERE LIFNR = W_EMPFG.
+    IF SY-SUBRC EQ 0.
+      REGUH-LIFNR = LFA1-LIFNR.
+    ELSE.
+      SELECT SINGLE * FROM LFA1 WHERE LIFNR = REGUH-LIFNR.
+    ENDIF.
+    W_ADRNR = LFA1-ADRNR.
+  ELSE.
+    SELECT SINGLE * FROM KNA1 WHERE KUNNR = W_EMPFG.
+    IF SY-SUBRC NE 0.
+      SELECT SINGLE * FROM KNA1 WHERE KUNNR = REGUH-KUNNR.
+    ENDIF.
+    W_ADRNR = KNA1-ADRNR.
+  ENDIF.
+
+* get one-time or alternate (individual) payee contact info
+* from BSEC. If not exists, get from ADRC.
+* 02-dec-02 use payment doc no. of sending company code for
+* for cross company payments.
+  CLEAR: BSEC, V_CC_BVORG, V_CC_VBLNR, V_ABSBU, V_CC_BKPF.
+  IF BKPF-BVORG NE SPACE.
+    CONCATENATE REGUH-VBLNR REGUH-ZBUKR BKPF-GJAHR+2(2) INTO
+V_CC_BVORG.
+* Changes start by Ajay on 31.03.2004 for performance Tuneing
+*    SELECT SINGLE * INTO V_CC_BKPF
+*    FROM BKPF WHERE BUKRS NE REGUH-ZBUKR
+*    AND GJAHR = BKPF-GJAHR
+*    AND BVORG = V_CC_BVORG.
+*    V_CC_VBLNR = V_CC_BKPF-BELNR.
+*    V_ABSBU = V_CC_BKPF-BUKRS.
+*  ELSE.
+*    V_CC_VBLNR = REGUH-VBLNR.
+*    V_ABSBU = REGUH-ZBUKR.
+*  ENDIF.
+    TYPES: BEGIN OF TS_CC_BELNR,
+             BUKRS TYPE BUKRS,
+             GJAHR TYPE GJAHR,
+             BELNR TYPE BELNR_D,
+           END OF TS_CC_BELNR.
+    DATA:  LT_CC_BELNR TYPE TABLE OF TS_CC_BELNR WITH HEADER LINE
+.
+
+*For one-time there can be multiple A/P documents that
+*are paid together as long as Name, Bank, etc. are the same
+    SELECT  BUKRS GJAHR BELNR FROM BVOR INTO TABLE LT_CC_BELNR
+                              WHERE BVORG = V_CC_BVORG
+                              AND   BUKRS NE REGUH-ZBUKR
+                              AND   GJAHR = BKPF-GJAHR.
+*In case of multiple A/P records - as all information for
+*db-Direct is the same (Name, Bank, etc.) we can read from the
+*first record in lt_cc_belnr
+    READ TABLE LT_CC_BELNR INDEX 1.
+    SELECT SINGLE * INTO V_CC_BKPF
+    FROM BKPF WHERE BUKRS = LT_CC_BELNR-BUKRS
+              AND   GJAHR = LT_CC_BELNR-GJAHR
+              AND   BELNR = LT_CC_BELNR-BELNR.
+
+    V_CC_VBLNR = V_CC_BKPF-BELNR.
+    V_ABSBU = V_CC_BKPF-BUKRS.
+  ELSE.
+    V_CC_VBLNR = REGUH-VBLNR.
+    V_ABSBU = REGUH-ZBUKR.
+  ENDIF.
+* Changs end by Ajay on 31.03.2004 for performance Tuneing
+
+* Zhukuang 25/02/08 - To shift the selection ADR6 out from the
+* if/else loop. This selection needs to be done for both normal
+* and one time vendor (Alternate vendor)
+ CLEAR:  ADR6 .
+ SELECT * INTO TABLE ITAB_ADR6 FROM ADR6 WHERE ADDRNUMBER = W_ADRNR.
+    LOOP AT ITAB_ADR6.
+CONCATENATE ADR6-SMTP_ADDR ITAB_ADR6-SMTP_ADDR ',' INTO ADR6-SMTP_ADDR.
+    ENDLOOP.
+*********************************************************************
+
+  SELECT SINGLE * FROM BSEC
+         WHERE BUKRS EQ V_ABSBU
+           AND BELNR EQ V_CC_VBLNR
+           AND GJAHR EQ BKPF-GJAHR.
+  IF SY-SUBRC EQ 0.
+    SELECT SINGLE * FROM T005U WHERE LAND1 = LFA1-LAND1
+                               AND   BLAND = BSEC-REGIO
+                               AND   SPRAS = SY-LANGU.
+  ELSE.
+*  IF SY-SUBRC NE 0.
+    SELECT SINGLE * FROM YHFPARMI
+         WHERE BUKRS = REGUH-ZBUKR
+           AND PARM1 = 'IAD'
+           AND PARM2 = REGUH-RZAWE.
+    IF SY-SUBRC EQ 0 AND YHFPARMI-PARM_VAL NE SPACE.
+      SELECT SINGLE * FROM ADRC WHERE ADDRNUMBER = W_ADRNR
+                         AND NATION       = YHFPARMI-PARM_VAL.
+        IF SY-SUBRC <> 0.
+          SELECT  SINGLE * FROM ADRC WHERE ADDRNUMBER = W_ADRNR
+                              AND   NATION     = SPACE.
+*          ENDSELECT.
+        ENDIF.
+*      ENDSELECT.
+    ELSE.
+      SELECT * FROM ADRC WHERE ADDRNUMBER = W_ADRNR
+                         AND NATION       = SPACE.
+      ENDSELECT.
+    ENDIF.
+*  Added on 16/01/2004
+    IF ADRC-REGION <> SPACE.
+      SELECT SINGLE * FROM T005U WHERE LAND1 = ADRC-COUNTRY
+                                 AND   BLAND = ADRC-REGION
+                                 AND   SPRAS = SY-LANGU.
+    ENDIF.
+
+    SELECT SINGLE * FROM TSAD3T WHERE LANGU = SY-LANGU
+                                AND TITLE = ADRC-TITLE.
+*    CLEAR:  ADR6 .
+**    SELECT SINGLE * FROM ADR6 WHERE ADDRNUMBER = W_ADRNR
+**    AND FLGDEFAULT = 'X'.
+*    SELECT * INTO TABLE ITAB_ADR6 FROM ADR6 WHERE ADDRNUMBER = W_ADRNR.
+*    LOOP AT ITAB_ADR6.
+*CONCATENATE ADR6-SMTP_ADDR ITAB_ADR6-SMTP_ADDR ',' INTO ADR6-SMTP_ADDR.
+*
+**         CONCATENATE V_MEMAIL ITAB_ADR6-SMTP_ADDR ',' INTO V_MEMAIL.
+*    ENDLOOP.
+  ENDIF.
+
+  CLEAR: LFBK, LFB1, KNBK, KNB1.
+* get partner bank info for mapping
+  IF REGUH-LIFNR NE SPACE.
+* 02-dec-02 use sending company code
+    SELECT SINGLE * FROM LFB1 WHERE BUKRS = V_ABSBU
+                                AND LIFNR = LFA1-LIFNR.
+    SELECT SINGLE * FROM LFBK WHERE LIFNR = LFA1-LIFNR
+                     AND   BANKS = REGUH-ZBNKS
+                     AND   BANKL = REGUH-ZBNKY
+                     AND   BANKN = REGUH-ZBNKN.
+  ELSE.
+* 02-dec-03 use sending company code
+    SELECT SINGLE * FROM KNB1 WHERE BUKRS = V_ABSBU
+                                AND KUNNR = KNA1-KUNNR.
+    SELECT SINGLE * FROM KNBK WHERE KUNNR = KNA1-KUNNR
+                     AND   BANKS = REGUH-ZBNKS
+                     AND   BANKL = REGUH-ZBNKY
+                     AND   BANKN = REGUH-ZBNKN.
+  ENDIF.
+
+  CLEAR T042I.
+* get charge instruction
+  SELECT * FROM T042I
+         WHERE ZBUKR = REGUH-ZBUKR
+         AND   HBKID = REGUH-HBKID
+         AND   ZLSCH = REGUH-RZAWE
+         AND   WAERS = REGUH-WAERS
+         AND   HKTID = REGUH-HKTID.
+  ENDSELECT.
+  IF SY-SUBRC <> 0.
+    SELECT * FROM T042I
+            WHERE ZBUKR = REGUH-ZBUKR
+            AND   HBKID = REGUH-HBKID
+            AND   ZLSCH = REGUH-RZAWE
+            AND   WAERS = ' '
+            AND   HKTID = REGUH-HKTID.
+    ENDSELECT.
+  ENDIF.
+
+  CLEAR: T042N.
+* get transaction code
+  SELECT SINGLE * FROM T042N
+         WHERE LAND1 = T001-LAND1
+         AND   ZLSCH = REGUH-RZAWE
+         AND   BANKL = REGUH-UBNKY.
+
+  CLEAR: T012K, T012D.
+* get charge account info
+  SELECT SINGLE * FROM T012K
+         WHERE BUKRS = REGUH-ZBUKR
+         AND   HBKID = REGUH-HBKID
+         AND   HKTID = REGUH-HKTID.
+  SELECT SINGLE * FROM T012D
+         WHERE BUKRS = REGUH-ZBUKR
+           AND HBKID = REGUH-HBKID.
+  IF T012D-DTGBK IS INITIAL.
+    CLEAR: T012D.
+  ENDIF.
+  CLEAR: TIBAN.
+
+*get IBAN info
+
+**12.03.2007 by yupinto
+**for countries maintained under parm
+**ACC REF, tiban must be selected with account number = accnt num + ref
+**ACC CK , tiban must be selected with account number = CK + accnt num
+clear: V_COUNTRIES1, V_COUNTRIES2, V_ACCT_REF, V_CK_ACCT.
+
+* Handle Reference
+  SELECT SINGLE PARM_VAL INTO V_COUNTRIES1 FROM YHFPARMI
+          WHERE BUKRS = REGUH-ZBUKR
+            AND PARM1 = 'ACC'
+            AND PARM2 = 'REF'.
+  SEARCH V_COUNTRIES1 FOR REGUH-ZBNKS.
+
+  IF SY-SUBRC = 0.
+    CONCATENATE REGUH-ZBNKN REGUH-BKREF INTO V_ACCT_REF.
+    SELECT SINGLE * FROM TIBAN
+           WHERE BANKS  = REGUH-ZBNKS
+           AND   BANKL  = REGUH-ZBNKY
+           AND   BANKN  = V_ACCT_REF.
+
+  else.
+* Handle Control key
+      SELECT SINGLE PARM_VAL INTO V_COUNTRIES2 FROM YHFPARMI
+              WHERE BUKRS = REGUH-ZBUKR
+                AND PARM1 = 'ACC'
+                AND PARM2 = 'CK'.
+      SEARCH V_COUNTRIES2 FOR REGUH-ZBNKS.
+
+      IF SY-SUBRC = 0.
+        CONCATENATE REGUH-ZBKON REGUH-ZBNKN INTO V_CK_ACCT.
+        SELECT SINGLE * FROM TIBAN
+               WHERE BANKS  = REGUH-ZBNKS
+               AND   BANKL  = REGUH-ZBNKY
+               AND   BANKN  = V_CK_ACCT.
+      else.
+        SELECT SINGLE * FROM TIBAN
+               WHERE BANKS  = REGUH-ZBNKS
+               AND   BANKL  = REGUH-ZBNKY
+               AND   BANKN  = REGUH-ZBNKN.
+
+     endif.
+  ENDIF.
+**end 12.03.2007
+
+
+  CLEAR: BSEG.
+* get accounting info
+  SELECT SINGLE * FROM BSEG
+         WHERE BUKRS   = REGUH-ZBUKR
+           AND BELNR   = REGUH-VBLNR     "pay doc
+           AND GJAHR   = BKPF-GJAHR    "fiscal yr
+           AND BUZEI   = 001.          "line item 1
+
+  CLEAR: YHFAPPLC.
+* get applicant contact if payment instruction is '06'.
+  IF REGUH-DTAWS = '06'.
+    SELECT SINGLE * FROM YHFAPPLC
+           WHERE BUKRS = REGUH-ZBUKR
+             AND HBKID = REGUH-HBKID
+             AND HKTID = REGUH-HKTID.
+  ENDIF.
+
+  CLEAR: T015W.
+* get instruction key.
+  SELECT SINGLE * FROM T015W WHERE
+                       BANKS = REGUH-UBNKS
+                   AND ZLSCH = REGUH-RZAWE
+                   AND DTAWS = REGUH-DTAWS.
+  IF SY-SUBRC NE 0.
+    SELECT SINGLE * FROM T015W WHERE
+                       BANKS = REGUH-UBNKS
+                   AND ZLSCH = REGUH-RZAWE
+                   AND DTAWS = '02'.
+  ENDIF.
+
+* include Bene Deduct
+  REGUH-RWBTR = REGUH-RWBTR + REGUH-RSPE1 + REGUH-RSPE2.
+  REGUH-RBETR = REGUH-RBETR + REGUH-RSPE1 + REGUH-RSPE2.
+
+* calculate value date for payroll records
+  IF REGUH-VALUT IS INITIAL.
+    PERFORM DETERMINE_VALUE_DATE.
+  ENDIF.
+*******************************************************pp01
+  MOVE P_EMID TO REGUH-SRTF2.
+
+  CLEAR: PAYR.
+* get cheque number
+  SELECT SINGLE * FROM PAYR
+         WHERE ZBUKR = REGUH-ZBUKR
+           AND VBLNR = REGUH-VBLNR
+           AND GJAHR = BKPF-GJAHR
+           AND VOIDD = 0.
+
+ENDFORM.
+
+*---------------------------------------------------------------------*
+*       FORM POPULATE_REPORT_FIELDS                                   *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  V_EXCEED                                                      *
+*---------------------------------------------------------------------*
+FORM POPULATE_REPORT_FIELDS USING V_EXCEED.
+  CASE ITAB_FMT_DET-COLUMN_NME.
+    WHEN 'CREDIT/DEBIT ACCOUNT'.
+      MASTER_ITAB-BANK_AC_NO = V_COLUMN_VALUE.
+    WHEN 'TRANSACTION CURRENCY'.
+      MASTER_ITAB-PAY_CURR = V_COLUMN_VALUE.
+    WHEN 'TRANSACTION DATE'.
+      MASTER_ITAB-VALUE_DATE = V_COLUMN_VALUE.
+    WHEN 'BENEFICIARY NAME'.
+      MASTER_ITAB-REC_AC_NAME = V_COLUMN_VALUE.
+    WHEN 'BENEFICIARY BANK CLEARING CODE'.
+      MASTER_ITAB-REC_BANK_CD = V_COLUMN_VALUE.
+    WHEN 'BENEFICIARY BRANCH CODE'.
+      MASTER_ITAB-REC_BR = V_COLUMN_VALUE.
+    WHEN 'BENEFICIARY ACCOUNT'.
+      MASTER_ITAB-REC_AC_NO = V_COLUMN_VALUE.
+      PERFORM CHECK_BENE_ACC_LENGTH USING V_EXCEED.
+    WHEN 'TRANSACTION AMOUNT'.
+      REPLACE ',' WITH '.' INTO V_COLUMN_VALUE.
+      MASTER_ITAB-PAYMENT_AMT = V_COLUMN_VALUE.
+  ENDCASE.
+ENDFORM.
+
+*---------------------------------------------------------------------*
+*       FORM EXTENDED_DETAILS                                         *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+FORM EXTENDED_DETAILS.
+  IF DBD_PAY1 NE SPACE.
+    CONCATENATE DBD_PAY1 'PAY' SY-DATUM INTO PAYDET.
+  ELSE.
+    CONCATENATE DBD_PAY 'PAY' SY-DATUM INTO PAYDET.
+  ENDIF.
+  SUBMIT (PAYPROG) WITH SELECTION-TABLE SELTAB
+         WITH PAYDET = PAYDET
+         EXPORTING LIST TO MEMORY
+         AND RETURN.
+
+*FOR 4.6
+*  OPEN DATASET PAYDET FOR INPUT IN TEXT MODE.
+*END 4.6
+
+*FOR 4.7
+  OPEN DATASET PAYDET FOR INPUT IN TEXT MODE ENCODING DEFAULT.
+*END 4.7
+
+  IF SY-SUBRC <> 0.
+    WRITE:/ 'cannot open extend payment details file'.
+    EXIT.
+  ENDIF.
+  DO.
+    READ DATASET PAYDET INTO ITAB_PAYDET-DETAILS.
+    APPEND ITAB_PAYDET.
+    IF SY-SUBRC <> 0.
+      EXIT.
+    ENDIF.
+  ENDDO.
+  CLOSE DATASET PAYDET.
+  DELETE DATASET PAYDET.
+ENDFORM.
+
+*---------------------------------------------------------------------*
+*       FORM EXTENDED_WTX_DETAILS                                     *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+FORM EXTENDED_WTX_DETAILS.
+  SUBMIT (WTXPROG) WITH SELECTION-TABLE SELTAB
+        EXPORTING LIST TO MEMORY
+        AND RETURN.
+  IF DBD_PAY1 NE SPACE.
+    CONCATENATE DBD_PAY1 'WTX' SY-DATUM INTO V_WTXFILE.
+  ELSE.
+    CONCATENATE DBD_PAY 'WTX' SY-DATUM INTO V_WTXFILE.
+  ENDIF.
+
+*FOR 4.6
+*  OPEN DATASET V_WTXFILE FOR INPUT IN TEXT MODE.
+*END 4.6
+
+*FOR 4.7
+  OPEN DATASET V_WTXFILE FOR INPUT IN TEXT MODE ENCODING DEFAULT.
+*END 4.7
+
+  IF SY-SUBRC <> 0.
+    WRITE:/ 'cannot open withholding tax details file'.
+    EXIT.
+  ENDIF.
+  DO.
+    READ DATASET V_WTXFILE INTO ITAB_WTXDET-DETAILS.
+    APPEND ITAB_WTXDET.
+    IF SY-SUBRC <> 0.
+      EXIT.
+    ENDIF.
+  ENDDO.
+  CLOSE DATASET V_WTXFILE.
+  DELETE DATASET V_WTXFILE.
+ENDFORM.
+
+*---------------------------------------------------------------------*
+*       FORM CALL_FUNC                                                *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+FORM CALL_FUNC.
+  IF ITAB_FMT_DET-SOURCE_VAL = 'FN_RPF'.
+    PERFORM FN_RPF(YHFDBIFN)
+       USING
+            REGUH-LAUFI
+       CHANGING
+            V_COLUMN_VALUE.
+  ELSEIF ITAB_FMT_DET-SOURCE_VAL = 'FN_PDL1'
+      OR ITAB_FMT_DET-SOURCE_VAL = 'FN_PDL2'
+      OR ITAB_FMT_DET-SOURCE_VAL = 'FN_PDL3'
+      OR ITAB_FMT_DET-SOURCE_VAL = 'FN_PDL4'
+      OR ITAB_FMT_DET-SOURCE_VAL = 'FN_PDL_CN'.
+    DATA: V_POS TYPE I.
+    IF V_PDL = SPACE.
+* concatenace reference text from vendor master with invoice text
+*             and invoice number
+      IF ITAB_FMT_DET-SOURCE_VAL = 'FN_PDL_CN'
+* concatenate invoice numbers
+         OR ITAB_FMT_DET-SOURCE_VAL = 'FN_PDL1'.
+        PERFORM FN_PDL(YHFDBIFN)
+          USING
+            REGUH-LAUFI
+            REGUH-LAUFD
+            REGUH-ZBUKR
+            REGUH-VBLNR
+            LFBK-BKREF
+            ITAB_FMT_DET-SOURCE_VAL
+          CHANGING
+            V_PDL.
+      ENDIF.
+    ENDIF.
+    CASE ITAB_FMT_DET-SOURCE_VAL.
+      WHEN 'FN_PDL1' OR 'FN_PDL_CN'.
+        V_POS = 0.
+      WHEN 'FN_PDL2'.
+        V_POS = ITAB_FMT_DET-MAX_LENGTH * 1.
+      WHEN 'FN_PDL3'.
+        V_POS = ITAB_FMT_DET-MAX_LENGTH * 2.
+      WHEN 'FN_PDL4'.
+        V_POS = ITAB_FMT_DET-MAX_LENGTH * 3.
+    ENDCASE.
+    V_COLUMN_VALUE = V_PDL+V_POS(ITAB_FMT_DET-MAX_LENGTH).
+  ELSEIF ITAB_FMT_DET-SOURCE_VAL = 'FN_TA'.
+    DATA: V_TA(15) TYPE C.
+    PERFORM FN_TA(YHFDBIFN)
+       USING
+            REGUH-RWBTR
+            REGUH-WAERS
+       CHANGING
+            V_FMT_AMT.
+    V_TA = V_FMT_AMT.
+    SHIFT V_TA RIGHT.
+*    YUSINTO: 24/9/07 Commented line below to fix
+*    2nd decimal point from being truncated
+*    OVERLAY V_TA WITH '000000000000000'.
+    SELECT SINGLE * FROM USR01
+                  WHERE BNAME = SY-UNAME.
+    IF SY-SUBRC EQ 0 AND USR01-DCPFM <> 'X'.
+      REPLACE '.' WITH ',' INTO V_TA.
+    ENDIF.
+    V_COLUMN_VALUE = V_TA.
+
+***2006.11.08 by yupinto
+***add in to check if decimal place sign of the user
+***needs to be changed to a point or comma.
+  data: decimal_sign.
+  select single parm_val into decimal_sign from yhfparmi
+                where bukrs = co_code
+                and parm1 = 'DEC'
+                and parm2 = 'SIG'.
+
+  if sy-subrc eq 0.
+
+    if v_column_value ca '.'.
+
+      replace '.' with decimal_sign into v_column_value.
+
+    elseif v_column_value ca ','.
+
+      replace ',' with decimal_sign into v_column_value.
+
+    endif.
+
+  endif.
+
+***end2006.11.08
+
+
+  ELSEIF ITAB_FMT_DET-SOURCE_VAL = 'FN_BA'.
+    PERFORM FN_BA(YHFDBIFN)
+       USING
+            REGUH-ZBUKR
+            REGUH-ZBNKS
+            TIBAN-IBAN
+            REGUH-ZBNKY
+            REGUH-ZBNKN
+            REGUH-BKREF
+            REGUH-ZBKON
+*            LFBK-BKREF
+*            LFBK-BKONT
+       CHANGING
+            V_COLUMN_VALUE.
+
+*  ELSEIF ITAB_FMT_DET-SOURCE_VAL = 'FN_BA_CK'.
+*    PERFORM FN_BA_CK(YHFDBIFN)
+*       USING
+*            REGUH-ZBUKR
+*            REGUH-ZBNKS
+*            TIBAN-IBAN
+*            REGUH-ZBNKY
+*            REGUH-ZBNKN
+*            LFBK-BKONT
+*       CHANGING
+*            V_COLUMN_VALUE.
+
+  ELSEIF ITAB_FMT_DET-SOURCE_VAL = 'FN_BBCC'
+      OR ITAB_FMT_DET-SOURCE_VAL = 'FN_BBCCT'.
+    IF V_CLEAR_CODE = SPACE.
+      PERFORM FN_BBCC(YHFDBIFN)
+        USING
+            REGUH-ZBUKR
+            REGUH-ZBNKS
+            BNKA-SWIFT
+            BNKA-BNKLZ
+            REGUH-WAERS
+            REGUH-ZLAND
+        CHANGING
+            V_CLEAR_CODE
+            V_CLEAR_TYPE.
+    ENDIF.
+    IF ITAB_FMT_DET-SOURCE_VAL = 'FN_BBCC'.
+      V_COLUMN_VALUE = V_CLEAR_CODE.
+    ELSEIF ITAB_FMT_DET-SOURCE_VAL = 'FN_BBCCT'.
+      V_COLUMN_VALUE = V_CLEAR_TYPE.
+    ENDIF.
+  ELSEIF ITAB_FMT_DET-SOURCE_VAL   = 'FN_IBCC'
+      OR ITAB_FMT_DET-SOURCE_VAL = 'FN_IBCCT'.
+    IF V_IB_CLEAR_CODE = SPACE.
+      PERFORM FN_BBCC(YHFDBIFN)
+        USING
+            REGUH-ZBUKR
+            REGUH-BNKS1
+            BNKAI-SWIFT
+            BNKAI-BNKLZ
+            REGUH-WAERS
+            REGUH-ZLAND
+        CHANGING
+            V_IB_CLEAR_CODE
+            V_IB_CLEAR_TYPE.
+    ENDIF.
+    IF ITAB_FMT_DET-SOURCE_VAL = 'FN_IBCC'.
+      V_COLUMN_VALUE = V_IB_CLEAR_CODE.
+    ELSEIF ITAB_FMT_DET-SOURCE_VAL = 'FN_IBCCT'.
+      V_COLUMN_VALUE = V_IB_CLEAR_TYPE.
+    ENDIF.
+  ELSEIF ITAB_FMT_DET-SOURCE_VAL = 'FN_BBCC_NG'
+      OR ITAB_FMT_DET-SOURCE_VAL = 'FN_BBCCT_NG'.
+    IF V_CLEAR_CODE = SPACE.
+      PERFORM FN_BBCC_NG(YHFDBIFN)
+        USING
+            REGUH-ZBUKR
+            REGUH-ZBNKS
+            BNKA-SWIFT
+            BNKA-BNKLZ
+            REGUH-WAERS
+            REGUH-ZLAND
+        CHANGING
+            V_CLEAR_CODE
+            V_CLEAR_TYPE.
+    ENDIF.
+    IF ITAB_FMT_DET-SOURCE_VAL = 'FN_BBCC_NG'.
+      V_COLUMN_VALUE = V_CLEAR_CODE.
+    ELSEIF ITAB_FMT_DET-SOURCE_VAL = 'FN_BBCCT_NG'.
+      V_COLUMN_VALUE = V_CLEAR_TYPE.
+    ENDIF.
+  ELSEIF ITAB_FMT_DET-SOURCE_VAL = 'FN_IBCC_NG'
+      OR ITAB_FMT_DET-SOURCE_VAL = 'FN_IBCCT_NG'.
+    IF V_IB_CLEAR_CODE = SPACE.
+      PERFORM FN_BBCC_NG(YHFDBIFN)
+        USING
+            REGUH-ZBUKR
+            REGUH-BNKS1
+            BNKAI-SWIFT
+            BNKAI-BNKLZ
+            REGUH-WAERS
+            REGUH-ZLAND
+        CHANGING
+            V_IB_CLEAR_CODE
+            V_IB_CLEAR_TYPE.
+    ENDIF.
+    IF ITAB_FMT_DET-SOURCE_VAL = 'FN_IBCC_NG'.
+      V_COLUMN_VALUE = V_IB_CLEAR_CODE.
+    ELSEIF ITAB_FMT_DET-SOURCE_VAL = 'FN_IBCCT_NG'.
+      V_COLUMN_VALUE = V_IB_CLEAR_TYPE.
+    ENDIF.
+   ELSEIF ITAB_FMT_DET-SOURCE_VAL = 'FN_FAX'.
+
+    IF NOT REGUH-ZTLFX IS INITIAL.
+    PERFORM FN_FAX(YHFDBIFN)
+      USING
+        REGUH-ZBUKR
+        REGUH-ZLAND
+        REGUH-ZTLFX
+      CHANGING
+        V_COLUMN_VALUE.
+    ELSE.
+      IF NOT REGUH-LIFNR IS INITIAL.
+      CLEAR T_TELFX.
+      SELECT TELFX FROM LFA1 INTO T_TELFX
+        WHERE LIFNR = REGUH-LIFNR.
+      ENDSELECT.
+
+      PERFORM FN_FAX(YHFDBIFN)
+      USING
+        REGUH-ZBUKR
+        REGUH-ZLAND
+        T_TELFX
+      CHANGING
+        V_COLUMN_VALUE.
+      ENDIF.
+    ENDIF.
+***********************************************PP01
+  ELSEIF itab_fmt_det-source_val = 'FN_FAX_EMAIL'.
+
+    IF NOT REGUH-ZTLFX IS INITIAL.
+    PERFORM FN_FAX(YHFDBIFN)
+      USING
+        REGUH-ZBUKR
+        REGUH-ZLAND
+        REGUH-ZTLFX
+      CHANGING
+        V_COLUMN_VALUE1.
+    ELSE.
+      IF NOT REGUH-LIFNR IS INITIAL.
+      CLEAR T_TELFX.
+      SELECT TELFX FROM LFA1 INTO T_TELFX
+        WHERE LIFNR = REGUH-LIFNR.
+      ENDSELECT.
+
+      PERFORM FN_FAX(YHFDBIFN)
+      USING
+        REGUH-ZBUKR
+        REGUH-ZLAND
+        T_TELFX
+      CHANGING
+        V_COLUMN_VALUE1.
+      ENDIF.
+    ENDIF.
+
+*    PERFORM fn_fax(yhfdbifn)
+*      USING
+*        reguh-zbukr
+*        reguh-zland
+*        reguh-ztlfx
+*      CHANGING
+*        v_column_value1.
+
+    PERFORM fn_email(yhfdbifn)
+      USING
+        reguh-zbukr
+        reguh-lifnr
+        reguh-adrnr
+        adr6-smtp_addr
+*        V_MEMAIL
+      CHANGING
+        v_column_value2.
+
+   IF NOT v_column_value1 IS INITIAL.
+     IF NOT v_column_value2 IS INITIAL.
+Concatenate v_column_value1 v_column_value2 into v_column_value
+                                               Separated by '|'.
+     ELSE.
+       v_column_value = V_column_value1.
+     ENDIF.
+   ELSE.
+     IF NOT v_column_value2 IS INITIAL.
+       v_column_value = V_column_value2.
+     ENDIF.
+   ENDIF.
+**************************************************PP01
+
+  ELSEIF ITAB_FMT_DET-SOURCE_VAL = 'FN_REF'.
+    PERFORM FN_REF(YHFDBIFN)
+      USING
+        REGUH-LAUFI
+        REGUH-VBLNR
+        REGUH-LIFNR
+      CHANGING
+        V_COLUMN_VALUE.
+  ELSEIF ITAB_FMT_DET-SOURCE_VAL = 'FN_BEN'.
+    PERFORM FN_BEN(YHFDBIFN)
+      USING
+        REGUH-LIFNR
+        REGUH-KUNNR
+      CHANGING
+        V_COLUMN_VALUE.
+  ELSEIF ITAB_FMT_DET-SOURCE_VAL = 'FN_CU_PAYMENT'.
+    PERFORM FN_CU_PAYMENT(YHFDBIFN) USING
+              REGUH-WAERS
+            CHANGING
+              V_COLUMN_VALUE.
+  ELSEIF ITAB_FMT_DET-SOURCE_VAL = 'FN_CU_ORDER_AC'.
+    PERFORM FN_CU_ORDER_AC(YHFDBIFN) USING
+              T012K-WAERS
+            CHANGING
+              V_COLUMN_VALUE.
+  ELSEIF ITAB_FMT_DET-DEFAULT_V = 'FN_BA'.
+    PERFORM FN_BA(YHFDBIFN)
+       USING
+            REGUH-ZBUKR
+            REGUH-ZBNKS
+            TIBAN-IBAN
+            REGUH-ZBNKY
+            REGUH-ZBNKN
+            LFBK-BKREF
+            LFBK-BKONT
+       CHANGING
+            V_COLUMN_VALUE.
+  ELSEIF ITAB_FMT_DET-SOURCE_VAL = 'FN_BN_CTRK'.
+    PERFORM FN_BN_CTRK(YHFDBIFN)
+      USING
+        REGUH-ZLAND
+      CHANGING
+        V_COLUMN_VALUE.
+  ELSEIF ITAB_FMT_DET-SOURCE_VAL = 'FN_BN_BK_CTRK'.
+    PERFORM FN_BN_BK_CTRK(YHFDBIFN)
+      USING
+        REGUH-ZBNKS
+      CHANGING
+        V_COLUMN_VALUE.
+  ELSEIF ITAB_FMT_DET-SOURCE_VAL = 'FN_LTEXT4'.
+    PERFORM FN_LTEXT4(YHFDBIFN)
+      USING
+        REGUH-LIFNR
+        REGUH-KUNNR
+      CHANGING
+        V_COLUMN_VALUE.
+  ELSEIF ITAB_FMT_DET-SOURCE_VAL = 'FN_BENE_ALERT'.
+    PERFORM FN_BENE_ALERT(YHFDBIFN)
+      USING
+        V_BENE_LEN_FLAG
+      CHANGING
+        V_COLUMN_VALUE.
+  ELSEIF ITAB_FMT_DET-SOURCE_VAL = 'FN_BB_SWIFT_TYPE'.
+    PERFORM FN_SWIFT_TYPE(YHFDBIFN)
+      USING
+        BNKA-SWIFT
+      CHANGING
+        V_COLUMN_VALUE.
+  ELSEIF ITAB_FMT_DET-SOURCE_VAL = 'FN_ZBNKN_REMOVE_DASH'.
+    PERFORM FN_ZBNKN_REMOVE_DASH(YHFDBIFN)
+       USING
+            REGUH-ZBUKR
+            REGUH-ZBNKS
+            REGUH-ZBNKY
+            REGUH-ZBNKN
+            REGUH-BKREF
+       CHANGING
+            V_COLUMN_VALUE.
+  ELSEIF ITAB_FMT_DET-DEFAULT_V = 'FN_ZBNKN_REMOVE_DASH'.
+    PERFORM FN_ZBNKN_REMOVE_DASH(YHFDBIFN)
+       USING
+            REGUH-ZBUKR
+            REGUH-ZBNKS
+            REGUH-ZBNKY
+            REGUH-ZBNKN
+            REGUH-BKREF
+       CHANGING
+            V_COLUMN_VALUE.
+  ELSEIF ITAB_FMT_DET-SOURCE_VAL = 'FN_BNKA_ORT01'.
+    IF REGUH-UBNKL = SPACE.
+      PERFORM FN_BNKA_ORT01(YHFDBIFN)
+         USING
+              REGUH-ZBUKR
+              REGUH-UBNKS
+              REGUH-UBKNT
+         CHANGING
+              V_COLUMN_VALUE.
+    ENDIF.
+  ELSEIF ITAB_FMT_DET-SOURCE_VAL = 'FN_BNKA_BRNCH'.
+    IF REGUH-UBNKL = SPACE.
+      PERFORM FN_BNKA_BRNCH(YHFDBIFN)
+         USING
+              REGUH-ZBUKR
+              REGUH-UBNKS
+              REGUH-UBKNT
+         CHANGING
+              V_COLUMN_VALUE.
+    ENDIF.
+  ELSEIF ITAB_FMT_DET-SOURCE_VAL = 'FN_EMAIL'.
+    PERFORM FN_EMAIL(YHFDBIFN)
+      USING
+        REGUH-ZBUKR
+        REGUH-LIFNR
+        REGUH-ADRNR
+        ADR6-SMTP_ADDR
+*        V_MEMAIL
+      CHANGING
+        V_COLUMN_VALUE.
+
+*FN_BULK 22.08.2006
+  ELSEIF ITAB_FMT_DET-SOURCE_VAL = 'FN_BULK'.
+
+
+* select the field based on which this will be split
+  SELECT SINGLE PARM_VAL INTO V_FLD FROM YHFPARMI
+        WHERE BUKRS = CO_CODE
+          AND PARM1 = 'BUL'
+          AND PARM2 = 'FLD'.
+
+
+    PERFORM FN_BULK(YHFDBIFN)
+      USING
+        REGUH-ZBUKR
+        REGUH-LAUFI
+        REGUH-LAUFD
+        V_FLD
+      CHANGING
+        V_COLUMN_VALUE.
+*END OF FN_BULK
+
+
+*FN_BANK_NAME 06.03.2007
+  ELSEIF ITAB_FMT_DET-SOURCE_VAL = 'FN_BANK_NAME'.
+
+
+    PERFORM FN_BANK_NAME(YHFDBIFN)
+      USING
+        BNKA-BNKLZ
+        BNKA-BANKA
+      CHANGING
+        V_COLUMN_VALUE.
+*END OF FN_BANK_NAME
+
+
+*FN_BANK_BRANCH 06.03.2007
+  ELSEIF ITAB_FMT_DET-SOURCE_VAL = 'FN_BANK_BRANCH'.
+
+    PERFORM FN_BANK_BRANCH(YHFDBIFN)
+      USING
+        BNKA-BNKLZ
+        BNKA-BRNCH
+        BNKA-BANKS
+      CHANGING
+        V_COLUMN_VALUE.
+*END OF FN_BANK_BRANCH
+
+
+  ELSEIF ITAB_FMT_DET-SOURCE_VAL = 'FN_IB_SWIFT_TYPE'.
+    PERFORM FN_SWIFT_TYPE(YHFDBIFN)
+      USING
+        BNKAI-SWIFT
+      CHANGING
+        V_COLUMN_VALUE.
+  ELSEIF ITAB_FMT_DET-SOURCE_VAL = 'FN_SGTXT_INV1'
+      OR ITAB_FMT_DET-SOURCE_VAL = 'FN_SGTXT_INV2'.
+    IF V_SGTXT = SPACE.
+      PERFORM FN_SGTXT_INV(YHFDBIFN)
+        USING
+          REGUH-LAUFD
+          REGUH-LAUFI
+          REGUH-VBLNR
+          V_ABSBU
+          BKPF-GJAHR
+        CHANGING
+          V_SGTXT.
+    ENDIF.
+    IF ITAB_FMT_DET-SOURCE_VAL = 'FN_SGTXT_INV1'.
+      V_COLUMN_VALUE = V_SGTXT+0(35).
+    ELSEIF ITAB_FMT_DET-SOURCE_VAL = 'FN_SGTXT_INV2'.
+      V_COLUMN_VALUE = V_SGTXT+35(35).
+    ELSEIF ITAB_FMT_DET-DEFAULT_V = 'FN_BLANK_ERR'.
+      PERFORM BLANK_ERR USING
+               LFA1-LIFNR
+             CHANGING
+               V_COLUMN_VALUE.
+      IF  V_COLUMN_VALUE  EQ 'Y'.
+        PERFORM FN_BLANK_ERROR.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+ENDFORM.
+
+*---------------------------------------------------------------------*
+*       FORM PRINT_SUMMARY_LIST                                       *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+FORM PRINT_SUMMARY_LIST.
+  DATA: BEGIN OF CURRENCY_PTAB OCCURS 200,
+          PAY_CURR            LIKE REGUH-WAERS, "currency key
+          PAY_METHOD          LIKE REGUH-RZAWE, "payment method
+*          PAYMENT_AMT(16)     TYPE P DECIMALS 2,
+          PAYMENT_AMT         LIKE REGUH-RWBTR,
+          PAY_AMT_LOCAL(16)   TYPE P DECIMALS 2,
+          TCOUNT       TYPE I,
+        END OF CURRENCY_PTAB.
+
+  DATA: BEGIN OF BANK_PTAB OCCURS 200,
+          BANK_NUMBER         LIKE REGUH-UBNKL, "our bank number
+          BANK_AC_NO          LIKE REGUH-UBKNT, "our account number
+          PAY_CURR            LIKE REGUH-WAERS, "currency key
+          PAY_METHOD          LIKE REGUH-RZAWE, "payment method
+          PAYMENT_AMT         LIKE REGUH-RWBTR,
+*          PAYMENT_AMT(16)     TYPE P DECIMALS 2,
+          PAY_AMT_LOCAL(16)   TYPE P DECIMALS 2,
+          TCOUNT       TYPE I,         "total count
+        END OF BANK_PTAB.
+  DATA: C TYPE I, ZTOT_RWBTR(16) TYPE P DECIMALS 2.
+  DATA: V_BENE(100).
+
+*-- print run information as header
+  NEW-PAGE NO-HEADING.
+  SKIP 1.
+  WRITE: /1 'Run Date         :',  23 ZW_LAUFD.
+  WRITE: /1 'Identification   :',  23 ZW_LAUFI.
+  PERFORM PRINT_SELECTION(YHFDBIFN) TABLES SELTAB
+                          USING 'W_LAUFI' 'Additional Ids   :'.
+  WRITE: /1 'Company Code     :',  23 CO_CODE.
+  PERFORM PRINT_SELECTION(YHFDBIFN) TABLES SELTAB
+                          USING 'HBK_KEY' 'House Bank       :'.
+  PERFORM PRINT_SELECTION(YHFDBIFN) TABLES SELTAB
+                          USING 'ACCT_ID' 'Account ID       :'.
+  PERFORM PRINT_SELECTION(YHFDBIFN) TABLES SELTAB
+                          USING 'PAY_METH' 'Payment Method   :'.
+  IF YHTEST EQ 'X'.
+    WRITE: /1 'Run Type         :',  23 'Test'.
+  ELSE.
+    WRITE: /1 'Run Type         :',  23 'Live'.
+  ENDIF.
+  WRITE: /1 'Stop FTP         :',  23 FALLBACK.
+  WRITE: /1 'KATAKANA 2-1 byte:',  23 KATAKANA.
+  WRITE: /1 'PayDtl Program   :',  23 PAYPROG.
+  IF REF1 EQ 'X'.
+    WRITE: /1 'Invoice Number   :',  23 'From Reference Text'.
+  ELSE.
+    WRITE: /1 'Invoice Number   :',  23 'From Doc. Header Text'.
+  ENDIF.
+  WRITE: /1 'WTX Program      :',  23 WTXPROG.
+  PERFORM PRINT_SELECTION(YHFDBIFN) TABLES SELTAB
+                          USING 'S_WITHT' 'WTX Tax Type     :'.
+  SKIP.
+*-- end of header printing
+*-- starts of detail printing
+  SKIP 2.
+  WRITE: /1 'Payment List Summary'.
+  ULINE.
+  WRITE: /1      'Vendor',
+          43     'Pay Doc',
+          54     'Pay Method',
+          65     'Housebank',
+          75     'Acct ID',
+          84     'Bank A/C No',
+          98     'Pay Curr',
+          110    'Pay Amount'.
+  ULINE.
+  SORT MASTER_ITAB BY BENE_NUMBER PAYMENT_DOC_NO PAY_CURR
+                      BANK_KEY ACCOUNT_ID BANK_AC_NO.
+  LOOP AT MASTER_ITAB.
+    SELECT SINGLE * FROM T042Z WHERE LAND1 = T001-LAND1
+                      AND ZLSCH = MASTER_ITAB-PAY_METHOD.
+    CONCATENATE MASTER_ITAB-BENE_NUMBER ' - '
+MASTER_ITAB-REC_AC_NAME
+      INTO V_BENE.
+    SHIFT V_BENE LEFT DELETING LEADING '0'.
+    WRITE: /1    V_BENE+0(41),
+          43     MASTER_ITAB-PAYMENT_DOC_NO,
+          54     MASTER_ITAB-PAY_METHOD,
+          65     MASTER_ITAB-BANK_KEY,
+          75     MASTER_ITAB-ACCOUNT_ID,
+          84     MASTER_ITAB-BANK_AC_NO,
+          98     MASTER_ITAB-PAY_CURR,
+          105    MASTER_ITAB-PAYMENT_AMT.
+  ENDLOOP.
+  ULINE.
+
+  LOOP AT MASTER_ITAB.
+    MOVE-CORRESPONDING MASTER_ITAB TO CURRENCY_PTAB.
+    MOVE-CORRESPONDING MASTER_ITAB TO BANK_PTAB.
+    COLLECT CURRENCY_PTAB.
+    COLLECT BANK_PTAB.
+  ENDLOOP.
+
+* compute no of items for each print line in currency_ptab.
+  LOOP AT CURRENCY_PTAB.
+    LOOP AT MASTER_ITAB.
+      IF MASTER_ITAB-PAY_CURR = CURRENCY_PTAB-PAY_CURR AND
+         MASTER_ITAB-PAY_METHOD = CURRENCY_PTAB-PAY_METHOD.
+        ADD 1 TO CURRENCY_PTAB-TCOUNT.
+      ENDIF.
+    ENDLOOP.
+    MODIFY CURRENCY_PTAB.
+  ENDLOOP.
+
+* compute no of items for each print line in bank_ptab.
+  LOOP AT BANK_PTAB.
+    LOOP AT MASTER_ITAB.
+      IF MASTER_ITAB-BANK_NUMBER = BANK_PTAB-BANK_NUMBER AND
+         MASTER_ITAB-BANK_AC_NO = BANK_PTAB-BANK_AC_NO AND
+         MASTER_ITAB-PAY_CURR = BANK_PTAB-PAY_CURR AND
+         MASTER_ITAB-PAY_METHOD = BANK_PTAB-PAY_METHOD.
+        ADD 1 TO BANK_PTAB-TCOUNT.
+      ENDIF.
+    ENDLOOP.
+    MODIFY BANK_PTAB.
+  ENDLOOP.
+
+* Print total by payment currency
+  SORT CURRENCY_PTAB BY PAY_CURR PAY_METHOD.
+  MOVE 0 TO ZTOT_RWBTR.
+  SKIP 2.
+  WRITE: /1     'Total by Payment Currency'.
+  ULINE.
+  WRITE: /1      'Pay Curr',
+            12   'Pay Method',
+            53   'No of Items',
+            72   'Amt(Pay Currency)',
+           105   'Amt(Local Currency)'.
+  ULINE.
+  LOOP AT CURRENCY_PTAB.
+    WRITE: /1      CURRENCY_PTAB-PAY_CURR,
+            14     CURRENCY_PTAB-PAY_METHOD,
+            45     CURRENCY_PTAB-TCOUNT,
+            55     CURRENCY_PTAB-PAYMENT_AMT,
+            88     CURRENCY_PTAB-PAY_AMT_LOCAL.
+    ZTOT_RWBTR = ZTOT_RWBTR + CURRENCY_PTAB-PAY_AMT_LOCAL.
+  ENDLOOP.
+  ULINE AT /97(25).
+  WRITE: /80     'Total :',            "total by local currency
+          88    ZTOT_RWBTR.                                 "
+  ULINE AT /97(25).
+
+** print total by payment method and currency
+  MOVE 0 TO ZTOT_RWBTR.
+  SORT CURRENCY_PTAB BY PAY_METHOD PAY_CURR.
+  SKIP 2.
+  WRITE: /1     'Total by Payment Method'.
+  ULINE.
+  WRITE: /1      'Pay Method',
+            14   'Pay Curr',
+            53   'No of Items',
+            72   'Amt(Pay Currency)',
+           105   'Amt(Local Currency)'.
+  ULINE.
+  LOOP AT CURRENCY_PTAB.
+    WRITE: /1      CURRENCY_PTAB-PAY_METHOD,
+            15     CURRENCY_PTAB-PAY_CURR,
+            45     CURRENCY_PTAB-TCOUNT,
+            55     CURRENCY_PTAB-PAYMENT_AMT,
+            88     CURRENCY_PTAB-PAY_AMT_LOCAL.
+    ZTOT_RWBTR = ZTOT_RWBTR + CURRENCY_PTAB-PAY_AMT_LOCAL.
+  ENDLOOP.
+  ULINE AT /97(25).
+  WRITE: /80     'Total :',            "total by payment method
+          88    ZTOT_RWBTR.                                 "
+  ULINE AT /97(25).
+
+*--print total by bank account
+  MOVE 0 TO ZTOT_RWBTR.
+  SORT BANK_PTAB BY BANK_NUMBER BANK_AC_NO PAY_CURR
+PAY_METHOD.
+  SKIP 2.
+  WRITE: /1     'Total by Bank Account'.
+  ULINE .
+  WRITE: /1      'Bank Number',
+            15   'Bank A/C No',
+            30   'Pay Curr',
+            41   'Pay Method',
+            53   'No of Items',
+            72   'Amt(Pay Currency)',
+           105   'Amt(Local Currency)'.
+  ULINE.
+  LOOP AT BANK_PTAB.
+    WRITE: /1      BANK_PTAB-BANK_NUMBER,
+            15     BANK_PTAB-BANK_AC_NO,
+            30     BANK_PTAB-PAY_CURR,
+            42     BANK_PTAB-PAY_METHOD,
+            45     BANK_PTAB-TCOUNT,
+            55     BANK_PTAB-PAYMENT_AMT,
+            88     BANK_PTAB-PAY_AMT_LOCAL.
+    ZTOT_RWBTR = ZTOT_RWBTR + BANK_PTAB-PAY_AMT_LOCAL.
+  ENDLOOP.
+  ULINE AT /97(25).
+  WRITE: /80     'Total :',            "total by bank account
+          88    ZTOT_RWBTR.                                 "
+  ULINE AT /97(25).
+
+  SKIP 3.
+*--print list for reverse payment document
+  WRITE: /'Reversed Payment Documents (will not be transferred) :'.
+  ULINE .
+  WRITE: /1    'Pay Doc No',
+          15   'Curr',
+          30   'Amt(Pay Curr)'.
+  ULINE.
+  SKIP 1.
+  SORT REVERSE_PTAB BY VBLNR WAERS.
+  LOOP AT REVERSE_PTAB.
+    WRITE: /1      REVERSE_PTAB-VBLNR,
+            15     REVERSE_PTAB-WAERS,
+            30     REVERSE_PTAB-RWBTR.
+  ENDLOOP.
+
+  SKIP 2.
+
+  IF WS_WARN_ACC_LENGTH    = 'Y' OR
+     WS_WARN_NO_VALUE_DATE = 'Y' OR
+     WS_WARN_NO_AUTHORITY  = 'Y' OR
+     V_DWC_FLAG = 'Y' OR
+     WS_WARN_FN_ERR = 'Y'.
+    WRITE: /10   '###############  WARNING  ##################'.
+    WRITE: /10   '#    Please check the DBERROR.TXT file     #'.
+    WRITE: /10   '############################################'.
+    IF WS_WARN_ACC_LENGTH = 'Y'.
+      WRITE: /10 '#  Bene Account Length is too long.        #'.
+    ENDIF.
+    IF WS_WARN_NO_VALUE_DATE = 'Y'.
+      WRITE: /10 '#  No Value Date                           #'.
+    ENDIF.
+    IF WS_WARN_NO_AUTHORITY = 'Y'.
+      WRITE: /10 '#  No Authorization to Payroll Record      #'.
+    ENDIF.
+    IF V_DWC_FLAG = 'Y'.
+      WRITE: /10 '# Some Check Numbers are not updated      #'.
+    ENDIF.
+    IF WS_WARN_FN_ERR = 'Y'.
+      WRITE: /10 '# BENE TAX PAYER ID is Blank             #'.
+    ENDIF.
+    MESSAGE I368 WITH
+                '##         WARNING              ##'
+                'Please check the DBERROR.TXT file '.
+  ENDIF.
+
+*--print list for incomplete payments
+
+  if flag_inc_pay eq 'Y'.
+    SKIP 3.
+    WRITE: /'Incomplete Payments (will not be transferred) :'.
+    ULINE .
+    WRITE: /1    'Currency',
+            20   'Amt(Pay Curr)'.
+
+    loop at it_incomplete_reguh.
+
+    write: /1      it_incomplete_reguh-waers,
+            15     it_incomplete_reguh-rwbtr.
+
+    endloop.
+
+    ULINE.
+    SKIP 1.
+  endif.
+
+*--print end of report
+  SKIP 2.
+  WRITE: /60   'End of Report'.
+
+ENDFORM.
+
+*---------------------------------------------------------------------*
+*       FORM CHECK_BENE_ACC_LENGTH                                    *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  V_EXCEED                                                      *
+*---------------------------------------------------------------------*
+FORM CHECK_BENE_ACC_LENGTH USING V_EXCEED.
+  DATA: ERRSTR(100) TYPE C.
+
+  IF V_EXCEED = 'Y'.
+    MOVE 'Y' TO WS_WARN_ACC_LENGTH.
+    CLEAR ERRSTR.
+    CONCATENATE REGUH-VBLNR ': BENE ACCOUNT TRUNCATED'
+                INTO ERRSTR SEPARATED BY SPACE.
+
+*FOR 4.6
+*    OPEN DATASET V_ERRFILE FOR APPENDING IN TEXT MODE.
+*END 4.6
+
+*FOR 4.7
+    CLOSE DATASET V_ERRFILE.
+    OPEN DATASET V_ERRFILE FOR APPENDING IN TEXT MODE ENCODING DEFAULT.
+*END 4.7
+
+    TRANSFER ERRSTR TO V_ERRFILE.
+  ENDIF.
+ENDFORM.
+
+*---------------------------------------------------------------------*
+*       FORM DETERMINE_VALUE_DATE                                     *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+FORM DETERMINE_VALUE_DATE.
+  DATA: ERRSTR(100) TYPE C.
+  DATA: VDATE LIKE BSEG-VALUT.
+
+  CALL FUNCTION 'DET_VALUE_DATE_FOR_PAYMENT'
+       EXPORTING
+            I_BLDAT            = REGUH-ZALDT  "pay date
+            I_BUDAT            = REGUH-ZALDT  "pay date
+            I_BUKRS            = REGUH-ZBUKR
+            I_FAEDT            = REGUH-ZALDT  "pay date
+            I_HBKID            = REGUH-HBKID
+            I_HKTID            = REGUH-HKTID
+            I_ZLSCH            = REGUH-RZAWE
+       IMPORTING
+            VALUTA             = VDATE
+       EXCEPTIONS
+            CAL_ID_ERROR       = 1
+            NOT_FOUND_IN_T012A = 2
+            NOT_FOUND_IN_T012C = 3
+            ERROR_IN_T012C     = 4
+            OTHERS             = 5.
+  IF SY-SUBRC EQ 0.
+    REGUH-VALUT = VDATE.
+**************************************************************PP01
+  ELSEIF SY-SUBRC NE 0.
+   SELECT SINGLE PARM_VAL FROM YHFPARMI INTO V_HR_PARM
+                             WHERE ( BUKRS = CO_CODE OR BUKRS = SPACE )
+                                  AND PARM1 = 'HRP'
+                                  AND PARM2 = 'DAT'.
+      IF V_HR_PARM EQ C_Y AND P_EMID NE SPACE.
+        REGUH-VALUT = P_EMID.
+      ENDIF.
+
+  ELSE.
+    MOVE 'Y' TO WS_WARN_ACC_LENGTH.
+    CLEAR ERRSTR.
+    CONCATENATE REGUH-VBLNR ':No Value Date'
+                INTO ERRSTR SEPARATED BY SPACE.
+
+*FOR 4.7
+   CLOSE DATASET V_ERRFILE.
+   OPEN DATASET V_ERRFILE FOR APPENDING IN TEXT MODE ENCODING DEFAULT.
+*END 4.7
+    TRANSFER ERRSTR TO V_ERRFILE.
+  ENDIF.
+ENDFORM.
+
+*---------------------------------------------------------------------*
+*       FORM GET_PARAM                                                *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+FORM GET_PARAM.
+  SELECT SINGLE PARM_VAL INTO V_CONVERT_LIST
+  FROM YHFPARMI
+  WHERE BUKRS = CO_CODE
+  AND PARM1 = 'INV'
+  AND PARM2 = 'CHR'.
+  IF SY-SUBRC EQ 0.
+    V_INV_CHR = 'Y'.
+  ENDIF.
+  SELECT SINGLE PARM_VAL INTO V_DWC_LIST
+  FROM YHFPARMI
+  WHERE BUKRS = CO_CODE
+  AND PARM1 = 'DWC'.
+ENDFORM.
+
+*---------------------------------------------------------------------*
+*       FORM GET_CONVERT_TYPE                                         *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+FORM GET_CONVERT_TYPE.
+  CLEAR CONVERT_TYPE.
+  IF V_INV_CHR = 'Y'.
+    IF V_CONVERT_LIST EQ SPACE OR V_CONVERT_LIST CS REGUH-RZAWE.
+      CONVERT_TYPE = 'E'.
+    ENDIF.
+  ELSEIF KATAKANA NE SPACE.
+    CONVERT_TYPE = 'K'.
+  ENDIF.
+ENDFORM.
+
+*---------------------------------------------------------------------*
+*       FORM CHEQUE_NUMBER_VAL                                        *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+FORM CHEQUE_NUMBER_VAL.
+* Print Error message if preassign check number warning is enabled
+* and the check number is blank.
+  IF V_DWC_LIST CS YHFFMTXR-YHFNO AND PAYR-CHECT EQ SPACE.
+    CONCATENATE REGUH-VBLNR ': Cheque Number Not Updated'
+                INTO ERRSTR SEPARATED BY SPACE.
+    TRANSFER ERRSTR TO V_ERRFILE.
+    V_DWC_FLAG = 'Y'.
+  ENDIF.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*&      Form  BLANK_ERR
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_LFA1_LIFNR  text
+*      -->P_LFA1_STCD1  text
+*      <--P_V_COLUMN_VALUE  text
+*----------------------------------------------------------------------*
+FORM BLANK_ERR USING
+                VALUE(L_LIFNR) LIKE LFA1-LIFNR
+              CHANGING VALUE(P_OUT) TYPE C.
+  MOVE 'Y' TO P_OUT.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*&      Form  FN_BLANK_ERROR
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM FN_BLANK_ERROR.
+  DATA: ERRSTR(100) TYPE C.
+  CONCATENATE DBD_PAY 'DBERROR.TXT' INTO V_ERRFILE.
+  MOVE 'Y' TO WS_WARN_FN_ERR.
+  CLEAR ERRSTR.
+  CONCATENATE REGUH-VBLNR ':' ITAB_FMT_DET-COLUMN_NME 'IS BLANK'
+              INTO ERRSTR SEPARATED BY SPACE.
+
+*FOR 4.6
+*  OPEN DATASET V_ERRFILE FOR APPENDING IN TEXT MODE.
+*END 4.6
+
+*FOR 4.7
+  CLOSE DATASET V_ERRFILE.
+  OPEN DATASET V_ERRFILE FOR APPENDING IN TEXT MODE ENCODING DEFAULT.
+*END 4.7
+  IF SY-SUBRC EQ 0.
+    TRANSFER ERRSTR TO V_ERRFILE.
+  ELSE.
+    EXIT.
+  ENDIF.
+  CLOSE DATASET V_ERRFILE.
+ENDFORM.                    " FN_BLANK_ERROR
+*****************************************************************PP01
+* Changed by : Purna Chandra
+* Date       : 08\06\2007
+* To skip the spool pop-up box
+
+*&---------------------------------------------------------------------*
+*&      Form  SKIP_SPOOL1
+*&---------------------------------------------------------------------*
+*       text
+FORM SKIP_SPOOL1 .
+   SELECT SINGLE PARM_VAL FROM YHFPARMI INTO V_SKIP_PARM1
+              WHERE ( BUKRS = CO_CODE OR BUKRS = SPACE )
+                  AND  PARM1 = 'STR'
+                  AND  PARM2 = 'SPL'.
+
+   IF V_SKIP_PARM1 EQ C_Y.
+
+  SUBMIT YHFDBI89 TO SAP-SPOOL
+        AND RETURN
+        WITH SELECTION-TABLE SELTAB
+        IMMEDIATELY ' '
+        SAP COVER PAGE ' '
+        COVER TEXT 'Deutsche Bank AG - Auto Payment Checksum'
+        WITHOUT SPOOL DYNPRO.
+  ELSE.
+    SUBMIT YHFDBI89 TO SAP-SPOOL
+        AND RETURN
+        WITH SELECTION-TABLE SELTAB
+        IMMEDIATELY ' '
+        SAP COVER PAGE ' '
+        COVER TEXT 'Deutsche Bank AG - Auto Payment Checksum'.
+
+     endif.
+
+ENDFORM.                    " SKIP_SPOOL1
+* End Changes
+
+*****************************************************************PP01
+*Selection text£º
+*ACCT_ID:        Account ID
+*CO_CODE:        Company  Code
+*DBD_PAY:        Export Path for DBI File
+*FALLBACK:        Stop FTP
+*HBK_KEY:        House Bank
+*KATAKANA:        KATAKANA 2-1 byte Conversion
+*PAYDET:        Payment Detail
+*PAYPROG:        Payment Detail Program
+*PAY_METH:        Payment Method
+*P_EMID:        Additional Information
+*S_WITHT:        Withholding Tax Type
+*WTXPROG:        Withholding Tax Program
+*W_LAUFI:        Additional Identification
+*YHLIVE:D       DBI: Live Run Indicator
+
+*YHTEST:D       db-direct : Test Run Indicator
+*List Title: Titlebar£º
+*:DEUTSCHE BANK AG - PAYMENT SUMMARY LIST

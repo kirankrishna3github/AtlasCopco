@@ -1,0 +1,194 @@
+***INCLUDE RVADOPFO .
+
+DATA: lvs_itcpo         TYPE   itcpo,
+      lvf_device(30)    TYPE   c,
+      lvf_dialog(1)     TYPE   c   VALUE ' ',
+      lvs_recipient     LIKE   swotobjid,
+      lvs_sender        LIKE   swotobjid,
+      lvs_snast         TYPE   snast,
+      lvf_program       LIKE   sy-repid,
+      lvs_comm_type     TYPE   ad_comm,
+      lvs_comm_values   TYPE   szadr_comm_values,
+      lv_otf_memory_switch TYPE c.
+
+FIELD-SYMBOLS:
+  <lv_xscreen> TYPE c.
+
+* reset return code
+retcode = 0.
+
+* if there is a communication strategy used ...
+IF NOT nast-tcode IS INITIAL AND nast-nacha EQ '5'.
+
+*   ... use stratagy to get communication type
+  CALL FUNCTION 'ADDR_GET_NEXT_COMM_TYPE'
+       EXPORTING
+            strategy           = nast-tcode
+*             ADDRESS_TYPE       =
+*             ADDRESS_NUMBER     = VBDKA-ADRNR
+*             PERSON_NUMBER      = VBDKA-ADRNP
+            address_number     = addr_key-addrnumber
+            person_number      = addr_key-persnumber
+       IMPORTING
+            comm_type          = lvs_comm_type
+            comm_values        = lvs_comm_values
+*        TABLES
+*             STRATEGY_TABLE     =
+       EXCEPTIONS
+            address_not_exist  = 1
+            person_not_exist   = 2
+            no_comm_type_found = 3
+            internal_error     = 4
+            parameter_error    = 5
+            OTHERS             = 6.
+  IF sy-subrc <> 0.
+    retcode = sy-subrc.
+    syst-msgty = 'E'.
+    PERFORM protocol_update.
+  ENDIF.
+
+ENDIF.
+
+
+* convert communication data
+MOVE-CORRESPONDING nast TO lvs_snast.
+MOVE sy-repid           TO lvf_program.
+CALL FUNCTION 'CONVERT_COMM_TYPE_DATA'
+     EXPORTING
+          pi_comm_type              = lvs_comm_type
+          pi_comm_values            = lvs_comm_values
+          pi_screen                 = us_screen
+*           PI_NEWID                  =
+          pi_country                = us_country
+          pi_repid                  = lvf_program
+          pi_snast                  = lvs_snast
+     IMPORTING
+          pe_itcpo                  = lvs_itcpo
+          pe_device                 = lvf_device
+          pe_mail_recipient         = lvs_recipient
+          pe_mail_sender            = lvs_sender
+     EXCEPTIONS
+          comm_type_not_supported   = 1
+          recipient_creation_failed = 2
+          sender_creation_failed    = 3
+          OTHERS                    = 4.
+IF sy-subrc <> 0.
+  retcode = sy-subrc.
+  syst-msgty = 'E'.
+  PERFORM protocol_update.
+ENDIF.
+
+CHECK retcode EQ 0.
+
+* if there is no communication type
+IF  lvs_comm_type IS INITIAL.
+*   set device
+  CASE nast-nacha.
+    WHEN '1'.
+      lvf_device = 'PRINTER'.
+    WHEN '2'.
+      lvf_device = 'TELEFAX'.
+      lvs_itcpo-tdtelenum = nast-telfx.
+      IF nast-tland IS INITIAL.
+        lvs_itcpo-tdteleland = us_country.
+      ELSE.
+        lvs_itcpo-tdteleland = nast-tland.
+      ENDIF.
+      lvs_itcpo-tdsenddate = nast-vsdat.
+      lvs_itcpo-tdsendtime = nast-vsura.
+      lvs_itcpo-tdfaxuser  = nast-usnam.
+    WHEN '3'.
+      lvf_device = 'TELETEX'.
+      lvs_itcpo-tdtelenum = nast-teltx.
+      IF nast-tland IS INITIAL.
+        lvs_itcpo-tdteleland = us_country.
+      ELSE.
+        lvs_itcpo-tdteleland = nast-tland.
+      ENDIF.
+      lvs_itcpo-tdsenddate = nast-vsdat.
+      lvs_itcpo-tdsendtime = nast-vsura.
+    WHEN '4'.
+      lvf_device = 'TELEX'.
+      lvs_itcpo-tdtelenum = nast-telx1.
+      IF nast-tland IS INITIAL.
+        lvs_itcpo-tdteleland = us_country.
+      ELSE.
+        lvs_itcpo-tdteleland = nast-tland.
+      ENDIF.
+      lvs_itcpo-tdsenddate = nast-vsdat.
+      lvs_itcpo-tdsendtime = nast-vsura.
+    WHEN OTHERS.
+      lvf_device = 'PRINTER'.
+  ENDCASE.
+ENDIF.
+
+* fill structure itcpo
+itcpo = lvs_itcpo.
+
+* insert note 508569 {
+* OTF-Output, wenn Browser-Druck
+IF nast-sort1 = 'EBPP'.
+  lvs_itcpo-tdgetotf = 'X'.
+ENDIF.
+* } end note 508569
+
+* Print Preview for CRM Web UI and ERP Sales UI
+* OTF will be converted to PDF in case of active SD EHP4 BF
+IF cl_ops_switch_check=>sd_sfws_sc3( ) EQ 'X'.
+* Dynamically assign for indicator XSCREEN
+  ASSIGN ('XSCREEN') TO <lv_xscreen>.
+  IF <lv_xscreen> IS ASSIGNED AND
+     <lv_xscreen> EQ 'W'      AND
+     lvf_device   EQ 'PRINTER'.
+* get otf
+    lvs_itcpo-tdgetotf = 'X'.
+* only print
+    lvs_itcpo-tdarmod = '1'.
+  ENDIF.
+ENDIF.
+
+* open form
+CALL FUNCTION 'OPEN_FORM'
+     EXPORTING
+*           APPLICATION        = 'TX'
+          archive_index      = toa_dara
+          archive_params     = arc_params
+          device             = lvf_device
+          dialog             = ' '
+          form               = tnapr-fonam
+          language           = nast-spras
+          OPTIONS            = lvs_itcpo
+          mail_sender        = lvs_sender
+          mail_recipient     = lvs_recipient
+*           MAIL_APPL_OBJECT   = ' '
+*           RAW_DATA_INTERFACE = '*'
+*      IMPORTING
+*           LANGUAGE           =
+*           NEW_ARCHIVE_PARAMS =
+*           RESULT             =
+     EXCEPTIONS
+          canceled           = 1
+          device             = 2
+          form               = 3
+          OPTIONS            = 4
+          unclosed           = 5
+          mail_options       = 6
+          archive_error      = 7
+          OTHERS             = 8.
+
+IF sy-subrc NE 0.
+  CASE sy-subrc.
+    WHEN 7.
+      retcode = sy-subrc.
+      syst-msgid = 'VN'.
+      syst-msgno = '096'.
+      syst-msgty = 'E'.
+      syst-msgv1 = nast-kschl.
+      syst-msgv2 = nast-kappl.
+      PERFORM protocol_update.
+    WHEN OTHERS.
+      retcode = sy-subrc.
+      PERFORM protocol_update.
+  ENDCASE.
+ENDIF.
+SET COUNTRY us_country.

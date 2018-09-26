@@ -1,0 +1,224 @@
+***INCLUDE MIOLXF22 .
+*---------------------------------------------------------------------*
+*       FORM PRESELECT_STATUS_F22                                     *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  P_STATI    Select-Option Selective Status (ext.Format)
+*  -->  P_STAT_EX  Select-Option Status not to be used (int.Format)
+*  -->  P_KEY      Table with selected key objects
+*  -->  P_OTYP     Objecttype for selection, key determination
+*  <--  E_OBJ_FOUND Object for status found? Yes/No
+*---------------------------------------------------------------------*
+FORM preselect_status_f22 TABLES p_stati
+                                 p_stat_ex
+                                 p_key
+                           USING  p_otyp      TYPE c
+                                  e_obj_found TYPE c.
+
+  CONSTANTS: hx        VALUE 'X'.
+  CONSTANTS: h_equi(3) VALUE 'IE',
+             h_iflo(3) VALUE 'IF',
+             h_aufk(3) VALUE 'OR',
+             h_qmel(2) VALUE 'QM',
+             h_qmsm(2) VALUE 'QA',
+             h_mpla(2) VALUE 'WO'.
+
+  RANGES h_stai_r FOR tj02t-txt04.
+  RANGES h_stat_r FOR tj02t-istat.
+  RANGES h_stae_r FOR tj02t-istat.
+
+  DATA: BEGIN OF h_stat_tab OCCURS 0,
+          istat LIKE tj02t-istat,
+        END OF h_stat_tab.
+  DATA: BEGIN OF h_otyp_select,
+          type(2),
+          filler(1) VALUE '%',
+        END OF h_otyp_select.
+
+  DATA h_jest_tab  TYPE TABLE OF jest.
+  DATA h_ionra_wa  LIKE ionra.
+  DATA h_sys_stat.
+  DATA h_usr_stat.
+  DATA h_exit_flag.
+
+  FIELD-SYMBOLS: <ls_jest> TYPE jest.
+
+*--- Selection via additonal systemstatus, userstatus
+  CHECK NOT p_stati[] IS INITIAL.
+*--- fill range with status which should be used for selection
+  LOOP AT p_stati.
+    h_stai_r = p_stati.
+*--- prefetch not supported for search with excluding, not-equal
+    IF h_stai_r-sign <> 'I' OR h_stai_r-option <> 'EQ'.
+      h_exit_flag = hx.
+    ENDIF.
+    APPEND h_stai_r.
+  ENDLOOP.
+*--- check whether continueing make sense
+  IF NOT h_exit_flag IS INITIAL OR h_stai_r[] IS INITIAL.
+    EXIT.
+  ENDIF.
+*--- fill range with status which should NOT be used for selection
+  LOOP AT p_stat_ex.
+    h_stae_r = p_stat_ex.
+    APPEND h_stae_r.
+  ENDLOOP.
+*--- Select internal status for systemstatus
+  SELECT istat FROM tj02t INTO TABLE h_stat_tab       "#EC CI_SGLSELECT
+                                            WHERE txt04 IN h_stai_r
+                                            AND   spras =  sy-langu.
+  IF sy-subrc IS INITIAL. h_sys_stat = hx. ENDIF.
+*--- Select internal status for userstatus
+  SELECT estat FROM tj30t APPENDING TABLE h_stat_tab
+                                            WHERE txt04 IN h_stai_r
+                                            AND   spras =  sy-langu.
+  IF sy-subrc IS INITIAL. h_usr_stat = hx. ENDIF.
+*--- check wether status are relevant for object type
+  PERFORM check_status_selected_f22 TABLES h_stat_tab
+                                    USING  h_sys_stat
+                                           h_usr_stat.
+*--- Delete Status which should not to be used.
+  IF NOT h_stae_r[] IS INITIAL.
+    DELETE h_stat_tab WHERE istat IN h_stae_r.
+  ENDIF.
+  CHECK NOT h_stat_tab[] IS INITIAL.
+*--- delete mulitple entries
+  SORT h_stat_tab.
+  DELETE ADJACENT DUPLICATES FROM h_stat_tab.
+*--- create range with internal status
+  h_stat_r-sign = 'I'. h_stat_r-option = 'EQ'.
+  LOOP AT h_stat_tab.
+    h_stat_r-low = h_stat_tab-istat.
+    APPEND h_stat_r.
+  ENDLOOP.
+  h_otyp_select-type = p_otyp.
+*--- Select objects according to status
+  SELECT * FROM jest INTO TABLE h_jest_tab
+                     UP TO 1001 ROWS
+                     WHERE stat  IN h_stat_r
+                     AND   inact = space
+  %_hints DB2 'use optimize for 1 rows'.
+*--- if more than 1000 record no select due to possible subsequent
+*--- problem with select for all enties in application table
+  IF sy-dbcnt > 1000.
+    e_obj_found = asterisk.
+    EXIT.
+*--- nothing selected -> message and stop programm
+  ELSEIF sy-dbcnt = 0.
+    MESSAGE s047(ih).
+    e_obj_found = no.
+    EXIT.
+  ENDIF.
+
+  CHECK sy-subrc IS INITIAL.
+  p_key(3) = 'IEQ'.
+*--- Read objects to status, fill key-table with object-key (range)
+  LOOP AT h_jest_tab ASSIGNING <ls_jest>.
+*--- due to index check object-type now, not in select-statement
+    CHECK <ls_jest>-objnr(2) = h_otyp_select-type.
+*--- get key of object
+    CALL FUNCTION 'OBJECT_KEY_GET'
+      EXPORTING
+        i_objnr = <ls_jest>-objnr
+      IMPORTING
+        e_ionra = h_ionra_wa.
+    CASE p_otyp.
+      WHEN h_equi.
+        IF NOT h_ionra_wa-equnr IS INITIAL.
+          MOVE h_ionra_wa-equnr TO p_key+3. APPEND p_key.
+        ENDIF.
+      WHEN h_iflo.
+        IF NOT h_ionra_wa-tplnr IS INITIAL.
+          MOVE h_ionra_wa-tplnr TO p_key+3. APPEND p_key.
+        ENDIF.
+      WHEN h_aufk.
+        IF NOT h_ionra_wa-aufnr IS INITIAL.
+          MOVE h_ionra_wa-aufnr TO p_key+3. APPEND p_key.
+        ENDIF.
+      WHEN h_qmel OR h_qmsm.
+        IF NOT h_ionra_wa-qmnum IS INITIAL.
+          MOVE h_ionra_wa-qmnum TO p_key+3. APPEND p_key.
+        ENDIF.
+      WHEN h_mpla.
+        IF NOT h_ionra_wa-warpl IS INITIAL.
+          MOVE h_ionra_wa-warpl TO p_key+3. APPEND p_key.
+        ENDIF.
+    ENDCASE.
+  ENDLOOP.
+*--- nothing selected -> message and stop programm
+  IF p_key[] IS INITIAL.
+    MESSAGE s047(ih).
+    e_obj_found = no.
+    EXIT.
+  ELSE.
+    e_obj_found = yes.
+  ENDIF.
+
+ENDFORM.                    "PRESELECT_STATUS_F22
+*---------------------------------------------------------------------*
+*       FORM CHECK_STATUS_SELECTED_F22                                *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  P_STAT_TAB                                                    *
+*  -->  P_SYS_STAT                                                    *
+*  -->  P_USR_STAT                                                    *
+*---------------------------------------------------------------------*
+FORM check_status_selected_f22 TABLES p_stat_tab
+                               USING  p_sys_stat TYPE c
+                                      p_usr_stat TYPE c.
+
+
+  DATA h_subrc      LIKE sy-subrc.
+  DATA h_record_tab LIKE seahlpres OCCURS 0 WITH HEADER LINE.
+
+  DATA: BEGIN OF h_stat_tab OCCURS 0,
+          istat LIKE tj02t-istat,
+        END OF h_stat_tab.
+
+  DATA: BEGIN OF h_wa_sys,
+         status     TYPE i_status,
+         text       TYPE text30,
+         status_int TYPE j_istat,
+        END OF h_wa_sys.
+
+  DATA: BEGIN OF h_wa_usr,
+         schema     TYPE j_stsma,
+         status     TYPE i_status,
+         text       TYPE text30,
+         status_int TYPE j_estat,
+        END OF h_wa_usr.
+
+  IF NOT p_sys_stat IS INITIAL.
+*--- Select systemstatus via search help exit for object type given
+*--- (object type is determined in search help exit itself)
+    PERFORM step_select_stat_sys(saplimch) TABLES h_record_tab
+                                           CHANGING h_subrc.
+    LOOP AT h_record_tab.
+      h_wa_sys         = h_record_tab.
+      h_stat_tab-istat = h_wa_sys-status_int.
+      APPEND h_stat_tab.
+    ENDLOOP.
+  ENDIF.
+  IF NOT p_usr_stat IS INITIAL.
+*--- Select userstatus via search help exit
+    PERFORM step_select_stat_usr(saplimch) TABLES h_record_tab
+                                           CHANGING h_subrc.
+    LOOP AT h_record_tab.
+      h_wa_usr         = h_record_tab.
+      h_stat_tab-istat = h_wa_usr-status_int.
+      APPEND h_stat_tab.
+    ENDLOOP.
+  ENDIF.
+*--- delete status which are neiterh user or system status for
+*--- object type given
+  SORT h_stat_tab.
+  LOOP AT p_stat_tab.
+    READ TABLE h_stat_tab WITH KEY istat = p_stat_tab BINARY SEARCH.
+    IF NOT sy-subrc IS INITIAL.
+      DELETE p_stat_tab.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    "CHECK_STATUS_SELECTED_F22

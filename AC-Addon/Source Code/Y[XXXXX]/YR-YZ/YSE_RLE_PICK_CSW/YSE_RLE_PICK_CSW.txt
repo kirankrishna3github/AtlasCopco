@@ -1,0 +1,551 @@
+**********************************************************************
+* Program ID        : YSE_RLE_PICK_CSW                               *
+* Project           : YSE_CSW                                        *
+* Author            : Filip Toelants                                 *
+* Date              : 12/02/2014                                     *
+* Functional spec   : copy of program  YSE_RLE_DELNOTE               *
+**********************************************************************
+*--------------------------------------------------------------------*
+*      Print of a picking list by SAPscript SMART FORMS              *
+*--------------------------------------------------------------------*
+REPORT yse_rle_pick_csw.
+
+* declaration of data
+INCLUDE rle_delnote_data_declare.
+DATA: lt_lips TYPE TABLE OF lips,
+      wa_lips TYPE lips,
+      lt_likp TYPE TABLE OF likp,
+      wa_likp TYPE likp,
+      wa_ekko TYPE ekko,
+      wa_vbak TYPE vbak,
+      v_urgency TYPE vtext,
+      l_payterm TYPE dzterm_bez.
+DATA: i_notiftask0  TYPE TABLE OF bapi2080_nottaske,
+      i_notiftask  TYPE TABLE OF bapi2080_nottaske.
+* definition of forms
+INCLUDE rle_delnote_forms.
+INCLUDE rle_print_forms.
+
+*---------------------------------------------------------------------*
+*       FORM ENTRY
+*---------------------------------------------------------------------*
+FORM entry USING return_code us_screen.
+
+  DATA: lf_retcode TYPE sy-subrc.
+  xscreen = us_screen.
+  PERFORM processing USING    us_screen
+                     CHANGING lf_retcode.
+  IF lf_retcode NE 0.
+    return_code = 1.
+  ELSE.
+    return_code = 0.
+  ENDIF.
+
+ENDFORM.                    "ENTRY
+*---------------------------------------------------------------------*
+*       FORM PROCESSING                                               *
+*---------------------------------------------------------------------*
+FORM processing USING    proc_screen
+                CHANGING cf_retcode.
+
+  DATA: ls_dlv_it_gen         TYPE LINE OF le_t_dlv_it_gen.
+  DATA: ls_print_data_to_read TYPE ledlv_print_data_to_read.
+  DATA: ls_dlv_delnote        TYPE ledlv_delnote.
+  DATA: lf_fm_name            TYPE rs38l_fnam.
+  DATA: ls_control_param      TYPE ssfctrlop.
+  DATA: ls_composer_param     TYPE ssfcompop.
+  DATA: ls_recipient          TYPE swotobjid.
+  DATA: ls_sender             TYPE swotobjid.
+  DATA: lf_formname           TYPE tdsfname.
+  DATA: ls_addr_key           LIKE addr_key.
+  DATA: ls_job_info           TYPE ssfcrescl.
+
+*>>>air22296: for other font countries,we will pick another layout
+  DATA: l_sform TYPE tdsfname,
+        l_land1 TYPE land1_gp,
+        l_bukrs TYPE bukrs.
+
+
+  CLEAR l_bukrs.
+  SELECT SINGLE t001k~bukrs INTO l_bukrs FROM lips
+  INNER JOIN t001k ON bwkey = lips~werks
+              WHERE lips~vbeln = nast-objky.
+
+  CLEAR l_land1.
+  SELECT SINGLE land1 INTO l_land1 FROM  t001
+         WHERE  bukrs  = l_bukrs.
+
+
+
+  CALL FUNCTION 'YSE_LAY_GET_FNAME'
+    EXPORTING
+      tnapr = tnapr
+      land1 = l_land1
+    IMPORTING
+      sform = l_sform.
+
+  IF NOT l_sform IS INITIAL.
+    lf_formname = l_sform.
+  ELSE.
+    lf_formname = tnapr-sform.
+  ENDIF.
+* SmartForm from customizing table TNAPR
+*  lf_formname = tnapr-sform.
+*<<<air22296
+
+
+* determine print data
+  PERFORM set_print_data_to_read USING    lf_formname
+                                 CHANGING ls_print_data_to_read
+                                 cf_retcode.
+  ls_print_data_to_read-it_reford  = 'X'.
+
+  IF cf_retcode = 0.
+* select print data
+    PERFORM get_data USING    ls_print_data_to_read
+                     CHANGING ls_addr_key
+                              ls_dlv_delnote
+                              cf_retcode.
+*>>>air22296 on 27/11
+    PERFORM get_additional_data.
+    PERFORM get_addres_data CHANGING ls_dlv_delnote-hd_adr.
+    PERFORM fill_notifications  USING ls_dlv_delnote-it_gen
+                                CHANGING ls_dlv_delnote-it_qm.
+
+*<<<
+  ENDIF.
+
+  IF cf_retcode = 0.
+    "* filter labour materials
+    "    loop at lt_lips into wa_lips
+    "         where mtart ne 'ZMAT'.
+    "      delete lt_lips index sy-tabix.
+    "    endloop.
+    LOOP AT ls_dlv_delnote-it_gen INTO ls_dlv_it_gen.
+      READ TABLE lt_lips INTO wa_lips WITH KEY vbeln = ls_dlv_it_gen-deliv_numb
+                                               posnr = ls_dlv_it_gen-itm_number.
+      " get bin nr from material master for sorting
+      SELECT SINGLE lgpbe INTO ls_dlv_it_gen-stge_bin
+             FROM mard
+             WHERE matnr EQ wa_lips-matnr
+              AND  werks EQ wa_lips-werks
+              AND  lgort EQ wa_lips-lgort.
+
+      MODIFY TABLE ls_dlv_delnote-it_gen FROM ls_dlv_it_gen.
+    ENDLOOP.
+
+  ENDIF.
+
+  IF cf_retcode = 0.
+    PERFORM set_print_param USING    ls_addr_key
+                            CHANGING ls_control_param
+                                     ls_composer_param
+                                     ls_recipient
+                                     ls_sender
+                                     cf_retcode.
+  ENDIF.
+
+  IF cf_retcode = 0.
+* determine smartform function module for delivery note
+    CALL FUNCTION 'SSF_FUNCTION_MODULE_NAME'
+         EXPORTING  formname           = lf_formname
+*                 variant            = ' '
+*                 direct_call        = ' '
+         IMPORTING  fm_name            = lf_fm_name
+         EXCEPTIONS no_form            = 1
+                    no_function_module = 2
+                    OTHERS             = 3.
+    IF sy-subrc <> 0.
+*   error handling
+      cf_retcode = sy-subrc.
+      PERFORM protocol_update.
+    ENDIF.
+  ENDIF.
+
+  IF cf_retcode = 0.
+*   call smartform delivery note
+    CALL FUNCTION lf_fm_name
+         EXPORTING
+                  archive_index        = toa_dara
+                  archive_parameters   = arc_params
+                  control_parameters   = ls_control_param
+*                 mail_appl_obj        =
+                  mail_recipient       = ls_recipient
+                  mail_sender          = ls_sender
+                  output_options       = ls_composer_param
+                  user_settings        = ' '
+                  is_dlv_delnote       = ls_dlv_delnote
+                  is_nast              = nast
+                  wa_likp              = wa_likp
+                  wa_vbak              = wa_vbak
+                  wa_ekko              = wa_ekko
+                  v_fname              = lf_formname
+                  l_urgency            = v_urgency
+                  l_payterm            = l_payterm
+       IMPORTING  job_output_info      = ls_job_info
+*                 document_output_info =
+*                 job_output_info      =
+*                 job_output_options   =
+       TABLES     it_lips              = lt_lips
+                  it_notiftask         = i_notiftask
+       EXCEPTIONS formatting_error     = 1
+                  internal_error       = 2
+                  send_error           = 3
+                  user_canceled        = 4
+                  OTHERS               = 5.
+    IF sy-subrc <> 0.
+*   error handling
+      cf_retcode = sy-subrc.
+      PERFORM protocol_update.
+*     get SmartForm protocoll and store it in the NAST protocoll
+      PERFORM add_smfrm_prot.                  "INS_HP_335958
+    ENDIF.
+  ENDIF.
+
+* get SmartForm protocoll and store it in the NAST protocoll
+* PERFORM ADD_SMFRM_PROT.                       DEL_HP_335958
+* get SmartForm spoolid and store it in the NAST protocoll
+  DATA ls_spoolid LIKE LINE OF ls_job_info-spoolids.
+  LOOP AT ls_job_info-spoolids INTO ls_spoolid.
+    IF ls_spoolid NE space.
+
+*       MOD-001 - start of modification for PDF output
+      IF nast-nacha = '8'.
+*         Define variable to build suggested file name
+        DATA: lv_fname TYPE string.
+        DATA: l_lfart TYPE likp-lfart.
+
+        CLEAR l_lfart.
+        SELECT SINGLE lfart INTO l_lfart FROM likp
+        WHERE vbeln = ls_dlv_delnote-hd_gen-deliv_numb.
+
+*         Build suggested filename
+        CONCATENATE l_lfart
+                    '_'
+                    ls_dlv_delnote-hd_gen-deliv_numb
+                    '.pdf'
+               INTO lv_fname.
+*         Call function to convert the spool to a local PDF file
+        CALL FUNCTION 'YSE_PRINT_PDF'
+          EXPORTING
+            ps_spoolid = ls_spoolid
+            pv_fname   = lv_fname.
+      ENDIF.
+*       MOD-001 - end of modif
+
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    "PROCESSING
+*&---------------------------------------------------------------------*
+*&      Form  get_addres_data
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM get_addres_data CHANGING ct_hd_adr TYPE le_t_dlv_hd_adr .
+
+  DATA: l_bukrs_vf TYPE bukrs,
+        l_adrnr TYPE adrnr,
+        wa_ledlv_hd_adr TYPE ledlv_hd_adr.
+
+*First empty the addresses:
+  REFRESH ct_hd_adr.
+
+*Get the sellers address:
+*-----------------------*
+  READ TABLE lt_lips INDEX 1 INTO wa_lips.
+
+* Get document's company code
+  SELECT SINGLE bukrs_vf
+    INTO l_bukrs_vf
+    FROM vbak
+    WHERE vbeln EQ wa_lips-vgbel.
+
+*¡°Seller¡¯s address¡± in language of output document (Bold). This
+* is always the company code address except for stock transfers where it
+* is the delivering storage location.
+  CLEAR l_adrnr.
+  CASE wa_likp-lfart.
+
+
+
+*take the address from the storage location:
+    WHEN  'NL' OR 'ZNLC'.
+      SELECT  SINGLE b~adrnr
+       INTO l_adrnr
+       FROM t001l AS a
+       LEFT JOIN twlad AS b   " Also select StLoc w/o address!
+         ON a~werks EQ b~werks
+        AND a~lgort EQ b~lgort
+      WHERE a~werks EQ wa_lips-werks
+        AND a~lgort EQ wa_lips-lgort.
+
+
+*    WHEN  'NL'.
+**take address of delivering storage location
+**When stock transport: take address of delivering plant (issue 3376)
+*      SELECT SINGLE adrnr
+*        INTO l_adrnr
+*        FROM t001w
+*        WHERE werks EQ wa_lips-werks.
+
+    WHEN 'ZRL'.
+*take address of EKKO-BUKRS (use LIPS-VGBEL)
+* Get address number
+      SELECT SINGLE adrnr
+        INTO l_adrnr
+        FROM t001
+        WHERE bukrs EQ wa_ekko-bukrs.
+
+    WHEN OTHERS.
+      SELECT SINGLE adrnr
+        INTO l_adrnr
+        FROM t001
+        WHERE bukrs EQ wa_vbak-bukrs_vf.
+  ENDCASE.
+
+  CLEAR wa_ledlv_hd_adr.
+  wa_ledlv_hd_adr-deliv_numb = wa_likp-vbeln.
+  wa_ledlv_hd_adr-partn_role = 'SE'.
+  wa_ledlv_hd_adr-addr_no = l_adrnr.
+  INSERT wa_ledlv_hd_adr INTO TABLE ct_hd_adr.
+
+*Get the customers address:
+*-------------------------*
+  CLEAR l_adrnr.
+  CASE wa_likp-lfart.
+*Take address of receiving plant : likp-werks
+    WHEN  'NL'.
+      SELECT SINGLE adrnr
+        INTO l_adrnr
+        FROM t001w
+        WHERE werks EQ wa_likp-werks.
+
+*Take address of purchase organisation
+    WHEN 'ZNLC'.
+      l_adrnr = 'SELL_ADDR'.
+
+*Take address of vendor
+    WHEN 'ZRL'.
+      SELECT SINGLE adrnr
+        INTO l_adrnr
+        FROM vbpa
+        WHERE vbeln EQ wa_likp-vbeln
+        AND   parvw EQ 'WE'.
+
+*Take address of sold-to partner : likp-kunag
+    WHEN OTHERS.
+      SELECT SINGLE adrnr
+        INTO l_adrnr
+        FROM kna1
+        WHERE kunnr EQ wa_likp-kunag.
+  ENDCASE.
+
+  CLEAR wa_ledlv_hd_adr.
+  wa_ledlv_hd_adr-deliv_numb = wa_likp-vbeln.
+  wa_ledlv_hd_adr-partn_role = 'SP'.
+  wa_ledlv_hd_adr-addr_no = l_adrnr.
+  INSERT wa_ledlv_hd_adr INTO TABLE ct_hd_adr.
+
+*Get the delivery address:
+*-------------------------*
+
+  SELECT SINGLE adrnr
+    INTO l_adrnr
+    FROM vbpa
+    WHERE vbeln EQ wa_likp-vbeln
+    AND   parvw EQ 'WE'.
+
+  CLEAR wa_ledlv_hd_adr.
+  wa_ledlv_hd_adr-deliv_numb = wa_likp-vbeln.
+  wa_ledlv_hd_adr-partn_role = 'WE'.
+  wa_ledlv_hd_adr-addr_no = l_adrnr.
+  INSERT wa_ledlv_hd_adr INTO TABLE ct_hd_adr.
+
+ENDFORM.                    " get_addres_data
+*&---------------------------------------------------------------------*
+*&      Form  get_additional_data
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM get_additional_data .
+
+  DATA: ls_delivery_key TYPE  leshp_delivery_key,
+        l_vbelv TYPE vbelv.
+
+  ls_delivery_key-vbeln = nast-objky.
+
+
+*fill likp data
+  CLEAR wa_likp.
+  SELECT SINGLE *
+    FROM likp
+    INTO wa_likp
+    WHERE vbeln EQ ls_delivery_key.
+
+*fill lips data
+  REFRESH lt_lips.
+  SELECT *
+    FROM lips
+    INTO TABLE lt_lips
+    WHERE vbeln EQ ls_delivery_key.
+
+
+*fill ekko data
+  READ TABLE lt_lips INDEX 1 INTO wa_lips.
+
+  CLEAR wa_ekko.
+  SELECT SINGLE * INTO wa_ekko
+  FROM ekko
+  WHERE ebeln = wa_lips-vgbel.
+
+*fill vbak data:
+  CLEAR l_vbelv.
+  SELECT SINGLE vbelv INTO l_vbelv FROM vbfa
+       WHERE vbeln = ls_delivery_key
+         AND vbtyp_v = 'C'.
+  CLEAR wa_vbak.
+  SELECT SINGLE * FROM vbak INTO wa_vbak WHERE vbeln = l_vbelv.
+
+  PERFORM get_urgency_code.
+  PERFORM get_so_payment_terms.
+
+
+ENDFORM.                    " get_additional_data
+*&---------------------------------------------------------------------*
+*&      Form  get_urgency_code
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+* At this moment only used for the Call off register
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM get_urgency_code .
+
+  CLEAR v_urgency.
+  SELECT SINGLE vtext INTO v_urgency
+    FROM tvsbt
+   WHERE spras = nast-spras
+     AND vsbed = wa_likp-vsbed.
+
+  IF sy-subrc NE 0.
+    SELECT SINGLE vtext INTO v_urgency
+      FROM tvsbt
+      WHERE spras = 'EN'
+        AND vsbed = wa_likp-vsbed.
+  ENDIF.
+
+ENDFORM.                    " get_urgency_code
+*&---------------------------------------------------------------------*
+*&      Form  fill_notifications
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM fill_notifications USING ct_it_gen TYPE le_t_dlv_it_gen
+                        CHANGING ct_it_qm TYPE le_t_dlv_it_qm.
+
+  DATA:   lv_tmptxt1(20)  TYPE c,
+  lv_tmptxt2(20)  TYPE c,
+  l_bstnk TYPE bstnk,
+  l_qmnum TYPE qmnum,
+  teller(2) TYPE n,
+  text(50).
+
+  DATA:  BEGIN OF it_qmel OCCURS 0,
+  qmnum TYPE qmnum,
+  objnr TYPE j_objnr,
+  bstnk TYPE bstkd,
+  END OF it_qmel.
+
+  DATA: wa_notiftask  TYPE  bapi2080_nottaske,
+        wa_it_qm  TYPE LINE OF  le_t_dlv_it_qm.
+
+
+  DATA: i_notifheader TYPE bapi2080_nothdre,
+        i_notifhdtext TYPE bapi2080_nothdtxte.
+
+  FIELD-SYMBOLS: <fs_it_den>  TYPE LINE OF le_t_dlv_it_gen.
+
+  CLEAR i_notiftask. REFRESH i_notiftask.
+
+  LOOP AT ct_it_gen ASSIGNING <fs_it_den>.
+
+* Remove leading zeros from document number
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+      EXPORTING
+        input  = <fs_it_den>-deliv_numb
+      IMPORTING
+        output = lv_tmptxt1.
+
+* Remove leading zeros from item number
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+      EXPORTING
+        input  = <fs_it_den>-itm_number
+      IMPORTING
+        output = lv_tmptxt2.
+
+* Build delivery/item code: this seems to be the way to get the
+*    notification.
+    CONCATENATE lv_tmptxt1 '/' lv_tmptxt2 INTO l_bstnk.
+
+    SELECT SINGLE qmnum INTO l_qmnum
+    FROM qmel
+    WHERE bstnk EQ l_bstnk.
+
+    CLEAR i_notiftask0. REFRESH i_notiftask0.
+
+    CALL FUNCTION 'BAPI_SERVNOT_GET_DETAIL'
+      EXPORTING
+        number      = l_qmnum
+      IMPORTING
+        notifheader = i_notifheader
+        notifhdtext = i_notifhdtext
+      TABLES
+        notiftask   = i_notiftask0.
+
+    LOOP AT i_notiftask0 INTO wa_notiftask.
+      wa_it_qm-deliv_numb = <fs_it_den>-deliv_numb.
+      wa_it_qm-itm_number = <fs_it_den>-itm_number.
+      wa_it_qm-notif_numb = wa_notiftask-notif_no.
+      INSERT wa_it_qm INTO TABLE ct_it_qm.
+    ENDLOOP.
+
+    APPEND LINES OF i_notiftask0 TO i_notiftask.
+
+  ENDLOOP.
+
+ENDFORM.                    " fill_notifications
+*&---------------------------------------------------------------------*
+*&      Form  get_so_payment_terms
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*get the payment terms for the sales order:
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM get_so_payment_terms .
+
+  DATA: l_zterm TYPE dzterm.
+
+  CLEAR l_payterm.
+
+  CLEAR l_zterm.
+  SELECT SINGLE zterm INTO l_zterm
+    FROM vbkd WHERE vbeln = wa_vbak-vbeln.
+
+  SELECT SINGLE vtext
+    INTO l_payterm
+    FROM tvzbt
+    WHERE zterm EQ l_zterm
+    AND   spras EQ nast-spras.
+
+ENDFORM.                    " get_so_payment_terms

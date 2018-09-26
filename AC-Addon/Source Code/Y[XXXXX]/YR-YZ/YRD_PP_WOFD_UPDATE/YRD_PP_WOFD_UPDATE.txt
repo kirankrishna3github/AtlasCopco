@@ -1,0 +1,296 @@
+*&---------------------------------------------------------------------*
+*& Report  YRD_PP_WOFD_UPDATE                                          *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+*----------------------------------------------------------------------*
+* PROGRAM ID           : YRD_PP_WOFD_UPDATE
+* PROGRAM TITLE        :
+* AUTHOR               : CSC Chris
+* DATE                 : 26/06/2015
+* DEVELOPMENT ID       : EXTCCG
+* TYPE                 :
+* DESCRIPTION          :
+* T-CODE               :
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME     | TRANSPORT NO | CHANGE REFERENCE #    *
+* Initial |26/06/2015| CSC Chris| CD1K985953   | #CR3632               *
+*----------------------------------------------------------------------*
+
+REPORT  yrd_pp_wofd_update.
+
+*&---------------------------------------------------------------------*
+*& DEFINE TABLES.                                                      *
+*&---------------------------------------------------------------------*
+TYPE-POOLS: icon.
+
+*&---------------------------------------------------------------------*
+*& DEFINE INNER TABLES.                                                *
+*&---------------------------------------------------------------------*
+DATA: it_yrd_open_wo TYPE TABLE OF yrd_open_wo WITH HEADER LINE.
+DATA: it_yrd_open_wo2 TYPE TABLE OF yrd_open_wo WITH HEADER LINE.
+DATA: it_yrd_supplement TYPE TABLE OF yrd_supplement WITH HEADER LINE.
+
+DATA: BEGIN OF it_message OCCURS 0,
+         light   TYPE icon_d,
+         aufnr   TYPE aufnr,
+         type    TYPE bapi_mtype,
+         message TYPE bapi_msg,
+      END OF it_message.
+
+DATA: lv_menge TYPE bbmng.
+DATA: lv_loop TYPE flag.
+
+DATA: wa_orderdata TYPE bapi_pp_order_change,
+      wa_orderdatax TYPE bapi_pp_order_changex,
+      wa_return TYPE bapiret2.
+
+CONSTANTS: gc_light_green TYPE icon_d VALUE '@08@',
+           gc_light_red   TYPE icon_d VALUE '@0A@'.
+
+*&---------------------------------------------------------------------*
+*& INITIALIZATION                                                      *
+*&---------------------------------------------------------------------*
+INITIALIZATION.
+  CLEAR: it_yrd_open_wo,it_yrd_open_wo[],
+         it_yrd_open_wo2,it_yrd_open_wo2[],
+         it_yrd_supplement,it_yrd_supplement[],
+         it_message,it_message[].
+
+*&---------------------------------------------------------------------*
+*& START-OF-SELECTION                                                  *
+*&---------------------------------------------------------------------*
+START-OF-SELECTION.
+
+*(1).Get Open Work Order Shortage Component
+  SELECT *
+    FROM yrd_open_wo
+    INTO TABLE it_yrd_open_wo.
+
+  SORT it_yrd_open_wo ASCENDING BY gstrs aufnr.
+  SORT it_yrd_open_wo STABLE BY aprio DESCENDING.
+
+
+*(2).Get Component Supplement
+  SELECT *
+    FROM yrd_supplement
+    INTO TABLE it_yrd_supplement.
+
+
+*(3).Set the same material committed quantity = 0 from second record (Only keep first record committed quantity)
+  it_yrd_open_wo2[] = it_yrd_open_wo[].
+  DELETE ADJACENT DUPLICATES FROM it_yrd_open_wo2 COMPARING matnr.
+
+  LOOP AT it_yrd_open_wo2.
+    LOOP AT it_yrd_open_wo WHERE matnr = it_yrd_open_wo2-matnr AND aufnr <> it_yrd_open_wo2-aufnr.
+      it_yrd_open_wo-vmeng = 0.
+      " Difference Quantity = Committed Qty ¨C Required Quantity
+      it_yrd_open_wo-diffqty = it_yrd_open_wo-vmeng - it_yrd_open_wo-bdmng.
+      MODIFY it_yrd_open_wo.
+    ENDLOOP.
+  ENDLOOP.
+
+
+*(4).Set plan finish date
+  LOOP AT it_yrd_open_wo.
+    CLEAR: lv_menge,lv_loop.
+
+    LOOP AT it_yrd_supplement WHERE matnr = it_yrd_open_wo-matnr
+                                AND werks = it_yrd_open_wo-werks
+                                AND deleted = ''.
+
+      IF lv_loop IS INITIAL. " First Loop
+        lv_menge = it_yrd_open_wo-bdmng * -1 + it_yrd_supplement-menge.
+        lv_loop = 'X'.
+      ELSE.
+        lv_menge = lv_menge + it_yrd_supplement-menge.
+      ENDIF.
+
+      IF lv_menge = 0.
+        it_yrd_open_wo-gltrp = it_yrd_supplement-eindt.
+
+        it_yrd_supplement-deleted = 'X'.
+        MODIFY it_yrd_supplement.
+        EXIT.
+      ELSEIF lv_menge < 0.
+
+        it_yrd_supplement-deleted = 'X'.
+        MODIFY it_yrd_supplement.
+
+      ELSEIF lv_menge > 0.
+        it_yrd_open_wo-gltrp = it_yrd_supplement-eindt.
+
+        it_yrd_supplement-menge = lv_menge.
+        MODIFY it_yrd_supplement.
+        EXIT.
+      ENDIF.
+
+    ENDLOOP.
+
+    IF NOT it_yrd_open_wo-gltrp IS INITIAL.
+
+      DELETE it_yrd_supplement WHERE matnr = it_yrd_open_wo-matnr
+                                 AND werks = it_yrd_open_wo-werks
+                                 AND deleted = 'X'.
+
+    ELSE.
+
+      LOOP AT it_yrd_supplement WHERE matnr = it_yrd_open_wo-matnr
+                                  AND werks = it_yrd_open_wo-werks
+                                  AND deleted = 'X'.
+        it_yrd_supplement-deleted = ''.
+        MODIFY it_yrd_supplement.
+      ENDLOOP.
+
+      CALL FUNCTION 'RP_CALC_DATE_IN_INTERVAL'
+        EXPORTING
+          date            = sy-datum
+          days            = 0
+          months          = 0
+*         SIGNUM          = '+'
+          years           = 5
+       IMPORTING
+         calc_date       = it_yrd_open_wo-gltrp.
+      CONCATENATE it_yrd_open_wo-gltrp(4) '1231' INTO it_yrd_open_wo-gltrp.
+      CONDENSE it_yrd_open_wo-gltrp NO-GAPS.
+
+    ENDIF.
+
+    MODIFY it_yrd_open_wo.
+  ENDLOOP.
+
+
+*(5).Update the DB table
+  MODIFY yrd_open_wo FROM TABLE it_yrd_open_wo.
+
+
+*(6).Update the finish date of work orders
+  SORT it_yrd_open_wo DESCENDING BY gltrp.
+  SORT it_yrd_open_wo STABLE BY aufnr ASCENDING.
+  DELETE ADJACENT DUPLICATES FROM it_yrd_open_wo COMPARING aufnr.
+
+  LOOP AT it_yrd_open_wo.
+    CLEAR: wa_orderdata,wa_orderdatax,wa_return.
+
+    IF it_yrd_open_wo-gltrp < sy-datum.
+      it_yrd_open_wo-gltrp = sy-datum.
+    ENDIF.
+    wa_orderdata-basic_end_date = it_yrd_open_wo-gltrp.
+    wa_orderdatax-basic_end_date = 'X'.
+
+    CALL FUNCTION 'BAPI_PRODORD_CHANGE'
+      EXPORTING
+        number                 = it_yrd_open_wo-aufnr
+        orderdata              = wa_orderdata
+        orderdatax             = wa_orderdatax
+      IMPORTING
+       return                 = wa_return
+*   ORDER_TYPE             =
+*   ORDER_STATUS           =
+*   MASTER_DATA_READ       =
+              .
+
+    IF NOT wa_return IS INITIAL.
+      it_message-light   = gc_light_red.
+      it_message-aufnr   = it_yrd_open_wo-aufnr.
+      it_message-type    = wa_return-type.
+      it_message-message = wa_return-message.
+    ELSE.
+      it_message-light   = gc_light_green.
+      it_message-aufnr   = it_yrd_open_wo-aufnr.
+      it_message-type    = 'S'.
+      it_message-message = 'Update success'.
+    ENDIF.
+    APPEND it_message.
+    CLEAR it_message.
+  ENDLOOP.
+
+
+*(7).Show_message
+  PERFORM show_message.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  SHOW_MESSAGE
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM show_message .
+
+*ALV Define
+  TYPE-POOLS: slis.
+  DATA: ls_layout TYPE slis_layout_alv.
+  DATA: lt_fieldcate TYPE slis_t_fieldcat_alv WITH HEADER LINE.
+
+*ALV Display set fields
+  CLEAR lt_fieldcate.
+  lt_fieldcate-fieldname = 'LIGHT'.
+  lt_fieldcate-seltext_m = text-z01.
+  lt_fieldcate-outputlen = 10.
+  lt_fieldcate-just = 'L'.
+  APPEND lt_fieldcate.
+
+  CLEAR lt_fieldcate.
+  lt_fieldcate-fieldname = 'AUFNR'.
+  lt_fieldcate-seltext_m = text-z02.
+  lt_fieldcate-outputlen = 10.
+  lt_fieldcate-just = 'L'.
+  APPEND lt_fieldcate.
+
+
+  CLEAR lt_fieldcate.
+  lt_fieldcate-fieldname = 'TYPE'.
+  lt_fieldcate-seltext_m = text-z03.
+  lt_fieldcate-outputlen = 5.
+  lt_fieldcate-just = 'L'.
+  APPEND lt_fieldcate.
+
+  CLEAR lt_fieldcate.
+  lt_fieldcate-fieldname = 'MESSAGE'.
+  lt_fieldcate-seltext_m = text-z04.
+  lt_fieldcate-outputlen = 100.
+  lt_fieldcate-just = 'L'.
+  APPEND lt_fieldcate.
+
+  ls_layout-colwidth_optimize =  'X'.
+  ls_layout-zebra = 'X'.
+
+*Call FM, Display ALV
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+    EXPORTING
+      i_callback_program = sy-repid
+      i_grid_title       = text-001
+      is_layout          = ls_layout
+      it_fieldcat        = lt_fieldcate[]
+    TABLES
+      t_outtab           = it_message.
+
+ENDFORM.                    " SHOW_MESSAGE
+
+*Text symbol text£º
+*001:WOFD Update Message
+*Z01:Light
+*Z02:Work Order
+*Z03:Message Type
+*Z04:Message Description

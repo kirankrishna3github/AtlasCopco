@@ -1,0 +1,1198 @@
+*&---------------------------------------------------------------------*
+*& Report  YSE_AUTOMON_VT_SAP
+*&
+*&---------------------------------------------------------------------*
+*&
+*& Auto Processing of Monitoring tool VisiTour vs. SAP
+*&
+*&---------------------------------------------------------------------*
+*  Author                : Jules Smets
+*  Date                  : 11.04.2013
+*  Change Request Number : CR2875
+*  Transport request Nr. : CD1K975573
+*----------------------------------------------------------------------*
+*                                                                      *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD.NR. |   DATE     | NAME               | CORRECT. NR| CHANGE REF. *
+*----------------------------------------------------------------------*
+* MOD-001 | 01.01.9999 |                    | CD1K9..... | CR....      *
+*----------------------------------------------------------------------*
+
+************************************************************************
+
+REPORT  yse_automon_vt_sap.
+
+*----------------------------------------------------------------------*
+* BDC Tables                                                           *
+*----------------------------------------------------------------------*
+DATA: i_bdcdata      LIKE bdcdata OCCURS 0 WITH HEADER LINE,
+      struct_bdcdata TYPE bdcdata.
+
+*BDC Structure for Messages
+DATA : BEGIN OF i_messtab OCCURS 0.
+        INCLUDE STRUCTURE bdcmsgcoll.
+DATA : END OF i_messtab.
+
+*----------------------------------------------------------------------*
+* Internal tables for BAPI-ALM_ORDER_GETDETAIL                         *
+*----------------------------------------------------------------------*
+DATA: BEGIN OF i_es_header OCCURS 100.
+        INCLUDE STRUCTURE bapi_alm_order_header_e.
+DATA: END OF i_es_header.
+
+DATA: BEGIN OF i_operations OCCURS 100.
+        INCLUDE STRUCTURE bapi_alm_order_operation_e.
+DATA: END OF i_operations.
+
+DATA: BEGIN OF i_return OCCURS 100.
+        INCLUDE STRUCTURE bapiret2.
+DATA: END OF i_return.
+
+* Return
+DATA: lt_return   TYPE STANDARD TABLE OF bapiret2 WITH HEADER LINE,
+      ls_return   LIKE bapiret2.
+
+DATA: BEGIN OF gt_vt  OCCURS 0,
+        aufnr        TYPE aufnr,
+        oper         TYPE vornr,
+        status       TYPE ycallstate,
+        work_cntr    TYPE arbpl,
+        duration(4)  TYPE n,
+        date         TYPE datum,
+      END OF gt_vt.
+
+DATA: BEGIN OF gt_seo  OCCURS 0,
+        aufnr        TYPE aufnr,
+        oper         TYPE vornr,
+        status_vt    TYPE ycallstate,
+        status_sap   TYPE usrflag,
+        workc_vt     TYPE arbpl,
+        workc_sap    TYPE arbpl,
+        dur_vt(4)    TYPE n,
+        dur_sap      TYPE arbeit,
+        date_vt      TYPE datum,
+        date_sap     TYPE datum,
+        stat_clsd    TYPE xfeld,
+      END OF gt_seo.
+
+DATA: gv_input           TYPE string,
+      gv_status          TYPE usrflag,
+      gv_dur_c(4)        TYPE c,
+      gv_dur_a           TYPE arbeit,
+      gv_date_c(10)      TYPE c,
+      gv_error           TYPE xfeld,
+      gv_oper_index      TYPE sytabix,
+      gv_count           TYPE sytabix,
+      gv_stat_nok        TYPE xfeld,
+      gv_stat_rel        TYPE xfeld,
+      gv_stat_clsd       TYPE xfeld,
+      gv_objnr           TYPE j_objnr,
+      gv_arbei(8)        TYPE c,
+      gv_arbei_p         TYPE arbeit,
+      gv_aufpl           TYPE co_aufpl,
+      wa_jest            TYPE jest,
+      gs_afvc            TYPE afvc,
+      gv_afvgd_old       TYPE afvgd,
+      gv_afvgd_new       TYPE afvgd,
+      gv_newdate         LIKE afvv-fsavd,
+      gv_enddate         LIKE afvv-fsavd,
+      gv_seconds         TYPE cx_bearb,
+      gv_bedid           TYPE bedid,
+      gv_gstrp           TYPE pm_ordgstrp,
+      gv_gltrp           TYPE co_gltrp,
+      gv_cnt_upd         TYPE i,
+      gv_mode(1)         TYPE c  VALUE 'N'.
+
+DATA: gv_directory     TYPE epsdirnam  VALUE '/var/load/xxx/UK/read/',
+      gv_ifile         LIKE /sapdmc/lsoinp-filename,
+      gv_logsys        LIKE tbdlst-logsys.
+
+CONSTANTS:  c_x                         VALUE 'X',
+            c_msgty_e                   VALUE 'E',
+            c_msgty_s                   VALUE 'S',
+            c_msgty_w                   VALUE 'W',
+            c_blank                     VALUE ' ',
+            c_tab(2)     TYPE x         VALUE '0009',   "Tab delimiter
+            c_0010(4)                   VALUE '0010',
+            c_stat_rel   TYPE j_status  VALUE 'I0002',
+            c_stat_cnf   TYPE j_status  VALUE 'I0009',
+            c_stat_teco  TYPE j_status  VALUE 'I0045',
+            c_stat_clsd  TYPE j_status  VALUE 'I0046',
+            c_z000001(7)                VALUE 'Z000001'.
+
+*&---------------------------------------------------------------------*
+*&  Selection screen                                                   *
+*&---------------------------------------------------------------------*
+* Input file
+PARAMETERS: p_infile    TYPE  epsfilnam  LOWER CASE
+                                         OBLIGATORY,
+            p_mdate     TYPE  filemoddat DEFAULT sy-datum
+                                         OBLIGATORY.
+
+
+*&---------------------------------------------------------------------*
+*&  Main program                                                       *
+*&---------------------------------------------------------------------*
+START-OF-SELECTION.
+
+* Logical system
+  CALL FUNCTION 'OWN_LOGICAL_SYSTEM_GET'
+    IMPORTING
+      own_logical_system             = gv_logsys
+    EXCEPTIONS
+      own_logical_system_not_defined = 1
+      OTHERS                         = 2.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE 'E' NUMBER sy-msgno
+         WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+    STOP.
+  ENDIF.
+  REPLACE 'xxx' IN gv_directory WITH gv_logsys(3).
+
+* Check the date of the file
+  PERFORM check_date.
+  IF NOT gv_error IS INITIAL.
+    STOP.
+  ENDIF.
+
+* Read input file
+  PERFORM upload_data.
+* Check anything selected
+  IF NOT gv_error IS INITIAL.
+    MESSAGE ID 'YSE_GENERAL' TYPE 'E' NUMBER '000'
+            WITH 'Could not open input file'(e01).
+    STOP.
+  ENDIF.
+
+* Compare input from VisiTour with SEO in SAP
+  PERFORM compare_data.
+
+* Update Service Orders
+  PERFORM update_service_orders.
+
+
+*----------------------------------------------------------------------*
+END-OF-SELECTION.
+
+  WRITE: /01 'File:', gv_ifile,
+         /01 'Date:', sy-datum,
+         /01 'Number of Service Orders updated:', gv_cnt_upd.
+
+
+*&---------------------------------------------------------------------*
+*&  Forms                                                              *
+*&---------------------------------------------------------------------*
+
+*&---------------------------------------------------------------------*
+*&      Form  UPLOAD_DATA
+*&---------------------------------------------------------------------*
+*       Upload UNIX file
+*----------------------------------------------------------------------*
+FORM upload_data .
+
+  CLEAR gv_error.
+
+  CONCATENATE gv_directory p_infile INTO gv_ifile.
+
+  OPEN DATASET gv_ifile FOR INPUT IN TEXT MODE ENCODING DEFAULT.
+  IF sy-subrc <> 0.
+    gv_error = c_x.
+    EXIT.
+  ENDIF.
+
+  DO.
+    READ DATASET gv_ifile INTO gv_input.
+    IF sy-subrc NE 0.
+      EXIT.
+    ENDIF.
+
+    SPLIT gv_input AT cl_abap_char_utilities=>horizontal_tab
+                   INTO gt_vt-aufnr
+                        gt_vt-oper
+                        gt_vt-status
+                        gt_vt-work_cntr
+                        gt_vt-duration
+                        gv_date_c.
+*   Order number
+    CHECK NOT gt_vt-aufnr IS INITIAL.
+    IF gt_vt-aufnr CO '0123456789 '.
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+        EXPORTING
+          input  = gt_vt-aufnr
+        IMPORTING
+          output = gt_vt-aufnr.
+    ELSE.
+*     Header
+      CONTINUE.
+    ENDIF.
+*   Date
+    gt_vt-date(4)   = gv_date_c+6(4).
+    gt_vt-date+4(2) = gv_date_c+3(2).
+    gt_vt-date+6(2) = gv_date_c(2).
+
+    APPEND gt_vt.
+  ENDDO.
+
+ENDFORM.                    " UPLOAD_DATA
+
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_DATE
+*&---------------------------------------------------------------------*
+*       Check the date of the file
+*----------------------------------------------------------------------*
+FORM check_date .
+
+  DATA: ls_epsf     TYPE epsf,
+        lv_mtime    TYPE p  DECIMALS 0,
+        lv_time(10) TYPE c,
+        lv_mdate    TYPE sydatum.
+
+  CLEAR gv_error.
+
+  CALL FUNCTION 'EPS_GET_FILE_ATTRIBUTES'
+    EXPORTING
+      file_name                    = p_infile
+      dir_name                     = gv_directory
+    IMPORTING
+      file_mtime                   = lv_mtime
+    EXCEPTIONS
+      read_directory_failed        = 1
+      read_attributes_failed       = 2
+      OTHERS                       = 3
+            .
+  IF sy-subrc <> 0.
+*    MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*            WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+  ENDIF.
+
+  PERFORM p6_to_date_time_tz IN PROGRAM rstr0400
+                             USING lv_mtime
+                                   lv_time
+                                   lv_mdate.
+
+  IF lv_mdate NE p_mdate.
+    MESSAGE ID 'YSE_GENERAL' TYPE 'E' NUMBER '000'
+            WITH 'Wrong date of input file'(e02) lv_mdate.
+    gv_error = c_x.
+  ENDIF.
+
+ENDFORM.                    " CHECK_DATE
+
+*&---------------------------------------------------------------------*
+*&      Form  COMPARE_DATA
+*&---------------------------------------------------------------------*
+*       Compare input from VisiTour with SEO in SAP
+*----------------------------------------------------------------------*
+FORM compare_data .
+
+  LOOP AT gt_vt.
+
+*   Get SAP data
+    PERFORM get_sap_data USING gt_vt-aufnr gt_vt-oper.
+    CHECK gv_error IS INITIAL.
+*   Status 'Fixed'
+    CLEAR gv_status.
+    IF gt_vt-status = '3'.
+      gv_status = 'X'.
+    ENDIF.
+    IF gv_status NE i_operations-usr11.
+      gv_error = c_x.
+    ENDIF.
+*   Workcenter
+    IF gt_vt-work_cntr NE i_operations-work_cntr.
+      gv_error = c_x.
+    ENDIF.
+*   Duration
+    gv_dur_a = gt_vt-duration / 60.
+    IF gv_dur_a NE i_operations-work_activity.
+      gv_error = c_x.
+    ENDIF.
+*   Date
+    IF gt_vt-date NE i_operations-earl_sched_start_date.
+      gv_error = c_x.
+    ENDIF.
+
+*   Error
+    IF gv_error = c_x.
+*     Get status 'Closed'
+      PERFORM get_stat_clsd.
+*     Fill internal table for output
+      PERFORM fill_output.
+    ENDIF.
+
+  ENDLOOP.
+
+ENDFORM.                    " COMPARE_DATA
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_SAP_DATA
+*&---------------------------------------------------------------------*
+*       Get SAP data
+*----------------------------------------------------------------------*
+*      -->P_AUFNR : Service order number
+*      -->P_OPER  : Operation number
+*----------------------------------------------------------------------*
+FORM get_sap_data  USING  p_aufnr TYPE aufnr
+                          p_oper  TYPE vornr.
+
+  CLEAR gv_error.
+
+  CALL FUNCTION 'BAPI_ALM_ORDER_GET_DETAIL'
+    EXPORTING
+      number        = p_aufnr
+    IMPORTING
+      es_header     = i_es_header
+    TABLES
+      et_operations = i_operations
+      return        = i_return[].
+
+*---------------------------------------------------------------*
+* Check if Ordernumber is available in SAP                      *
+*---------------------------------------------------------------*
+  IF NOT i_return[] IS INITIAL.
+    READ TABLE i_return INDEX 1.
+    IF i_return-type NE c_msgty_s.
+      gv_error = c_x.
+      RETURN.
+    ENDIF.
+  ENDIF.
+
+*---------------------------------------------------------------*
+* Check if operation exists in SAP                              *
+*---------------------------------------------------------------*
+  SORT i_operations[] BY activity.
+  IF NOT i_operations[] IS INITIAL AND
+     NOT gt_vt-oper IS INITIAL.
+    READ TABLE i_operations WITH KEY activity = p_oper
+                            BINARY SEARCH.
+    IF sy-subrc <> 0.
+      gv_error = c_x.
+      RETURN.
+    ELSE.
+      gv_oper_index = sy-tabix.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    " GET_SAP_DATA
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_STAT_CLSD
+*&---------------------------------------------------------------------*
+*       Get status 'Closed'
+*----------------------------------------------------------------------*
+FORM get_stat_clsd .
+
+  CLEAR gv_stat_clsd.
+
+* Get status CLSD (Closed)
+  CALL FUNCTION 'STATUS_CHECK'
+    EXPORTING
+      objnr             = i_es_header-object_no
+      status            = c_stat_clsd
+    EXCEPTIONS
+      object_not_found  = 1
+      status_not_active = 2
+      OTHERS            = 3.
+
+  IF sy-subrc = 0.
+    gv_stat_clsd = 'X'.
+    RETURN.
+  ELSE.
+*    MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*            WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+  ENDIF.
+
+ENDFORM.                    " GET_STAT_CLSD
+
+*&---------------------------------------------------------------------*
+*&      Form  FILL_OUTPUT
+*&---------------------------------------------------------------------*
+*       Fill internal table for output
+*----------------------------------------------------------------------*
+FORM fill_output .
+
+  gt_seo-aufnr      = gt_vt-aufnr.
+  gt_seo-oper       = gt_vt-oper.
+  gt_seo-status_vt  = gt_vt-status.
+  gt_seo-status_sap = i_operations-usr11.
+  gt_seo-workc_vt   = gt_vt-work_cntr.
+  gt_seo-workc_sap  = i_operations-work_cntr.
+  gt_seo-dur_vt     = gt_vt-duration.
+  gt_seo-dur_sap    = i_operations-work_activity.
+  gt_seo-date_vt    = gt_vt-date.
+  gt_seo-date_sap   = i_operations-earl_sched_start_date.
+  gt_seo-stat_clsd  = gv_stat_clsd.
+  APPEND gt_seo.
+
+ENDFORM.                    " FILL_OUTPUT
+
+*&---------------------------------------------------------------------*
+*&      Form  UPDATE_SERVICE_ORDERS
+*&---------------------------------------------------------------------*
+*       Update Service Orders
+*----------------------------------------------------------------------*
+FORM update_service_orders .
+
+  CLEAR gv_cnt_upd.
+
+* Loop on the Service orders
+  LOOP AT gt_seo.
+
+*   Get SAP data
+    PERFORM get_sap_data USING gt_seo-aufnr gt_seo-oper.
+    CHECK gv_error IS INITIAL.
+
+*   Check if status is not CNF, TECO or CLSD
+    CLEAR gv_stat_nok.
+    PERFORM check_status.
+    CHECK gv_stat_nok IS INITIAL.
+
+*   Check status REL
+    PERFORM check_status_rel.
+
+*   Update operation data
+    PERFORM update_operation.
+
+*   Update OK ?
+    IF gv_error IS INITIAL.
+*     Count
+      gv_cnt_upd = gv_cnt_upd + 1.
+    ENDIF.
+
+  ENDLOOP.
+
+ENDFORM.                    " UPDATE_SERVICE_ORDERS
+
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_STATUS
+*&---------------------------------------------------------------------*
+*       Check if status is not CNF, TECO or CLSD
+*----------------------------------------------------------------------*
+FORM check_status .
+
+  CONCATENATE 'OR' gt_seo-aufnr INTO gv_objnr.
+
+* Check status CNF (Confirmed)
+  CALL FUNCTION 'STATUS_CHECK'
+    EXPORTING
+      objnr             = gv_objnr
+      status            = c_stat_cnf
+    EXCEPTIONS
+      object_not_found  = 1
+      status_not_active = 2
+      OTHERS            = 3.
+  IF sy-subrc = 0.
+    gv_stat_nok = 'X'.
+    RETURN.
+  ELSE.
+*    MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*            WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+  ENDIF.
+
+* Check status TECO (Technical Completed)
+  CALL FUNCTION 'STATUS_CHECK'
+    EXPORTING
+      objnr             = gv_objnr
+      status            = c_stat_teco
+    EXCEPTIONS
+      object_not_found  = 1
+      status_not_active = 2
+      OTHERS            = 3.
+  IF sy-subrc = 0.
+    gv_stat_nok = 'X'.
+    RETURN.
+  ELSE.
+*    MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*            WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+  ENDIF.
+
+* Check status CLSD (Closed)
+  CALL FUNCTION 'STATUS_CHECK'
+    EXPORTING
+      objnr             = gv_objnr
+      status            = c_stat_clsd
+    EXCEPTIONS
+      object_not_found  = 1
+      status_not_active = 2
+      OTHERS            = 3.
+  IF sy-subrc = 0.
+    gv_stat_nok = 'X'.
+    RETURN.
+  ELSE.
+*    MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*            WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+  ENDIF.
+
+ENDFORM.                    " CHECK_STATUS
+
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_STATUS_REL
+*&---------------------------------------------------------------------*
+*       Check status REL (Released)
+*----------------------------------------------------------------------*
+FORM check_status_rel .
+
+  CONCATENATE 'OR' gt_seo-aufnr INTO gv_objnr.
+
+  CLEAR gv_stat_rel.
+
+  CALL FUNCTION 'STATUS_CHECK'
+    EXPORTING
+      objnr             = gv_objnr
+      status            = c_stat_rel
+    EXCEPTIONS
+      object_not_found  = 1
+      status_not_active = 2
+      OTHERS            = 3.
+  IF sy-subrc = 0.
+    gv_stat_rel = 'X'.
+  ELSE.
+*    MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*            WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+  ENDIF.
+
+ENDFORM.                    " CHECK_STATUS_REL
+
+*&---------------------------------------------------------------------*
+*&      Form  UPDATE_OPERATION
+*&---------------------------------------------------------------------*
+*       Update operation data
+*----------------------------------------------------------------------*
+FORM update_operation .
+
+  REFRESH: i_bdcdata, i_messtab.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                 USING    'SAPLCOIH'  '0101'  'X' ' ' ' '
+                 CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+     USING    ''  '' ' ' 'CAUFVD-AUFNR' gt_seo-aufnr
+     CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+     USING    ''  '' ' ' 'BDC_OKCODE'  '/00'
+     CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+*----------------------------------------------------------------------*
+*   Operations
+*----------------------------------------------------------------------*
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+               USING    'SAPLCOIH'  '3000'  'X' ''  ''
+               CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+               USING    ''  ''  '' 'BDC_OKCODE'  '=VGUE'
+               CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+*----------------------------------------------------------------------*
+*   Select all operations
+*----------------------------------------------------------------------*
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    'SAPLCOIH'  '3000'  'X' ''  ''
+       CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+      USING    ''  ''  '' 'BDC_OKCODE' '=AMAK'
+      CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+*----------------------------------------------------------------------*
+*   General data
+*----------------------------------------------------------------------*
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    'SAPLCOIH'  '3000'  'X' ''  ''
+       CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+      USING    ''  ''  '' 'BDC_OKCODE' '=VGD0'
+      CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+*----------------------------------------------------------------------*
+*   Hit the next operation button as many times as necessary to find
+*   the correct operation
+*----------------------------------------------------------------------*
+  IF gv_oper_index > 1.
+    gv_count = gv_oper_index - 1.
+    DO gv_count TIMES.
+      PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    'SAPLCOIH'  '3000'  'X' ''  ''
+           CHANGING struct_bdcdata.
+      APPEND struct_bdcdata  TO i_bdcdata.
+      CLEAR  struct_bdcdata.
+
+      PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  '' 'BDC_OKCODE' '=VG+'
+          CHANGING struct_bdcdata.
+      APPEND struct_bdcdata  TO i_bdcdata.
+      CLEAR  struct_bdcdata.
+    ENDDO.
+  ENDIF.
+*----------------------------------------------------------------------*
+*   Change workcenter (eventually) and go to the tab dates
+*----------------------------------------------------------------------*
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    'SAPLCOIH'  '3000'  'X' ''  ''
+       CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  IF NOT gt_seo-workc_vt IS INITIAL.
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                USING    ''  ''  '' 'AFVGD-ARBPL' gt_seo-workc_vt
+                CHANGING struct_bdcdata.
+    APPEND struct_bdcdata  TO i_bdcdata.
+    CLEAR  struct_bdcdata.
+  ENDIF.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  '' 'BDC_OKCODE' '=VGD1'
+          CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+               USING    'SAPLCOIH'  '3000'  'X' ''  ''
+               CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  gv_dur_a = gt_seo-dur_vt.
+  gv_arbei_p =   gv_dur_a / 60.
+  IF NOT gv_arbei_p IS INITIAL.
+    WRITE gv_arbei_p TO gv_arbei.
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                        USING    ''  ''  '' 'AFVGD-ARBEI' gv_arbei
+                        CHANGING struct_bdcdata.
+    APPEND struct_bdcdata  TO i_bdcdata.
+    CLEAR  struct_bdcdata.
+  ENDIF.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  '' 'BDC_OKCODE' '=VGD3'
+          CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+*----------------------------------------------------------------------*
+*   To the tab with the enhancement
+*----------------------------------------------------------------------*
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+     USING    'SAPLCOIH'  '3000'  'X' ''  ''
+     CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  '' 'BDC_OKCODE' '=VGD5'
+          CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+*----------------------------------------------------------------------*
+*   Update the field 'field key'
+*----------------------------------------------------------------------*
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+     USING    'SAPLCOIH'  '3000'  'X' ''  ''
+     CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+      USING    ''  ''  '' 'AFVGD-SLWID' c_z000001
+      CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+        USING    ''  ''  '' 'BDC_OKCODE' '/00'
+        CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    'SAPLCOIH'  '3000'  'X' ''  ''
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+* Status Fixed
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+    USING    ''  ''  '' 'AFVGD-USR11' c_x
+    CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+* Order alrady released ?
+  IF NOT gv_stat_rel IS INITIAL.
+*   Save
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+        USING    ''  ''  '' 'BDC_OKCODE' '=BU'
+        CHANGING struct_bdcdata.
+    APPEND struct_bdcdata  TO i_bdcdata.
+    CLEAR  struct_bdcdata.
+  ELSE.
+*  Release the order
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+         USING    ''  ''  '' 'BDC_OKCODE' '=IHKZ'
+         CHANGING struct_bdcdata.
+    APPEND struct_bdcdata  TO i_bdcdata.
+    CLEAR  struct_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    'SAPLCOIH'  '3000'  'X' ''  ''
+           CHANGING struct_bdcdata.
+    APPEND struct_bdcdata  TO i_bdcdata.
+    CLEAR  struct_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  '' 'BDC_OKCODE' '=FREI'
+          CHANGING struct_bdcdata.
+    APPEND struct_bdcdata  TO i_bdcdata.
+    CLEAR  struct_bdcdata.
+*   Save
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    'SAPLCOIH'  '3000'  'X' ''  ''
+           CHANGING struct_bdcdata.
+    APPEND struct_bdcdata  TO i_bdcdata.
+    CLEAR  struct_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  '' 'BDC_OKCODE' '=BU'
+          CHANGING struct_bdcdata.
+    APPEND struct_bdcdata  TO i_bdcdata.
+    CLEAR  struct_bdcdata.
+  ENDIF.
+*----------------------------------------------------------------------*
+*   Call transaction IW32
+*----------------------------------------------------------------------*
+  CALL TRANSACTION  'IW32'  USING i_bdcdata
+                            MODE gv_mode
+                            UPDATE 'S'
+                            MESSAGES INTO i_messtab.
+
+* Check if BDC error
+  IF NOT i_messtab[] IS INITIAL.
+    LOOP AT i_messtab WHERE msgtyp = 'E'  OR
+                            msgtyp = 'A'.
+      gv_error = 'X'.
+      EXIT.
+    ENDLOOP.
+  ENDIF.
+  CHECK gv_error IS INITIAL.
+
+* Dates
+  IF gt_seo-date_vt NE gt_seo-date_sap.
+*   Update dates
+    PERFORM update_dates.
+*   Update dates from other operations
+    PERFORM update_dates_oper.
+  ENDIF.
+
+* User status
+  IF gt_seo-status_sap IS INITIAL.
+    PERFORM update_user_status.
+  ENDIF.
+
+*----------------------------------------------------------------------*
+* If there is a workcenter change --> also change notification
+*----------------------------------------------------------------------*
+  REFRESH i_bdcdata.
+
+  IF gt_seo-workc_vt NE gt_seo-workc_sap  AND
+     gt_seo-oper = c_0010                 AND
+     NOT gt_seo-workc_vt IS INITIAL.
+    PERFORM change_workcenter.
+  ENDIF.
+
+ENDFORM.                    " UPDATE_OPERATION
+
+*&---------------------------------------------------------------------*
+*&      Form  UPDATE_DATES
+*&---------------------------------------------------------------------*
+*       Update dates
+*----------------------------------------------------------------------*
+FORM update_dates .
+
+  SELECT SINGLE aufpl INTO gv_aufpl
+         FROM afko
+         WHERE aufnr = gt_seo-aufnr.
+
+  CALL FUNCTION 'CO_DB_AFVG_READ_WITH_VORNR'
+    EXPORTING
+      afvg_nummer = gv_aufpl
+      vornr_imp   = gt_seo-oper
+*      VSNMR_IMP   =
+    IMPORTING
+      afvgd_exp   = gv_afvgd_old
+    EXCEPTIONS
+      not_found   = 1
+      OTHERS      = 2
+            .
+  IF sy-subrc = 0.
+    CLEAR: gv_newdate.
+    CLEAR: gv_enddate.
+    IF NOT gt_seo-date_vt IS INITIAL.
+      gv_newdate = gt_seo-date_vt.
+      gv_seconds = gt_seo-dur_vt * 60.
+
+      CALL FUNCTION 'CX_SCHED_VIA_OPERATING_TIME'
+       EXPORTING
+         i_date_start          = gv_newdate
+*         i_time_start          = gv_newtime
+         i_duration_sec        = gv_seconds
+       IMPORTING
+         e_date_end            = gv_enddate
+*         e_time_end            = gv_endtime
+       EXCEPTIONS
+         parameters_not_valid  = 1
+         OTHERS                = 2
+            .
+      IF sy-subrc <> 0.
+      ENDIF.
+
+*     Intercept wrong dates from Visitour
+      IF gv_newdate(4) < '2000'.
+        CLEAR: gv_gstrp, gv_gltrp.
+        SELECT SINGLE gstrp gltrp INTO (gv_gstrp, gv_gltrp)
+               FROM afko
+               WHERE aufnr = gt_seo-aufnr.
+        IF sy-subrc = 0.
+          IF gv_gstrp < sy-datum.
+            gv_gstrp = sy-datum.
+          ENDIF.
+          IF gv_gltrp < sy-datum.
+            gv_gltrp = sy-datum.
+          ENDIF.
+          gv_newdate = gv_gstrp.
+          gv_enddate = gv_gltrp.
+        ENDIF.
+      ENDIF.
+
+*     Modify dates
+      IF gv_newdate <> gv_afvgd_old-fsavd.
+        gv_afvgd_new = gv_afvgd_old.
+        MOVE gv_newdate TO gv_afvgd_new-fsavd.
+        MOVE gv_newdate TO gv_afvgd_new-ssavd.
+        IF NOT gv_enddate IS INITIAL.
+          MOVE gv_enddate TO gv_afvgd_new-fsedd.
+          MOVE gv_enddate TO gv_afvgd_new-ssedd.
+        ELSE.
+          MOVE gv_newdate TO gv_afvgd_new-fsedd.
+          MOVE gv_newdate TO gv_afvgd_new-ssedd.
+        ENDIF.
+
+        UPDATE afvv SET fsavd = gv_afvgd_new-fsavd
+                        ssavd = gv_afvgd_new-ssavd
+                        fsedd = gv_afvgd_new-fsedd
+                        ssedd = gv_afvgd_new-ssedd
+                        epanf = gv_afvgd_new-fsavd
+                        epend = gv_afvgd_new-fsedd
+                        ntanf = gv_afvgd_new-fsavd
+                        ntend = gv_afvgd_new-fsedd
+                    WHERE aufpl = gv_afvgd_new-aufpl
+                      AND aplzl = gv_afvgd_new-aplzl.
+
+        PERFORM create_changedoc.
+
+*       Extra updates on header (when operation = 0010)
+        IF gt_seo-oper = c_0010.
+          CLEAR: gv_bedid.
+          SELECT SINGLE bedid INTO gv_bedid
+                 FROM afko
+                 WHERE aufnr = gt_seo-aufnr.
+          IF sy-subrc = 0.
+            UPDATE afko SET gstrs = gv_afvgd_new-fsavd
+                            gltrs = gv_afvgd_new-fsedd
+                        WHERE aufnr = gt_seo-aufnr.
+            UPDATE kbko SET gstrs = gv_afvgd_new-fsavd
+                            gltrs = gv_afvgd_new-fsedd
+                        WHERE bedid = gv_bedid.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    " UPDATE_DATES
+
+*&---------------------------------------------------------------------*
+*&      Form  CREATE_CHANGEDOC
+*&---------------------------------------------------------------------*
+*       Create change document
+*----------------------------------------------------------------------*
+FORM create_changedoc.
+
+  DATA: n_afvv         TYPE afvv,
+        o_afvv         TYPE afvv,
+        objectid       TYPE cdhdr-objectid ,
+        t_cdtxt        TYPE TABLE OF cdtxt,
+        wa_viauf_afvc  TYPE viauf_afvc,
+        lv_aufnr       TYPE aufnr,
+        lv_autyp       TYPE auftyp.
+
+
+  CLEAR : o_afvv, n_afvv, lv_aufnr, lv_autyp.
+
+  IF gv_afvgd_old-epanf <> gv_afvgd_new-epanf.
+
+    o_afvv-mandt = sy-mandt.
+    o_afvv-aufpl = gv_afvgd_old-aufpl.
+    o_afvv-aplzl = gv_afvgd_old-aplzl.
+    o_afvv-epanf = gv_afvgd_old-epanf.
+
+    n_afvv = o_afvv.
+    n_afvv-epanf = gv_afvgd_new-epanf.
+
+    SELECT SINGLE aufnr INTO lv_aufnr
+           FROM viauf_afvc
+           WHERE aufpl = gv_afvgd_old-aufpl
+             AND aplzl = gv_afvgd_old-aplzl.
+
+    IF sy-subrc = 0.
+      SELECT SINGLE autyp INTO lv_autyp
+             FROM aufk
+             WHERE aufnr = lv_aufnr.
+      CONCATENATE sy-mandt lv_autyp lv_aufnr INTO objectid.
+
+      CALL FUNCTION 'YSE_AFVV_WRITE_DOCUMENT'
+        EXPORTING
+          objectid                = objectid
+          tcode                   = 'IW32'
+          utime                   = sy-uzeit
+          udate                   = sy-datum
+          username                = sy-uname
+          planned_or_real_changes = 'R'
+          n_afvv                  = n_afvv
+          o_afvv                  = o_afvv
+          upd_afvv                = 'U'
+        TABLES
+          icdtxt_afvv             = t_cdtxt.
+    ENDIF.
+
+  ENDIF.
+
+ENDFORM.                    " CREATE_CHANGEDOC
+
+*&---------------------------------------------------------------------*
+*&      Form  UPDATE_DATES_OPER
+*&---------------------------------------------------------------------*
+*       Update dates from other operations
+*----------------------------------------------------------------------*
+FORM update_dates_oper .
+
+  DATA: lv_oper    TYPE vornr,
+        lv_afvgd   TYPE afvgd.
+
+
+  SELECT SINGLE aufpl INTO gv_aufpl
+         FROM afko
+         WHERE aufnr = gt_seo-aufnr.
+
+* First change header dates
+  lv_oper = c_0010.
+  CALL FUNCTION 'CO_DB_AFVG_READ_WITH_VORNR'
+    EXPORTING
+      afvg_nummer = gv_aufpl
+      vornr_imp   = lv_oper
+*      VSNMR_IMP   =
+    IMPORTING
+      afvgd_exp   = lv_afvgd
+    EXCEPTIONS
+      not_found   = 1
+      OTHERS      = 2
+            .
+  IF sy-subrc = 0.
+    CLEAR: gv_bedid.
+    SELECT SINGLE bedid INTO gv_bedid
+           FROM afko
+           WHERE aufnr = gt_seo-aufnr.
+    IF sy-subrc = 0.
+      UPDATE afko SET gstrs = lv_afvgd-ntanf
+                      gsuzs = lv_afvgd-ntanz
+                      gltrs = lv_afvgd-ntend
+                      gluzs = lv_afvgd-ntenz
+                  WHERE aufnr = gt_seo-aufnr.
+      UPDATE kbko SET gstrs = lv_afvgd-ntanf
+                      gltrs = lv_afvgd-ntend
+                  WHERE bedid = gv_bedid.
+    ENDIF.
+  ENDIF.
+
+* Change other operations (when needed)
+  LOOP AT i_operations WHERE control_key = 'ZCO3'.
+    CHECK i_operations-activity NE gt_seo-oper.
+    lv_oper = i_operations-activity.
+    CALL FUNCTION 'CO_DB_AFVG_READ_WITH_VORNR'
+      EXPORTING
+        afvg_nummer = gv_aufpl
+        vornr_imp   = lv_oper
+*      VSNMR_IMP   =
+      IMPORTING
+        afvgd_exp   = lv_afvgd
+      EXCEPTIONS
+        not_found   = 1
+        OTHERS      = 2
+              .
+    IF sy-subrc = 0.
+      UPDATE afvv SET fsavd = lv_afvgd-ntanf
+                      ssavd = lv_afvgd-ntanf
+                      fsavz = lv_afvgd-ntanz
+                      ssavz = lv_afvgd-ntanz
+                      fsedd = lv_afvgd-ntend
+                      ssedd = lv_afvgd-ntend
+                      fsedz = lv_afvgd-ntenz
+                      ssedz = lv_afvgd-ntenz
+                      epanf = lv_afvgd-ntanf
+                      epanz = lv_afvgd-ntanz
+                      epend = lv_afvgd-ntend
+                      epenz = lv_afvgd-ntenz
+                  WHERE aufpl = lv_afvgd-aufpl
+                    AND aplzl = lv_afvgd-aplzl.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    " UPDATE_DATES_OPER
+
+*&---------------------------------------------------------------------*
+*&      Form  UPDATE_USER_STATUS
+*&---------------------------------------------------------------------*
+*       Update user status
+*----------------------------------------------------------------------*
+FORM update_user_status .
+
+  DATA: lv_usr_stat_fixe  LIKE  tj30t-estat,
+        lv_aufpl          LIKE afko-aufpl,
+        ls_afvc           TYPE afvc.
+
+  SELECT SINGLE aufpl INTO lv_aufpl
+         FROM afko
+         WHERE aufnr = gt_seo-aufnr.
+
+  SELECT SINGLE * INTO ls_afvc
+         FROM afvc
+         WHERE aufpl = lv_aufpl
+           AND vornr = gt_seo-oper.
+
+  CONCATENATE 'OV' ls_afvc-aufpl ls_afvc-aplzl INTO gv_objnr.
+
+  SELECT SINGLE estat INTO lv_usr_stat_fixe
+         FROM tj30t
+         WHERE stsma = 'ZAM00003'
+           AND txt04 = 'FIXE'
+           AND spras = sy-langu.
+
+  CALL FUNCTION 'STATUS_CHANGE_EXTERN'
+    EXPORTING
+      check_only          = ' '
+      client              = sy-mandt
+      objnr               = gv_objnr
+      user_status         = lv_usr_stat_fixe
+      set_inact           = ' '
+      no_check            = ' '
+    EXCEPTIONS
+      object_not_found    = 1
+      status_inconsistent = 2
+      status_not_allowed  = 3
+      OTHERS              = 4.
+  IF sy-subrc = 0.
+*   COMMIT WORK AND WAIT.
+    PERFORM process_commit.
+  ENDIF.
+
+ENDFORM.                    " UPDATE_USER_STATUS
+
+*&---------------------------------------------------------------------*
+*&      Form  PROCESS_COMMIT
+*&---------------------------------------------------------------------*
+*       Process commit
+*----------------------------------------------------------------------*
+FORM process_commit .
+
+  DATA: lv_bapiret2 TYPE bapiret2.
+
+  CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+    EXPORTING
+      wait   = 'X'
+    IMPORTING
+      return = lv_bapiret2.
+
+ENDFORM.                    " PROCESS_COMMIT
+
+*&---------------------------------------------------------------------*
+*&      Form  CHANGE_WORKCENTER
+*&---------------------------------------------------------------------*
+*       Change workcenter
+*----------------------------------------------------------------------*
+FORM change_workcenter .
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                       USING    'SAPLIQS0'  '0100'  'X' ' ' ' '
+                       CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+     USING    ''  '' ' ' 'RIWO00-QMNUM' i_es_header-notif_no
+     CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+     USING    ''  '' ' ' 'BDC_OKCODE'  '/00'
+     CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                         USING    'SAPLIQS0'  '7200'  'X' ' ' ' '
+                         CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+     USING    ''  '' ' ' 'RIWO00-GEWRK' gt_seo-workc_vt
+     CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+     USING    ''  '' ' ' 'BDC_OKCODE'  '=BUCH'
+     CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+*----------------------------------------------------------------------*
+*   Call transaction IW52
+*----------------------------------------------------------------------*
+  CALL TRANSACTION  'IW52'  USING i_bdcdata
+                            MODE gv_mode
+                            UPDATE 'S'
+                            MESSAGES INTO i_messtab.
+
+ENDFORM.                    " CHANGE_WORKCENTER
+
+*Text symbol text£º
+*E01:Could not open input file
+
+*E02:Wrong date of input file
+*Selection text£º
+*P_INFILE:        Input File
+*P_MDATE:D       .

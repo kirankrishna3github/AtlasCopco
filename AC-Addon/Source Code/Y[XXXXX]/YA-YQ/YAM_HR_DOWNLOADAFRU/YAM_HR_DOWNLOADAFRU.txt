@@ -1,0 +1,437 @@
+*&---------------------------------------------------------------------*
+*& Report YAM_HR_DOWNLOADAFRU                                          *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+* Program ID        : YAM_HR_DOWNLOADAFRU 					
+* Program Title        : Download contents AFRU table                            	
+* Author               : Rosa Maria Revuelta Moran
+* Date                 : 07/11/2007                               	
+* Change Request Number: CD1K924273                                	
+* Description         : This program downloads data from AFRU and
+*                       CRHD tables into a flat file.
+*
+*======================================================================*
+* Copied From         : (Cloned Program)
+* Title               : (Program Title)                          	
+* Other Related obj   : (Object names)                 		
+*======================================================================*
+* Change History Log                                             	
+*----------------------------------------------------------------------*
+* Mod. no.|  Date    | Name           | Correction Number  | Change
+* Reference #	
+*----------------------------------------------------------------------*
+
+REPORT  YAM_HR_DOWNLOADAFRU NO STANDARD PAGE HEADING
+                            message-ID YAM_AFRU
+                            LINE-SIZE 164
+                            LINE-COUNT 65(2).
+
+*----------------------------------------------------------------------*
+* TYPES DEFINITIONS                                                    *
+*----------------------------------------------------------------------*
+TYPES: BEGIN OF ty_centers,
+         objid TYPE crhd-objid,  " Object id
+         arbpl TYPE crhd-arbpl.  " work center
+TYPES: END OF ty_centers.
+
+TYPES: BEGIN OF ty_work,
+         arbpl TYPE crhd-arbpl,  " work center
+         isdd TYPE afru-isdd,    " execution date
+         aufnr TYPE afru-aufnr,  " order
+         learr TYPE afru-learr,  " activity type
+         grund TYPE afru-grund,  " reason
+         isdz TYPE afru-isdz,    " start time
+         ismnw TYPE p decimals 2,  " number of hours
+         ismnu TYPE afru-ismnu,  " unit for work
+         stzhl type afru-stzhl,  " Confirmation counter of cancelled confirmation
+                                 " (to know if hours are negative)
+         ismne TYPE afru-ismne.  " unit for work
+
+TYPES: END OF ty_work.
+
+TYPES: BEGIN OF ty_file,
+         arbpl(8),          " work center
+         isdd(8),           " execution date
+         aufnr(12),         " order
+         learr(6),          " activity type
+         grund(4),          " reason
+         isdz(6),           " start time
+         ismnw(9).          " number of hours
+
+TYPES: END OF ty_file.
+
+TYPES: BEGIN OF ty_dates,
+         objid TYPE crhd-objid,   " object id
+         isdd TYPE afru-isdd,     " execution date
+         arbpl TYPE crhd-arbpl.   " work center
+TYPES: END OF ty_dates.
+
+*----------------------------------------------------------------------*
+*  Declaration of SYSTEM TABLES                                        *
+*----------------------------------------------------------------------*
+TABLES: crhd,   " Work Center Header
+        afru,   " Order Confirmations
+        pa0105. " HR Master Record: Infotype 0105 (Communications)
+
+
+*----------------------------------------------------------------------*
+*  Declaration of INTERNAL TABLES                                      *
+*----------------------------------------------------------------------*
+DATA:
+* internal table to store the work centers
+  i_centers TYPE STANDARD TABLE OF ty_centers WITH HEADER LINE,
+* internal table to store the structure needed in the file
+  i_work TYPE STANDARD TABLE OF ty_work WITH HEADER LINE,
+  i_file TYPE STANDARD TABLE OF ty_file WITH HEADER LINE,
+  i_dates TYPE STANDARD TABLE OF ty_dates WITH HEADER LINE.
+
+*----------------------------------------------------------------------*
+*  Declaration of VARIABLES                                            *
+*----------------------------------------------------------------------*
+DATA: v_path TYPE string.         " local file path
+DATA: v_out_file TYPE string.     " server file path
+DATA: v_hours TYPE p decimals 2.
+
+DATA: g_directory(25) TYPE c VALUE '/var/load/xxx/UK/read/',
+      g_ofile         LIKE /sapdmc/lsoinp-filename.
+
+*----------------------------------------------------------------------*
+*  SELECTION SCREEN definition                                         *
+*----------------------------------------------------------------------*
+SELECTION-SCREEN BEGIN OF BLOCK 1 WITH FRAME.
+PARAMETERS: p_plant TYPE crhd-werks,
+            p_date TYPE dats,
+            cb_ref AS CHECKBOX,
+            p_file TYPE rlgrap-filename.
+SELECTION-SCREEN END OF BLOCK 1.
+
+*---------------------------------------------------------------------*
+* AT SELECTION-SCREEN                                                  *
+*----------------------------------------------------------------------*
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_file.
+
+  PERFORM get_file_name CHANGING p_file.
+
+*----------------------------------------------------------------------*
+*  MAIN PROCESS                                                        *
+*----------------------------------------------------------------------*
+*----------------------------------------------------------------------*
+*                    START - OF - SELECTION                            *
+*----------------------------------------------------------------------*
+START-OF-SELECTION.
+******************
+
+* We get data only for the last week
+  IF p_date IS INITIAL.
+    p_date = sy-datum - 7.
+  ENDIF.
+
+* We select the unique work center according to the plant given
+* in the selection screen. It has to store values that exist
+* in table PA0105 with subtype=WCTR
+  SELECT DISTINCT a~objid a~arbpl
+  INTO CORRESPONDING FIELDS OF TABLE i_centers
+  FROM crhd as a inner join pa0105 as b
+  ON a~arbpl = b~usrid
+  WHERE a~werks = p_plant and
+        b~subty = 'WCTR'
+  GROUP BY a~objid a~arbpl.
+
+  REFRESH i_dates.
+
+* For each work center
+  LOOP AT i_centers.
+
+    IF cb_ref = 'X'.
+
+*      We retrieve all needed information from AFRU where
+*      execution date is >= the date given in the selection screen
+      SELECT isdd aufnr learr grund isdz ismnw ismnu stzhl ismne
+      INTO CORRESPONDING FIELDS OF i_work
+      FROM afru
+      WHERE arbid = i_centers-objid AND
+            ( ismnu = 'STD' OR
+            ismnu = 'MIN' ) AND
+            isdd >= p_date.
+
+        i_work-arbpl = i_centers-arbpl.
+        IF i_work-stzhl <> '00000000'.
+          i_work-ismnw = -1 * i_work-ismnw.
+        ENDIF.
+
+        IF i_work-ismnw <> 0.
+          APPEND i_work.
+          CLEAR i_work.
+        ENDIF.
+
+      ENDSELECT.
+
+    ELSE.
+*   13-03-2008 BEGIN
+*     Refresh is not checked, so we only need the days for which
+*     there are modifications.
+*     We retrieve all needed information from AFRU where
+*     execution date is >= the date given in the selection screen
+*     entered on >= the date given OR
+*     last change >= the date given.
+*      SELECT isdd aufnr learr grund isdz ismnw ismnu stzhl ismne
+*       INTO CORRESPONDING FIELDS OF i_work
+*       FROM afru
+*       WHERE arbid = i_centers-objid AND
+*             ( ismnu = 'STD'  or
+*              ismnu = 'MIN' ) AND
+*             ( ersda >= p_date or
+*             laeda >= p_date ).
+*
+*        i_work-arbpl = i_centers-arbpl.
+*        IF i_work-stzhl <> '00000000'.
+*          i_work-ismnw = -1 * i_work-ismnw.
+*        ENDIF.
+*
+*        IF i_work-ismnw <> 0.
+*          APPEND i_work.
+*          CLEAR i_work.
+*        ENDIF.
+*      ENDSELECT.
+
+*     Refresh is not checked, so we retrieve all execution date from
+*     AFRU where execution date is >= the date given in the selection screen
+*     entered on >= the date given OR last change >= the date given.
+      SELECT DISTINCT isdd
+      INTO CORRESPONDING FIELDS OF i_dates
+      FROM afru
+      WHERE arbid = i_centers-objid AND
+              ( ismnu = 'STD'  or
+               ismnu = 'MIN' ) AND
+              ( ersda >= p_date or
+              laeda >= p_date ).
+        i_dates-objid = i_centers-objid.
+        i_dates-arbpl = i_centers-arbpl.
+        APPEND i_dates.
+        CLEAR i_dates.
+
+      ENDSELECT.
+*   13-03-2008 END
+    ENDIF.
+
+  ENDLOOP.
+
+*   13-03-2008 BEGIN
+*   If refresh is not checked (i_dates has registers), we download all
+*   records from AFRU table.
+  LOOP AT i_dates.
+    SELECT isdd aufnr learr grund isdz ismnw ismnu stzhl ismne
+    INTO CORRESPONDING FIELDS OF i_work
+    FROM afru
+    WHERE arbid = i_dates-objid AND
+          isdd = i_dates-isdd AND
+           ( ismnu = 'STD' or ismnu = 'MIN' )
+.
+      i_work-arbpl = i_dates-arbpl.
+      IF i_work-stzhl <> '00000000'.
+        i_work-ismnw = -1 * i_work-ismnw.
+      ENDIF.
+
+      IF i_work-ismnw <> 0.
+        APPEND i_work.
+        CLEAR i_work.
+      ENDIF.
+    ENDSELECT.
+
+  ENDLOOP.
+*   13-03-2008 END
+
+
+  LOOP AT i_work.
+    MOVE-CORRESPONDING i_work TO i_file.
+    IF i_work-ismne = 'MIN'.
+      v_hours = i_work-ismnw / 60.
+      i_file-ismnw = v_hours.
+    ENDIF.
+    APPEND i_file.
+  ENDLOOP.
+
+  IF sy-batch = ' '.
+    PERFORM save_table_to_file_local TABLES i_file.
+  ELSE.
+    PERFORM save_table_to_file_server TABLES i_file.
+  ENDIF.
+
+
+*----------------------------------------------------------------------*
+* SUBROUTINES.                                                          *
+*----------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  save_table_to_file_local
+*&---------------------------------------------------------------------*
+*       Move i_file in the given file
+*----------------------------------------------------------------------*
+*       -->I_FILE
+*----------------------------------------------------------------------*
+FORM save_table_to_file_local  TABLES  i_file STRUCTURE i_file.
+
+  v_path = p_file.
+
+  CALL FUNCTION 'GUI_DOWNLOAD'
+    EXPORTING
+*   BIN_FILESIZE                    =
+      filename                        = v_path
+      filetype                        = 'ASC'
+*   APPEND                          = ' '
+      write_field_separator           = 'X'
+*   HEADER                          = '00'
+*   TRUNC_TRAILING_BLANKS           = ' '
+*   WRITE_LF                        = 'X'
+*   COL_SELECT                      = ' '
+*   COL_SELECT_MASK                 = ' '
+*   DAT_MODE                        = ' '
+*  CONFIRM_OVERWRITE               = ' '
+*   NO_AUTH_CHECK                   = ' '
+*   CODEPAGE                        = ' '
+*   IGNORE_CERR                     = ABAP_TRUE
+*   REPLACEMENT                     = '#'
+*   WRITE_BOM                       = ' '
+*   TRUNC_TRAILING_BLANKS_EOL       = 'X'
+*   WK1_N_FORMAT                    = ' '
+*   WK1_N_SIZE                      = ' '
+*   WK1_T_FORMAT                    = ' '
+*   WK1_T_SIZE                      = ' '
+*   WRITE_EOL                       = ABAP_TRUE
+* IMPORTING
+*   FILELENGTH                      =
+    TABLES
+      data_tab                        = i_file
+*   FIELDNAMES                      =
+* EXCEPTIONS
+*   FILE_WRITE_ERROR                = 1
+*   NO_BATCH                        = 2
+*   GUI_REFUSE_FILETRANSFER         = 3
+*   INVALID_TYPE                    = 4
+*   NO_AUTHORITY                    = 5
+*   UNKNOWN_ERROR                   = 6
+*   HEADER_NOT_ALLOWED              = 7
+*   SEPARATOR_NOT_ALLOWED           = 8
+*   FILESIZE_NOT_ALLOWED            = 9
+*   HEADER_TOO_LONG                 = 10
+*   DP_ERROR_CREATE                 = 11
+*   DP_ERROR_SEND                   = 12
+*   DP_ERROR_WRITE                  = 13
+*   UNKNOWN_DP_ERROR                = 14
+*   ACCESS_DENIED                   = 15
+*   DP_OUT_OF_MEMORY                = 16
+*   DISK_FULL                       = 17
+*   DP_TIMEOUT                      = 18
+*   FILE_NOT_FOUND                  = 19
+*   DATAPROVIDER_EXCEPTION          = 20
+*   CONTROL_FLUSH_ERROR             = 21
+*   OTHERS                          = 22
+            .
+  IF sy-subrc <> 0.
+* MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*         WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+  ENDIF.
+
+ENDFORM.                    " save_table_to_file_local
+*&---------------------------------------------------------------------*
+*&      Form  get_file_name
+*&---------------------------------------------------------------------*
+*      Text
+*----------------------------------------------------------------------*
+*      <--P_FNAME
+*----------------------------------------------------------------------*
+FORM get_file_name CHANGING p_fname TYPE rlgrap-filename.
+
+* File table and number of selected files
+  DATA:
+  t_tabfich TYPE filetable,
+  l_rc TYPE i.
+
+  DATA: l_extension TYPE string,
+        l_nombre TYPE string,
+        l_directorio TYPE string.
+
+* Initialization
+  REFRESH t_tabfich.
+  CLEAR t_tabfich.
+
+* Open a dialog to choose a file
+  CALL METHOD cl_gui_frontend_services=>file_open_dialog
+    EXPORTING
+*      window_title      = p_window_title
+      default_extension = l_extension
+      default_filename  = l_nombre
+      initial_directory = l_directorio
+      multiselection    = space
+    CHANGING
+      file_table        = t_tabfich
+      rc                = l_rc.
+*      file_encoding     = l_encoding.
+
+  IF sy-subrc <> 0.
+    MESSAGE w003.
+  ELSE.
+* Multiple selection are not allowed so only one
+* file could be selected
+    READ TABLE t_tabfich INDEX l_rc INTO p_fname.
+    v_path = p_fname.
+  ENDIF.
+
+
+ENDFORM.                    " get_file_name
+
+*&---------------------------------------------------------------------*
+*&      Form  save_table_to_file_server
+*&---------------------------------------------------------------------*
+*       Move i_file in the given logical file
+*----------------------------------------------------------------------*
+*       -->I_FILE
+*----------------------------------------------------------------------*
+FORM save_table_to_file_server  TABLES   i_file STRUCTURE i_file.
+  if p_file > ' '.
+     REPLACE 'xxx' IN p_file WITH sy-sysid.                   "BDB 200810
+     move p_file TO v_out_file.                               "BDB 200810
+  else.                                                       "BDB 200810
+*    Get the name file of the logical file.
+     REPLACE 'xxx' IN g_directory WITH sy-sysid.
+     CONCATENATE g_directory sy-repid INTO v_out_file.
+  endif.                                                       "BDB 200810
+
+* Open the file
+  OPEN DATASET v_out_file FOR OUTPUT IN TEXT MODE ENCODING DEFAULT.
+
+  IF sy-subrc NE 0.
+    MESSAGE e000 WITH v_out_file.
+    EXIT.
+  ENDIF.
+
+  LOOP AT i_file.
+* Move the table to the file
+    TRANSFER i_file TO v_out_file.
+    IF sy-subrc <> 0.
+      EXIT.
+    ENDIF.
+  ENDLOOP.
+
+  IF sy-subrc = 8.
+    sy-subrc = 3. EXIT.
+  ENDIF.
+
+* Close the file
+  CLOSE DATASET v_out_file.
+
+  IF sy-subrc NE 0.
+    MESSAGE e001 WITH v_out_file.
+    EXIT.
+  ENDIF.
+
+ENDFORM.                    " save_table_to_file_server
+
+*Text symbol text£º
+*E03:Open dataset failed for :
+
+*E04:Close dataset failed for :
+*Selection text£º
+*CB_REF:        Refresh
+*P_DATE:        Start Date
+*P_FILE:        Output File
+*P_PLANT:        Plant

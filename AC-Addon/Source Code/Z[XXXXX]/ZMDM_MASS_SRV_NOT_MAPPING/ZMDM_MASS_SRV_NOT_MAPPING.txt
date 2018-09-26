@@ -1,0 +1,410 @@
+REPORT  ZMDM_MASS_SRV_NOT_MAPPING MESSAGE-ID yam_inf.
+
+*----------------------------------------------------------------------*
+* PROGRAM ID           : ZMDM_MASS_SRV_PO_MAPPING                  *
+* PROGRAM TITLE        : Establish automated link between CP1, AP1, SQL*
+* AUTHOR               : Inge Bruyndonckx                              *
+* DATE                 : 14/10/2013                                    *
+* DEVELOPMENT ID       :                                               *
+*                                                                      *
+* CHANGE REQUEST NUMBER:                                               *
+*                                                                      *
+* Program Description:  Mapping service notification to order (CR 197) *
+*                                                                      *
+************************************************************************
+
+************************************************************************
+*                   T Y P E - P O O L S                                *
+************************************************************************
+TYPE-POOLS: ibco2.
+
+TYPES: name_of_dir(1024)        TYPE c,
+       name_of_file(260)        TYPE c.
+************************************************************************
+*                   C O N S T A N T S                                  *
+************************************************************************
+
+CONSTANTS: c_rec(28)    TYPE c        VALUE  'ZMDM_CS_NOTIF_MAP',
+           gc_charx(1) TYPE c VALUE 'X',
+           c_all     TYPE c VALUE '*',    "generic filename shall select
+           c_CS_MAP     TYPE c VALUE 'ZMDM_MASS_NOTIF_MAP*'.
+
+
+************************************************************************
+*                  I N T E R N A L   T A B L E S                       *
+************************************************************************
+TABLES: aufk.
+
+DATA: BEGIN OF file_list OCCURS 100,
+        dirname     TYPE name_of_dir,  " name of directory. (possibly
+                                       " truncated.)
+        name        TYPE name_of_file, " name of entry. (possibly
+                                       " truncated.)
+        errno(3)    TYPE c,
+        errmsg(40)  TYPE c,
+      END OF file_list.
+
+
+DATA: BEGIN OF file,
+        dirname     TYPE name_of_dir,  " name of directory. (possibly
+                                       " truncated.)
+        name        TYPE name_of_file, " name of entry. (possibly
+                                       " truncated.)
+        errno(3)    TYPE c,
+        errmsg(40)  TYPE c,
+      END OF file.
+
+DATA: BEGIN OF searchpoints OCCURS 1,
+          dirname     TYPE name_of_dir,  " name of directory.
+          sp_name     TYPE name_of_file, " name of entry.
+          sp_cs(40)   TYPE c,         " ContainsString pattern for name.
+        END OF searchpoints.
+
+data: begin of lt_orders occurs 0,
+      aufnr like AUFK-aufnr,
+      werks like AUFK-werks,
+      qmnum like qmel-qmnum,
+     end of lt_orders.
+
+data: begin of lt_OUTPUT occurs 0,
+        aufnr like AUFK-aufnr,
+      werks like AUFK-werks,
+      qmnum like qmel-qmnum,
+  end of lt_OUTPUT.
+
+data: begin of gt_OUTPUT occurs 0,
+          aufnr like aufk-aufnr,
+          deli1      TYPE c,
+      werks like aufk-werks,
+          deli2      TYPE c,
+      qmnum like qmel-qmnum,
+  end of gt_OUTPUT.
+
+data: begin of gt_OUTPUT_c occurs 0,
+          aufnr like dd03l-fieldname,
+          deli1      TYPE c,
+      werks like dd03l-fieldname,
+          deli2      TYPE c,
+      qmnum like dd03l-fieldname,
+  end of Gt_OUTPUT_c.
+
+************************************************************************
+*                  VARIABLES                                           *
+************************************************************************
+DATA: g_directory(25) TYPE c VALUE '/var/load/xxx/UK/read/',
+      g_ofile         LIKE /sapdmc/lsoinp-filename,
+      p_logsys        LIKE tbdlst-logsys.
+DATA: lv_file(40) TYPE c.
+DATA: g_delfile    TYPE epspath,
+      g_lin        TYPE i,
+      g_numlin(3)  TYPE c.
+************************************************************************
+*       S E L E C T - O P T I O N S / P A R A M E T E R S              *
+************************************************************************
+SELECTION-SCREEN : BEGIN OF BLOCK b1 WITH FRAME TITLE text-001.
+SELECT-OPTIONS: s_AUFNR  FOR  AUFK-AUFNR.
+SELECT-OPTIONS: s_werks  FOR  AUFK-werks.
+
+PARAMETERS:     p_day    DEFAULT '0'.
+PARAMETERS:     l_file  LIKE rlgrap-filename
+                    DEFAULT 'C:\SAP\CS_NOTIF_MAP'.
+SELECTION-SCREEN: END OF BLOCK b1.
+
+*- Initialization -----------------------------------------------------*
+INITIALIZATION.
+
+  CALL FUNCTION 'OWN_LOGICAL_SYSTEM_GET'
+    IMPORTING
+      own_logical_system             = p_logsys
+    EXCEPTIONS
+      own_logical_system_not_defined = 1
+      OTHERS                         = 2.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+         WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+************************************************************************
+*       S T A R T - O F - S E L E C T I O N    E V E N T               *
+************************************************************************
+START-OF-SELECTION.
+
+  lv_file = 'ZMDM_MASS_NOTIF_MAP*'.
+  PERFORM delete_old_files USING lv_file.
+
+* get all orders for selection criteria
+
+  select aufk~aufnr werks qmel~qmnum
+      into table lt_orders
+    from aufk
+  inner join qmel on qmel~aufnr = aufk~aufnr
+    where aufk~aufnr in s_aufnr
+    and werks in s_werks.
+
+
+
+
+
+  loop at lt_orderS.
+    MOVE-CORRESPONDING lt_orders to Gt_OUTPUT.
+
+    MOVE '|' TO: Gt_OUTPUT-deli1, Gt_OUTPUT-deli2.
+    APPEND Gt_OUTPUT.
+  endloop.
+
+
+  IF NOT  Gt_OUTPUT[] IS INITIAL.
+    PERFORM download_files.
+  ENDIF.
+
+*&---------------------------------------------------------------------*
+*&      Form  download_files
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM download_files.
+
+
+
+  DATA: file TYPE string.
+
+  PERFORM header_fill.
+
+  IF sy-batch = 'X'.
+    REPLACE 'xxx' IN g_directory WITH p_logsys(3).
+
+* Header
+    CONCATENATE g_directory c_rec '_'  syst-datlo syst-timlo INTO g_ofile.
+
+    OPEN DATASET g_ofile FOR OUTPUT IN TEXT MODE ENCODING DEFAULT.
+    IF sy-subrc <> 0.
+      WRITE: / text-e04, g_ofile.
+      EXIT.
+    ENDIF.
+
+    TRANSFER Gt_output_c TO g_ofile.
+    LOOP AT Gt_output.
+      TRANSFER Gt_output TO g_ofile.
+    ENDLOOP.
+
+    CLOSE DATASET g_ofile.
+    IF sy-subrc <> 0.
+      WRITE: / text-e05, g_ofile.
+      EXIT.
+    ENDIF.
+***
+  ELSE.
+    file = l_file.
+    CONCATENATE file '_' syst-datlo syst-timlo '.txt' INTO file.
+
+    CALL FUNCTION 'GUI_DOWNLOAD'
+      EXPORTING
+        filename                = file
+        append                  = ' '
+        filetype                = 'DAT'
+        write_field_separator   = 'X'
+      TABLES
+        data_tab                = Gt_output
+      EXCEPTIONS
+        file_write_error        = 1
+        no_batch                = 2
+        gui_refuse_filetransfer = 3
+        invalid_type            = 4
+        no_authority            = 5
+        unknown_error           = 6
+        header_not_allowed      = 7
+        separator_not_allowed   = 8
+        filesize_not_allowed    = 9
+        header_too_long         = 10
+        dp_error_create         = 11
+        dp_error_send           = 12
+        dp_error_write          = 13
+        unknown_dp_error        = 14
+        access_denied           = 15
+        dp_out_of_memory        = 16
+        disk_full               = 17
+        dp_timeout              = 18
+        file_not_found          = 19
+        dataprovider_exception  = 20
+        control_flush_error     = 21
+        OTHERS                  = 22.
+
+    CALL FUNCTION 'GUI_DOWNLOAD'
+      EXPORTING
+        filename                = file
+        append                  = 'X'
+        filetype                = 'DAT'
+        write_field_separator   = 'X'
+      TABLES
+        data_tab                = Gt_output
+      EXCEPTIONS
+        file_write_error        = 1
+        no_batch                = 2
+        gui_refuse_filetransfer = 3
+        invalid_type            = 4
+        no_authority            = 5
+        unknown_error           = 6
+        header_not_allowed      = 7
+        separator_not_allowed   = 8
+        filesize_not_allowed    = 9
+        header_too_long         = 10
+        dp_error_create         = 11
+        dp_error_send           = 12
+        dp_error_write          = 13
+        unknown_dp_error        = 14
+        access_denied           = 15
+        dp_out_of_memory        = 16
+        disk_full               = 17
+        dp_timeout              = 18
+        file_not_found          = 19
+        dataprovider_exception  = 20
+        control_flush_error     = 21
+        OTHERS                  = 22.
+
+  ENDIF.
+
+ENDFORM.                    "download_file
+
+*&---------------------------------------------------------------------*
+*&      Form  header_fill
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM header_fill.
+
+  MOVE '|' TO: Gt_output_c-deli1, Gt_output_c-deli2.
+  Gt_output_c-AUFNR = 'AUFNR'.
+  Gt_output_c-werks = 'WERKS'.
+  Gt_output_c-QMNUM = 'QMNUM'.
+  APPEND Gt_output_c.
+
+
+ENDFORM.                    "header_fill
+*---------------------------------------------------------------------*
+*&      Form  delete_old_files
+*&---------------------------------------------------------------------*
+*       delete files older then a week
+*----------------------------------------------------------------------*
+FORM delete_old_files USING lv_file.
+
+
+  DATA: g_date    LIKE sy-datum,
+        g_subrc   LIKE sy-subrc.
+
+  g_date = sy-datum - p_day.
+* get directory
+  g_subrc = 0.
+  REFRESH file_list.
+  REFRESH searchpoints.
+
+  searchpoints-dirname = g_directory.
+  searchpoints-sp_name = c_all.
+  searchpoints-sp_cs   = lv_file.
+  APPEND searchpoints.
+
+  LOOP AT searchpoints.
+    PERFORM fill_file_list USING searchpoints-dirname
+                                 searchpoints-sp_name
+                                 searchpoints-sp_cs.
+    g_subrc = sy-subrc.
+  ENDLOOP.
+
+  IF g_subrc <> 0 OR
+     file_list[] IS INITIAL.
+    WRITE: / text-e03.                "No files were selected
+    EXIT.
+  ENDIF.
+* file must be older then 1 week.
+  LOOP AT file_list.
+
+    IF file_list-name+29(8) CO '0123456789'.      "MOD-001 * insert
+      IF file_list-name+29(8) <= g_date.
+        CONCATENATE file_list-dirname '/' file_list-name INTO g_delfile.
+        DELETE DATASET g_delfile.
+      ENDIF.
+*** MOD-001 * begin insert ***
+    ELSE.
+*     New filename (with FAM code)
+*      IF file_list-name+4(8) CO '0123456789'.
+*        IF file_list-name+4(8) < g_date.
+*          CONCATENATE file_list-dirname '/' file_list-name INTO g_delfile.
+*          DELETE DATASET g_delfile.
+*        ENDIF.
+*      ENDIF.
+    ENDIF.
+*** MOD-001 * end insert ***
+
+  ENDLOOP.
+
+
+ENDFORM.                    "delete_old_files
+
+*&---------------------------------------------------------------------*
+*&      Form  fill_file_list
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->A_DIR_NAME      text
+*      -->A_GENERIC_NAME  text
+*      -->A_MUST_CS       text
+*----------------------------------------------------------------------*
+FORM fill_file_list USING a_dir_name a_generic_name a_must_cs.
+
+  CALL 'C_DIR_READ_FINISH'             " just to be sure
+      ID 'ERRNO'  FIELD file_list-errno
+      ID 'ERRMSG' FIELD file_list-errmsg.
+
+  REPLACE 'xxx' IN a_dir_name WITH p_logsys(3).
+
+  CALL 'C_DIR_READ_START' ID 'DIR'    FIELD a_dir_name
+                          ID 'FILE'   FIELD a_generic_name
+                          ID 'ERRNO'  FIELD file-errno
+                          ID 'ERRMSG' FIELD file-errmsg.
+  IF sy-subrc <> 0.
+    sy-subrc = 4.
+    EXIT.
+  ENDIF.
+
+  DO.
+    CLEAR file.
+    CALL 'C_DIR_READ_NEXT'
+      ID 'NAME'   FIELD file-name
+      ID 'ERRNO'  FIELD file-errno
+      ID 'ERRMSG' FIELD file-errmsg.
+    file-dirname = a_dir_name.
+
+    IF sy-subrc <> 0.
+      EXIT.
+    ENDIF.
+
+*   Does the filename contains the requested pattern?
+*   Then store it, else forget it.
+    IF a_must_cs CS '*'.
+      IF file-name CP a_must_cs.
+        MOVE-CORRESPONDING file TO file_list.
+        APPEND file_list.
+      ENDIF.
+    ELSE.
+      IF file-name EQ a_must_cs.
+        MOVE-CORRESPONDING file TO file_list.
+        APPEND file_list.
+      ENDIF.
+    ENDIF.
+  ENDDO.
+
+  CALL 'C_DIR_READ_FINISH'
+      ID 'ERRNO'  FIELD file_list-errno
+      ID 'ERRMSG' FIELD file_list-errmsg.
+  IF sy-subrc <> 0.
+    WRITE: / 'C_DIR_READ_FINISH', 'SUBRC', sy-subrc.
+  ENDIF.
+
+  sy-subrc = 0.
+
+ENDFORM.                    "fill_file_list
+
+*Selection text£º
+*L_FILE:        File name
+*P_DAY:        Days
+*S_AUFNR:        Order
+*S_WERKS:        Plant

@@ -1,0 +1,773 @@
+*&---------------------------------------------------------------------*
+*& Report  ZPSFC008
+*&
+*&---------------------------------------------------------------------*
+*&
+*&
+*&---------------------------------------------------------------------*
+
+
+*----------------------------------------------------------------------*
+* Corrects status objects of objects within production orders with
+* incorrect status. This may include objects with no status objects,
+* objects with temporary status object numbers, objects with only
+* partially created status objects (only JEST or only JSTO entries).
+* Correct status objects for those objects will be created and an
+* initial status 'Created' will be generated.
+* Objects within the production orders handled within this report
+* can be: header, sequences, operations, PRTs, components
+*----------------------------------------------------------------------*
+Report  ZPSFC008.
+
+TABLES: CAUFV,
+        AUFK,
+        AFFL,
+        AFVC,
+        AFFH,
+        CRFH,
+        RESB,
+        ONR00,
+        JSTO,
+        JEST.
+
+* constant definitions
+CONSTANTS: STK_ERO LIKE JEST-STAT VALUE 'I0001',
+           OBJ_NUMBER_TMP(2) TYPE C  VALUE 'TM',
+           YX VALUE 'X',
+           TYPE_NET  LIKE CAUFV-AUTYP VALUE '20',
+           TYPE_ORD  LIKE CAUFV-AUTYP VALUE '10',
+           TYPE_PRC LIKE CAUFV-AUTYP VALUE '40',
+           TYPE_IH  LIKE CAUFV-AUTYP VALUE '30',
+           MATERIAL  LIKE TCF02-FHMAR  VALUE 'M',
+           DOKUMENT  LIKE TCF02-FHMAR  VALUE 'D',
+           SONSTIGE  LIKE TCF02-FHMAR  VALUE 'S',
+           EQUIPMENT LIKE TCF02-FHMAR  VALUE 'E',
+           OBJEKTTYP_FHM_SON LIKE TJ03-OBTYP VALUE 'OFS',
+           OBJEKTTYP_FHM_MAT LIKE TJ03-OBTYP VALUE 'OFM',
+           OBJEKTTYP_FHM_DOK LIKE TJ03-OBTYP VALUE 'OFD',
+           OBJEKTTYP_FHM_EQU LIKE TJ03-OBTYP VALUE 'OFE'.
+
+* parameter definitions
+PARAMETERS: TESTMODE AS   CHECKBOX DEFAULT YX.
+PARAMETERS: ORDER    LIKE CAUFV-AUFNR.
+PARAMETERS: HEADER   AS   CHECKBOX DEFAULT YX,
+            SEQUENCE AS   CHECKBOX DEFAULT YX,
+            OPER     AS   CHECKBOX DEFAULT YX,
+            PRT      AS   CHECKBOX DEFAULT YX,
+            COMP     AS   CHECKBOX DEFAULT YX.
+
+* help variables
+DATA: FLG_JSTO,
+      FLG_JEST,
+      OBTYP            LIKE JSTO-OBTYP,
+      OBTYP_HEADER     LIKE JSTO-OBTYP,
+      OBTYP_OPER       LIKE JSTO-OBTYP,
+      PREFIX_HEADER(2) TYPE C,
+      PREFIX_OPER(2)   TYPE C,
+      PREFIX_PRT(2)    TYPE C,
+      FLG_ERROR        TYPE C VALUE 'X'.
+
+* table definitions
+* Initial status for objects ('Created')
+DATA: BEGIN OF INIT_TAB OCCURS 1.
+        INCLUDE STRUCTURE JSTAT.
+DATA: END OF INIT_TAB.
+* Insert table jsto
+DATA: BEGIN OF JSTO_TAB OCCURS 0.
+        INCLUDE STRUCTURE JSTO.
+DATA: END OF JSTO_TAB.
+* table for sequences
+DATA: BEGIN OF AFFL_TAB OCCURS 0.
+        INCLUDE STRUCTURE AFFL.
+DATA: END OF AFFL_TAB.
+* table for operations
+DATA: BEGIN OF AFVC_TAB OCCURS 0.
+        INCLUDE STRUCTURE AFVC.
+DATA: END OF AFVC_TAB.
+* table for PRTs
+DATA: BEGIN OF AFFH_TAB OCCURS 0,
+        AUFPL LIKE AFFH-AUFPL,
+        PZLFH LIKE AFFH-PZLFH,
+        OBJTY LIKE AFFH-OBJTY,
+        OBJID LIKE AFFH-OBJID,
+        OBJNR LIKE AFFH-OBJNR,
+        FHMAR LIKE CRFH-FHMAR,
+      END OF AFFH_TAB.
+* table for reservations
+DATA: BEGIN OF RESB_TAB OCCURS 0.
+        INCLUDE STRUCTURE RESB.
+DATA: END OF RESB_TAB.
+
+* first check if order exists
+IF NOT ORDER IS INITIAL.
+  SELECT SINGLE * FROM CAUFV WHERE AUFNR EQ ORDER.
+  IF NOT SY-SUBRC IS INITIAL.
+    WRITE: /'Order', ORDER, 'not found'.
+    EXIT.                         ">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+  ENDIF.
+ELSE.
+  WRITE: /'Please enter an order number'.
+  EXIT.                           ">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+ENDIF.
+
+* initialize initial status to be set
+INIT_TAB-STAT  = STK_ERO.
+INIT_TAB-INACT = SPACE.
+APPEND INIT_TAB.
+* initialize prefixes and object types for different order types
+CASE CAUFV-AUTYP.
+  WHEN TYPE_ORD.
+    OBTYP_HEADER  = 'ORH'.
+    OBTYP_OPER    = 'OVG'.
+    PREFIX_HEADER = 'OR'.
+    PREFIX_OPER   = 'OV'.
+    PREFIX_PRT    = 'OF'.
+  WHEN TYPE_NET.
+    OBTYP_HEADER  = 'NPH'.
+    OBTYP_OPER    = 'NVO'.
+    PREFIX_HEADER = 'NP'.
+    PREFIX_OPER   = 'NV'.
+    PREFIX_PRT    = 'OF'.
+  WHEN TYPE_PRC.
+    OBTYP_HEADER  = 'ORB'.
+    OBTYP_OPER    = 'OVB'.
+    PREFIX_HEADER = 'OR'.
+    PREFIX_OPER   = 'OV'.
+  WHEN TYPE_IH.
+    OBTYP_HEADER  = 'ORI'.
+    OBTYP_OPER    = 'OVG'.
+    PREFIX_HEADER = 'OR'.
+    PREFIX_OPER   = 'OV'.
+    PREFIX_PRT    = 'OF'.
+  WHEN OTHERS.
+    WRITE: /'order type', CAUFV-AUTYP, 'not supported yet'.
+    EXIT.                         ">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+ENDCASE.
+
+************************************************************************
+* edit HEADER if requested
+************************************************************************
+IF NOT HEADER IS INITIAL.
+*.. provide valid object number if necessary
+  IF CAUFV-OBJNR IS INITIAL OR
+     CAUFV-OBJNR+0(2) = OBJ_NUMBER_TMP.
+*     build object number
+    perform build_object_number_header using    caufv-aufnr
+                                                prefix_header
+                                       changing caufv-objnr.
+    IF TESTMODE IS INITIAL.
+*...... Update object number in aufk
+      UPDATE AUFK   SET OBJNR = CAUFV-OBJNR
+                  WHERE AUFNR EQ CAUFV-AUFNR.
+    ENDIF.
+  ENDIF.
+  OBTYP = OBTYP_HEADER.
+  CLEAR: FLG_JSTO, FLG_JEST.
+  PERFORM CHECK_STATUS_EXISTS USING CAUFV-OBJNR
+                                    FLG_JSTO
+                                    FLG_JEST
+                                    FLG_ERROR.
+  PERFORM REPAIR_STATUS_OBJECT USING CAUFV-OBJNR
+                                     OBTYP
+                                     CAUFV-AUFNR
+                                     TESTMODE
+                                     FLG_JSTO
+                                     FLG_JEST.
+ENDIF.
+
+************************************************************************
+* edit SEQUENCES if requested.
+************************************************************************
+IF NOT SEQUENCE IS INITIAL.
+  SELECT * FROM AFFL INTO TABLE AFFL_TAB
+                     WHERE AUFPL EQ CAUFV-AUFPL.
+  OBTYP = 'OSF'.
+  IF NOT AFFL_TAB[] IS INITIAL.
+    LOOP AT AFFL_TAB.
+      IF AFFL_TAB-OBJNR IS INITIAL OR
+        AFFL_TAB-OBJNR+0(2) = OBJ_NUMBER_TMP.
+        perform build_object_number_sequence using   affl_tab-aufpl
+                                                     affl_tab-aplzl
+                                             changing affl_tab-objnr.
+        IF TESTMODE IS INITIAL.
+*.......... Update object number in affl
+          UPDATE AFFL SET OBJNR = AFFL_TAB-OBJNR
+                      WHERE AUFPL EQ AFFL_TAB-AUFPL
+                        AND APLZL EQ AFFL_TAB-APLZL.
+        ENDIF.
+      ENDIF.
+      CLEAR: FLG_JSTO, FLG_JEST.
+      PERFORM CHECK_STATUS_EXISTS USING AFFL_TAB-OBJNR
+                                        FLG_JSTO
+                                        FLG_JEST
+                                        FLG_ERROR.
+      PERFORM REPAIR_STATUS_OBJECT USING AFFL_TAB-OBJNR
+                                         OBTYP
+                                         CAUFV-AUFNR
+                                         TESTMODE
+                                         FLG_JSTO
+                                         FLG_JEST.
+    ENDLOOP.
+  ENDIF.
+ENDIF.
+
+************************************************************************
+* edit OPERATIONS if requested.
+************************************************************************
+IF NOT OPER IS INITIAL.
+  SELECT * FROM AFVC INTO TABLE AFVC_TAB
+                     WHERE AUFPL EQ CAUFV-AUFPL.
+  OBTYP = OBTYP_OPER.
+  IF NOT AFVC_TAB[] IS INITIAL.
+    LOOP AT AFVC_TAB.
+
+      IF AFVC_TAB-OBJNR IS INITIAL OR
+         AFVC_TAB-OBJNR+0(2)  = OBJ_NUMBER_TMP OR
+         AFVC_TAB-OBJNR+2(10) NE AFVC_TAB-AUFPL OR
+         AFVC_TAB-OBJNR+12(8) NE AFVC_TAB-APLZL.
+        perform object_number_build_oper using   afvc_tab-aufpl
+                                                 afvc_tab-aplzl
+                                                 prefix_oper
+                                         changing afvc_tab-objnr.
+        IF TESTMODE IS INITIAL.
+*.......... Update object number in afvc
+          UPDATE AFVC SET OBJNR = AFVC_TAB-OBJNR
+                      WHERE AUFPL EQ AFVC_TAB-AUFPL
+                        AND APLZL EQ AFVC_TAB-APLZL.
+        ENDIF.
+      ENDIF.
+      CLEAR: FLG_JSTO, FLG_JEST.
+      PERFORM CHECK_STATUS_EXISTS USING AFVC_TAB-OBJNR
+                                        FLG_JSTO
+                                        FLG_JEST
+                                        FLG_ERROR.
+
+*     when changing network activity, check network header status
+      if flg_jest is initial and obtyp = 'NVO'.
+        perform check_network_head using afvc_tab-aufpl
+                                         testmode.
+      endif.
+
+      PERFORM REPAIR_STATUS_OBJECT USING AFVC_TAB-OBJNR
+                                         OBTYP
+                                         CAUFV-AUFNR
+                                         TESTMODE
+                                         FLG_JSTO
+                                         FLG_JEST.
+    ENDLOOP.
+  ENDIF.
+ENDIF.
+
+************************************************************************
+* edit Production resource tools if requested
+************************************************************************
+IF NOT PRT IS INITIAL.
+  SELECT AUFPL PZLFH OBJTY OBJID OBJNR FROM AFFH
+                     INTO CORRESPONDING FIELDS OF TABLE AFFH_TAB
+                     WHERE AUFPL EQ CAUFV-AUFPL.
+  IF NOT AFFH_TAB[] IS INITIAL.
+    LOOP AT AFFH_TAB.
+*       determine kind of PRT
+      SELECT SINGLE FHMAR FROM CRFH INTO AFFH_TAB-FHMAR
+                          WHERE OBJTY = AFFH_TAB-OBJTY
+                            AND OBJID = AFFH_TAB-OBJID.
+      IF SY-SUBRC IS INITIAL.
+        MODIFY AFFH_TAB.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+  IF NOT AFFH_TAB[] IS INITIAL.
+    LOOP AT AFFH_TAB.
+*       determine object type dependent on kind of PRT
+      CASE AFFH_TAB-FHMAR.
+        WHEN MATERIAL.
+          OBTYP = OBJEKTTYP_FHM_MAT.
+        WHEN DOKUMENT.
+          OBTYP = OBJEKTTYP_FHM_DOK.
+        WHEN SONSTIGE.
+          OBTYP = OBJEKTTYP_FHM_SON.
+        WHEN EQUIPMENT.
+          OBTYP = OBJEKTTYP_FHM_EQU.
+        WHEN OTHERS.
+          CONTINUE.
+      ENDCASE.
+      IF AFFH_TAB-OBJNR IS INITIAL OR
+         AFFH_TAB-OBJNR+0(2) = OBJ_NUMBER_TMP.
+        perform object_number_build_prt using affh_tab-aufpl
+                                              affh_tab-pzlfh
+                                              prefix_prt
+                                        changing affh_tab-objnr.
+        IF TESTMODE IS INITIAL.
+*.......... Update object number in afvc
+          UPDATE AFFH SET OBJNR = AFFH_TAB-OBJNR
+                      WHERE AUFPL EQ AFFH_TAB-AUFPL
+                        AND PZLFH EQ AFFH_TAB-PZLFH.
+        ENDIF.
+      ENDIF.
+      CLEAR: FLG_JSTO, FLG_JEST.
+      PERFORM CHECK_STATUS_EXISTS USING AFFH_TAB-OBJNR
+                                        FLG_JSTO
+                                        FLG_JEST
+                                        FLG_ERROR.
+      PERFORM REPAIR_STATUS_OBJECT USING AFFH_TAB-OBJNR
+                                         OBTYP
+                                         CAUFV-AUFNR
+                                         TESTMODE
+                                         FLG_JSTO
+                                         FLG_JEST.
+    ENDLOOP.
+  ENDIF.
+ENDIF.
+
+************************************************************************
+* edit COMPONENTS if requested.
+************************************************************************
+IF NOT COMP IS INITIAL.
+  SELECT * FROM RESB INTO TABLE RESB_TAB
+                     WHERE RSNUM EQ CAUFV-RSNUM.
+  OBTYP = 'OKP'.
+  IF NOT RESB_TAB[] IS INITIAL.
+    LOOP AT RESB_TAB.
+      IF RESB_TAB-OBJNR IS INITIAL OR
+         RESB_TAB-OBJNR+0(2) = OBJ_NUMBER_TMP.
+        perform object_number_build_comp using    resb_tab-rsnum
+                                                  resb_tab-rspos
+                                                  resb_tab-rsart
+                                         changing resb_tab-objnr.
+        IF TESTMODE IS INITIAL.
+*.......... Update object number in resb
+          UPDATE RESB SET OBJNR = RESB_TAB-OBJNR
+                      WHERE RSNUM EQ RESB_TAB-RSNUM
+                        AND RSPOS EQ RESB_TAB-RSPOS
+                        AND RSART EQ RESB_TAB-RSART.
+        ENDIF.
+      ENDIF.
+      CLEAR: FLG_JSTO, FLG_JEST.
+      PERFORM CHECK_STATUS_EXISTS USING RESB_TAB-OBJNR
+                                        FLG_JSTO
+                                        FLG_JEST
+                                        FLG_ERROR.
+      PERFORM REPAIR_STATUS_OBJECT USING RESB_TAB-OBJNR
+                                         OBTYP
+                                         CAUFV-AUFNR
+                                         TESTMODE
+                                         FLG_JSTO
+                                         FLG_JEST.
+    ENDLOOP.
+  ENDIF.
+ENDIF.
+
+* Update JSTO entries and status objects (commit work)
+IF TESTMODE IS INITIAL.
+  IF NOT JSTO_TAB[] IS INITIAL.
+    INSERT JSTO FROM TABLE JSTO_TAB.
+  ENDIF.
+  COMMIT WORK.
+ENDIF.
+
+* Was an incomplete status found ?
+IF NOT FLG_ERROR IS INITIAL.
+  WRITE:/ 'No wrong or incomplete status objects were found'.
+ENDIF.
+
+
+* help routines
+
+************************************************************************
+* check_status_exists: checks which parts of the status object
+*                      already exists
+*  -> objnr_imp: Object number to check
+*  <- jsto_exists: set to X if jsto entry exists
+*  <- jest_exists: set to X if jest entrie for initial status exists
+************************************************************************
+FORM CHECK_STATUS_EXISTS USING OBJNR_IMP   LIKE JSTO-OBJNR
+                               JSTO_EXISTS
+                               JEST_EXISTS
+                               C_FLG_ERROR.
+
+  CLEAR JSTO_EXISTS.
+  CLEAR JEST_EXISTS.
+
+  SELECT SINGLE * FROM JSTO WHERE OBJNR EQ OBJNR_IMP.
+  IF SY-SUBRC IS INITIAL.
+*.. Jsto entry exists
+    JSTO_EXISTS = YX.
+  ELSE.
+    CLEAR C_FLG_ERROR.
+  ENDIF.
+
+  SELECT SINGLE * FROM JEST WHERE OBJNR EQ OBJNR_IMP
+                              AND STAT  EQ STK_ERO.
+  IF SY-SUBRC IS INITIAL.
+*.. initial jest entry exists
+    JEST_EXISTS = YX.
+  ELSE.
+    CLEAR C_FLG_ERROR.
+  ENDIF.
+
+ENDFORM.                    "CHECK_STATUS_EXISTS
+
+************************************************************************
+* repair_status_object: repairs the status object
+*  -> objnr_imp: Object number to be repaired
+*  -> obtyp_imp: Object type of the object to be repaired
+*  -> order_imp: For reporting purpose only
+*  -> testmode_imp: For reporting purpose only
+*  -> jsto_exists: tells if jsto already exists
+*  -> jest_exists: tells if jest already exists
+************************************************************************
+
+FORM REPAIR_STATUS_OBJECT USING OBJNR_IMP LIKE JSTO-OBJNR
+                                OBTYP_IMP LIKE JSTO-OBTYP
+                                ORDER_IMP LIKE CAUFV-AUFNR
+                                TESTMODE_IMP
+                                JSTO_EXISTS
+                                JEST_EXISTS.
+
+* 1. status object does completely not exist
+  IF     JSTO_EXISTS IS INITIAL AND
+         JEST_EXISTS IS INITIAL.
+*.. Create status object completely
+    CALL FUNCTION 'STATUS_OBJECT_CREATE'
+      EXPORTING
+        OBJNR = OBJNR_IMP
+        OBTYP = OBTYP_IMP.
+*.. report to user
+    PERFORM WRITE_SUCCESS USING OBTYP_IMP
+                               OBJNR_IMP
+                               ORDER_IMP
+                               TESTMODE_IMP.
+  ENDIF.
+
+* 2. no entry in jsto but in jest
+  IF     JSTO_EXISTS IS INITIAL AND
+     NOT JEST_EXISTS IS INITIAL.
+*.. only create an entry in jsto
+    CLEAR JSTO_TAB.
+    JSTO_TAB-OBJNR = OBJNR_IMP.
+    JSTO_TAB-OBTYP = OBTYP_IMP.
+    APPEND JSTO_TAB.
+*.. report to user
+    PERFORM WRITE_SUCCESS USING OBTYP_IMP
+                               OBJNR_IMP
+                               ORDER_IMP
+                               TESTMODE_IMP.
+  ENDIF.
+
+* 3. no entry in jest but in jsto
+  IF NOT JSTO_EXISTS IS INITIAL AND
+         JEST_EXISTS IS INITIAL.
+*.. only set initial status for object in table jest
+    CALL FUNCTION 'STATUS_CHANGE_INTERN'
+      EXPORTING
+        OBJNR  = OBJNR_IMP
+      TABLES
+        STATUS = INIT_TAB.
+*.. report to user
+    PERFORM WRITE_SUCCESS USING OBTYP_IMP
+                               OBJNR_IMP
+                               ORDER_IMP
+                               TESTMODE_IMP.
+  ENDIF.
+
+* 4. both exist -> nothing to be done
+
+ENDFORM.                    "REPAIR_STATUS_OBJECT
+
+************************************************************************
+* log routine
+************************************************************************
+FORM WRITE_SUCCESS USING OBTYP_IMP LIKE JSTO-OBTYP
+                         OBJNR_IMP LIKE JSTO-OBJNR
+                         ORDER_IMP LIKE CAUFV-AUFNR
+                         TESTMODE_IMP.
+
+  DATA: OBJECT(10).
+
+  CASE OBTYP_IMP.
+    WHEN 'NPH'.
+      OBJECT = 'network'.
+    WHEN 'ORH' OR 'ORB' or 'ORI'.
+      OBJECT = 'order'.
+    WHEN 'OSF'.
+      OBJECT = 'sequence'.
+    WHEN 'OVG' OR 'NPV' OR 'OVB'.
+      OBJECT = 'operation'.
+    WHEN 'OKP'.
+      OBJECT = 'component'.
+    when 'NVO'.
+      object = 'activity'.
+    WHEN OTHERS.
+      OBJECT = 'unknown'.
+  ENDCASE.
+
+  WRITE: / 'Status object', OBJNR_IMP, 'for', OBJECT, 'of order',
+           ORDER_IMP.
+  IF TESTMODE_IMP IS INITIAL.
+    WRITE: 'succesfully created.'.
+  ELSE.
+    WRITE: 'does not exist.'.
+  ENDIF.
+ENDFORM.                    "WRITE_SUCCESS
+
+*&---------------------------------------------------------------------*
+*&      Form  BUILD_OBJECT_NUMBER_HEADER
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_CAUFV_AUFNR  text
+*      -->P_PREFIX_HEADER  text
+*      <--P_CAUFV_OBJNR  text
+*----------------------------------------------------------------------*
+FORM BUILD_OBJECT_NUMBER_HEADER USING    I_AUFNR like caufvd-aufnr
+                                         I_PREFIX_HEADER
+                                CHANGING E_OBJNR like caufvd-objnr.
+
+* initializations
+  clear e_objnr.
+  e_objnr = prefix_header.
+  e_objnr+2 = i_aufnr.
+
+* check if onr00 entry exists
+  select single * from onr00 where objnr = e_objnr.
+  if not sy-subrc is initial.
+*   onr00 entry does not exist -> create onr00 entry
+    clear e_objnr.
+    if i_prefix_header = 'OR'.
+*     production or process order
+      call function 'OBJECT_NUMBER_GET_OR'
+        EXPORTING
+          aufnr = i_aufnr
+        IMPORTING
+          OBJNR = e_objnr.
+    elseif i_prefix_header = 'NP'.
+*     network orders
+      call function 'OBJECT_NUMBER_GET_NP'
+        EXPORTING
+          aufnr = i_aufnr
+        IMPORTING
+          OBJNR = e_objnr.
+    endif.
+  endif.
+
+ENDFORM.                    " BUILD_OBJECT_NUMBER_HEADER
+
+*&---------------------------------------------------------------------*
+*&      Form  BUILD_OBJECT_NUMBER_SEQUENCE
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_AFFL_TAB_AUFPL  text
+*      -->P_AFFL_TAB_APLZL  text
+*      <--P_AFFL_TAB_OBJNR  text
+*----------------------------------------------------------------------*
+FORM BUILD_OBJECT_NUMBER_SEQUENCE USING    I_AUFPL like affl-aufpl
+                                           I_APLZL like affl-aplzl
+                                  CHANGING E_OBJNR.
+
+* initializations
+  clear e_objnr.
+  e_objnr = 'OS'.
+  e_objnr+2  = i_aufpl.
+  e_objnr+12 = i_aplzl.
+
+* check if onr00 entry exists
+  select single * from onr00 where objnr = e_objnr.
+  if not sy-subrc is initial.
+*   onr00 entry does not exist -> create onr00 entry
+    clear e_objnr.
+    call function 'OBJECT_NUMBER_GET_OS'
+      EXPORTING
+        aplzl = i_aplzl
+        aufpl = i_aufpl
+      IMPORTING
+        OBJNR = e_objnr.
+  endif.
+
+ENDFORM.                    " BUILD_OBJECT_NUMBER_SEQUENCE
+
+*&---------------------------------------------------------------------*
+*&      Form  OBJECT_NUMBER_BUILD_OPER
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_AFVC_TAB_AUFPL  text
+*      -->P_AFVC_TAB_APLZL  text
+*      -->P_PREFIX_OPER  text
+*      <--P_AFVC_TAB_OBJNR  text
+*----------------------------------------------------------------------*
+FORM OBJECT_NUMBER_BUILD_OPER USING    i_aufpl like afvc-aufpl
+                                       i_aplzl like afvc-aplzl
+                                       i_prefix_oper
+                              CHANGING e_objnr like afvc-objnr.
+
+* initializations
+  clear e_objnr.
+  e_objnr    = i_prefix_oper.
+  e_objnr+2  = i_aufpl.
+  e_objnr+12 = i_aplzl.
+
+* check if onr00 entry exists
+  select single * from onr00 where objnr = e_objnr.
+  if not sy-subrc is initial.
+*   onr00 entry does not exist -> create onr00 entry
+    clear e_objnr.
+    if i_prefix_oper = 'OV'.
+*     production or process orders
+      call function 'OBJECT_NUMBER_GET_OV'
+        EXPORTING
+          aplzl = i_aplzl
+          aufpl = i_aufpl
+        IMPORTING
+          OBJNR = e_objnr.
+    elseif i_prefix_oper = 'NV'.
+*     network orders
+      call function 'OBJECT_NUMBER_GET_NV'
+        EXPORTING
+          aplzl = i_aplzl
+          aufpl = i_aufpl
+        IMPORTING
+          OBJNR = e_objnr.
+    endif.
+  endif.
+ENDFORM.                    " OBJECT_NUMBER_BUILD_OPER
+
+*&---------------------------------------------------------------------*
+*&      Form  OBJECT_NUMBER_BUILD_COMP
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_RESB_TAB_RSNUM  text
+*      -->P_RESB_TAB_RSPOS  text
+*      -->P_RESB_TAB_RSART  text
+*      <--P_RESB_TAB_OBJNR  text
+*----------------------------------------------------------------------*
+FORM OBJECT_NUMBER_BUILD_COMP USING    I_RSNUM LIKE RESB-RSNUM
+                                       I_RSPOS LIKE RESB-RSPOS
+                                       I_RSART LIKE RESB-RSART
+                              CHANGING E_OBJNR LIKE RESB-OBJNR.
+
+* initializations
+  clear e_objnr.
+  e_objnr    = 'OK'.
+  e_objnr+2  = i_rsnum.
+  e_objnr+12 = i_rspos.
+  e_objnr+16 = i_rsart..
+
+* check if onr00 entry exists
+  select single * from onr00 where objnr = e_objnr.
+  if not sy-subrc is initial.
+*   onr00 entry does not exist -> create onr00 entry
+    clear e_objnr.
+    call function 'OBJECT_NUMBER_GET_OK'
+      EXPORTING
+        rsart = i_rsart
+        rsnum = i_rsnum
+        rspos = i_rspos
+      IMPORTING
+        OBJNR = e_objnr.
+  endif.
+
+ENDFORM.                    " OBJECT_NUMBER_BUILD_COMP
+
+*&---------------------------------------------------------------------*
+*&      Form  object_number_build_prt
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_AFFH_TAB_AUFPL  text
+*      -->P_AFFH_TAB_PZLFH  text
+*      -->P_PREFIX_PRT  text
+*      <--P_AFFH_TAB_OBJNR  text
+*----------------------------------------------------------------------*
+FORM object_number_build_prt USING    I_AUFPL
+                                      I_PZLFH
+                                      I_PREFIX_PRT
+                             CHANGING E_OBJNR.
+
+* initializations
+  clear e_objnr.
+  e_objnr    = I_PREFIX_PRT.
+  e_objnr+2  = I_AUFPL.
+  e_objnr+12 = I_PZLFH.
+
+* check if onr00 entry exists
+  select single * from onr00 where objnr = e_objnr.
+  if not sy-subrc is initial.
+*   onr00 entry does not exist -> create onr00 entry
+    clear e_objnr.
+    call function 'OBJECT_NUMBER_GET_OF'
+      EXPORTING
+        aufpl = i_aufpl
+        pzlfh = i_pzlfh
+      IMPORTING
+        OBJNR = e_objnr.
+  endif.
+
+ENDFORM.                    " object_number_build_prt
+
+*&--------------------------------------------------------------------*
+*&      Form  check_network_head
+*&--------------------------------------------------------------------*
+*       When setting activities to status CRTD, network may not be
+*       REL ==> set network to PREL.
+*---------------------------------------------------------------------*
+*      -->I_OBJNR    text
+*---------------------------------------------------------------------*
+form check_network_head using i_aufpl like afvc-aufpl
+                              i_testmode.
+
+  statics: sv_aufpl like afvc-aufpl.
+
+  data: lt_stat  like jstat occurs 0 with header line,
+        lv_objnr like resb-objnr.
+
+* Process only once for each network
+  if sv_aufpl ne i_aufpl.
+    refresh lt_stat.
+    sv_aufpl = i_aufpl.
+    select single objnr from caufv into lv_objnr
+           where aufpl = i_aufpl.
+    check sy-subrc is initial.
+
+*   check wether network is released
+    CALL FUNCTION 'STATUS_CHECK'
+      EXPORTING
+        OBJNR             = lv_objnr
+        STATUS            = 'I0002'
+      EXCEPTIONS
+        OBJECT_NOT_FOUND  = 1
+        STATUS_NOT_ACTIVE = 2
+        OTHERS            = 3.
+
+    if sy-subrc is initial.
+*     set REL to inactive
+      lt_stat-stat = 'I0002'.
+      lt_stat-inact = 'X'.
+      append lt_stat.
+*     set PREL to active
+      lt_stat-stat = 'I0042'.
+      lt_stat-inact = ' '.
+      append lt_stat.
+    endif.
+
+    if not testmode is initial.
+      write: / 'REL Network',lv_objnr+2(12),'would be reset to PREL'.
+      write:   'due to new activity status CRTD'.
+    endif.
+
+    if testmode is initial.
+      write: / 'REL Network',lv_objnr+2(12),'is reset to PREL'.
+      write:   'due to new activity status CRTD'.
+
+      CALL FUNCTION 'STATUS_CHANGE_INTERN'
+        EXPORTING
+          OBJNR  = lv_objnr
+        TABLES
+          STATUS = lt_stat.
+    endif.
+  endif.
+endform.                    "check_network_head
+
+*Selection text£º
+*ORDER:D       .

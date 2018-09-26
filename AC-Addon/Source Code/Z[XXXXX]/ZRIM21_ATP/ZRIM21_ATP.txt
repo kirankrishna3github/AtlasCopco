@@ -1,0 +1,534 @@
+*BEGIN_METHOD CHANGESERVORDERAUTOMATICALLY CHANGING CONTAINER.
+REPORT zrim21.
+
+
+DATA:  BEGIN OF gs_vbeln_qmnum,
+         vbeln TYPE kdauf,
+         qmnum TYPE qmnum,
+       END OF gs_vbeln_qmnum.
+DATA: ls_viqmel TYPE viqmel.
+* Internal tables for the BAPI
+DATA lt_methods      TYPE bapi_alm_order_method_t.
+DATA ls_methods      TYPE bapi_alm_order_method.
+DATA lt_header              TYPE TABLE OF bapi_alm_order_headers_i.
+DATA ls_header              TYPE bapi_alm_order_headers_i.
+DATA lt_header_up           TYPE TABLE OF bapi_alm_order_headers_up.
+DATA ls_header_up           TYPE bapi_alm_order_headers_up.
+* Return
+DATA lt_return TYPE STANDARD TABLE OF bapiret2 WITH HEADER LINE.
+
+
+DATA: nodata_character VALUE '/'.
+DATA: bdc_options TYPE ctu_params.
+DATA: it_messtab TYPE TABLE OF bdcmsgcoll.
+DATA: bdcdata LIKE bdcdata OCCURS 0 WITH HEADER LINE.
+
+DATA: ls_header_ex LIKE bapi_alm_order_header_e.
+
+DATA: et_partner	LIKE	bapi_alm_order_partner OCCURS 0
+WITH HEADER LINE,
+       et_operations	LIKE	bapi_alm_order_operation_e OCCURS 0
+       WITH HEADER LINE,
+         et_components	LIKE	bapi_alm_order_component_e OCCURS 0
+         WITH HEADER LINE,
+       et_relations LIKE	bapi_alm_order_relation_export OCCURS 0
+WITH HEADER LINE,
+       et_texts LIKE	bapi_alm_text OCCURS 0 WITH HEADER LINE,
+       et_text_lines	LIKE	bapi_alm_text_lines OCCURS 0
+       WITH HEADER LINE,
+
+       et_prts	LIKE	bapi_alm_order_prt_e OCCURS 0 WITH HEADER LINE,
+       et_costs_sum	LIKE	bapi_alm_order_costs_sum_e OCCURS 0
+       WITH HEADER LINE,
+       et_costs_details	LIKE	bapi_alm_order_costs_detail_e OCCURS 0
+WITH HEADER LINE,
+       et_return	LIKE	bapiret2 OCCURS 0 WITH HEADER LINE,
+       requisition_items  LIKE bapiebanc  OCCURS 0 WITH HEADER LINE,
+    requisition_account_assignment  LIKE bapiebkn  OCCURS 0
+    WITH HEADER LINE,
+    return LIKE bapireturn OCCURS 0 WITH HEADER LINE.
+
+DATA it_component    TYPE bapi_alm_order_component_t WITH HEADER LINE .
+DATA ls_components    TYPE bapi_alm_order_component.
+DATA it_component_up TYPE bapi_alm_order_component_ut.
+DATA ls_components_up TYPE bapi_alm_order_component_up.
+
+DATA: lv_create_purch_org,
+      lv_preferred_plant LIKE marc-werks.
+
+PARAMETER: p_aufnr TYPE aufnr OBLIGATORY.
+
+PARAMETER: p_VBELN LIKE VBAK-VBELN OBLIGATORY.
+
+** - Get the newly created service order. => OBJECT-KEY-NUMBER (I hope)
+*SELECT VBELN POSNR ETENR AUFNR INTO TABLE IT_VBEP
+*                               FROM VBEP
+*                                FOR ALL ENTRIES IN IT_VBAP
+*                              WHERE VBELN = IT_VBAP-VBELN
+*                                AND POSNR = IT_VBAP-POSNR.
+** Normally only 1 entry should be in IT_VBEP.
+*READ TABLE IT_VBEP INDEX 1.
+*CHECK SY-SUBRC EQ 0 AND NOT ( IT_VBEP-AUFNR IS INITIAL ).
+*
+*SELECT SINGLE * INTO CORRESPONDING FIELDS OF CAUFVD
+*                FROM CAUFV
+*               WHERE AUFNR = IT_VBEP-AUFNR.
+*IT_RIWOL-IHNUM = OBJECT-KEY-NUMBER.
+*APPEND IT_RIWOL.
+*
+* Get the sales order linked with the service order. If no sales order
+* found, this method should not be executed.
+
+*FIRST CHECK FOR LOCK
+*IF NECESSARY WAIT
+DATA: lt_enq TYPE STANDARD TABLE OF seqg3,
+      lv_gname TYPE eqegraname VALUE 'AUFK',
+      lv_garg TYPE eqegraarg,
+      lv_count TYPE sytabix.
+
+CONCATENATE sy-mandt p_aufnr INTO lv_garg.
+DO 5 TIMES.
+
+
+  CALL FUNCTION 'ENQUEUE_READ'
+    EXPORTING
+      gclient = sy-mandt
+      gname   = lv_gname
+      garg    = lv_garg
+    IMPORTING
+      number  = lv_count
+    TABLES
+      enq     = lt_enq.
+
+  IF lv_count = 0.
+    EXIT.
+  ELSE.
+    WAIT UP TO 1 SECONDS.
+  ENDIF.
+
+ENDDO.
+
+SELECT SINGLE kdauf INTO gs_vbeln_qmnum-vbeln FROM caufv
+                   WHERE aufnr = p_aufnr.
+
+********************
+* FOR TEST PURPOSES WE SET THIS IN COMMETN
+***********************
+* FOR TEST PURPOSES WE FILL IN NOT NR IN SEL SCREEN.
+
+* BECAUSE THE LINK IS NOT SET AT THIS MOMENT !!!
+*CHECK NOT gs_vbeln_qmnum-vbeln IS INITIAL.
+* Get the originating notification. If not found, stop!
+SELECT SINGLE qmnum INTO gs_vbeln_qmnum-qmnum FROM vbak
+                   WHERE vbeln =  gs_vbeln_qmnum-vbeln.
+
+SELECT SINGLE qmnum INTO gs_vbeln_qmnum-qmnum FROM VIQMEL
+                   WHERE vbeln =  P_vbeln.
+
+CHECK NOT gs_vbeln_qmnum-vbeln IS INITIAL.
+
+
+
+*CHECK NOT gs_vbeln_qmnum-qmnum IS INITIAL.
+* Read notification data.
+CALL FUNCTION 'READ_NOTIFICATION'
+  EXPORTING
+*   FEKNZ                = 'X'
+*   MAKNZ                = 'X'
+*   MSGTY                = 'E'
+    qmnum                = gs_vbeln_qmnum-qmnum
+  IMPORTING
+    iviqmel              = ls_viqmel
+* EXCEPTIONS
+*   INVALID_NUMBER       = 1
+*   OTHERS               = 2
+          .
+IF sy-subrc <> 0.
+* MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*         WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+ENDIF.
+
+* I. Change the service order: default values!
+* 1. Fill in the Method.
+* 1a. Header.
+ls_methods-refnumber  = '1'.
+ls_methods-objecttype = 'HEADER'.
+ls_methods-method     = 'CHANGE'.
+ls_methods-objectkey  = p_aufnr.
+APPEND ls_methods TO lt_methods.
+* 1e. Add SAVE-statement to the Methods.
+CLEAR ls_methods.
+ls_methods-method     = 'SAVE'.
+*   LS_METHODS-METHOD     = 'DIALOG'.
+APPEND ls_methods TO lt_methods.
+
+
+* 2. Fill in the Header.
+ls_header-orderid       = p_aufnr.
+ls_header_up-orderid    = p_aufnr.
+ls_header-calc_motive   = '1E'. "Moet nog bekeken worden!!!!!!!!!!!!!!
+ls_header_up-calc_motive = 'X'.
+* LS_HEADER-START_DATE    = LS_VIQMEL-strmn.
+ls_header-start_date    = '20070201'.
+ls_header_up-start_date = 'X'.
+* LS_HEADER-FINISH_DATE   = LS_VIQMEL-ltrmn.
+ls_header-finish_date   = ls_viqmel-strmn.
+"LTRMN is not always filled in. for testreasons, copy startdate into fin
+"ish.
+ls_header_up-finish_date  = 'X'.
+ls_header-basic_fin     = '240000'.
+ls_header_up-basic_fin     = 'X'.
+ls_header-priority      = ls_viqmel-priok.
+ls_header_up-priority = 'X'.
+ls_header-plangroup     = ls_viqmel-ingrp.
+ls_header_up-plangroup  = 'X'.
+APPEND ls_header TO lt_header.
+APPEND ls_header_up TO lt_header_up.
+break air21775.
+
+* GET ALL SERVICE INFO
+
+CALL FUNCTION 'BAPI_ALM_ORDER_GET_DETAIL'
+  EXPORTING
+    number                 = p_aufnr
+  IMPORTING
+    es_header              = ls_header_ex
+*    ES_SRVDATA             =
+TABLES
+   et_partner             = et_partner
+   et_operations          = et_operations
+    et_components          = et_components
+    et_relations           = et_relations
+  et_texts               = et_texts
+  et_text_lines          = et_text_lines
+  et_prts                = et_prts
+  et_costs_sum           = et_costs_sum
+  et_costs_details       = et_costs_details
+  return                 = et_return
+*   EXTENSION_IN           =
+*   EXTENSION_OUT          =
+
+              .
+
+break air22187.
+
+*READ TABLE   et_components INDEX 1.
+*
+*MOVE-CORRESPONDING et_components TO it_component.
+*
+*
+*
+*
+**CLEAR
+**it_component-plant = 'PL02'.
+**it_component-special_stock = '1'.
+*
+*APPEND  it_component.
+*
+*
+*it_component-special_stock = '1'.
+*CLEAR it_component-reserv_no.
+*
+*APPEND  it_component.
+**
+**PERFORM fill_component_up TABLES it_component
+**                                  it_component_up.
+** FOR TESTING COMPONENT DELETE//CREATE
+*CLEAR ls_methods.
+*ls_methods-refnumber  = '1'.
+*ls_methods-objecttype = 'COMPONENT'.
+*ls_methods-method     = 'DELETE'.
+*
+*READ TABLE it_component INDEX 1.
+**CONCATENATE it_component-ACTIVITY p_aufnr INTO
+**ls_methods-objectkey .
+*
+*.ls_methods-objectkey = p_aufnr.
+*APPEND ls_methods TO lt_methods.
+*
+**CLEAR ls_methods.
+**ls_methods-refnumber  = '1'.
+**ls_methods-objecttype = 'COMPONENT'.
+**ls_methods-method     = 'CREATE'.
+**
+**
+**READ TABLE it_component INDEX 2.
+**
+***CONCATENATE it_component-ACTIVITY p_aufnr INTO
+***ls_methods-objectkey .
+**.ls_methods-objectkey = p_aufnr.
+**APPEND ls_methods TO lt_methods.
+*
+*CLEAR ls_methods.
+*ls_methods-refnumber  = '2'.
+*ls_methods-objecttype = 'COMPONENT'.
+*ls_methods-method     = 'CREATE'.
+*
+*
+*READ TABLE it_component INDEX 2.
+*
+**CONCATENATE it_component-ACTIVITY p_aufnr INTO
+**ls_methods-objectkey .
+*.ls_methods-objectkey = p_aufnr.
+*APPEND ls_methods TO lt_methods.
+
+LOOP AT et_components.
+  MOVE-CORRESPONDING et_components TO it_component.
+  APPEND it_component.
+ENDLOOP.
+*
+*It_component[] = et_components[].
+
+LOOP AT it_component.
+
+  CLEAR ls_methods.
+
+  ls_methods-objectkey = p_aufnr.
+  ls_methods-refnumber  = sy-tabix.
+  ls_methods-objecttype = 'COMPONENT'.
+  ls_methods-method     = 'DELETE'.
+  APPEND ls_methods TO lt_methods.
+ENDLOOP.
+
+LOOP AT it_component WHERE NOT reserv_no IS INITIAL.
+
+
+  it_component-special_stock = '1'.
+  CLEAR it_component-reserv_no.
+
+  APPEND  it_component.
+
+ENDLOOP.
+
+LOOP AT it_component .
+
+  IF it_component-reserv_no IS INITIAL.
+
+    CLEAR ls_methods.
+
+    ls_methods-objectkey = p_aufnr.
+    ls_methods-refnumber  = sy-tabix.
+    ls_methods-objecttype = 'COMPONENT'.
+    ls_methods-method     = 'CREATE'.
+    APPEND ls_methods TO lt_methods.
+
+  ENDIF.
+ENDLOOP.
+
+*CLEAR ls_methods.
+*
+**ls_methods-refnumber  = '1'.
+*ls_methods-objecttype = 'COMPONENT'.
+*ls_methods-method     = 'DELETE'.
+*
+**READ TABLE it_component INDEX 1.
+**CONCATENATE it_component-ACTIVITY p_aufnr INTO
+**ls_methods-objectkey .
+*
+*ls_methods-objectkey = p_aufnr.
+*APPEND ls_methods TO lt_methods.
+*
+*
+*
+*ENDLOOP.
+
+
+CALL FUNCTION 'BAPI_ALM_ORDER_MAINTAIN'
+  TABLES
+    it_methods             = lt_methods
+    it_header              = lt_header
+    it_header_up           = lt_header_up
+*   IT_HEADER_SRV          =
+*   IT_HEADER_SRV_UP       =
+*   IT_USERSTATUS          =
+*   IT_PARTNER             =
+*   IT_PARTNER_UP          =
+*   IT_OPERATION           =
+*   IT_OPERATION_UP        =
+*   IT_RELATION            =
+*   IT_RELATION_UP         =
+    it_component           =  it_component
+*    it_component_up        = it_component_up
+*   IT_TEXT                =
+*   IT_TEXT_LINES          =
+*   EXTENSION_IN           =
+    return                 = lt_return
+*   ET_NUMBERS             =
+          .
+break air21775.
+break air22187.
+CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+* EXPORTING
+*   WAIT          =
+* IMPORTING
+*   RETURN        =
+          .
+
+LOOP AT lt_return.
+
+  WRITE:/ lt_return-id, 5 lt_return-number, 12 lt_return-message.
+
+ENDLOOP.
+
+
+EXIT.
+
+
+*CALL FUNCTION 'IWOL_ADD_NOTIF_TO_DDB_INT'
+*  EXPORTING
+*    I_CAUFVD                  = CAUFVD
+*  TABLES
+*    T_RIWOL                   = IT_RIWOL
+** EXCEPTIONS
+**   NOTIFICATION_EXISTS       = 1
+**   OTHERS                    = 2
+*          .
+*IF SY-SUBRC <> 0.
+** MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+**         WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+*ENDIF.
+*
+*
+*CALL FUNCTION 'IWOL_ADD_OBJECTS_TO_DDB_EXT'
+*  EXPORTING
+*    I_CAUFVD            = CAUFVD
+*  TABLES
+*    T_RIWOL             = IT_RIWOL
+** EXCEPTIONS
+**   SHOW_MESSAGE        = 1
+**   INVALID_ENTRY       = 2
+**   OTHERS              = 3
+*          .
+*
+CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+*   EXPORTING
+*     WAIT          =
+*   IMPORTING
+*     RETURN        =
+.
+
+EXIT .
+
+FREE bdcdata.
+
+*----------------------------------------------
+PERFORM bdc_dynpro      USING 'SAPLCOIH'
+                              '0101'.
+PERFORM bdc_field       USING 'BDC_OKCODE'
+                              '/00'.
+PERFORM bdc_field       USING 'CAUFVD-AUFNR'
+                              p_aufnr.
+
+*----------------------------------------------
+PERFORM bdc_dynpro      USING 'SAPLCOIH'
+                              '3000'.
+PERFORM bdc_field       USING 'BDC_OKCODE'
+                              '=IOLU'.
+
+*----------------------------------------------
+PERFORM bdc_dynpro      USING 'SAPLCOIH'
+                              '3000'.
+PERFORM bdc_field       USING 'BDC_OKCODE'
+                              '=IHAD'.
+PERFORM bdc_field       USING 'RIWOL0-SELEC(01)'
+                              'X'.
+PERFORM bdc_field       USING 'RIWOL-IHNUM(01)'
+                              gs_vbeln_qmnum-qmnum.
+*----------------------------------------------
+PERFORM bdc_dynpro      USING 'SAPLCOIH'
+                              '3000'.
+PERFORM bdc_field       USING 'BDC_OKCODE'
+                              '=BU'.
+
+bdc_options-dismode = 'A'.
+*Call change sales order transaction
+CALL TRANSACTION 'IW32' USING bdcdata
+
+                        OPTIONS FROM bdc_options
+                        MESSAGES INTO it_messtab.
+
+
+IF sy-subrc EQ 0.
+
+ELSE.
+
+ENDIF.
+
+
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  BDC_DYNPRO
+*&---------------------------------------------------------------------*
+*       Start new screen
+*----------------------------------------------------------------------*
+FORM bdc_dynpro USING program dynpro.
+  CLEAR bdcdata.
+  bdcdata-program  = program.
+  bdcdata-dynpro   = dynpro.
+  bdcdata-dynbegin = 'X'.
+  APPEND bdcdata.
+ENDFORM.                    "bdc_dynpro
+*&---------------------------------------------------------------------*
+*&      Form  BDC_FIELD
+*&---------------------------------------------------------------------*
+*       Insert field
+*----------------------------------------------------------------------*
+FORM bdc_field USING fnam fval.
+  IF fval <> nodata_character.
+    CLEAR bdcdata.
+    bdcdata-fnam = fnam.
+    bdcdata-fval = fval.
+    APPEND bdcdata.
+  ENDIF.
+ENDFORM.                    "bdc_field
+
+
+
+
+
+
+
+*END_METHOD.
+*&---------------------------------------------------------------------*
+*&      Form  FILL_COMPONENT_UP
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_IT_COMPONENT  text
+*      -->P_IT_COMPONENT_UP  text
+*----------------------------------------------------------------------*
+FORM fill_component_up  TABLES   p_it_component
+                  STRUCTURE bapi_alm_order_component
+                                 p_it_component_up
+                   STRUCTURE bapi_alm_order_component_up.
+
+
+
+  DATA: lv_counter TYPE i.
+  FIELD-SYMBOLS: <field>, <field2>.
+
+  READ TABLE  p_it_component INDEX 2.
+
+  lv_counter = 1.
+  DO.
+    ASSIGN COMPONENT lv_counter OF STRUCTURE p_it_component
+    TO <field>.
+    IF sy-subrc EQ 0.
+      IF NOT <field> IS INITIAL.
+
+        ASSIGN COMPONENT lv_counter
+        OF STRUCTURE p_it_component_up
+        TO <field2>.
+        <field2> = 'X'.
+      ENDIF.
+      ADD 1 TO lv_counter.
+    ELSE.
+      EXIT.
+    ENDIF.
+  ENDDO.
+  APPEND p_it_component_up.
+
+
+ENDFORM.                    " FILL_COMPONENT_UP

@@ -1,0 +1,2768 @@
+**
+*D332
+*
+REPORT rv56td01 MESSAGE-ID vw
+                LINE-SIZE 85
+                NO STANDARD PAGE HEADING.
+
+* extended syntax checker should not detect any 'UNUSED VARIABLES'Error
+SET EXTENDED CHECK OFF.
+
+*------- Includes
+INCLUDE vttkdata.                      "Shipment Header
+INCLUDE vttsdata.                      "Shipment Stages
+INCLUDE vttpdata.                      "Shipment Items
+INCLUDE vbpadata.                      "Partner
+INCLUDE vtfadata.                      "Flow
+INCLUDE sadrdata.                      "Address
+INCLUDE vtlfdata.                      "Deliveries selected
+INCLUDE rvadtabl.                      "Messages
+INCLUDE vsedata.                       "shipping units
+INCLUDE rv56acom.                      "I/O-Structure
+
+*------- Tables
+TABLES: vbpla, t005, t005t, t604t, marc.
+
+TABLES: cmr_01,
+        cmr_02,
+        cmr_03,
+        cmr_04,
+        cmr_06ff,
+        cmr_06a,
+        cmr_14,
+        cmr_15,
+        cmr_16,
+        cmr_17,
+        cmr_20,
+        cmr_21.
+
+* reactivate extended syntax checker ...
+SET EXTENDED CHECK ON.
+
+*------- Types
+
+TYPES: cmr_01_type       LIKE cmr_01,
+       cmr_02_type       LIKE cmr_02,
+       cmr_03_type       LIKE cmr_03,
+       cmr_04_type       LIKE cmr_04,
+       cmr_06ff_type     LIKE cmr_06ff,
+       cmr_06ff_tab_type LIKE cmr_06ff OCCURS 0,
+       cmr_06a_type      LIKE cmr_06a,
+       cmr_14_type       LIKE cmr_14,
+       cmr_15_type       LIKE cmr_15,
+       cmr_16_type       LIKE cmr_16,
+       cmr_17_type       LIKE cmr_17,
+       cmr_20_type       LIKE cmr_20,
+       cmr_21_type       LIKE cmr_21.
+
+TYPES: BEGIN OF cmr_type,
+         language LIKE t005-spras,
+         country  LIKE t005-land1,
+         cmr_01   TYPE cmr_01_type,
+         cmr_02   TYPE cmr_02_type,
+         cmr_03   TYPE cmr_03_type,
+         cmr_04   TYPE cmr_04_type,
+         cmr_06ff TYPE cmr_06ff_tab_type,
+         cmr_06a  TYPE cmr_06a_type,
+         cmr_14   TYPE cmr_14_type,
+         cmr_15   TYPE cmr_15_type,
+         cmr_16   TYPE cmr_16_type,
+         cmr_17   TYPE cmr_17_type,
+         cmr_20   TYPE cmr_20_type,
+         cmr_21   TYPE cmr_21_type,
+       END OF cmr_type.
+
+TYPES: cmr_tab_typ TYPE cmr_type OCCURS 0.
+
+*------- General Data
+DATA: retcode LIKE sy-subrc,           "Return code
+      xscreen(1) TYPE c.               "Output on printer or screen
+
+DATA: cmr_form           TYPE cmr_tab_typ,     "Documents to print
+      something_to_print TYPE boolean.         "Flag for printing
+
+DATA: BEGIN OF protocol_tab OCCURS 0,
+         msg_arbgb LIKE syst-msgid,
+         msg_nr    LIKE syst-msgno,
+         msg_ty    LIKE syst-msgty,
+         msg_v1    LIKE syst-msgv1,
+         msg_v2    LIKE syst-msgv2,
+         msg_v3    LIKE syst-msgv3,
+         msg_v4    LIKE syst-msgv4.
+DATA: END OF protocol_tab.
+
+DATA:  it_plc     TYPE k9rcd11000010    OCCURS 0 WITH HEADER LINE,
+       lv_plc     TYPE char3,
+       lv_plctext TYPE char10.
+DATA: lv_sort2 TYPE adrc-sort2.
+DATA: p_day(2) TYPE c,
+      p_month(2) TYPE c,
+      p_year(4) TYPE c,
+      lv_datum(10) TYPE c.
+
+DATA: BEGIN OF i_lines OCCURS 0.
+        INCLUDE STRUCTURE tline.
+DATA: END OF i_lines.
+
+DATA: lv_text(132) TYPE c.
+
+*------- Constant values
+CONSTANTS:
+  two              LIKE adrs-anzzl  VALUE 2,   "number of lines
+  three            LIKE adrs-anzzl  VALUE 3,   "number of lines
+  four             LIKE adrs-anzzl  VALUE 4,   "number of lines
+  five             LIKE adrs-anzzl  VALUE 5,   "number of lines
+  kg               LIKE vbplk-gewei VALUE 'KG ',
+  m3               LIKE vbplk-gewei VALUE 'M3 ',
+
+
+  cmr_foname       LIKE tnapr-fonam VALUE 'SD_SHIPMENT_CMR'.
+
+DATA: l_szadr TYPE TABLE OF yse_printform_table WITH HEADER LINE.
+
+TABLES: stxh.
+
+*----------------------------------------------------------------------*
+*        Aufruf der Entry-Routine aus der Nachrichtensteuerung         *
+*----------------------------------------------------------------------*
+FORM entry USING return_code us_screen.                     "#EC *
+
+  CLEAR retcode.
+  xscreen = us_screen.
+*  PERFORM processing.
+  PERFORM create_xls_file.
+  IF retcode NE 0.
+    return_code = 1.
+  ELSE.
+    return_code = 0.
+  ENDIF.
+
+ENDFORM.                    "ENTRY
+
+*---------------------------------------------------------------------*
+*       FORM PROCESSING                                               *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+FORM processing.
+
+  PERFORM initialize_data.
+
+  PERFORM get_data.
+
+  IF ( something_to_print = true ).
+    PERFORM print_cmr_documents USING cmr_form.
+  ELSE.
+    LOOP AT protocol_tab.
+      MOVE protocol_tab-msg_arbgb TO syst-msgid.
+      MOVE protocol_tab-msg_nr    TO syst-msgno.
+      MOVE protocol_tab-msg_ty    TO syst-msgty.
+      MOVE protocol_tab-msg_v1    TO syst-msgv1.
+      MOVE protocol_tab-msg_v2    TO syst-msgv2.
+      MOVE protocol_tab-msg_v3    TO syst-msgv3.
+      MOVE protocol_tab-msg_v4    TO syst-msgv4.
+      PERFORM protocol_update.
+    ENDLOOP.
+    retcode = 1.
+  ENDIF.
+ENDFORM.                    "PROCESSING
+
+*---------------------------------------------------------------------*
+*       FORM INITIALIZE_DATA                                          *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+FORM initialize_data.
+
+  CLEAR:   protocol_tab.
+  REFRESH: cmr_form,
+           protocol_tab.
+  something_to_print = true.
+
+ENDFORM.                    "INITIALIZE_DATA
+
+*---------------------------------------------------------------------*
+*       FORM PRINT_CMR_DOCUMENTS                                      *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  DOC                                                           *
+*---------------------------------------------------------------------*
+FORM print_cmr_documents USING doc TYPE cmr_tab_typ.
+
+  DATA: doc_rec TYPE cmr_type.
+
+  LOOP AT doc INTO doc_rec.
+    PERFORM open_form USING xscreen doc_rec-country.
+    IF ( retcode IS INITIAL ).
+      PERFORM print_document_body USING doc_rec.
+      PERFORM close_form.
+    ENDIF.
+    IF NOT ( retcode IS INITIAL ).
+      EXIT.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    "PRINT_CMR_DOCUMENTS
+
+*---------------------------------------------------------------------*
+*       FORM PRINT_DOCUMENT_BODY                                      *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  DOC_REC                                                       *
+*---------------------------------------------------------------------*
+FORM print_document_body USING doc_rec TYPE cmr_type.
+
+  PERFORM write_form USING 'CMR-PAGE' space.
+
+* cmr_14 must be assigned first because of field tdname needed for texts
+  cmr_14 = doc_rec-cmr_14.
+  PERFORM write_form USING 'CMR-14-1' space.
+  PERFORM write_form USING 'CMR-14-2' space.
+  cmr_01 = doc_rec-cmr_01.
+  PERFORM write_form USING 'CMR-1' space.
+  cmr_02 = doc_rec-cmr_02.
+  PERFORM write_form USING 'CMR-2' space.
+  cmr_03 = doc_rec-cmr_03.
+  PERFORM write_form USING 'CMR-3' space.
+  cmr_04 = doc_rec-cmr_04.
+  PERFORM write_form USING 'CMR-4' space.
+  PERFORM write_form USING 'CMR-5' 'TEXTE'.
+  cmr_06a = doc_rec-cmr_06a.
+  PERFORM write_form USING 'CMR-6A' space.
+  PERFORM write_form USING 'CMR-13' 'TEXTE'.
+  cmr_15 = doc_rec-cmr_15.
+  PERFORM write_form USING 'CMR-15' space.
+  cmr_16 = doc_rec-cmr_16.
+  PERFORM write_form USING 'CMR-16' space.
+  cmr_17 = doc_rec-cmr_17.
+  PERFORM write_form USING 'CMR-17' space.
+  PERFORM write_form USING 'CMR-18' 'TEXTE'.
+  PERFORM write_form USING 'CMR-19' 'TEXTE'.
+  cmr_20 = doc_rec-cmr_20.
+  PERFORM write_form USING 'CMR-20' space.
+  cmr_21 = doc_rec-cmr_21.
+  PERFORM write_form USING 'CMR-21' space.
+
+  LOOP AT doc_rec-cmr_06ff INTO cmr_06ff.
+    PERFORM write_form USING 'MAIN' 'ITEM_LINE'.
+    IF NOT ( sy-subrc IS INITIAL ).
+      EXIT.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    "PRINT_DOCUMENT_BODY
+
+*---------------------------------------------------------------------*
+*       FORM OPEN_FORM                                                *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  US_SCREEN                                                     *
+*  -->  US_COUNTRY                                                    *
+*---------------------------------------------------------------------*
+FORM open_form USING  us_screen  LIKE xscreen
+                      us_country LIKE sadr-land1.           "SADR40A
+
+  INCLUDE rvadopfo.
+
+ENDFORM.                    "OPEN_FORM
+
+*---------------------------------------------------------------------*
+*       FORM CLOSE_FORM                                               *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+FORM close_form.
+
+  CALL FUNCTION 'CLOSE_FORM'
+    EXCEPTIONS
+      OTHERS = 1.
+
+  IF NOT ( sy-subrc IS INITIAL ).
+    PERFORM protocol_update.
+    retcode = 1.
+  ENDIF.
+
+ENDFORM.                    "CLOSE_FORM
+
+*---------------------------------------------------------------------*
+*       FORM WRITE_FORM                                               *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  VALUE(WINDOW)                                                 *
+*  -->  VALUE(ELEMENT)                                                *
+*---------------------------------------------------------------------*
+FORM write_form USING    value(window)  TYPE c
+                         value(element) TYPE c.
+
+  CALL FUNCTION 'WRITE_FORM'
+    EXPORTING
+      element = element
+      window  = window
+    EXCEPTIONS
+      element = 1
+      window  = 2.
+
+  IF NOT ( sy-subrc IS INITIAL ).
+    PERFORM protocol_update.
+  ENDIF.
+
+ENDFORM.                    "WRITE_FORM
+
+*---------------------------------------------------------------------*
+*       FORM PROTOCOL_UPDATE                                          *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+FORM protocol_update.
+
+  CHECK xscreen = false.               "output on printer
+
+  CALL FUNCTION 'NAST_PROTOCOL_UPDATE'
+    EXPORTING
+      msg_arbgb = syst-msgid
+      msg_nr    = syst-msgno
+      msg_ty    = syst-msgty
+      msg_v1    = syst-msgv1
+      msg_v2    = syst-msgv2
+      msg_v3    = syst-msgv3
+      msg_v4    = syst-msgv4.
+
+ENDFORM.                    "PROTOCOL_UPDATE
+
+*---------------------------------------------------------------------*
+*       FORM GET_DATA                                                 *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+FORM get_data.
+
+  DATA: shipment_num LIKE vttk-tknum,
+        language     LIKE nast-spras,
+        cmr_record   TYPE cmr_type,
+        sadr_begin   LIKE sadr,                             "SADR40A
+        sadr_end     LIKE sadr,                             "SADR40A
+        cmr_xvtts    LIKE xvtts OCCURS 0 WITH HEADER LINE.
+  "print relevant segments
+
+  language     = nast-spras.
+  shipment_num = nast-objky.
+
+  CALL FUNCTION 'RV_SHIPMENT_PRINT_VIEW'
+    EXPORTING
+      shipment_number     = shipment_num
+      option_tvtk         = true          "Shipmenttype Y/N
+      option_ttds         = true          "Disposition Y/N
+      language            = language
+      option_items        = true          "Transport Items Y/N
+      option_sales_orders = true          "Transport Segments Y/N
+      option_export_data  = true          "Partners Y/N
+      option_segments     = true          "Sales orders Y/N
+      option_partners     = true          "Export data Y/N
+      option_packages     = true          "Packages Y/N
+      option_flow         = true          "Flow Y/N
+      option_no_refresh   = false         "Refresh Tables Y/N
+    IMPORTING
+      f_vttkvb            = vttkvb        "Shipment Head
+      f_tvtk              = tvtk          "Shipmenttype
+      f_tvtkt             = tvtkt         "Description Shipmenttye
+      f_ttds              = ttds          "Disposition
+      f_ttdst             = ttdst         "Description Disposition
+      f_vbpla             = vbpla         "Packages
+    TABLES
+      f_vttp              = xvttp         "Shipment Items
+      f_trlk              = slk           "Delivery
+      f_trlp              = slp           "Delivery Item
+      f_vtts              = xvtts         "Shipment Segments
+      f_vtsp              = xvtsp         "Segments/Items
+      f_vbpa              = xvbpa         "Partner
+      f_vbadr             = xvbadr        "Address
+      f_vtfa              = xvtfa         "Flow
+      f_vbplk             = xvbplk        "Shipment Unit Header
+      f_vbplp             = xvbplp        "Shipment Unit
+      f_vbpls             = xvbpls        "Shipment Unit Sum
+    EXCEPTIONS
+      not_found           = 1
+      OTHERS              = 2.
+
+  IF NOT ( sy-subrc IS INITIAL ).
+* save protocol record
+    protocol_tab-msg_arbgb = 'VW'.
+    protocol_tab-msg_nr    = '010'.
+    protocol_tab-msg_ty    = 'E'.
+    protocol_tab-msg_v1    = shipment_num.
+    APPEND protocol_tab.
+* set flag nothing to print
+    something_to_print = false.
+  ELSE.
+    PERFORM get_legs_to_print TABLES cmr_xvtts.
+    LOOP AT cmr_xvtts.
+      CLEAR: cmr_record,
+             sadr_begin,
+             sadr_end.
+* convert all units to kg and m3
+      PERFORM unit_conversion TABLES xvbplk slp.
+* get address data of leg (begin and end)
+      PERFORM get_address_data_of_leg USING cmr_xvtts
+                                            sadr_begin
+                                            sadr_end.
+* set country and language
+      cmr_record-country  = sadr_begin-land1.
+      cmr_record-language = sy-langu.
+      SELECT SINGLE spras INTO cmr_record-language FROM t005
+                          WHERE land1 = cmr_record-country.
+* get sender data
+      PERFORM get_data_cmr_01 USING cmr_record
+                                    sadr_begin
+                                    sadr_begin-land1.
+* get consignee data
+      PERFORM get_data_cmr_02 USING cmr_record
+                                    sadr_end
+                                    sadr_begin-land1.
+* get place of delivery of the goods
+      PERFORM get_data_cmr_03 USING cmr_record
+                                    sadr_end
+                                    sadr_begin-land1.
+* get place and date of taking over the goods
+      PERFORM get_data_cmr_04 USING cmr_record
+                                    sadr_begin
+                                    sadr_begin-land1
+                                    cmr_xvtts.
+* get position data
+      PERFORM get_data_cmr_06ff USING  cmr_record
+                                       cmr_xvtts.
+
+* get instructions as to payment for carriage and
+* save shipment number for printing texts
+      PERFORM get_data_cmr_14 USING  cmr_record
+                                     cmr_xvtts.
+
+* get carrier data
+      PERFORM get_data_cmr_16 USING cmr_record
+                                    sadr_begin-land1
+                                    cmr_xvtts.
+
+* get established in/on
+      PERFORM get_data_cmr_21 USING cmr_record.
+
+      APPEND cmr_record TO cmr_form.
+    ENDLOOP.
+  ENDIF.
+
+ENDFORM.                    "GET_DATA
+
+*---------------------------------------------------------------------*
+*       FORM GET_ADDRESS_DATA_OF_LEG                                  *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  VALUE(LEG)                                                    *
+*  -->  SADR_BEGIN                                                    *
+*  -->  SADR_END                                                      *
+*---------------------------------------------------------------------*
+FORM get_address_data_of_leg USING value(leg)   LIKE      xvtts
+                                   sadr_begin   STRUCTURE sadr "SADR40A
+                                   sadr_end     STRUCTURE sadr. "SADR40A
+
+  DATA:
+    l_dept LIKE loc_dept,
+    l_dest LIKE loc_dest.
+
+  MOVE-CORRESPONDING leg TO l_dept.
+  CALL FUNCTION 'ST_LOCATION_ADDR_READ'
+    EXPORTING
+      i_location        = l_dept
+    IMPORTING
+      e_sadr            = sadr_begin
+    EXCEPTIONS
+      address_not_found = 1
+      OTHERS            = 2.
+  IF sy-subrc NE 0.
+    syst-msgid = 'VW'.
+    syst-msgno = '002'.
+    syst-msgty = 'E'.
+    syst-msgv1 = text-001.
+    syst-msgv2 = 'SADR'.
+    PERFORM protocol_update.
+    CLEAR sadr_begin.
+  ENDIF.
+
+  MOVE-CORRESPONDING leg TO l_dest.
+  CALL FUNCTION 'ST_LOCATION_ADDR_READ'
+    EXPORTING
+      i_location        = l_dest
+    IMPORTING
+      e_sadr            = sadr_end
+    EXCEPTIONS
+      address_not_found = 1
+      OTHERS            = 2.
+  IF sy-subrc NE 0.
+    syst-msgid = 'VW'.
+    syst-msgno = '002'.
+    syst-msgty = 'E'.
+    syst-msgv1 = text-001.
+    syst-msgv2 = 'SADR'.
+    PERFORM protocol_update.
+    CLEAR sadr_end.
+  ENDIF.
+
+ENDFORM.                    "GET_ADDRESS_DATA_OF_LEG
+
+*---------------------------------------------------------------------*
+*       FORM GET_DATA_CMR_01                                          *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  CMR_REC                                                       *
+*  -->  VALUE(H_SADR)                                                 *
+*  -->  VALUE(SENDER_COUNTRY)                                         *
+*---------------------------------------------------------------------*
+FORM get_data_cmr_01
+                  USING cmr_rec         TYPE      cmr_type
+                  value(h_sadr)         STRUCTURE sadr      "SADR40A
+                  value(sender_country) LIKE      sadr-land1. "SADR40A
+
+  DATA: h_adrs LIKE adrs,
+        language LIKE t005-spras.
+
+  IF NOT ( h_sadr IS INITIAL ).
+    MOVE-CORRESPONDING h_sadr TO h_adrs.
+    h_adrs-inlnd = sender_country.
+* country
+    language = sy-langu.
+    SELECT SINGLE spras INTO language FROM t005
+                                      WHERE land1 = sender_country.
+    SELECT SINGLE * FROM t005t WHERE spras = language    AND
+                                     land1 = h_adrs-land1.
+    IF ( sy-subrc IS INITIAL ).
+      SET LOCALE LANGUAGE language.
+      TRANSLATE t005t-landx TO UPPER CASE.               "#EC TRANSLANG
+      SET LOCALE LANGUAGE space.
+      cmr_rec-cmr_01-line4 = t005t-landx.
+    ENDIF.
+* address
+    h_adrs-anzzl = four.
+    PERFORM address_into_printform USING h_adrs.
+    cmr_rec-cmr_01-line0 = h_adrs-line0(40).
+    cmr_rec-cmr_01-line1 = h_adrs-line1(40).
+    cmr_rec-cmr_01-line2 = h_adrs-line2(40).
+    cmr_rec-cmr_01-line3 = h_adrs-line3(40).
+  ENDIF.
+
+ENDFORM.                    "GET_DATA_CMR_01
+
+*---------------------------------------------------------------------*
+*       FORM GET_DATA_CMR_02                                          *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  CMR_REC                                                       *
+*  -->  VALUE(H_SADR)                                                 *
+*  -->  VALUE(SENDER_COUNTRY)                                         *
+*---------------------------------------------------------------------*
+FORM get_data_cmr_02 USING cmr_rec         TYPE      cmr_type
+                     value(h_sadr)         STRUCTURE sadr   "SADR40A
+                     value(sender_country) LIKE      sadr-land1. "SADR40A
+
+  DATA: h_adrs   LIKE adrs,
+        language LIKE t005-spras.
+
+  IF NOT ( h_sadr IS INITIAL ).
+    MOVE-CORRESPONDING h_sadr TO h_adrs.
+    h_adrs-inlnd = sender_country.
+    IF ( h_adrs-land1 = h_adrs-inlnd ).
+* country
+      language = sy-langu.
+      SELECT SINGLE spras INTO language FROM t005
+                                        WHERE land1 = sender_country.
+      SELECT SINGLE * FROM t005t WHERE spras = language    AND
+                                       land1 = h_adrs-land1.
+      IF ( sy-subrc IS INITIAL ).
+        SET LOCALE LANGUAGE language.
+        TRANSLATE t005t-landx TO UPPER CASE.             "#EC TRANSLANG
+        SET LOCALE LANGUAGE space.
+        cmr_rec-cmr_02-line4 = t005t-landx.
+      ENDIF.
+* address
+      h_adrs-anzzl = four.
+      PERFORM address_into_printform USING h_adrs.
+      cmr_rec-cmr_02-line0 = h_adrs-line0(40).
+      cmr_rec-cmr_02-line1 = h_adrs-line1(40).
+      cmr_rec-cmr_02-line2 = h_adrs-line2(40).
+      cmr_rec-cmr_02-line3 = h_adrs-line3(40).
+    ELSE.
+      h_adrs-anzzl = five.
+      PERFORM address_into_printform USING h_adrs.
+      cmr_rec-cmr_02-line0 = h_adrs-line0(40).
+      cmr_rec-cmr_02-line1 = h_adrs-line1(40).
+      cmr_rec-cmr_02-line2 = h_adrs-line2(40).
+      cmr_rec-cmr_02-line3 = h_adrs-line3(40).
+      cmr_rec-cmr_02-line4 = h_adrs-line4(40).
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    "GET_DATA_CMR_02
+
+*---------------------------------------------------------------------*
+*       FORM GET_DATA_CMR_03                                          *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  CMR_REC                                                       *
+*  -->  VALUE(H_SADR)                                                 *
+*  -->  VALUE(SENDER_COUNTRY)                                         *
+*---------------------------------------------------------------------*
+FORM get_data_cmr_03 USING cmr_rec         TYPE      cmr_type
+                     value(h_sadr)         STRUCTURE sadr   "SADR40A
+                     value(sender_country) LIKE      sadr-land1. "SADR40A
+
+  DATA: h_adrs   LIKE adrs,
+        language LIKE t005-spras.
+
+  IF NOT ( h_sadr IS INITIAL ).
+    MOVE-CORRESPONDING h_sadr TO h_adrs.
+    h_adrs-inlnd = sender_country.
+    IF ( h_adrs-land1 = h_adrs-inlnd ).
+* country
+      language = sy-langu.
+      SELECT SINGLE spras INTO language FROM t005
+                                        WHERE land1 = sender_country.
+      SELECT SINGLE * FROM t005t WHERE spras = language     AND
+                                       land1 = h_adrs-land1.
+      IF ( sy-subrc IS INITIAL ).
+        SET LOCALE LANGUAGE language.
+        TRANSLATE t005t-landx TO UPPER CASE.             "#EC TRANSLANG
+        SET LOCALE LANGUAGE space.
+        cmr_rec-cmr_03-line2 = t005t-landx.
+      ENDIF.
+* address
+      h_adrs-anzzl = two.
+      PERFORM address_into_printform USING h_adrs.
+      cmr_rec-cmr_03-line0 = h_adrs-line0(40).
+      cmr_rec-cmr_03-line1 = h_adrs-line1(40).
+    ELSE.
+      h_adrs-anzzl = three.
+      PERFORM address_into_printform USING h_adrs.
+      cmr_rec-cmr_03-line0 = h_adrs-line0(40).
+      cmr_rec-cmr_03-line1 = h_adrs-line1(40).
+      cmr_rec-cmr_03-line2 = h_adrs-line2(40).
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    "GET_DATA_CMR_03
+
+*---------------------------------------------------------------------*
+*       FORM GET_DATA_CMR_04                                          *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  CMR_REC                                                       *
+*  -->  VALUE(H_SADR)                                                 *
+*  -->  VALUE(SENDER_COUNTRY)                                         *
+*  -->  VALUE(LEG)                                                    *
+*---------------------------------------------------------------------*
+FORM get_data_cmr_04 USING cmr_rec         TYPE      cmr_type
+                     value(h_sadr)         STRUCTURE sadr   "SADR40A
+                     value(sender_country) LIKE      sadr-land1 "SADR40A
+                     value(leg)            LIKE      xvtts.
+
+  DATA: h_adrs   LIKE adrs,
+        language LIKE t005-spras.
+
+  IF NOT ( h_sadr IS INITIAL ).
+    MOVE-CORRESPONDING h_sadr TO h_adrs.
+    h_adrs-inlnd = sender_country.
+* country
+    language = sy-langu.
+    SELECT SINGLE spras INTO language FROM t005
+                                      WHERE land1 = sender_country.
+    SELECT SINGLE * FROM t005t WHERE spras = language     AND
+                                     land1 = h_adrs-land1.
+    IF ( sy-subrc IS INITIAL ).
+      SET LOCALE LANGUAGE language.
+      TRANSLATE t005t-landx TO UPPER CASE.               "#EC TRANSLANG
+      SET LOCALE LANGUAGE space.
+      cmr_rec-cmr_04-line1 = t005t-landx.
+    ENDIF.
+* short-address
+    h_adrs-anzzl = four.
+    PERFORM address_into_printform USING h_adrs.
+    cmr_rec-cmr_04-line0 = h_adrs-linek(40).
+  ENDIF.
+
+* date
+* actual date of the begining of the leg
+  IF NOT ( leg-datbg IS INITIAL ).
+    cmr_rec-cmr_04-line2 = leg-datbg.
+* actual date of the begining of the shipment (complition)
+  ELSEIF NOT ( vttkvb-dtabf IS INITIAL ).
+    cmr_rec-cmr_04-line2 = vttkvb-dtabf.
+* planed date of the begining of the leg
+  ELSEIF NOT ( leg-dptbg IS INITIAL ).
+    cmr_rec-cmr_04-line2 = leg-dptbg.
+* planed date of the begining of the shipment (complition)
+  ELSEIF NOT ( vttkvb-dpabf IS INITIAL ).
+    cmr_rec-cmr_04-line2 = vttkvb-dpabf.
+  ENDIF.
+
+ENDFORM.                    "GET_DATA_CMR_04
+
+*---------------------------------------------------------------------*
+*       FORM GET_DATA_CMR_06FF                                        *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  CMR_REC                                                       *
+*  -->  VALUE(LEG)                                                    *
+*---------------------------------------------------------------------*
+FORM get_data_cmr_06ff USING  cmr_rec    TYPE  cmr_type
+                              value(leg) LIKE  xvtts.
+
+  DATA: vbplk_to_check LIKE xvbplk OCCURS 0 WITH HEADER LINE.
+  DATA: vbplk_to_print LIKE xvbplk OCCURS 0 WITH HEADER LINE.
+
+* view shiping units in shipment ********************************
+* get shiping units to be printed
+  LOOP AT xvbplk WHERE kzobe = true.
+    APPEND xvbplk TO vbplk_to_check.
+  ENDLOOP.
+  PERFORM get_shiping_units TABLES vbplk_to_check
+                                   vbplk_to_print.
+* condense shiping units to be printed
+  PERFORM condense_shiping_units TABLES vbplk_to_print
+                                 USING  cmr_rec.
+
+* view materials on leg *****************************************
+* condense materials shiped on leg
+  PERFORM condense_materials USING  cmr_rec
+                                    leg.
+
+  SORT cmr_rec-cmr_06ff ASCENDING BY pos10 pos09.
+
+ENDFORM.                    "GET_DATA_CMR_06FF
+
+*---------------------------------------------------------------------*
+*       FORM GET_DATA_CMR_14                                          *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  CMR_REC                                                       *
+*  -->  VALUE(LEG)                                                    *
+*---------------------------------------------------------------------*
+FORM get_data_cmr_14 USING  cmr_rec    TYPE  cmr_type
+                            value(leg) LIKE  xvtts.
+
+  DATA: h_inco1 LIKE vtts-inco1 OCCURS 0 WITH HEADER LINE.
+
+  DATA: lin LIKE sy-tabix.
+
+* save shipment number for printing texts ****************
+  cmr_rec-cmr_14-tdname = vttkvb-tknum.
+
+* get incoterms ******************************************
+  IF NOT ( leg-inco1 IS INITIAL ).
+* check on leg if <> initial
+    h_inco1 = leg-inco1.
+    APPEND leg-inco1 TO h_inco1.
+  ELSE.
+* check delivery inco
+    LOOP AT xvtsp WHERE tsnum = leg-tsnum.        "get shipment-position
+      READ TABLE xvttp WITH KEY tpnum = xvtsp-tpnum. "get delivery
+      IF ( sy-subrc IS INITIAL ).
+        READ TABLE slk WITH KEY vbeln = xvttp-vbeln.
+        IF ( sy-subrc IS INITIAL ).
+          h_inco1 = slk-inco1.
+          COLLECT h_inco1.
+        ENDIF.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+
+  DESCRIBE TABLE h_inco1 LINES lin.
+  IF ( lin = 1 ).
+* inco is definite (unique) --> print it
+    CASE h_inco1.
+      WHEN 'EXW' OR 'CFR' OR 'CIF' OR 'CPT' OR 'CIP' OR
+           'DAF' OR 'DES' OR 'DEQ' OR 'DDU' OR 'DDP'.
+        cmr_rec-cmr_14-unfrei = true.
+      WHEN 'FCA' OR 'FAS' OR 'FOB'.
+        cmr_rec-cmr_14-frei = true.
+    ENDCASE.
+  ENDIF.
+
+ENDFORM.                    "GET_DATA_CMR_14
+
+*---------------------------------------------------------------------*
+*       FORM GET_DATA_CMR_16                                          *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  CMR_REC                                                       *
+*  -->  VALUE(SENDER_COUNTRY)                                         *
+*  -->  VALUE(LEG)                                                    *
+*---------------------------------------------------------------------*
+FORM get_data_cmr_16 USING cmr_rec         TYPE cmr_type
+                     value(sender_country) LIKE sadr-land1  "SADR40A
+                     value(leg)            LIKE xvtts.
+
+  DATA: found    TYPE boolean,
+        h_sadr   LIKE sadr,                                 "SADR40A
+        h_adrs   LIKE adrs,
+        language LIKE t005-spras.
+
+  CLEAR: h_adrs,
+         h_sadr.
+  found = false.
+  READ TABLE xvbpa WITH KEY lifnr = leg-tdlnr.
+
+  IF ( sy-subrc IS INITIAL ) AND NOT ( xvbpa-adrnr IS INITIAL ).
+    PERFORM address_get_data USING xvbpa-adrnr xvbpa-adrda h_sadr.
+    IF ( sy-subrc IS INITIAL ).
+      MOVE-CORRESPONDING h_sadr TO h_adrs.
+      found = true.
+    ENDIF.
+  ELSE.
+    SELECT SINGLE * FROM lfa1 WHERE lifnr = leg-tdlnr.
+    IF ( sy-subrc IS INITIAL ).
+      MOVE-CORRESPONDING lfa1 TO h_adrs.
+      found = true.
+    ENDIF.
+  ENDIF.
+
+  IF ( found = true ).
+    h_adrs-inlnd = sender_country.
+    IF ( h_adrs-land1 = h_adrs-inlnd ).
+      language = sy-langu.
+      SELECT SINGLE spras INTO language FROM t005
+                                        WHERE land1 = sender_country.
+      SELECT SINGLE * FROM t005t WHERE spras = language    AND
+                                       land1 = h_adrs-land1.
+      IF ( sy-subrc IS INITIAL ).
+        SET LOCALE LANGUAGE language.
+        TRANSLATE t005t-landx TO UPPER CASE.             "#EC TRANSLANG
+        SET LOCALE LANGUAGE space.
+        cmr_rec-cmr_16-line4 = t005t-landx.
+      ENDIF.
+      h_adrs-anzzl = four.
+      PERFORM address_into_printform USING h_adrs.
+      cmr_rec-cmr_16-line0 = h_adrs-line0(40).
+      cmr_rec-cmr_16-line1 = h_adrs-line1(40).
+      cmr_rec-cmr_16-line2 = h_adrs-line2(40).
+      cmr_rec-cmr_16-line3 = h_adrs-line3(40).
+    ELSE.
+      h_adrs-anzzl = five.
+      PERFORM address_into_printform USING h_adrs.
+      cmr_rec-cmr_16-line0 = h_adrs-line0(40).
+      cmr_rec-cmr_16-line1 = h_adrs-line1(40).
+      cmr_rec-cmr_16-line2 = h_adrs-line2(40).
+      cmr_rec-cmr_16-line3 = h_adrs-line3(40).
+      cmr_rec-cmr_16-line4 = h_adrs-line4(40).
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    "GET_DATA_CMR_16
+
+*---------------------------------------------------------------------*
+*       FORM GET_DATA_CMR_21                                          *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  CMR_REC                                                       *
+*---------------------------------------------------------------------*
+FORM get_data_cmr_21 USING cmr_rec         TYPE cmr_type.
+
+  DATA:
+    l_addr1_sel LIKE addr1_sel,
+    h_sadr      LIKE sadr.                                  "SADR40A
+
+* established in (short-address)
+  IF NOT ( ttds-adrnr IS INITIAL ).                         "SADR40A
+    l_addr1_sel-addrnumber = ttds-adrnr.                    "SADR40A
+    CALL FUNCTION 'ADDR_GET'
+      EXPORTING
+        address_selection = l_addr1_sel
+        address_group     = 'CA01'        "it's a Customizing-Address
+      IMPORTING
+        sadr              = h_sadr
+      EXCEPTIONS
+        OTHERS            = 1.
+    IF NOT ( sy-subrc IS INITIAL ).
+      syst-msgid = 'VW'.
+      syst-msgno = '002'.
+      syst-msgty = 'E'.
+      syst-msgv1 = text-001.
+      syst-msgv2 = 'SADR'.
+      syst-msgv3 = ttds-adrnr.                              "SADR40A
+      PERFORM protocol_update.
+    ELSE.
+      IF NOT ( h_sadr-ort01 IS INITIAL ).
+        cmr_rec-cmr_21-pos00 = h_sadr-ort01(25).
+      ENDIF.
+    ENDIF.
+  ENDIF.
+* established on is generated by functionality of SapSkript
+* cmr_rec-cmr_21-pos01 = sy-datum.
+
+ENDFORM.                    "GET_DATA_CMR_21
+
+*---------------------------------------------------------------------*
+*       FORM UNIT_CONVERSION                                          *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  VBPLK_TAB                                                     *
+*  -->  VTRLP_TAB                                                     *
+*---------------------------------------------------------------------*
+FORM unit_conversion TABLES vbplk_tab STRUCTURE xvbplk
+                            vtrlp_tab STRUCTURE slp.
+
+  LOOP AT vbplk_tab.
+    PERFORM unit_conversion_simple USING vbplk_tab-brgew
+                                         vbplk_tab-brgew
+                                         vbplk_tab-gewei_max kg.
+
+    PERFORM unit_conversion_simple USING vbplk_tab-ntgew
+                                         vbplk_tab-ntgew
+                                         vbplk_tab-gewei_max kg.
+
+    PERFORM unit_conversion_simple USING vbplk_tab-magew
+                                         vbplk_tab-magew
+                                         vbplk_tab-gewei_max kg.
+
+    PERFORM unit_conversion_simple USING vbplk_tab-tarag
+                                         vbplk_tab-tarag
+                                         vbplk_tab-gewei kg.
+    vbplk_tab-gewei_max = kg.
+    vbplk_tab-gewei     = kg.
+
+    PERFORM unit_conversion_simple USING vbplk_tab-btvol
+                                         vbplk_tab-btvol
+                                         vbplk_tab-voleh_max m3.
+
+    PERFORM unit_conversion_simple USING vbplk_tab-ntvol
+                                         vbplk_tab-ntvol
+                                         vbplk_tab-voleh_max m3.
+
+    PERFORM unit_conversion_simple USING vbplk_tab-mavol
+                                         vbplk_tab-mavol
+                                         vbplk_tab-voleh_max m3.
+
+    PERFORM unit_conversion_simple USING vbplk_tab-tavol
+                                         vbplk_tab-tavol
+                                         vbplk_tab-voleh m3.
+    vbplk_tab-voleh_max = m3.
+    vbplk_tab-voleh     = m3.
+
+    MODIFY vbplk_tab.
+  ENDLOOP.
+
+  LOOP AT vtrlp_tab.
+    PERFORM unit_conversion_simple USING vtrlp_tab-brgew
+                                         vtrlp_tab-brgew
+                                         vtrlp_tab-gewei kg.
+
+    PERFORM unit_conversion_simple USING vtrlp_tab-ntgew
+                                         vtrlp_tab-ntgew
+                                         vtrlp_tab-gewei kg.
+    vbplk_tab-gewei = kg.
+
+    PERFORM unit_conversion_simple USING vtrlp_tab-volum
+                                         vtrlp_tab-volum
+                                         vtrlp_tab-voleh m3.
+    vtrlp_tab-voleh = m3.
+
+    MODIFY vtrlp_tab.
+  ENDLOOP.
+
+ENDFORM.                    "UNIT_CONVERSION
+
+*---------------------------------------------------------------------*
+*       FORM UNIT_CONVERSION_SIMPLE                                   *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  VALUE(INPUT)                                                  *
+*  -->  OUTPUT                                                        *
+*  -->  VALUE(UNIT_IN)                                                *
+*  -->  VALUE(UNIT_OUT)                                               *
+*---------------------------------------------------------------------*
+FORM unit_conversion_simple USING value(input)    TYPE any
+                                        output    TYPE any
+                                  value(unit_in)  LIKE t006-msehi
+                                  value(unit_out) LIKE t006-msehi.
+
+  CALL FUNCTION 'UNIT_CONVERSION_SIMPLE'
+    EXPORTING
+      input    = input
+      unit_in  = unit_in
+      unit_out = unit_out
+    IMPORTING
+      output   = output.
+
+ENDFORM.                    "UNIT_CONVERSION_SIMPLE
+
+*---------------------------------------------------------------------*
+*       FORM CONDENSE_SHIPING_UNITS                                   *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  VBPLK_TO_PRINT                                                *
+*  -->  CMR_REC                                                       *
+*---------------------------------------------------------------------*
+FORM condense_shiping_units TABLES vbplk_to_print STRUCTURE xvbplk
+                            USING  cmr_rec        TYPE      cmr_type.
+
+  DATA: BEGIN OF vbplk_condensed OCCURS 0,
+          vhilm     LIKE vbplk-vhilm,
+          vebez     LIKE vbplk-vebez,
+          tarag     LIKE vbplk-tarag,
+          tavol     LIKE vbplk-tavol,
+          number    LIKE sy-tabix.
+  DATA: END OF vbplk_condensed.
+  DATA: cmr_rec_06ff TYPE cmr_06ff_type.                    "Workarea
+  DATA: l_exidv      LIKE vbplk-exidv.
+
+* condense shiping units by vhilm
+  LOOP AT vbplk_to_print.
+    CLEAR: vbplk_condensed.
+    MOVE-CORRESPONDING vbplk_to_print TO vbplk_condensed.
+    vbplk_condensed-number = 1.
+    COLLECT vbplk_condensed.
+  ENDLOOP.
+
+* generate output of shiping units
+  LOOP AT vbplk_condensed.
+    CLEAR: cmr_rec_06ff.
+    IF ( vbplk_condensed-number = 1 ).
+      READ TABLE vbplk_to_print WITH KEY vhilm = vbplk_condensed-vhilm.
+* cmr_rec_06ff-pos06 is only 10 chars but exidv is 20 chars !
+* so leading blanks or zeroes are ignored
+      IF NOT vbplk_to_print-exidv2 IS INITIAL.
+        l_exidv = vbplk_to_print-exidv2.
+      ELSE.
+        l_exidv = vbplk_to_print-exidv.
+      ENDIF.
+      SHIFT l_exidv LEFT DELETING LEADING ' 0'.
+      cmr_rec_06ff-pos06 = l_exidv(10).
+    ENDIF.
+    cmr_rec_06ff-pos07 = vbplk_condensed-number.
+    cmr_rec_06ff-pos08 = vbplk_condensed-vebez(40).
+    cmr_rec_06ff-pos11 = vbplk_condensed-tarag.
+    cmr_rec_06ff-pos12 = vbplk_condensed-tavol.
+    cmr_rec_06ff-gewei = kg.
+    cmr_rec_06ff-voleh = m3.
+
+    APPEND cmr_rec_06ff TO cmr_rec-cmr_06ff.
+  ENDLOOP.
+
+ENDFORM.                    "CONDENSE_SHIPING_UNITS
+
+*---------------------------------------------------------------------*
+*       FORM CONDENSE_MATERIALS                                       *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  CMR_REC                                                       *
+*  -->  VALUE(LEG)                                                    *
+*---------------------------------------------------------------------*
+FORM condense_materials USING  cmr_rec    TYPE  cmr_type
+                               value(leg) LIKE xvtts.
+
+  DATA: tmp_slp LIKE slp OCCURS 0 WITH HEADER LINE.      "copy of slp
+
+  DATA: BEGIN OF vtrlp_condensed OCCURS 0,
+          matnr     LIKE vtrlp-matnr,
+          arktx     LIKE vtrlp-arktx,
+          stawn     LIKE vtrlp-stawn,
+          brgew     LIKE vtrlp-brgew,
+          volum     LIKE vtrlp-volum.
+  DATA: END OF vtrlp_condensed.
+
+  DATA: tmp_t604t LIKE t604t OCCURS 0 WITH HEADER LINE.
+
+  DATA: cmr_rec_06ff TYPE cmr_06ff_type.                "Workarea
+
+* find relevant delivery-positions
+  LOOP AT xvtsp WHERE tsnum = leg-tsnum.          "get shipment-position
+    READ TABLE xvttp WITH KEY tpnum = xvtsp-tpnum. "get delivery
+    LOOP AT slp WHERE vbeln = xvttp-vbeln.         "get delivery(item)
+      APPEND slp TO tmp_slp.
+    ENDLOOP.
+  ENDLOOP.
+
+* get stawn
+  PERFORM get_stawn TABLES tmp_slp
+                    USING  cmr_rec-country.
+
+* condense delivery-positions by stawn if it is not initial
+* otherwise condense by matnr
+  LOOP AT tmp_slp.
+    CLEAR: vtrlp_condensed.
+    MOVE-CORRESPONDING tmp_slp TO vtrlp_condensed.
+    IF NOT ( vtrlp_condensed-stawn IS INITIAL ).
+      CLEAR: vtrlp_condensed-matnr,
+             vtrlp_condensed-arktx.
+    ENDIF.
+    COLLECT vtrlp_condensed.
+  ENDLOOP.
+
+* get stawn-text
+  SELECT * FROM t604t INTO TABLE tmp_t604t            "#EC CI_SGLSELECT
+                      FOR ALL ENTRIES IN vtrlp_condensed
+                      WHERE spras = cmr_rec-language     AND
+                            land1 = cmr_rec-country      AND
+                            stawn = vtrlp_condensed-stawn.
+
+* generate output of condensed materials
+  LOOP AT vtrlp_condensed.
+    CLEAR: cmr_rec_06ff.
+    IF ( vtrlp_condensed-stawn IS INITIAL ).
+      cmr_rec_06ff-pos09 = vtrlp_condensed-arktx(14).
+    ELSE.
+      READ TABLE tmp_t604t WITH KEY spras = cmr_rec-language
+                                    land1 = cmr_rec-country
+                                    stawn = vtrlp_condensed-stawn.
+      IF ( sy-subrc IS INITIAL ).
+        cmr_rec_06ff-pos09 = tmp_t604t-text1(14).
+      ENDIF.
+      cmr_rec_06ff-pos10      = vtrlp_condensed-stawn(8).
+      cmr_rec_06ff-pos10+8(2) = '* '.
+    ENDIF.
+    cmr_rec_06ff-pos11 = vtrlp_condensed-brgew.
+    cmr_rec_06ff-pos12 = vtrlp_condensed-volum.
+    cmr_rec_06ff-gewei = kg.
+    cmr_rec_06ff-voleh = m3.
+
+    APPEND cmr_rec_06ff TO cmr_rec-cmr_06ff.
+  ENDLOOP.
+
+ENDFORM.                    "CONDENSE_MATERIALS
+
+*---------------------------------------------------------------------*
+*       FORM GET_STAWN                                                *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  TMP_SLP                                                       *
+*  -->  SENDER_COUNTRY                                                *
+*---------------------------------------------------------------------*
+FORM get_stawn TABLES tmp_slp STRUCTURE slp
+               USING  sender_country    LIKE t604-land1.
+
+  DATA: BEGIN OF tmp_marc OCCURS 0,
+          matnr LIKE marc-matnr,
+          werks LIKE marc-werks,
+          stawn LIKE marc-stawn.
+  DATA: END OF tmp_marc.
+
+  DATA: BEGIN OF tmp_t001w OCCURS 0,
+          werks LIKE t001w-werks,
+          land1 LIKE t001w-land1.
+  DATA: END OF tmp_t001w.
+* deleted lines of n_729272
+* v_n_729272
+  DATA:
+    tmp_marc_comb LIKE slp OCCURS 0 WITH HEADER LINE.
+  DATA:
+    BEGIN OF tmp_matnr OCCURS 0,
+               matnr LIKE marc-matnr,
+    END OF tmp_matnr.
+
+*------------------------------------------------------------------
+* The commodity code STAWN is determined for each delivery item.
+* It is retrieved from the material master MARC segment
+* using the item's material number and plant.
+* If it is not found, it is retrieved by a second access from
+* any other plant of the same country.
+*------------------------------------------------------------------
+* v_n_736942
+* do not process unless there is a departure country code
+  CHECK NOT sender_country IS INITIAL.
+* do not process unless there are delivery items
+  CHECK NOT tmp_slp[] IS INITIAL.
+* ^_n_736942
+* get all plants in sender_country
+  SELECT werks land1
+         FROM t001w
+         INTO CORRESPONDING FIELDS OF TABLE tmp_t001w
+         WHERE land1 = sender_country.
+
+  SORT tmp_t001w BY werks land1.
+
+* combinations of material and plant
+  tmp_marc_comb[] = tmp_slp[].
+* v_n_736942
+* reduce to those delivery items where the STAWN is missing
+  DELETE tmp_marc_comb WHERE NOT stawn IS INITIAL.
+  CHECK NOT tmp_marc_comb[] IS INITIAL.
+* ^_n_736942
+  SORT tmp_marc_comb BY matnr werks.
+  DELETE ADJACENT DUPLICATES
+         FROM tmp_marc_comb
+         COMPARING matnr werks.
+
+* get all stawn for all material/plant combinations
+  CHECK NOT tmp_marc_comb[] IS INITIAL.
+  SELECT matnr werks stawn
+         FROM marc
+         INTO TABLE tmp_marc
+         FOR ALL ENTRIES IN tmp_marc_comb
+         WHERE matnr =  tmp_marc_comb-matnr
+         AND   werks =  tmp_marc_comb-werks
+         AND   stawn NE space.               "not initial
+  SORT tmp_marc BY matnr werks.
+
+* retrieve the stawn
+  LOOP AT tmp_slp.
+    CHECK tmp_slp-stawn IS INITIAL.                         "n_980662
+    CLEAR sy-subrc.
+    IF tmp_slp-werks IS INITIAL.
+      sy-subrc = 4.
+    ELSE.
+*     retrieve with material/plant
+      READ TABLE tmp_marc
+           WITH KEY matnr = tmp_slp-matnr
+                    werks = tmp_slp-werks
+           BINARY SEARCH.
+    ENDIF.
+    IF NOT sy-subrc IS INITIAL.
+*     check if retrieval was already done for this material
+      READ TABLE tmp_matnr
+           WITH KEY matnr = tmp_slp-matnr
+           BINARY SEARCH.
+      IF NOT sy-subrc IS INITIAL.
+*       indicator for 2nd access by material only
+        tmp_matnr-matnr = tmp_slp-matnr.
+        INSERT tmp_matnr INDEX sy-tabix.
+*       prepare all plants of the same country
+        REFRESH tmp_marc_comb.
+        tmp_marc_comb-matnr = tmp_slp-matnr.
+        LOOP AT tmp_t001w.
+          tmp_marc_comb-werks = tmp_t001w-werks.
+          APPEND tmp_marc_comb.
+        ENDLOOP.
+        IF NOT tmp_marc_comb[] IS INITIAL.
+*         determine stawn for all plants
+          SELECT matnr werks stawn
+                 FROM marc
+                 APPENDING TABLE tmp_marc
+                 FOR ALL ENTRIES IN tmp_marc_comb
+                 WHERE matnr =  tmp_marc_comb-matnr
+                 AND   werks =  tmp_marc_comb-werks
+                 AND   stawn NE space.               "not initial
+          IF sy-subrc IS INITIAL.
+            SORT tmp_marc BY matnr werks.
+          ELSE.
+            CONTINUE.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+*     retrieve stawn with material only
+      READ TABLE tmp_marc
+           WITH KEY matnr = tmp_slp-matnr
+           BINARY SEARCH.
+    ENDIF.
+* insert the stawn
+    IF sy-subrc IS INITIAL.
+      tmp_slp-stawn = tmp_marc-stawn.
+      MODIFY tmp_slp.
+    ENDIF.
+  ENDLOOP.
+
+* ^_n_729272
+
+ENDFORM.                    "GET_STAWN
+
+*---------------------------------------------------------------------*
+*       FORM ADDRESS_GET_DATA                                         *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  VALUE(ADRNR)                                                  *
+*  -->  SADR                                                          *
+*---------------------------------------------------------------------*
+FORM address_get_data USING value(adrnr) LIKE      sadr-adrnr "SADR40A
+                            value(adrda) LIKE      vbpa-adrda
+                            sadr         STRUCTURE sadr.    "SADR40A
+
+  DATA:
+    l_addr1_sel LIKE addr1_sel,
+    l_read_sadr_only LIKE szad_field-flag.
+
+  l_addr1_sel-addrnumber = adrnr.
+
+  IF adrda CO 'DEF'.
+    CLEAR l_read_sadr_only.
+  ELSE.
+    l_read_sadr_only = 'X'.
+  ENDIF.
+
+  CALL FUNCTION 'ADDR_GET'
+    EXPORTING
+      address_selection = l_addr1_sel
+      read_sadr_only    = l_read_sadr_only
+    IMPORTING
+      sadr              = sadr
+    EXCEPTIONS
+      OTHERS            = 1.
+
+  IF NOT ( sy-subrc IS INITIAL ).
+    syst-msgid = 'VW'.
+    syst-msgno = '002'.
+    syst-msgty = 'E'.
+    syst-msgv1 = text-001.
+    syst-msgv2 = 'SADR'.
+    syst-msgv3 = adrnr.
+    PERFORM protocol_update.
+  ENDIF.
+
+ENDFORM.                    "ADDRESS_GET_DATA
+
+*---------------------------------------------------------------------*
+*       FORM ADDRESS_INTO_PRINTFORM                                   *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  ADRS                                                          *
+*---------------------------------------------------------------------*
+FORM address_into_printform USING adrs         LIKE adrs.
+
+  CALL FUNCTION 'ADDRESS_INTO_PRINTFORM'
+    EXPORTING
+      adrswa_in  = adrs
+    IMPORTING
+      adrswa_out = adrs.
+
+ENDFORM.                    "ADDRESS_INTO_PRINTFORM
+
+*---------------------------------------------------------------------*
+*       FORM GET_LEGS_TO_PRINT                                        *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  LEGS_TAB                                                      *
+*---------------------------------------------------------------------*
+FORM get_legs_to_print TABLES legs_tab STRUCTURE xvtts.
+
+  DATA: flag TYPE boolean.
+
+  CLEAR:   legs_tab.
+  REFRESH: legs_tab.
+* save protocol record (general)
+  protocol_tab-msg_arbgb = 'VW'.
+  protocol_tab-msg_nr    = '080'.
+  protocol_tab-msg_ty    = 'E'.
+  protocol_tab-msg_v1    = vttkvb-tknum.
+  APPEND protocol_tab.
+
+* set there is nothing to print if there are no legs
+  something_to_print = false.
+
+  SORT xvtts BY tsrfo.
+* check legs
+  LOOP AT xvtts.
+    PERFORM check_print_relevance USING    xvtts
+                                  CHANGING flag.
+* exit if the first print-relevant leg was found
+    IF ( flag = true ).
+      APPEND xvtts TO legs_tab.
+      EXIT.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    "GET_LEGS_TO_PRINT
+
+*---------------------------------------------------------------------*
+*       FORM CHECK_PRINT_RELEVANCE                                    *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  LEG                                                           *
+*  -->  FLAG                                                          *
+*---------------------------------------------------------------------*
+FORM check_print_relevance USING    leg LIKE xvtts
+                           CHANGING flag.
+
+  flag = false.
+  something_to_print = false.
+
+  IF ( leg-laufk = laufk-1 ) OR ( leg-laufk = laufk-4 ).
+    IF ( leg-tdlnr = nast-parnr ).
+      flag = true.
+      something_to_print = true.
+    ELSE.
+* save protocol record (wrong laufk)
+      protocol_tab-msg_arbgb = 'VW'.
+      protocol_tab-msg_nr    = '082'.
+      protocol_tab-msg_ty    = 'I'.
+      protocol_tab-msg_v1    = leg-tsnum.
+      APPEND protocol_tab.
+    ENDIF.
+  ELSE.
+* save protocol record (wrong tdlnr)
+    protocol_tab-msg_arbgb = 'VW'.
+    protocol_tab-msg_nr    = '081'.
+    protocol_tab-msg_ty    = 'I'.
+    protocol_tab-msg_v1    = leg-tsnum.
+    APPEND protocol_tab.
+  ENDIF.
+
+ENDFORM.                    "CHECK_PRINT_RELEVANCE
+
+*---------------------------------------------------------------------*
+*       FORM GET_SHIPING_UNITS                                        *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  VBPLK_TO_CHECK                                                *
+*  -->  VBPLK_TO_PRINT                                                *
+*---------------------------------------------------------------------*
+FORM get_shiping_units TABLES vbplk_to_check STRUCTURE xvbplk
+                              vbplk_to_print STRUCTURE xvbplk.
+
+  DATA: lin     LIKE sy-tabix.
+  DATA: h_vbplk LIKE vbplk OCCURS 0.
+
+  DESCRIBE TABLE vbplk_to_check LINES lin.
+
+  CHECK NOT ( lin IS INITIAL ).
+
+* print-relevant shiping units
+  LOOP AT vbplk_to_check WHERE ( veltp <> veltp_tpm ).
+    APPEND vbplk_to_check TO vbplk_to_print.
+    DELETE vbplk_to_check.
+  ENDLOOP.
+
+* get child shiping units to check
+  LOOP AT vbplk_to_check.
+    LOOP AT xvbplk WHERE ( uevel = vbplk_to_check-venum ).
+      APPEND xvbplk TO h_vbplk.
+    ENDLOOP.
+  ENDLOOP.
+
+  REFRESH: vbplk_to_check.
+  vbplk_to_check[] = h_vbplk[].
+
+* check child shiping units
+  PERFORM get_shiping_units TABLES vbplk_to_check
+                                   vbplk_to_print.
+
+ENDFORM.                    "GET_SHIPING_UNITS
+*&---------------------------------------------------------------------*
+*&      Form  create_xls_file
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM create_xls_file .
+  TABLES: tve1t, ekpv, vbak, vbap, vbfa, knvk, ekbe, addr1_val.
+
+  TYPES: BEGIN OF tp_tab_char,
+  space(1) TYPE c,
+  outbdel(255) TYPE c,
+  ordnbr(50) TYPE c,
+  dpdmode(30) TYPE c ,
+  category(30) TYPE c ,
+  cases(5) TYPE c ,
+  brgew(15) TYPE c ,
+  text50(50) TYPE c ,
+  text1(52) TYPE c ,
+  text51(50) TYPE c ,
+  text2(20) TYPE c ,
+  tprod(14) TYPE c ,
+  text52(50) TYPE c ,
+  sname(81) TYPE c ,
+  sapreg(21) TYPE c ,
+  city(25) TYPE c ,
+  address(60) TYPE c ,
+  building(20) TYPE c ,
+  roomnumber(40) TYPE c ,
+  space1(2) TYPE c,
+  space2(2) TYPE c,
+  contact(50) TYPE c ,
+  phone(60) TYPE c ,
+  text3(75) TYPE c ,
+  text4(30) TYPE c ,
+  text5(24) TYPE c ,
+  text6(32) TYPE c ,
+  text7(30) TYPE c ,
+  text8(17) TYPE c ,
+  text9(44) TYPE c ,
+  text53(50) TYPE c ,
+  text10(12) TYPE c ,
+  text11(21) TYPE c ,
+         END OF tp_tab_char.
+
+  TYPES: BEGIN OF tp_matnr,
+   matnr TYPE matnr,
+   prctr TYPE prctr,
+  END OF tp_matnr.
+
+  DATA: it_tab_char1 TYPE STANDARD TABLE OF tp_tab_char.
+  DATA: wa_tab_char1 TYPE tp_tab_char.
+*Begin of changes by EXTSPA On 29.11.2013 for CR3079
+  DATA : it_tab_char2 TYPE STANDARD TABLE OF tp_tab_char.
+  DATA : wa_tab_char2 TYPE tp_tab_char.
+  DATA : lv_delivery TYPE vbeln_vl.
+*End of changes by EXTSPA on 29.11.2013 for CR3079
+  DATA: lv_vsbed TYPE ekpv-vsbed.
+  DATA: lv_type TYPE c.
+  DATA: lv_kunnr LIKE ekpv-kunnr.
+  DATA: lv_adrnr LIKE vbpa-adrnr.
+  DATA: lv_parnr LIKE vbpa-parnr.
+  DATA: lv_adrda LIKE vbpa-adrda.
+
+  DATA: shipment_num LIKE vttk-tknum.
+  DATA: lv_file TYPE string.
+
+  DATA: lv_file1(132) TYPE c.
+
+  DATA: lv_par1(40) TYPE c.
+  DATA: lv_par2(40) TYPE c.
+  DATA: it_tab TYPE STANDARD TABLE OF yse_forwarder_zfor_mrua.
+  DATA: wa_tab TYPE yse_forwarder_zfor_mrua.
+  DATA: lv_len1 TYPE i,
+        lv_len2 TYPE i.
+  DATA: i_szadr TYPE yse_printform_table OCCURS 0.
+  DATA: w_szadr TYPE yse_printform_table,
+        street4 TYPE stras_gp,
+        street5 TYPE stras_gp.
+
+  DATA: lv_codepage2 TYPE cpcodepage.
+  DATA: lv_codepage TYPE abap_encod.
+
+  DATA: adrnr_vkorg LIKE slk-adrnr.
+  DATA: sel LIKE addr1_sel.
+
+  DATA: lv_landx50 LIKE t005t-landx50,
+        lv_region LIKE t005u-bezei.
+
+  DATA: lv_counter(5) TYPE n.
+  DATA: lv_inco2 TYPE inco2.
+  DATA: lv_brgew TYPE brgew.
+  DATA: lv_counter_c TYPE char5.
+  DATA: lv_brgew_c TYPE char15.
+  DATA: lv_btvol_c TYPE char15.
+  DATA: lv_btvol TYPE vekp-btvol.
+
+  DATA: vkorg TYPE vtrlk-vkorg, kunwe TYPE vtrlk-kunwe,
+      vstel TYPE vtrlk-vstel, kunag TYPE vtrlk-kunag.
+
+  DATA: first TYPE c.
+
+  DATA: wa_knvk_contact TYPE knvk.
+  DATA: wa_adcp_contact TYPE adcp.
+  DATA: wa_tpfkt_contact TYPE tpfkt.
+
+  DATA: lv_bstnk TYPE bstnk.
+  DATA: lv_name1 LIKE thead-tdname,
+        lv_street TYPE stras,
+        lv_building TYPE ad_bldng,
+        lv_city1 TYPE ad_city1,
+        lv_postal TYPE pstlz,
+        lv_region2 TYPE regio.
+  DATA: lv_slkname1 TYPE name1_gp.
+  DATA: lv_slkname2 TYPE name2_gp.
+
+
+
+  DATA: lt_matnr TYPE STANDARD TABLE OF tp_matnr WITH HEADER LINE.
+  DATA: lv_bukrs TYPE bukrs,
+        lv_matnr TYPE matnr,
+        lv_vtweg TYPE vtweg,
+        gv_segmt   TYPE z_segment,
+        lv_ordnbr TYPE char50,
+        lv_outbdel TYPE char255,
+        lv_contact TYPE char255,
+        lv_tele TYPE char255,
+        lv_old_vbeln TYPE vtrlk-vbeln.
+
+*Begin of changes by EXTSPA on 29.11.2013 for CR3079
+  DATA : lv_data TYPE string,
+         lv_slen TYPE i,
+         lv_lines TYPE i,
+         lv_cnt  TYPE i,
+         itab TYPE TABLE OF string,
+         wa_itab TYPE string.
+  DATA : it_reg_ship TYPE STANDARD TABLE OF yse_sd_reg_ship INITIAL SIZE 0,
+         wa_reg_ship TYPE yse_sd_reg_ship.
+  CONSTANTS : c_cur(3) TYPE c VALUE 'CUR',
+              c_z1(2)  TYPE c VALUE 'Z1',
+*Begin of changes by EXTSPA on 12.12.2013 for CR3079
+              c_bzp(3) TYPE c VALUE 'BZP',
+*End of changes by EXTSPA on 12.12.2013 for CR3079
+              c_z2(2)  TYPE c VALUE 'Z2',
+              c_z3(2)  TYPE c VALUE 'Z3',
+              c_ru03(4) TYPE c VALUE 'RU03'.
+  SELECT * FROM yse_sd_reg_ship INTO TABLE it_reg_ship.
+  IF sy-subrc IS INITIAL.
+    SORT it_reg_ship BY region.
+  ENDIF.
+*End of changes by EXTSPA on 29.11.2013 for CR3079
+*Begin of changes by EXTSPA on 17.12.2013 for CR3079
+
+  first = 'X'.
+
+  PERFORM get_custom_data.
+
+*Begin of changes by EXTSPA on 12.12.2013 for CR3079
+  TYPES : BEGIN OF ty_vbak,
+          vbeln TYPE vbeln_va,
+          bstnk TYPE bstnk,
+          END OF ty_vbak,
+          BEGIN OF ty_vekp,
+          venum TYPE venum,
+          brgew TYPE brgew_vekp,
+          vpobjkey TYPE vpobjkey,
+          END OF ty_vekp,
+          BEGIN OF ty_info,
+          vpobjkey TYPE vpobjkey,
+          END OF ty_info,
+          BEGIN OF ty_vekp_t,
+          vpobjkey TYPE vpobjkey,
+          venum TYPE venum,
+          brgew TYPE brgew_vekp,
+          count TYPE i,
+          END OF ty_vekp_t.
+  DATA : it_vbak TYPE STANDARD TABLE OF ty_vbak INITIAL SIZE 0,
+         it_vekp TYPE STANDARD TABLE OF ty_vekp INITIAL SIZE 0,
+         it_vekp_t TYPE STANDARD TABLE OF ty_vekp_t INITIAL SIZE 0,
+         it_vekp_tmp TYPE STANDARD TABLE OF ty_vekp_t INITIAL SIZE 0,
+         it_info TYPE STANDARD TABLE OF ty_info INITIAL SIZE 0,
+         wa_info TYPE ty_info,
+         wa_vekp TYPE ty_vekp,
+         wa_vekp_t TYPE ty_vekp_t,
+         wa_vekp_tmp TYPE ty_vekp_t,
+         it_slk TYPE STANDARD TABLE OF vtrlk INITIAL SIZE 0,
+         wa_slk TYPE vtrlk,
+         wa_vbak TYPE ty_vbak,
+         lv_val1 TYPE string,
+         lv_val2 TYPE string,
+         lv_count TYPE i,
+         lv_tot_weight TYPE brgew.
+  DATA : lv_strlen TYPE i,
+         lv_pos    TYPE i,
+         lv_off    TYPE i.
+  SELECT vbeln bstnk FROM vbak INTO TABLE it_vbak
+                     FOR ALL ENTRIES IN slk
+                     WHERE vbeln = slk-vbeln_vauf.
+  IF sy-subrc IS INITIAL.
+    SORT it_vbak.
+  ENDIF.
+  it_slk[] = slk[].
+  LOOP AT it_slk INTO wa_slk.
+    wa_info-vpobjkey = wa_slk-tdname.
+    APPEND wa_info TO it_info.
+    CLEAR : wa_slk, wa_info.
+  ENDLOOP.
+  IF it_info[] IS NOT INITIAL.
+    SELECT venum brgew vpobjkey FROM vekp INTO TABLE it_vekp
+                                FOR ALL ENTRIES IN it_info
+                                WHERE vpobjkey = it_info-vpobjkey.
+    IF sy-subrc IS INITIAL.
+      SORT it_vekp BY vpobjkey.
+    ENDIF.
+  ENDIF.
+  LOOP AT it_vekp INTO wa_vekp.
+    wa_vekp_tmp-vpobjkey = wa_vekp-vpobjkey.
+    wa_vekp_tmp-venum    = wa_vekp-venum.
+    wa_vekp_tmp-brgew    = wa_vekp-brgew.
+    APPEND wa_vekp_tmp TO it_vekp_tmp.
+    CLEAR : wa_vekp_tmp, wa_vekp.
+  ENDLOOP.
+  REFRESH : it_vekp[].
+  LOOP AT it_vekp_tmp INTO wa_vekp_tmp.
+    lv_tot_weight = lv_tot_weight + wa_vekp_tmp-brgew.
+    lv_count = lv_count + 1.
+    AT END OF vpobjkey.
+      wa_vekp_t-count = lv_count.
+      wa_vekp_t-brgew = lv_tot_weight.
+      wa_vekp_t-vpobjkey = wa_vekp_tmp-vpobjkey.
+      CLEAR : lv_count, lv_tot_weight.
+      APPEND wa_vekp_t TO it_vekp_t.
+      CLEAR : wa_vekp_t.
+    ENDAT.
+  ENDLOOP.
+*End of changes by EXTSPA on 12.12.2013 for CR3079
+*End of changes by EXTSPA on 17.12.2013 for CR3079
+
+*Fill the structure
+  CLEAR: vkorg, kunwe, vstel, kunag.
+*sort slk by vkorg kunwe vstel kunag.
+  SORT slk BY kunwe name1_we stras_we ort01_we pstlz_we regio_we.
+
+  LOOP AT slk.   "deliveries
+    wa_tab-delivery = slk-vbeln.
+
+* new ship to ?
+    IF slk-kunwe NE kunwe
+       OR slk-name1 NE lv_slkname1
+       OR slk-name2 NE lv_slkname2
+       OR slk-stras NE lv_street
+       OR slk-ort01 NE lv_city1
+       OR slk-pstlz NE lv_postal
+       OR slk-regio NE lv_region2.
+      kunwe = slk-kunwe.
+      lv_slkname1  = slk-name1.
+      lv_slkname2  = slk-name2.
+      lv_street = slk-stras.
+      lv_city1 = slk-ort01.
+      lv_postal = slk-pstlz.
+      lv_region2 = slk-regio.
+
+
+      IF first <> 'X'.
+        wa_tab_char1-space = ' '.
+        wa_tab_char1-outbdel = lv_outbdel.
+        CLEAR lv_outbdel.
+        wa_tab_char1-ordnbr = lv_ordnbr.
+        wa_tab_char1-dpdmode = text-dv4.
+        wa_tab_char1-category = text-dv2.
+        wa_tab_char1-cases = lv_counter.
+        wa_tab_char1-brgew = lv_brgew.
+        wa_tab_char1-text50 = ' '.
+        wa_tab_char1-text1 = text-dv1.
+        wa_tab_char1-text51 = ' '.
+        wa_tab_char1-text2 = text-dv1.
+        wa_tab_char1-tprod = text-dv3.
+        wa_tab_char1-contact = lv_contact.
+        CLEAR lv_contact.
+        IF lv_tele IS INITIAL.
+          CALL FUNCTION 'YSE_GET_CONTACT_PERSON'
+            EXPORTING
+              ls_vbeln = lv_old_vbeln
+              ls_parvw = 'WE'
+            TABLES
+              szadr    = l_szadr.
+
+*      CLEAR l_szadr.
+*      READ TABLE l_szadr WITH KEY line_type = 'N'.
+*      IF sy-subrc = 0.
+*        wa_tab_char1-contact = l_szadr-address_line.
+*      ENDIF.
+
+
+          CLEAR l_szadr.
+          READ TABLE l_szadr WITH KEY line_type = 'T'.
+          IF sy-subrc = 0.
+            wa_tab_char1-phone = l_szadr-address_line.
+          ENDIF.
+
+          CLEAR l_szadr.
+          READ TABLE l_szadr WITH KEY line_type = 'M'.
+          IF sy-subrc = 0 AND l_szadr-address_line <> ' '.
+            CONCATENATE wa_tab_char1-phone l_szadr-address_line INTO wa_tab_char1-phone SEPARATED BY ', '.
+          ENDIF.
+
+          CLEAR l_szadr.
+          READ TABLE l_szadr WITH KEY line_type = 'F'.
+          IF sy-subrc = 0 AND l_szadr-address_line <> ' '.
+            CONCATENATE wa_tab_char1-phone l_szadr-address_line INTO wa_tab_char1-phone SEPARATED BY ', '.
+          ENDIF.
+        ELSE.
+          wa_tab_char1-phone = lv_tele.
+        ENDIF.
+        CLEAR lv_tele.
+        wa_tab_char1-text52 = ' '.
+        CONCATENATE addr1_val-name1 addr1_val-name2 INTO wa_tab_char1-sname SEPARATED BY ' '.
+        wa_tab_char1-sapreg = lv_region.
+        wa_tab_char1-city = addr1_val-city1.
+        wa_tab_char1-address = addr1_val-street.
+        wa_tab_char1-building = addr1_val-house_num1.
+        CONCATENATE addr1_val-building addr1_val-roomnumber addr1_val-floor INTO wa_tab_char1-roomnumber SEPARATED BY ', '.
+        REPLACE ALL OCCURRENCES OF ', ,' IN wa_tab_char1-roomnumber WITH ','.
+        IF wa_tab_char1-roomnumber = ','.
+          wa_tab_char1-roomnumber = ' '.
+        ENDIF.
+        wa_tab_char1-space1 = ' '.
+        wa_tab_char1-space2 = ' '.
+        CLEAR: lv_btvol_c, lv_brgew_c, lv_counter_c.
+        lv_btvol_c = lv_btvol.
+        lv_brgew_c = lv_brgew.
+        lv_counter_c = lv_counter.
+
+        CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+          EXPORTING
+            input  = lv_counter_c
+          IMPORTING
+            output = lv_counter_c.
+
+*        concatenate lv_inco2 text-DV1 lv_btvol_c lv_ntgew_c lv_counter_c lv_text into wa_tab_char1-text3 separated by '-'.
+*        condense wa_tab_char1-text3.
+        wa_tab_char1-text4 = text-dv1.
+        wa_tab_char1-text5 = text-dv1.
+        wa_tab_char1-text6 = text-dv1.
+        wa_tab_char1-text7 = text-dv1.
+        wa_tab_char1-text8 = text-dv1.
+        wa_tab_char1-text9 = text-dv1.
+        wa_tab_char1-text53 = text-dv1.
+        wa_tab_char1-text10 = text-dv1.
+        wa_tab_char1-text11 = text-dv1.
+
+        APPEND wa_tab_char1 TO it_tab_char1.
+        CLEAR: wa_tab, wa_tab_char1.
+
+        lv_counter = 0.
+        lv_brgew = 0.
+        lv_btvol = 0.
+      ENDIF.  "First time ?
+
+      CLEAR lv_old_vbeln.
+      lv_old_vbeln = slk-vbeln.
+      first = ' '.
+
+
+* customer order number + cost center + accounting code
+      CLEAR lv_bstnk.
+      CLEAR lv_vtweg.
+      CLEAR lv_bukrs.
+      CLEAR lt_matnr[].
+      CLEAR lv_matnr.
+      CLEAR lv_ordnbr.
+
+
+      SELECT SINGLE bstnk bukrs_vf vtweg FROM vbak INTO (lv_bstnk, lv_bukrs, lv_vtweg)
+          WHERE vbeln = slk-vbeln_vauf.
+
+      SELECT matnr prctr INTO lt_matnr FROM vbap
+      WHERE vbeln = slk-vbeln_vauf
+            AND matkl = '01'.
+        APPEND lt_matnr.
+      ENDSELECT.
+      IF sy-subrc = 0.
+
+        READ TABLE lt_matnr INDEX 1.
+
+*.. Derive segment from profit center
+        CALL FUNCTION 'YSE_CONVERT_PRCTR_BL'
+          EXPORTING
+            prctr_in    = lt_matnr-prctr
+            bukrs       = lv_bukrs
+          IMPORTING
+            segment_out = gv_segmt.
+
+        SELECT      *
+            FROM k9rcd11000010
+            INTO TABLE it_plc.
+
+        LOOP AT it_plc WHERE sour1_from LE gv_segmt
+                      AND sour1_to   GE gv_segmt
+                      AND valid_from LE sy-datum.
+          lv_plc = it_plc-target1.
+          EXIT.
+        ENDLOOP.
+
+        SELECT SINGLE plcnbr FROM yse_ru_plcnr INTO lv_plctext
+        WHERE plc = lv_plc.
+        CONCATENATE lv_bstnk '-'lv_plctext  INTO lv_ordnbr SEPARATED BY ' '.
+      ELSE.
+        CLEAR lt_matnr[]. REFRESH lt_matnr.
+        SELECT  matnr prctr INTO lt_matnr FROM vbap
+        WHERE vbeln = slk-vbeln_vauf.
+          APPEND lt_matnr.
+        ENDSELECT.
+
+        READ TABLE lt_matnr INDEX 1.
+
+*.. Derive segment from profit center
+        CALL FUNCTION 'YSE_CONVERT_PRCTR_BL'
+          EXPORTING
+            prctr_in    = lt_matnr-prctr
+            bukrs       = lv_bukrs
+          IMPORTING
+            segment_out = gv_segmt.
+
+        SELECT      *
+            FROM k9rcd11000010
+            INTO TABLE it_plc.
+
+        LOOP AT it_plc WHERE sour1_from LE gv_segmt
+                      AND sour1_to   GE gv_segmt
+                      AND valid_from LE sy-datum.
+          lv_plc = it_plc-target1.
+          EXIT.
+        ENDLOOP.
+
+        SELECT SINGLE plcnbr FROM yse_ru_plcnr INTO lv_plctext
+        WHERE plc = lv_plc.
+        CONCATENATE lv_bstnk '-' lv_plctext INTO lv_ordnbr SEPARATED BY ' '.
+      ENDIF.
+
+
+
+
+* goods consignor adress
+
+      sel-addrnumber = slk-adrnr_we.
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+        EXPORTING
+          input  = sel-addrnumber
+        IMPORTING
+          output = sel-addrnumber.
+
+      sel-nation = 'R'.
+      CLEAR addr1_val.
+      CALL FUNCTION 'ADDR_GET'
+        EXPORTING
+          address_selection = sel
+        IMPORTING
+          address_value     = addr1_val
+        EXCEPTIONS
+          parameter_error   = 1
+          address_not_exist = 2
+          version_not_exist = 3
+          internal_error    = 4
+          OTHERS            = 5.
+      IF sy-subrc NE 0.
+        CLEAR sel-nation.
+        CALL FUNCTION 'ADDR_GET'
+          EXPORTING
+            address_selection = sel
+          IMPORTING
+            address_value     = addr1_val
+          EXCEPTIONS
+            parameter_error   = 1
+            address_not_exist = 2
+            version_not_exist = 3
+            internal_error    = 4
+            OTHERS            = 5.
+      ENDIF.
+
+      CLEAR lv_region.
+      SELECT SINGLE bezei FROM t005u INTO lv_region
+       WHERE spras = nast-spras
+       AND land1 = addr1_val-country
+       AND bland = addr1_val-region.
+
+
+
+      CLEAR lv_sort2.
+      SELECT SINGLE sort2 FROM adrc INTO lv_sort2
+        WHERE addrnumber = slk-adrnr_ag.
+
+      CLEAR lv_inco2.
+      IF lv_sort2+0(2) = 'SE'.
+        lv_inco2 = slk-inco2.
+*        clear wa_tab_char1-contact.
+*        wa_tab_char1-contact = addr1_val-NAME3.
+*        clear wa_tab_char1-phone.
+** mobile phone ship to
+*        SELECT SINGLE tel_number
+*        INTO wa_tab_char1-phone
+*        FROM adr2
+*        WHERE addrnumber = slk-ADRNR_WE
+*          AND r3_user    = '3'.           "standard mobile tel.
+*        if   wa_tab_char1-phone is not initial.
+*          concatenate addr1_val-TEL_NUMBER wa_tab_char1-phone into wa_tab_char1-phone separated by ', '.
+*        else.
+*          wa_tab_char1-phone = addr1_val-TEL_NUMBER.
+*        endif.
+      ELSE.
+        lv_inco2 = '/'.
+      ENDIF.
+
+      wa_tab_char1-text3 = addr1_val-remark.
+
+      REFRESH: i_lines.
+      lv_name1 = slk-vbeln.
+
+      SELECT SINGLE * FROM stxh
+             WHERE tdobject = 'VBBK'
+               AND tdname   = lv_name1
+               AND tdid     = 'SL02'.
+
+      IF sy-subrc = 0.
+        CALL FUNCTION 'READ_TEXT'
+          EXPORTING
+            id                      = 'SL02'
+            language                = addr1_val-langu
+            name                    = lv_name1
+            object                  = 'VBBK'
+          TABLES
+            lines                   = i_lines
+          EXCEPTIONS
+            id                      = 1
+            language                = 2
+            name                    = 3
+            not_found               = 4
+            object                  = 5
+            reference_check         = 6
+            wrong_access_to_archive = 7
+            OTHERS                  = 8.
+        IF sy-subrc = 0.
+          READ TABLE i_lines INDEX 1.
+          lv_text = i_lines-tdline.
+        ENDIF.
+      ENDIF.
+
+
+*  SELECT SINGLE * FROM knvk INTO wa_knvk_contact
+*                WHERE kunnr EQ slk-ADRNR_WE.
+*
+**Get the phone and fax of contact
+*  IF sy-subrc EQ 0.
+*    SELECT SINGLE * FROM adcp INTO wa_adcp_contact
+*                  WHERE persnumber EQ wa_knvk_contact-prsnr AND
+*                        date_from <= sy-datum AND
+*                        date_to >= sy-datum.
+*
+**Get the title of the contact
+*    SELECT SINGLE * FROM tpfkt INTO wa_tpfkt_contact
+*                  WHERE pafkt EQ wa_knvk_contact-pafkt AND
+*                  spras EQ nast-spras.
+*    IF sy-subrc NE 0.
+*      SELECT SINGLE * FROM tpfkt INTO wa_tpfkt_contact
+*                WHERE pafkt EQ wa_knvk_contact-pafkt AND
+*                spras EQ 'E'.
+*    ENDIF.
+*   ENDIF.
+
+      kunag = slk-kunag.
+    ENDIF. "per ship-to
+
+    LOOP AT xvbplk   "handling units
+            WHERE vpobjkey EQ slk-vbeln.
+      lv_counter = lv_counter + 1.
+      lv_brgew = lv_brgew + xvbplk-brgew.
+      lv_btvol = lv_btvol + xvbplk-btvol.
+    ENDLOOP.
+
+
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+      EXPORTING
+        input  = slk-vbeln
+      IMPORTING
+        output = slk-vbeln.
+
+    IF lv_outbdel IS INITIAL.
+      lv_outbdel = slk-vbeln.
+    ELSE.
+      CONCATENATE lv_outbdel slk-vbeln INTO lv_outbdel SEPARATED BY ', '.
+    ENDIF.
+
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+      EXPORTING
+        input  = slk-vbeln
+      IMPORTING
+        output = slk-vbeln.
+
+*Get the contact person
+
+    CALL FUNCTION 'YSE_GET_CONTACT_PERSON'
+      EXPORTING
+        ls_vbeln = slk-vbeln
+        ls_parvw = 'ZP'
+      TABLES
+        szadr    = l_szadr.
+
+    CLEAR l_szadr.
+    READ TABLE l_szadr WITH KEY line_type = 'N'.
+    IF sy-subrc = 0.
+      IF lv_contact IS INITIAL.
+        lv_contact = l_szadr-address_line.
+      ELSE.
+        CONCATENATE lv_contact l_szadr-address_line INTO lv_contact SEPARATED BY ', '.
+      ENDIF .
+    ENDIF.
+
+
+    CLEAR l_szadr.
+    READ TABLE l_szadr WITH KEY line_type = 'T'.
+    IF sy-subrc = 0.
+      IF lv_tele IS INITIAL.
+        lv_tele = l_szadr-address_line.
+      ELSE.
+        CONCATENATE lv_tele l_szadr-address_line INTO lv_tele SEPARATED BY ', '.
+      ENDIF.
+    ENDIF.
+
+    CLEAR l_szadr.
+    READ TABLE l_szadr WITH KEY line_type = 'M'.
+    IF sy-subrc = 0 AND l_szadr-address_line <> ' '.
+      IF lv_tele IS INITIAL.
+        lv_tele = l_szadr-address_line.
+      ELSE.
+        CONCATENATE lv_tele l_szadr-address_line INTO lv_tele SEPARATED BY ', '.
+      ENDIF.
+    ENDIF.
+
+    CLEAR l_szadr.
+    READ TABLE l_szadr WITH KEY line_type = 'F'.
+    IF sy-subrc = 0 AND l_szadr-address_line <> ' '.
+      IF lv_tele IS INITIAL.
+        lv_tele = l_szadr-address_line.
+      ELSE.
+        CONCATENATE lv_tele l_szadr-address_line INTO lv_tele SEPARATED BY ', '.
+      ENDIF.
+    ENDIF.
+
+    CLEAR l_szadr[].
+
+
+  ENDLOOP.
+  wa_tab_char1-space = ' '.
+  wa_tab_char1-outbdel = lv_outbdel.
+  wa_tab_char1-contact = lv_contact.
+  IF lv_tele IS INITIAL.
+    CALL FUNCTION 'YSE_GET_CONTACT_PERSON'
+      EXPORTING
+        ls_vbeln = lv_old_vbeln
+        ls_parvw = 'WE'
+      TABLES
+        szadr    = l_szadr.
+
+*      CLEAR l_szadr.
+*      READ TABLE l_szadr WITH KEY line_type = 'N'.
+*      IF sy-subrc = 0.
+*        wa_tab_char1-contact = l_szadr-address_line.
+*      ENDIF.
+
+
+    CLEAR l_szadr.
+    READ TABLE l_szadr WITH KEY line_type = 'T'.
+    IF sy-subrc = 0.
+      wa_tab_char1-phone = l_szadr-address_line.
+    ENDIF.
+
+    CLEAR l_szadr.
+    READ TABLE l_szadr WITH KEY line_type = 'M'.
+    IF sy-subrc = 0 AND l_szadr-address_line <> ' '.
+      CONCATENATE wa_tab_char1-phone l_szadr-address_line INTO wa_tab_char1-phone SEPARATED BY ', '.
+    ENDIF.
+
+    CLEAR l_szadr.
+    READ TABLE l_szadr WITH KEY line_type = 'F'.
+    IF sy-subrc = 0 AND l_szadr-address_line <> ' '.
+      CONCATENATE wa_tab_char1-phone l_szadr-address_line INTO wa_tab_char1-phone SEPARATED BY ', '.
+    ENDIF.
+  ELSE.
+    wa_tab_char1-phone = lv_tele.
+  ENDIF.
+  wa_tab_char1-ordnbr = lv_ordnbr.
+  wa_tab_char1-dpdmode = text-dv4.
+  wa_tab_char1-category = text-dv2.
+  wa_tab_char1-cases = lv_counter.
+  wa_tab_char1-brgew = lv_brgew.
+  wa_tab_char1-text50 = ' '.
+  wa_tab_char1-text1 = text-dv1.
+  wa_tab_char1-text51 = ' '.
+  wa_tab_char1-text2 = text-dv1.
+  wa_tab_char1-tprod = text-dv3.
+  wa_tab_char1-text52 = ' '.
+  CONCATENATE addr1_val-name1 addr1_val-name2 INTO wa_tab_char1-sname SEPARATED BY ' '.
+  wa_tab_char1-sapreg = lv_region.
+  wa_tab_char1-city = addr1_val-city1.
+  wa_tab_char1-address = addr1_val-street.
+  wa_tab_char1-building = addr1_val-house_num1.
+  CONCATENATE addr1_val-building addr1_val-roomnumber addr1_val-floor INTO wa_tab_char1-roomnumber SEPARATED BY ', '.
+  REPLACE ALL OCCURRENCES OF ', ,' IN wa_tab_char1-roomnumber WITH ','.
+  IF wa_tab_char1-roomnumber = ','.
+    wa_tab_char1-roomnumber = ' '.
+  ENDIF.
+  wa_tab_char1-space1 = ' '.
+  wa_tab_char1-space2 = ' '.
+
+  CLEAR lv_sort2.
+  SELECT SINGLE sort2 FROM adrc INTO lv_sort2
+    WHERE addrnumber = slk-adrnr_ag.
+
+  IF lv_sort2+0(2) = 'SE'.
+    SELECT SINGLE inco2 INTO lv_inco2
+    FROM knvv
+    WHERE kunnr = kunag.
+*          AND vkorg = xvbak-vkorg
+*          AND vtweg = xvbak-vtweg
+*          AND spart = xvbak-spart.
+  ELSE.
+    lv_inco2 = '/'.
+  ENDIF.
+  CLEAR: lv_btvol_c, lv_brgew_c, lv_counter_c.
+  lv_btvol_c = lv_btvol.
+  lv_brgew_c = lv_brgew.
+  lv_counter_c = lv_counter.
+
+  CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+    EXPORTING
+      input  = lv_counter_c
+    IMPORTING
+      output = lv_counter_c.
+
+*  concatenate lv_inco2 text-DV1 lv_btvol_c lv_ntgew_c lv_counter_c lv_text into wa_tab_char1-text3 separated by '-'.
+*  condense wa_tab_char1-text3.
+  wa_tab_char1-text4 = text-dv1.
+  wa_tab_char1-text5 = text-dv1.
+  wa_tab_char1-text6 = text-dv1.
+  wa_tab_char1-text7 = text-dv1.
+  wa_tab_char1-text8 = text-dv1.
+  wa_tab_char1-text9 = text-dv1.
+  wa_tab_char1-text53 = text-dv1.
+  wa_tab_char1-text10 = text-dv1.
+  wa_tab_char1-text11 = text-dv1.
+
+  APPEND wa_tab_char1 TO it_tab_char1.
+  CLEAR: wa_tab, wa_tab_char1.
+
+*Begin of changes by EXTSPA on 29.11.2013 for CR3079
+  LOOP AT it_tab_char1 INTO wa_tab_char1.
+    lv_data = wa_tab_char1-outbdel.
+    SPLIT lv_data AT ',' INTO TABLE itab.
+    DESCRIBE TABLE itab LINES lv_lines.
+    DO lv_lines TIMES.
+      MOVE-CORRESPONDING wa_tab_char1 TO wa_tab_char2.
+      READ TABLE itab INTO wa_itab INDEX sy-index.
+      wa_tab_char2-outbdel = wa_itab.
+      CONDENSE wa_tab_char2-outbdel NO-GAPS.
+      APPEND wa_tab_char2 TO it_tab_char2.
+      CLEAR : wa_tab_char2.
+    ENDDO.
+  ENDLOOP.
+  it_tab_char1[] = it_tab_char2[].
+  REFRESH : it_tab_char2[].
+  LOOP AT it_tab_char1 INTO wa_tab_char1.
+    lv_delivery = wa_tab_char1-outbdel.
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+      EXPORTING
+        input  = lv_delivery
+      IMPORTING
+        output = lv_delivery.
+    wa_tab_char1-outbdel = lv_delivery.
+    READ TABLE slk WITH KEY tdname = wa_tab_char1-outbdel.
+    IF sy-subrc IS INITIAL.
+      IF slk-vsbed = c_z1.
+*Begin of changes by EXTSPA on 12.12.2013 for CR3079
+*        wa_tab_char1-dpdmode = text-dv4.
+        wa_tab_char1-dpdmode = c_bzp.
+*End of changes by EXTSPA on 12.12.2013 for CR2079
+      ELSEIF slk-vsbed = c_z2 OR slk-vsbed = c_z3.
+        wa_tab_char1-dpdmode = c_cur.
+      ENDIF.
+    ENDIF.
+    READ TABLE it_reg_ship INTO wa_reg_ship WITH KEY region = slk-regio_we.
+    IF sy-subrc IS NOT INITIAL.
+      IF slk-vkorg = c_ru03.
+        wa_tab_char1-dpdmode = c_cur.
+      ENDIF.
+    ENDIF.
+**Begin of changes by EXTSPA on 12.12.2013 for CR3079
+    READ TABLE it_vekp_t INTO wa_vekp_t WITH KEY vpobjkey = lv_delivery.
+    IF sy-subrc IS INITIAL.
+      wa_tab_char1-cases = wa_vekp_t-count.
+      wa_tab_char1-brgew = wa_vekp_t-brgew.
+    ELSE.
+      wa_tab_char1-brgew = '0'.
+      wa_tab_char1-cases = '0'.
+    ENDIF.
+**End of changes by EXTSPA on 12.12.2013 for CR3079
+*Begin of changes by EXTSPA on 12.17.2013 for CR3079
+    lv_val1 = wa_tab_char1-ordnbr.
+    CONDENSE lv_val1 NO-GAPS.
+    lv_strlen = STRLEN( lv_val1 ).
+    lv_off = lv_strlen.
+    lv_strlen = lv_strlen - 1.
+    DO.
+      IF lv_val1+lv_strlen(1) = '-'.
+        lv_pos = lv_strlen.
+        EXIT.
+      ENDIF.
+      lv_strlen = lv_strlen - 1.
+    ENDDO.
+
+    lv_pos = lv_pos + 1.
+    lv_strlen = lv_off - lv_pos.
+    wa_tab_char1-ordnbr = lv_val1+lv_pos(lv_strlen).
+    CLEAR : wa_vbak.
+    READ TABLE it_vbak INTO wa_vbak WITH KEY vbeln = slk-vbeln_vauf.
+    IF sy-subrc IS INITIAL.
+      lv_val1 = wa_vbak-bstnk.
+      CONCATENATE lv_val1 '-' wa_tab_char1-ordnbr INTO wa_tab_char1-ordnbr SEPARATED BY ' '.
+    ENDIF.
+*End of changes by EXTSPA on 12.17.2013 for CR3079
+*Begin of changes by EXTSPA on 12.12.2013 for CR3079
+*    MODIFY it_tab_char1 FROM wa_tab_char1 TRANSPORTING dpdmode.
+    MODIFY it_tab_char1 FROM wa_tab_char1 TRANSPORTING dpdmode ordnbr cases brgew.
+*End of changes by EXTSPA on 12.12.2013 for CR3079
+    CLEAR : wa_tab_char1.
+  ENDLOOP.
+*End of changes by EXTSPA on 29.11.2013 for CR3079
+
+*Create the filepath
+  CLEAR: lv_par1, lv_par2.
+  GET PARAMETER ID 'YSE_FORWARDER_LOC1' FIELD lv_par1.
+  GET PARAMETER ID 'YSE_FORWARDER_LOC2' FIELD lv_par2.
+
+  CLEAR: lv_len1, lv_len2, lv_file, lv_file1.
+  IF NOT lv_par1 IS INITIAL OR
+     NOT lv_par2 IS INITIAL.
+
+    lv_len1 = STRLEN( lv_par1 ).
+    lv_len2 = STRLEN( lv_par2 ).
+
+    lv_file1 = lv_par1.
+
+    IF NOT lv_par2 IS INITIAL.
+*      LV_FILE1+LV_LEN1(1) = '\'.
+*      LV_LEN1 = LV_LEN1 + 1.
+      lv_file1+lv_len1(lv_len2) = lv_par2.
+    ENDIF.
+
+    CONCATENATE lv_file1 '\' vttkvb-tknum '.txt' INTO lv_file.
+
+  ELSE.
+*if nothing in the user parameter, put it on the C:\
+    CONCATENATE 'C:\SAP\' vttkvb-tknum '.xls' INTO lv_file.
+
+  ENDIF.
+
+**********
+
+  SELECT SINGLE adrnr FROM tvko INTO adrnr_vkorg
+    WHERE vkorg = slk-vkorg.
+
+* goods consignor adress
+
+  sel-addrnumber = adrnr_vkorg.
+  CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+    EXPORTING
+      input  = sel-addrnumber
+    IMPORTING
+      output = sel-addrnumber.
+
+  sel-nation = 'R'.
+  CLEAR addr1_val.
+  CALL FUNCTION 'ADDR_GET'
+    EXPORTING
+      address_selection = sel
+    IMPORTING
+      address_value     = addr1_val
+    EXCEPTIONS
+      parameter_error   = 1
+      address_not_exist = 2
+      version_not_exist = 3
+      internal_error    = 4
+      OTHERS            = 5.
+  IF sy-subrc NE 0.
+    CLEAR sel-nation.
+    CALL FUNCTION 'ADDR_GET'
+      EXPORTING
+        address_selection = sel
+      IMPORTING
+        address_value     = addr1_val
+      EXCEPTIONS
+        parameter_error   = 1
+        address_not_exist = 2
+        version_not_exist = 3
+        internal_error    = 4
+        OTHERS            = 5.
+  ENDIF.
+
+  CLEAR lv_region.
+
+  SELECT SINGLE landx50 FROM t005t INTO lv_landx50
+           WHERE spras = nast-spras
+             AND land1 = addr1_val-country.
+
+*if addr1_val-region ne '77' and addr1_val-region ne '78'.
+  SELECT SINGLE bezei FROM t005u INTO lv_region
+    WHERE spras = nast-spras
+      AND land1 = addr1_val-country
+      AND bland = addr1_val-region.
+*endif.
+
+
+**********
+
+*Put in the header row 1 for the file
+  CLEAR wa_tab_char1.
+  INSERT wa_tab_char1 INTO it_tab_char1 INDEX 1.
+
+*Put in the header row 2 for the file
+  CLEAR wa_tab_char1.
+  wa_tab_char1-ordnbr = text-h01.
+*  select single erdat into wa_tab_char1-DPDmode from vttk
+*    where tknum = shipment_num.
+
+  CLEAR lv_datum.
+  p_year = sy-datum(4).
+  p_month = sy-datum+4(2).
+  p_day = sy-datum+6(2).
+  CONCATENATE p_day '.' p_month '.' p_year INTO lv_datum.
+  wa_tab_char1-dpdmode = lv_datum.
+  INSERT wa_tab_char1 INTO it_tab_char1 INDEX 2.
+
+*Put in the header row 3 for the file
+  CLEAR wa_tab_char1.
+  wa_tab_char1-ordnbr = text-h02.
+  wa_tab_char1-dpdmode = text-hv2.
+  INSERT wa_tab_char1 INTO it_tab_char1 INDEX 3.
+
+*Put in the header row 4 for the file
+  CLEAR wa_tab_char1.
+  wa_tab_char1-ordnbr = text-h03.
+  wa_tab_char1-dpdmode = addr1_val-name1.
+  INSERT wa_tab_char1 INTO it_tab_char1 INDEX 4.
+
+*Put in the header row 5 for the file
+  CLEAR wa_tab_char1.
+  wa_tab_char1-ordnbr = text-h04.
+  wa_tab_char1-dpdmode = text-hv4.
+  INSERT wa_tab_char1 INTO it_tab_char1 INDEX 5.
+
+*Put in the header row 6 for the file
+  CLEAR wa_tab_char1.
+  wa_tab_char1-ordnbr = text-h05.
+  wa_tab_char1-dpdmode = text-hv5.
+  INSERT wa_tab_char1 INTO it_tab_char1 INDEX 6.
+
+*Put in the header row 7 for the file
+  CLEAR wa_tab_char1.
+  wa_tab_char1-ordnbr = text-h06.
+  INSERT wa_tab_char1 INTO it_tab_char1 INDEX 7.
+
+*Put in the header row 8 for the file
+  CLEAR wa_tab_char1.
+  wa_tab_char1-ordnbr = text-h07.
+  wa_tab_char1-dpdmode = addr1_val-name1.
+  INSERT wa_tab_char1 INTO it_tab_char1 INDEX 8.
+
+*Put in the header row 9 for the file
+  CLEAR wa_tab_char1.
+  wa_tab_char1-ordnbr = text-h08.
+  wa_tab_char1-dpdmode = lv_region.
+  INSERT wa_tab_char1 INTO it_tab_char1 INDEX 9.
+
+*Put in the header row 10 for the file
+  CLEAR wa_tab_char1.
+  wa_tab_char1-ordnbr = text-h09.
+  wa_tab_char1-dpdmode = addr1_val-city1.
+  INSERT wa_tab_char1 INTO it_tab_char1 INDEX 10.
+
+*Put in the header row 11 for the file
+  CLEAR wa_tab_char1.
+  wa_tab_char1-ordnbr = text-h10.
+  wa_tab_char1-dpdmode = text-dv5.
+  INSERT wa_tab_char1 INTO it_tab_char1 INDEX 11.
+
+*Put in the header row 12 for the file
+  CLEAR wa_tab_char1.
+  wa_tab_char1-ordnbr = text-h11.
+  wa_tab_char1-dpdmode = text-dv6.
+  INSERT wa_tab_char1 INTO it_tab_char1 INDEX 12.
+
+*Put in the header row 13 for the file
+  CLEAR wa_tab_char1.
+  wa_tab_char1-ordnbr = text-h12.
+  INSERT wa_tab_char1 INTO it_tab_char1 INDEX 13.
+
+*Put in the header row 14 for the file
+  CLEAR wa_tab_char1.
+  wa_tab_char1-ordnbr = text-h13.
+  wa_tab_char1-dpdmode = text-hv4.
+  INSERT wa_tab_char1 INTO it_tab_char1 INDEX 14.
+
+*Put in the header row 15 for the file
+  CLEAR wa_tab_char1.
+  wa_tab_char1-ordnbr = text-h14.
+  wa_tab_char1-dpdmode = text-hv5.
+  INSERT wa_tab_char1 INTO it_tab_char1 INDEX 15.
+
+*Put in the header row 16 for the file
+  CLEAR wa_tab_char1.
+  wa_tab_char1-ordnbr = text-h15.
+  INSERT wa_tab_char1 INTO it_tab_char1 INDEX 16.
+
+*Put in the header row 17 for the file
+  CLEAR wa_tab_char1.
+  wa_tab_char1-ordnbr = text-h16.
+  wa_tab_char1-dpdmode = text-hv6.
+  INSERT wa_tab_char1 INTO it_tab_char1 INDEX 17.
+
+*Put in the header row 18 for the file
+  CLEAR wa_tab_char1.
+  INSERT wa_tab_char1 INTO it_tab_char1 INDEX 18.
+
+
+*Put in the header row 19 for the file
+
+  CLEAR wa_tab_char1.
+  wa_tab_char1-ordnbr = text-h17.
+  wa_tab_char1-dpdmode = text-h18.
+  wa_tab_char1-cases = text-h19.
+  wa_tab_char1-sname = text-h20.
+  wa_tab_char1-text4 = text-h21.
+  wa_tab_char1-text10 = text-h22.
+  INSERT wa_tab_char1 INTO it_tab_char1 INDEX 19.
+
+
+*Put in the header row 20 for the file
+  CLEAR wa_tab_char1.
+  wa_tab_char1-space = ' '.
+  wa_tab_char1-outbdel = text-054.
+  wa_tab_char1-ordnbr = text-003.
+  wa_tab_char1-dpdmode = text-004.
+  wa_tab_char1-category = text-005.
+  wa_tab_char1-cases = text-006.
+  wa_tab_char1-brgew = text-007.
+  wa_tab_char1-text50 = text-050.
+  wa_tab_char1-text1 = text-008.
+  wa_tab_char1-text51 = text-051.
+  wa_tab_char1-text2 = text-009.
+  wa_tab_char1-tprod = text-010.
+  wa_tab_char1-text52 = text-052.
+  wa_tab_char1-sname = text-011.
+  wa_tab_char1-sapreg = text-012.
+  wa_tab_char1-city = text-013.
+  wa_tab_char1-address = text-014.
+  wa_tab_char1-building = text-015.
+  wa_tab_char1-roomnumber = text-016.
+  wa_tab_char1-space1 = ' '.
+  wa_tab_char1-space2 = ' '.
+  wa_tab_char1-contact = text-017.
+  wa_tab_char1-phone = text-018.
+  wa_tab_char1-text3 = text-019.
+  wa_tab_char1-text4 = text-020.
+  wa_tab_char1-text5 = text-021.
+  wa_tab_char1-text6 = text-022.
+  wa_tab_char1-text7 = text-023.
+  wa_tab_char1-text8 = text-024.
+  wa_tab_char1-text9 = text-025.
+  wa_tab_char1-text53 = text-053.
+  wa_tab_char1-text10 = text-026.
+  wa_tab_char1-text11 = text-027.
+  INSERT wa_tab_char1 INTO it_tab_char1 INDEX 20.
+
+
+*Put in the header row 21 for the file
+  CLEAR wa_tab_char1.
+  wa_tab_char1-space = ' '.
+  wa_tab_char1-outbdel = '1'.
+  wa_tab_char1-ordnbr = '2'.
+  wa_tab_char1-dpdmode = '3'.
+  wa_tab_char1-category = '4'.
+  wa_tab_char1-cases = '5'.
+  wa_tab_char1-brgew = '6'.
+  wa_tab_char1-text50 = '7'.
+  wa_tab_char1-text1 = '8'.
+  wa_tab_char1-text51 = '9'.
+  wa_tab_char1-text2 = '10'.
+  wa_tab_char1-tprod = '11'.
+  wa_tab_char1-text52 = '12'.
+  wa_tab_char1-sname = '13'.
+  wa_tab_char1-sapreg = '14'.
+  wa_tab_char1-city = '15'.
+  wa_tab_char1-address = '16'.
+  wa_tab_char1-building = '17'.
+  wa_tab_char1-roomnumber = '18'.
+  wa_tab_char1-space1 = '19'.
+  wa_tab_char1-space2 = '20'.
+  wa_tab_char1-contact = '21'.
+  wa_tab_char1-phone = '22'.
+  wa_tab_char1-text3 = '23'.
+  wa_tab_char1-text4 = '24'.
+  wa_tab_char1-text5 = '25'.
+  wa_tab_char1-text6 = '26'.
+  wa_tab_char1-text7 = '27'.
+  wa_tab_char1-text8 = '28'.
+  wa_tab_char1-text9 = '29'.
+  wa_tab_char1-text53 = '30'.
+  wa_tab_char1-text10 = '31'.
+  wa_tab_char1-text11 = '32'.
+  INSERT wa_tab_char1 INTO it_tab_char1 INDEX 21.
+
+
+
+  IF nast-vsztp NE '4'.
+*Do not use the frontend function for option 4 'transfer immediately'
+*Because this is frontend function and output is in background
+*otherwise it dumps!!!
+*
+*CALL FUNCTION 'NLS_GET_FRONTEND_CP'
+*  EXPORTING
+*    LANGU                       = nast-spras
+*    FETYPE                      = 'MS'
+*  IMPORTING
+*   FRONTEND_CODEPAGE           = lv_codepage2
+* EXCEPTIONS
+*   ILLEGAL_SYST_CODEPAGE       = 1
+*   NO_FRONTEND_CP_FOUND        = 2
+*   INTERNAL_OR_DB_ERROR        = 3
+*   OTHERS                      = 4
+    .
+    IF sy-subrc <> 0.
+* MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*         WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+    ENDIF.
+
+    lv_codepage = lv_codepage2.
+
+    CALL METHOD cl_gui_frontend_services=>gui_download
+      EXPORTING
+        filename                = lv_file
+        filetype                = 'ASC'
+        codepage                = '4103'
+        write_bom               = 'X'
+        write_field_separator   = 'X'
+      CHANGING
+        data_tab                = it_tab_char1
+      EXCEPTIONS
+        file_write_error        = 1
+        no_batch                = 2
+        gui_refuse_filetransfer = 3
+        invalid_type            = 4
+        no_authority            = 5
+        unknown_error           = 6
+        header_not_allowed      = 7
+        separator_not_allowed   = 8
+        filesize_not_allowed    = 9
+        header_too_long         = 10
+        dp_error_create         = 11
+        dp_error_send           = 12
+        dp_error_write          = 13
+        unknown_dp_error        = 14
+        access_denied           = 15
+        dp_out_of_memory        = 16
+        disk_full               = 17
+        dp_timeout              = 18
+        file_not_found          = 19
+        dataprovider_exception  = 20
+        control_flush_error     = 21
+        not_supported_by_gui    = 22
+        error_no_gui            = 23
+        OTHERS                  = 24.
+
+    IF sy-subrc <> 0.
+*   MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*              WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+    ENDIF.
+
+  ENDIF.
+
+ENDFORM.                    " create_xls_file
+*&---------------------------------------------------------------------*
+*&      Form  get_custom_data
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM get_custom_data .
+  DATA: shipment_num LIKE vttk-tknum,
+        language     LIKE nast-spras,
+        cmr_record   TYPE cmr_type,
+        sadr_begin   LIKE sadr,                             "SADR40A
+        sadr_end     LIKE sadr,                             "SADR40A
+        cmr_xvtts    LIKE xvtts OCCURS 0 WITH HEADER LINE.
+  "print relevant segments
+
+  language     = nast-spras.
+  shipment_num = nast-objky.
+
+  CALL FUNCTION 'RV_SHIPMENT_PRINT_VIEW'
+    EXPORTING
+      shipment_number     = shipment_num
+      option_tvtk         = true          "Shipmenttype Y/N
+      option_ttds         = true          "Disposition Y/N
+      language            = language
+      option_items        = true          "Transport Items Y/N
+      option_sales_orders = true          "Transport Segments Y/N
+      option_export_data  = true          "Partners Y/N
+      option_segments     = true          "Sales orders Y/N
+      option_partners     = true          "Export data Y/N
+      option_packages     = true          "Packages Y/N
+      option_flow         = true          "Flow Y/N
+      option_no_refresh   = false         "Refresh Tables Y/N
+    IMPORTING
+      f_vttkvb            = vttkvb        "Shipment Head
+      f_tvtk              = tvtk          "Shipmenttype
+      f_tvtkt             = tvtkt         "Description Shipmenttye
+      f_ttds              = ttds          "Disposition
+      f_ttdst             = ttdst         "Description Disposition
+      f_vbpla             = vbpla         "Packages
+    TABLES
+      f_vttp              = xvttp         "Shipment Items
+      f_trlk              = slk           "Delivery
+      f_trlp              = slp           "Delivery Item
+      f_vtts              = xvtts         "Shipment Segments
+      f_vtsp              = xvtsp         "Segments/Items
+      f_vbpa              = xvbpa         "Partner
+      f_vbadr             = xvbadr        "Address
+      f_vtfa              = xvtfa         "Flow
+      f_vbplk             = xvbplk        "Shipment Unit Header
+      f_vbplp             = xvbplp        "Shipment Unit
+      f_vbpls             = xvbpls        "Shipment Unit Sum
+    EXCEPTIONS
+      not_found           = 1
+      OTHERS              = 2.
+
+ENDFORM.                    " get_custom_data
+
+*Text symbol text£º
+*001:Normal
+*002:Express
+*003:§£§ß§å§ä§â§Ö§ß§ß§Ú§Û §ß§à§Þ§Ö§â §Ù§Ñ§Ü§Ñ§Ù§Ñ
+*004:§¬§à§Õ §å§ã§Ý§å§Ô§Ú
+*005:§£§Ñ§â§Ú§Ñ§ß§ä
+*006:§®§Ö§ã§ä
+*007:§£§Ö§ã, §Ü§Ô
+*008:§¸§Ö§ß§ß§í§Û §Ô§â§å§Ù (§ß§Ñ§Ý§Ú§é§Ú§Ö §Þ§à§Ò§Ú§Ý§î§ß§í§ç §ä§Ö§Ý§Ö§æ§à§ß§à§Ó, §ß§à§å§ä§Ò§å§Ü§à§Ó)
+*009:§°§¢§¼§Á§£§­§¦§¯§¯§¡§Á §¸§¦§¯§¯§°§³§´§¾
+*010:§·§Ñ§â§Ñ§Ü§ä§Ö§â §Ô§â§å§Ù§Ñ
+*011:§±§à§Ý§å§é§Ñ§ä§Ö§Ý§î
+*012:§²§Ö§Ô§Ú§à§ß (§à§Ò§Ý§Ñ§ã§ä§î/§Ü§â§Ñ§Û)
+*013:§¯§Ñ§ã§Ö§Ý§Ö§ß§ß§í§Û §á§å§ß§Ü§ä
+*014:§µ§Ý§Ú§è§Ñ
+*015:§¥§à§Þ
+*016:§¬§à§â§á§å§ã, §ã§ä§â§à§Ö§ß§Ú§Ö, §Ü§Ó§Ñ§â§ä§Ú§â§Ñ
+*017:§¬§à§ß§ä§Ñ§Ü§ä§ß§í§Ö §Ý§Ú§è§Ñ
+*018:§´§Ö§Ý§Ö§æ§à§ß
+*019:§ª§ß§ã§ä§â§å§Ü§è§Ú§ñ §á§à §Õ§à§ã§ä§Ñ§Ó§Ü§Ö
+*020:§£§à§Ù§Ó§â§Ñ§ä §Õ§à§Ü§å§Þ§Ö§ß§ä§à§Ó §à§ä§á§â§Ñ§Ó§Ú§ä§Ö§Ý§ð
+*021:§±§à§Õ§ä§Ó§Ö§â§Ø§Õ§Ö§ß§Ú§Ö §à §Õ§à§ã§ä§Ñ§Ó§Ü§Ö
+*022:§¿§Ý§Ö§Ü§ä§â§à§ß§ß§à§Ö §ã§à§à§Ò§ë§Ö§ß§Ú§Ö §à §Õ§à§ã§ä§Ñ§Ó§Ü§Ö
+*023:§¿§Ý§Ö§Ü§ä§â§à§ß§ß§à§Ö §ã§à§à§Ò§ë§Ö§ß§Ú§Ö §à §Ù§Ñ§Ü§Ñ§Ù§Ö
+*024:SMS §á§à§Õ§ä§Ó§Ö§â§Ø§Õ§Ö§ß§Ú§Ö
+*025:§±§à§Ô§â§å§Ù§à§é§ß§à -§â§Ñ§Ù§Ô§â§å§Ù§à§é§ß§í§Ö §â§Ñ§Ò§à§ä§í §á§â§Ú §Õ§à§ã§ä§Ñ§Ó§Ü§Ö
+*026:§¯§à§Þ§Ö§â §Ù§Ñ§Ü§Ñ§Ù§Ñ
+*027:§ª§ß§æ§à§â§Þ§Ñ§è§Ú§ñ §à§Ò §à§ê§Ú§Ò§Ü§Ñ§ç
+*050:§°§Ò§ë§Ú§Û §à§Ò§ì§Ö§Þ, §Þ3
+*051:§³§ä§à§Ú§Þ§à§ã§ä§î, §â§å§Ò
+*052:§µ§é§Ö§ä§ß§í§Û §Ü§à§Õ §Ñ§Õ§â§Ö§ã§Ñ §Ó §ã§Ú§ã§ä§Ö§Þ§Ö §Ü§Ý§Ú§Ö§ß§ä§Ñ
+*053:§³§ä§â§Ñ§ç§à§Ó§Ñ§ß§Ú§Ö
+*054:§°§´§¤§²§µ§©§¬§¡
+*DV1:HET
+*DV2:§¥§¥
+*DV3:§°§¢§°§²§µ§¥§°§£§¡§¯§ª§¦
+*DV4:DPD
+*DV5:§£§Ñ§ê§å§ä§Ú§ß§ã§Ü§à§Ö §ê§à§ã§ã§Ö
+*DV6:15
+*H01:§¥§Ñ§ä§Ñ §Ù§Ñ§Ò§à§â§Ñ
+*H02:10-§Ù§ß§Ñ§é§ß§í§Û §ß§à§Þ§Ö§â §Ù§Ñ§Ü§Ñ§Ù§é§Ú§Ü§Ñ
+*H03:§©§Ñ§Ü§Ñ§Ù§é§Ú§Ü
+*H04:§¶.§ª.§°.
+*H05:§¬§à§ß§ä§Ñ§Ü§ä§ß§í§Û §ä§Ö§Ý§Ö§æ§à§ß
+*H06:§µ§é§Ö§ä§ß§í§Û §Ü§à§Õ §Ñ§Õ§â§Ö§ã§Ñ §Ó §ã§Ú§ã§ä§Ö§Þ§Ö §Ü§Ý§Ú§Ö§ß§ä§Ñ
+*H07:§°§ä§á§â§Ñ§Ó§Ú§ä§Ö§Ý§î
+*H08:§²§Ö§Ô§Ú§à§ß §à§ä§á§â§Ñ§Ó§Ý§Ö§ß§Ú§ñ
+*H09:§¯§Ñ§ã§Ö§Ý§Ö§ß§ß§í§Û §á§å§ß§Ü§ä §à§ä§á§â§Ñ§Ó§Ý§Ö§ß§Ú§ñ
+*H10:§µ§Ý§Ú§è§Ñ §Ú§Ý§Ú §Ñ§Õ§â§Ö§ã §³§Ú§ä§Ú-§¥§Ö§á§à §Õ§Ý§ñ §ã§Ñ§Þ§à§á§â§Ú§Ó§à§Ù§Ñ
+*H11:§¥§à§Þ
+*H12:§¬§à§â§á§å§ã, §Ü§Ó§Ñ§â§ä§Ú§â§Ñ
+*H13:§¬§à§ß§ä§Ñ§Ü§ä§ß§í§Ö §Ý§Ú§è§Ñ §à§ä§á§â§Ñ§Ó§Ú§ä§Ö§Ý§ñ
+*H14:§¬§à§ß§ä§Ñ§Ü§ä§ß§í§Ö §ä§Ö§Ý§Ö§æ§à§ß§í §à§ä§á§â§Ñ§Ó§Ú§ä§Ö§Ý§ñ
+*H15:§ª§ß§ã§ä§â§å§Ü§è§Ú§ñ §á§à §Ù§Ñ§Ò§à§â§å §Ô§â§å§Ù§Ñ
+*H16:§£§â§Ö§Þ§ñ §Ù§Ñ§Ò§à§â§Ñ §Ô§â§å§Ù§Ñ
+*H17:§©§Ñ§Ü§Ñ§Ù
+*H18:§µ§ã§Ý§å§Ô§Ñ
+*H19:§¤§â§å§Ù
+*H20:§¤§â§å§Ù§à§á§à§Ý§å§é§Ñ§ä§Ö§Ý§î
+*H21:§¥§à§á§à§Ý§ß§Ú§ä§Ö§Ý§î§ß§í§Ö §å§ã§Ý§å§Ô§Ú
+*H22:§²§Ö§Ô§Ú§ã§ä§â§Ñ§è§Ú§ñ §Ù§Ñ§Ü§Ñ§Ù§Ñ
+*HV2:1001010531
+*HV4:§ã§à§ä§â§å§Õ§ß§Ú§Ü §Ý§à§Ô§Ú§ã§ä§Ú§Ü§Ú
+*HV5:933 55 54
+*HV6:9 ~ 18

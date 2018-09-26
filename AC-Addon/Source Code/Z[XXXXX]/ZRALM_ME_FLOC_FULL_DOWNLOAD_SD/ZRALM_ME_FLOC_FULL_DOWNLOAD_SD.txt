@@ -1,0 +1,170 @@
+*&---------------------------------------------------------------------*
+*& Report  RALM_ME_FLOC_FULL_DOWNLOAD_SD                               *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+
+REPORT  zralm_me_floc_full_download_sd .
+
+* Pass all relevant functional location keys to the
+* server-driven SyncBOs on the middleware
+* for an initial download.
+
+* Selection screen
+PARAMETERS p_full  TYPE char01 AS CHECKBOX.
+SELECTION-SCREEN SKIP.
+PARAMETERS p_rfcd  TYPE rfcdest.
+PARAMETERS p_mamver type ALM_ME_MAMVERSION. "MAM Version." 1034868
+PARAMETERS p_fdest AS CHECKBOX.
+SELECTION-SCREEN SKIP.
+PARAMETERS p_datum   TYPE sy-datum.
+PARAMETERS variant TYPE alm_me_c030prf-floc_sel_v_mass.
+
+* Data definition
+* Equipment list from report
+DATA: BEGIN OF ls_floc_list,
+      mandt TYPE mandt,
+      tplnr TYPE itob-tplnr,
+END OF ls_floc_list.
+DATA lt_floc_list      LIKE TABLE OF ls_floc_list.
+DATA lt_floc_full_list LIKE TABLE OF ls_floc_list.
+* Table for keys to pass to middleware
+DATA ls_floc_keys TYPE          alm_me_r3keys_sd.
+DATA lt_floc_keys TYPE TABLE OF alm_me_r3keys_sd.
+* Table for middleware systems to call
+DATA lt_rfchosts TYPE TABLE OF alm_me_dest_sd.
+DATA ls_rfchosts TYPE          alm_me_dest_sd.
+* General settings for master data
+DATA ls_master_data TYPE alm_me_c030prf.
+* Constants
+CONSTANTS gc_mam_030 TYPE char100 VALUE 'MAM_030'.
+CONSTANTS lc_action_update  TYPE msgfn VALUE '018'.
+CONSTANTS lc_action_delete  TYPE msgfn VALUE '003'.
+
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR variant.
+  CONSTANTS lc_fl_m_report  TYPE rsvar-report
+    VALUE 'RALM_ME_FUNCLOC_LIST'.
+  CONSTANTS lc_fl_dynnr     TYPE sy-dynnr
+    VALUE '1000'.
+
+  CALL FUNCTION 'RS_VARIANT_CATALOG'
+    EXPORTING
+      report      = lc_fl_m_report
+      dynnr       = lc_fl_dynnr
+    IMPORTING
+      sel_variant = variant
+    EXCEPTIONS
+      OTHERS      = 7.
+  IF sy-subrc NE 0.
+    CLEAR variant.
+  ENDIF.
+
+START-OF-SELECTION.
+* When a variant is given on the selection-screen, this variant
+* is used to do a (partial) update without change of customizing
+  IF NOT variant IS INITIAL.
+    MOVE variant TO ls_master_data-floc_sel_v_mass.
+  ELSE.
+* Otherwise get the variant from MAM customizing
+    CALL FUNCTION 'ALM_ME_CMASTER_DATA_GETDETAIL'
+      IMPORTING
+        master_data_selection = ls_master_data
+      EXCEPTIONS
+        entry_not_found       = 1
+        OTHERS                = 2.
+    IF sy-subrc NE 0.
+* Directly show an error message if entry does not exist
+      MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+              WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+    ENDIF.
+  ENDIF.
+
+
+* Call the selection report
+  SUBMIT ralm_me_funcloc_list
+    USING SELECTION-SET ls_master_data-floc_sel_v_mass
+    WITH p_datum EQ p_datum
+    WITH dy_selm EQ 'D'
+    AND RETURN.
+
+* Get the result from the report
+  IMPORT lt_funcloc_list TO lt_floc_list
+    FROM MEMORY ID 'RALM_ME_FUNCLOC_LIST'.
+  FREE MEMORY ID 'RALM_ME_FUNCLOC_LIST'.
+
+  IF p_full NE space.
+* When full update is desired, also select all funclocs.
+    SUBMIT ralm_me_funcloc_list
+       WITH dy_selm EQ 'D'
+      AND RETURN.
+    IMPORT lt_funcloc_list TO lt_floc_full_list
+      FROM MEMORY ID 'RALM_ME_FUNCLOC_LIST'.
+    FREE MEMORY ID 'RALM_ME_FUNCLOC_LIST'.
+    LOOP AT lt_floc_full_list INTO ls_floc_list.
+      MOVE ls_floc_list-tplnr TO ls_floc_keys-r3key.
+* check the action
+* Table from report is read sorted from database
+      READ TABLE lt_floc_list
+        WITH KEY  tplnr = ls_floc_list-tplnr
+        BINARY SEARCH
+        TRANSPORTING NO FIELDS.
+      IF sy-subrc EQ 0.
+        MOVE lc_action_update TO ls_floc_keys-msgfn.
+      ELSE.
+* Not in customer selection
+        MOVE lc_action_delete TO ls_floc_keys-msgfn.
+      ENDIF.
+      APPEND ls_floc_keys TO lt_floc_keys.
+    ENDLOOP. "lt_floc_full_list
+
+  ELSE.
+    LOOP AT lt_floc_list INTO ls_floc_list.
+      MOVE ls_floc_list-tplnr TO ls_floc_keys-r3key.
+      MOVE lc_action_update TO ls_floc_keys-msgfn.
+      APPEND ls_floc_keys TO lt_floc_keys.
+    ENDLOOP. "lt_floc_list
+  ENDIF. "p_full
+  free lt_floc_list.
+  free lt_floc_full_list.
+
+  IF p_fdest EQ space.
+* Get the RFC destination from the customizing
+    CALL FUNCTION 'ALM_ME_GET_SERVERDRIVEN_CUST'
+      TABLES
+        serverdriven = lt_rfchosts.
+  ENDIF.
+* Set the RFC destination from the selection screen
+  IF NOT p_rfcd IS INITIAL.
+    ls_rfchosts-rfcdest = p_rfcd.
+    if NOT p_mamver is INITIAL.
+*     use the version provided by user
+      ls_rfchosts-MAMVERSION = p_mamver.
+     endif.
+* when no version is provided then object type will be
+* version independent. do not expect version depebdet key entry in MEREP_DELTABO
+
+      APPEND ls_rfchosts TO lt_rfchosts.
+    ENDIF.
+
+* Call the middleware system and pass all the keys
+*Wouter Replaced by Y-version (in oder to pass the correct sync_bo)
+    CALL FUNCTION 'YALM_ME_SERVER_DRIVEN_TRIGGER'
+      EXPORTING
+        objtyp             = gc_mam_030
+        fixed_destinations = p_fdest
+      TABLES
+        keys               = lt_floc_keys
+        destinations       = lt_rfchosts.
+*          return       = return.
+
+* Execute the trigger (in background task)
+    CALL FUNCTION 'ALM_ME_UPDATE_DUMMY' IN UPDATE TASK.
+
+    COMMIT WORK.
+
+*Selection text£º
+*P_DATUM:        Changed/Created Since
+*P_FDEST:        Only Specified RFC Destination
+*P_FULL:        Full Update with Deletion
+*P_MAMVER:D       .
+*P_RFCD:D       .
+*VARIANT:D       .

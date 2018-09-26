@@ -1,0 +1,707 @@
+*----------------------------------------------------------------------*
+* PROGRAM ID           : YAM_RETURNED_PARTS                            *
+* PROGRAM TITLE        : AM: ALV showing the returned parts            *
+* AUTHOR               : Geert Rutten                                  *
+* DATE                 : 11/02/2011                                    *
+* DEVELOPMENT ID       :                                               *
+*                                                                      *
+* CHANGE REQUEST NUMBER: CD1K962904                                    *
+*                                                                      *
+* Program Description:  Program which shows the returned parts         *
+*                       which are in a special BPCS location           *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME     |CORRECTION NUMBER| CHANGE REFERENCE # *
+*----------------------------------------------------------------------*
+*                                                                      *
+************************************************************************
+REPORT yam_returned_parts MESSAGE-ID yam_inf.
+
+************************************************************************
+*                   T A B L E S                                        *
+************************************************************************
+
+
+
+TABLES: crhd, aufm.
+
+
+"Necessary types for ALV display management
+"-----------------------------------------------------------------------
+
+TYPE-POOLS:
+    " Global type for display ALV use
+
+      slis.
+
+FIELD-SYMBOLS:
+    " Structure field description
+
+      <data_alv_grid>.
+
+
+
+DATA:
+    BEGIN OF t_field OCCURS 0,
+
+                 posnr LIKE vbap-posnr,
+                 lib   LIKE dd03t-ddtext,
+                 name  LIKE dd03l-fieldname,
+
+    END OF   t_field.
+
+DATA:
+    g_repid                 LIKE sy-repid,
+
+    gt_list_top_of_page     TYPE slis_t_listheader,
+    g_status_set            TYPE slis_formname VALUE
+    'PF_STATUS_SET',
+    g_user_command          TYPE slis_formname VALUE
+    'USER_COMMAND',
+    g_top_of_page           TYPE slis_formname VALUE 'TOP_OF_PAGE'
+    ,
+    g_top_of_list           TYPE slis_formname VALUE 'TOP_OF_LIST'
+    ,
+    g_end_of_list           TYPE slis_formname VALUE 'END_OF_LIST'
+    ,
+
+    gs_layout               TYPE slis_layout_alv,
+
+    g_exit_caused_by_caller TYPE slis_exit_by_user,
+    gs_exit_caused_by_user  TYPE slis_exit_by_user,
+    gt_events               TYPE slis_t_event,
+    gs_variant              LIKE disvariant,
+    g_save.
+
+
+
+************************************************************************
+*                   C O N S T A N T S                                  *
+************************************************************************
+CONSTANTS :c_mestyp     LIKE edidc-mestyp VALUE 'YAM_I001' ,
+           c_idoc_type  LIKE edidc-idoctp VALUE 'YAM_I001' ,
+           c_segment(10) TYPE c    VALUE 'YAM_E1I001',
+           c_equipment  TYPE eqart VALUE 'EQUIPMENT',
+           c_99991231(8)           VALUE '99991231',
+           c_yam_ret(18) TYPE c    VALUE 'BPCS_Returns',
+           c_bp         TYPE parvw VALUE 'RE',   " Bill-to-party
+           c_k          TYPE objvw VALUE 'K',    " Maintenance contract
+           c_c(1)       TYPE c     VALUE 'C',    " Change
+           c_a(1)       TYPE c     VALUE 'A',    " Add
+           c_x(1)       TYPE c     VALUE 'X',
+           c_run_hours  TYPE impt-atnam VALUE 'ZAM_RHRSTOTAL_ACT',
+           c_underscore(1) TYPE c  VALUE '_',    " Underscore
+           c_ls(2)                 VALUE 'LS',
+           c_sc1(3)                VALUE 'SC1',
+           c_input                 VALUE '0',
+           c_0000(4)    TYPE c     VALUE '0000',
+           c_001(3)     TYPE c     VALUE '001',
+           c_e          TYPE spras VALUE 'E',    " Language
+           c_clnt(4)    TYPE c     VALUE 'CLNT' ,
+           c_wbi(3)     TYPE c     VALUE 'WBI'   .
+
+************************************************************************
+*                   V A R I A B L E S                                  *
+************************************************************************
+DATA:  g_equnr  TYPE equi-equnr,                " Equip Number
+       g_pfile  LIKE      /sapdmc/lsoinp-filename,
+       g_ofile  LIKE      /sapdmc/lsoinp-filename,
+       g_delsetupfile LIKE rlgrap-filename,
+       g_swerk  TYPE v_equi-swerk,              " Plant
+       g_ansdt  LIKE equi-ansdt,                " Acquisition date
+       g_retcd  LIKE sy-subrc,                  " return code
+       g_subrc  LIKE sy-subrc,                  " return code
+       g_index  LIKE sy-tabix,
+       g_stat   LIKE jest-stat,                 " System status
+       g_directory(25) TYPE c VALUE '/var/load/xxx/UK/read/',
+       g_fm_atinn TYPE ausp-atinn,
+       g_point  LIKE imptt-point,               " Measurement point
+       g_ersda(12) TYPE c,                      " YYYYMMDDHHMM
+       g_date   LIKE sy-datum,
+       g_parnr  TYPE i_parnr.                   " Partner Number
+
+************************************************************************
+*                  I N T E R N A L   T A B L E S                       *
+************************************************************************
+DATA : BEGIN OF i_tab OCCURS 0,
+        vkorg TYPE vkorg,
+        zwareh TYPE zwareh,
+        lgort TYPE char4,
+        matnr TYPE char15,
+        menge TYPE char15.
+DATA : END OF i_tab.
+
+
+
+DATA: i_edidc_control_comm LIKE edidc OCCURS 1 WITH HEADER LINE ,
+      i_edidd_data LIKE edidd OCCURS 0 WITH HEADER LINE         ,
+      wa_edidc LIKE edidc                                       ,
+      p_logsys LIKE tbdlst-logsys                               ,
+      warehouse TYPE ZWAREH.
+
+************************************************************************
+*       S E L E C T - O P T I O N S / P A R A M E T E R S              *
+************************************************************************
+
+SELECTION-SCREEN : BEGIN OF BLOCK b1 WITH FRAME TITLE text-001.
+
+PARAMETERS: p_vkorg  TYPE vkorg OBLIGATORY.    "Sales Organisation
+SELECT-OPTIONS: s_zwareh FOR warehouse,    "Warehouse
+                s_lgort FOR aufm-lgort.        "Storage Location
+SELECTION-SCREEN: END OF BLOCK b1.
+
+************************************************************************
+INITIALIZATION.
+
+  CALL FUNCTION 'OWN_LOGICAL_SYSTEM_GET'
+    IMPORTING
+      own_logical_system             = p_logsys
+    EXCEPTIONS
+      own_logical_system_not_defined = 1
+      OTHERS                         = 2.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+         WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+* ELSE.
+*   REPLACE FIRST OCCURRENCE OF c_clnt IN p_logsys WITH c_wbi  .
+  ENDIF.
+
+
+
+INITIALIZATION.
+
+
+  PERFORM init_alv_field. " Field names initialization
+
+  g_repid           = sy-repid.
+  gs_variant-report = g_repid.
+  g_save            = 'A'.
+
+
+
+*End of Mod-018
+
+
+*****************************
+* AT SELECTION SCREEN
+****************************
+AT SELECTION-SCREEN.
+
+  PERFORM check_authorization.
+
+
+
+
+*= START-OF-SELECTION
+*=======================================================================
+
+START-OF-SELECTION.
+
+  PERFORM init_main_table. " Display table initialization
+
+
+
+*= END-OF-SELECTION
+*=======================================================================
+
+END-OF-SELECTION.
+
+*    IF NOT t_main_table[] IS INITIAL. " Check if table contains data
+
+  PERFORM print_alv_report.
+
+*    ENDIF.
+
+
+
+*= TOP-OF-PAGE
+*=======================================================================
+
+TOP-OF-PAGE.
+
+
+
+*= AT USER-COMMANDE
+*=======================================================================
+
+AT USER-COMMAND.
+
+
+
+************************************************************************
+*
+*   INTERNAL FORMS
+*
+************************************************************************
+
+
+
+* ----------------------------------------------------------------------
+*   FORM
+*   EXTRACT FROM DB
+*   Fill internal table with SAP data
+* ----------------------------------------------------------------------
+FORM init_main_table.
+
+
+  PERFORM get_file USING p_vkorg
+                          CHANGING g_retcd.
+
+ENDFORM.                                                "init_main_table
+
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  init_alv_field
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM init_alv_field.
+
+  REFRESH t_field.
+
+  PERFORM insert_alv_field USING  'VKORG'   text-015.
+  PERFORM insert_alv_field USING  'ZWAREH'   text-017.
+  PERFORM insert_alv_field USING  'LGORT'   text-016.
+  PERFORM insert_alv_field USING  'MATNR'   text-018.
+  PERFORM insert_alv_field USING  'MENGE'   text-019.
+ENDFORM.                                                 "init_alv_field
+
+
+* ----------------------------------------------------------------------
+*   FORM
+*   INSERT ALV FIELD
+*
+*   Sub-procedure of INIT ALV FIELD
+* ----------------------------------------------------------------------
+FORM insert_alv_field USING value(pi_field)
+                            value(pi_libel).
+
+  DATA:         l_pos(4) TYPE n,
+                l_nbr    TYPE i.
+
+  DESCRIBE TABLE t_field LINES l_nbr.
+
+  l_pos = l_nbr + 1.
+
+  TRANSLATE pi_field TO UPPER CASE.
+
+  CLEAR t_field.
+  CONCATENATE l_pos '00' INTO t_field-posnr.
+  CONDENSE t_field-posnr.
+
+  t_field-name  = pi_field.
+  t_field-lib   = pi_libel.
+
+  APPEND t_field.
+
+ENDFORM.                                               "insert_alv_field
+
+
+
+* ----------------------------------------------------------------------
+*   FORM
+*   PF STATUS SET
+*
+*   Assign user menu and icons.
+* ----------------------------------------------------------------------
+FORM pf_status_set USING pi_extab TYPE slis_t_extab.
+
+  SET PF-STATUS 'USER_STATUS' EXCLUDING pi_extab.
+
+ENDFORM.                                                  "pf_status_set
+
+
+
+* ----------------------------------------------------------------------
+*   FORM
+*   USER COMMAND
+*
+*   User commands management
+*
+* ----------------------------------------------------------------------
+FORM user_command USING pi_ucomm       LIKE sy-ucomm
+                        pi_rs_selfield TYPE slis_selfield.  "#EC CALLED
+
+  CASE pi_ucomm.
+
+    WHEN '&IC1'.
+      CASE  pi_rs_selfield-fieldname.
+        WHEN 'EBELN'.
+          SET PARAMETER ID 'BES' FIELD pi_rs_selfield-value.
+          CALL TRANSACTION 'ME23N' AND SKIP FIRST SCREEN.
+      ENDCASE.
+
+  ENDCASE.
+
+ENDFORM.                                                   "user_command
+
+
+
+* ----------------------------------------------------------------------
+*   FORM
+*   TOP OF PAGE
+*
+*   Top of page initialization
+* ----------------------------------------------------------------------
+FORM top_of_page.                                           "#EC CALLED
+
+  CALL FUNCTION 'REUSE_ALV_COMMENTARY_WRITE'
+    EXPORTING
+      i_logo             = 'Z_IB_LOGO'
+      it_list_commentary = gt_list_top_of_page.
+
+ENDFORM.                                                    "top_of_page
+
+
+
+* ----------------------------------------------------------------------
+*   FORM
+*   BUILD TOP OF PAGE
+*
+* top of page text initialization
+* ----------------------------------------------------------------------
+FORM build_top_of_page USING lt_top_of_page TYPE slis_t_listheader.
+
+  DATA: ls_line TYPE slis_listheader,
+        l_date(10),
+        l_heure(8).
+
+  CLEAR ls_line.
+
+  ls_line-typ  = 'S'.
+  ls_line-key  = text-012.
+  CONCATENATE sy-sysid '|' sy-mandt '|' sy-repid INTO ls_line-info
+  SEPARATED BY space.
+  APPEND ls_line TO lt_top_of_page.
+
+
+ENDFORM.                                              "build_top_of_page
+
+
+
+* ----------------------------------------------------------------------
+*   FORM
+*   BUILD ALV LAYOUT
+*
+*   Layout parameters initialization
+* ----------------------------------------------------------------------
+
+FORM build_alv_layout USING pi_layout TYPE slis_layout_alv.
+
+  pi_layout-colwidth_optimize   = 'X'. "Optimise les colonnes
+  pi_layout-zebra               = 'X'. "Z¨¨brer les lignes
+  pi_layout-key_hotspot         = 'X'. "Hotspot sur cl¨¦
+  pi_layout-confirmation_prompt = 'X'. "Confirmation en exit
+
+ENDFORM.                    "build_alv_layout
+
+
+
+* ----------------------------------------------------------------------
+*   FORM
+*   BUILD ALV CATALOG
+*
+*
+* ----------------------------------------------------------------------
+
+FORM build_alv_catalog TABLES t_alv_catalog
+                              fieldname_tab STRUCTURE t_field.
+
+  TYPE-POOLS:   slis,
+                sydes.
+
+  DATA:         s_fieldcat TYPE slis_fieldcat_alv,
+                td         TYPE sydes_desc,
+                td_type    TYPE sydes_typeinfo,
+                td_name    TYPE sydes_nameinfo,
+                idx        TYPE i,
+                end_flag,
+                component(60).
+
+  REFRESH t_alv_catalog.
+
+* Read component table
+  DESCRIBE FIELD <data_alv_grid> INTO td.
+
+* loop on components
+  LOOP AT td-types INTO td_type.
+
+    IF td_type-idx_name IS INITIAL.
+      CONTINUE.
+    ENDIF.
+
+    end_flag = ' '.
+    idx = td_type-idx_name.
+
+    CLEAR component.
+
+    WHILE ( end_flag = ' ' ).
+      READ TABLE td-names INTO td_name INDEX idx.
+      CONCATENATE component td_name-name INTO component.
+
+      IF td_name-continue IS INITIAL.
+        end_flag = 'X'.
+      ENDIF.
+
+      ADD 1 TO idx.
+    ENDWHILE.
+
+    READ TABLE fieldname_tab WITH KEY name = component.
+    IF sy-subrc <> 0.
+      CONTINUE.
+    ENDIF.
+
+    CLEAR s_fieldcat.
+    s_fieldcat-fieldname = component.
+    s_fieldcat-col_pos   = fieldname_tab-posnr.
+    s_fieldcat-seltext_l = fieldname_tab-lib.
+    s_fieldcat-ddictxt   = 'L'.
+
+*   Allow lowercase letters for fields
+    s_fieldcat-lowercase = 'X'.
+
+*   Set output length (necessary for filter)
+    s_fieldcat-outputlen = 128.
+
+*   Define content as key
+    IF component EQ 'EBELN'.
+      s_fieldcat-key        = 'X'.
+      s_fieldcat-key_sel    = 'X'.
+      s_fieldcat-fix_column = 'X'.
+      s_fieldcat-emphasize  = 'C100'.
+    ELSE.
+      s_fieldcat-key = ' '.
+    ENDIF.
+
+    IF component EQ 'BSART'.
+      s_fieldcat-outputlen = 5.
+    ENDIF.
+
+    IF component EQ 'ZZEINDT'.
+      s_fieldcat-outputlen = 10.
+    ENDIF.
+
+*   Field conversion
+    IF component EQ 'VBELN'.
+      s_fieldcat-edit_mask   = '==ALPHA'.
+    ENDIF.
+
+*   Sum only these fields
+    IF component EQ 'NTGEW'.
+      s_fieldcat-do_sum = 'X'.
+    ELSE.
+*   Prevent sums on other fields
+      IF td_type-type = 'P'.
+        s_fieldcat-no_sum = 'X'.
+      ENDIF.
+    ENDIF.
+
+*   Leading zeros for numc fields
+    IF td_type-type = 'N'.
+      s_fieldcat-lzero = 'X'.
+    ENDIF.
+
+    APPEND s_fieldcat TO t_alv_catalog.
+
+  ENDLOOP.
+ENDFORM.                                              "build_alv_catalog
+
+
+
+* ----------------------------------------------------------------------
+*   FORM
+*   PRINT ALV REPORT
+*
+*   Display report.
+* ----------------------------------------------------------------------
+
+FORM print_alv_report.
+
+  DATA:         t_alv_catalog   TYPE slis_t_fieldcat_alv,
+                t_fieldsel      TYPE slis_t_fieldcat_alv,
+                t_exclude       TYPE slis_t_extab,
+                s_layout        TYPE slis_layout_alv,
+                s_grid_settings TYPE lvc_s_glay.
+
+  SET SCREEN 0.
+
+  ASSIGN i_tab TO <data_alv_grid>.
+
+* default display options
+  PERFORM build_alv_layout USING s_layout.
+
+* Header display.
+  s_grid_settings-top_p_only   = 'X'. "Afficher le header standard
+
+* Build top of page (old print_standard_screen)
+  PERFORM build_top_of_page USING gt_list_top_of_page[].
+
+* Build catalog.
+  PERFORM build_alv_catalog TABLES t_alv_catalog t_field.
+
+* Display ALV
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+    EXPORTING
+*      i_interface_check           = ' '
+*      i_bypassing_buffer          = ' '
+*      i_buffer_active             = ' '
+       i_callback_program          = g_repid
+*       i_callback_pf_status_set    = g_status_set
+       i_callback_user_command     = g_user_command
+       i_callback_top_of_page      = g_top_of_page
+*      i_callback_html_top_of_page =
+*      i_callback_html_end_of_list =
+*      i_structure_name            =
+*      i_background_id             =
+*      i_grid_title                =
+       i_grid_settings             = s_grid_settings
+       is_layout                   = s_layout
+       it_fieldcat                 = t_alv_catalog[]
+       it_excluding                = t_exclude[]
+*      it_special_groups           =
+*      it_sort                     =
+*      it_filter                   =
+*      is_sel_hide                 =
+*      i_default                   =
+       i_save                      = g_save
+       is_variant                  = gs_variant
+*      it_events                   =
+*      it_event_exit               =
+*      is_print                    =
+*      is_reprep_id                =
+*      i_screen_start_column       = 0
+*      i_screen_start_line         = 0
+*      i_screen_end_column         = 0
+*      i_screen_end_line           = 0
+*      it_alv_graphics             =
+*      it_hyperlink                =
+*      it_add_fieldcat             =
+*      it_except_qinfo             =
+*      i_html_height_top           =
+*      i_html_height_end           =
+    IMPORTING
+       e_exit_caused_by_caller     = g_exit_caused_by_caller
+       es_exit_caused_by_user      = gs_exit_caused_by_user
+    TABLES
+       t_outtab                    = i_tab
+    EXCEPTIONS
+       program_error = 1
+       OTHERS        = 2.
+
+  . "end call function REUSE_ALV_GRID_DISPLAY
+
+* Handle errors
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid
+          TYPE sy-msgty
+        NUMBER sy-msgno
+          WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+ENDFORM.                                               "print_alv_repor
+*&---------------------------------------------------------------------*
+*&      Form  Check_Authorization
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM check_authorization .
+
+  AUTHORITY-CHECK OBJECT 'V_VBAK_VKO'
+           ID 'VKORG' FIELD p_vkorg.
+*          ID 'VTWEG' FIELD p_vtweg
+*          ID 'SPART' FIELD p_spart
+*           ID 'ACTVT' FIELD '03'.
+
+  IF sy-subrc = 4.
+*   No authorisation to display the data
+    MESSAGE ID 'YSE_GENERAL' TYPE 'E' NUMBER '002' WITH p_vkorg.
+  ELSEIF sy-subrc <> 0.
+*   Error checking authorization.
+    MESSAGE ID 'YSE_GENERAL' TYPE 'E' NUMBER '001'.
+  ENDIF.
+
+ENDFORM.                    "check_authorization
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  Get_previous_file
+*&---------------------------------------------------------------------*
+*       Get file from previous run
+*----------------------------------------------------------------------*
+FORM get_file USING p_vkorg
+              CHANGING p_retcd.
+
+
+  REPLACE 'xxx' IN g_directory WITH p_logsys(3).
+  CONCATENATE g_directory c_yam_ret INTO g_pfile.
+
+* FILE READ FROM APPLICATION SERVER
+  PERFORM get_from_appl TABLES  i_tab
+                        USING   g_pfile
+                                p_retcd.
+
+  LOOP AT i_tab.
+    IF i_tab-vkorg <> p_vkorg or i_tab-zwareh not in s_zwareh or i_tab-lgort not in s_lgort.
+      DELETE i_tab.
+    ENDIF.
+  ENDLOOP.
+
+  SORT i_tab by VKORG LGORT MATNR.
+
+ENDFORM.                    " Get_previous_file
+*&---------------------------------------------------------------------*
+*&      Form  Get_from_appl
+*&---------------------------------------------------------------------*
+*       Get the file from application server into internal table
+*----------------------------------------------------------------------*
+FORM get_from_appl TABLES i_infile STRUCTURE i_tab
+                   USING p_infile p_subrc.
+
+  OPEN DATASET p_infile FOR INPUT IN TEXT MODE ENCODING DEFAULT.
+  IF sy-subrc <> 0.
+    WRITE: / text-e03, p_infile.
+    p_subrc = 4.
+    EXIT.
+  ENDIF.
+
+  REFRESH i_infile.
+
+  DO.
+    READ DATASET p_infile INTO i_infile.
+    IF sy-subrc <> 0.
+      EXIT.
+    ENDIF.
+    APPEND i_infile.
+  ENDDO.
+  CLOSE DATASET p_infile.
+
+ENDFORM.                    " GET_FROM_APPL
+
+*Text symbol text£º
+*001:Selection Screen Input
+*015:Sales Organisation
+*016:Storage Location
+*017:Warehouse
+*018:Material Number
+*019:Quantity returned
+*E01:No data available for the Selected Plant :
+*E02:No previous run entry found in custom table YAM_I001 for plant :
+*E03:Open dataset failed for :
+*E04:No counter found for measurement point :
+*E05:Could not delete file :
+*E06:Could not delete entrie(s) in table YAM_I001 for :
+*I01:Number of Idocs created :
+*I02:Job finished
+
+*I03:No Idocs created
+*Selection text£º
+*P_VKORG:        Sales Organisation
+*S_LGORT:        Storage Location
+*S_ZWAREH:        Warehouse

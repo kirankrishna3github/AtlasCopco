@@ -1,0 +1,631 @@
+*&---------------------------------------------------------------------*
+*& Report  YAM_HR_RUN_TIME_EVALUATION                                  *
+*&---------------------------------------------------------------------*
+*&  This program will execute the program RPTIME00 for every selected  *
+*&  employee number.                                                   *
+*&  The timesheets will be retrieved from the spool and delivered via  *
+*&  email to the employee. This is done by calling the program         *
+*&  YAM_HR_EMAIL_SPOOL_IN_HTML                                         *
+*&---------------------------------------------------------------------*
+* Change History Log
+*----------------------------------------------------------------------*
+* Date     Name           Description
+* 200810   DeBruyne Bart  remove hardcoded DE-TIMESHEETS
+* 200811   Deplancke W.   added explanation texts
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME     |CORRECTION NR | CHANGE REFERENCE      *
+*----------------------------------------------------------------------*
+* MOD-001 |21.01.2010|M.Jacobs  |CD1K953940    |change spool handling  *
+*----------------------------------------------------------------------*
+*----------------------------------------------------------------------*
+
+REPORT  yam_hr_run_time_evaluation_htm.
+*----------------------------------------------------------------------*
+*  Declaration of SYSTEM TABLES                                        *
+*----------------------------------------------------------------------*
+TABLES: pernr,        " Standard Selections for HR Master Data Reporting
+        p0105,        " HR Master Record: Infotype 0105 (Communications)
+        alm_me_d997,  " User-specific settings
+        tsp01.        " Spool Requests
+
+*----------------------------------------------------------------------*
+*  TYPES DEFINITIONS                                                   *
+*----------------------------------------------------------------------*
+TYPES: BEGIN OF t_tsp01.
+        INCLUDE STRUCTURE tsp01.               " Spool Requests
+TYPES: END OF t_tsp01.
+
+*----------------------------------------------------------------------*
+*  Declaration of INTERNAL TABLES                                      *
+*----------------------------------------------------------------------*
+DATA: i_params TYPE STANDARD TABLE OF rsparams WITH HEADER LINE,
+      i_variant TYPE STANDARD TABLE OF rsparams WITH HEADER LINE.
+
+DATA: i_return TYPE STANDARD TABLE OF bapiret2 WITH HEADER LINE,
+      i_smtp TYPE STANDARD TABLE OF bapiadsmtp WITH HEADER LINE,
+      i_addr TYPE STANDARD TABLE OF bapiaddr3 WITH HEADER LINE.
+
+* Management errors
+DATA: messtab TYPE STANDARD TABLE OF bdcmsgcoll WITH HEADER LINE.
+*----------------------------------------------------------------------*
+*  Declaration of VARIABLES                                            *
+*----------------------------------------------------------------------*
+DATA: ws_pgm_1 LIKE rsvar-report,
+      ws_pgm_2 LIKE rsvar-report.
+
+DATA: rc LIKE sy-subrc.
+
+DATA: params LIKE pri_params,
+      valid    TYPE c,
+      lv_paart(50),
+      lv_linsz(10),
+      lv_linct(10).
+
+DATA: wa_tsp01 TYPE t_tsp01.
+
+DATA: ws_spool_num  LIKE tsp01-rqident,
+      ws_spool_name LIKE tsp01-rq2name,
+      ws_mail       LIKE i_smtp-e_mail.
+
+* Management errors
+DATA: l_mstring TYPE string.
+DATA: g_error(1) VALUE ' '.
+* begin of insertion MOD-001
+DATA: gv_ldest    LIKE yse_hr_printer-ldest.
+* end of insertion MOD-001
+*----------------------------------------------------------------------*
+*  Selection screen                                                    *
+*----------------------------------------------------------------------*
+SELECTION-SCREEN BEGIN OF BLOCK 0 WITH FRAME.
+PARAMETERS: p_myvar(14),
+            p_date LIKE sy-datum,
+            p_sub LIKE sodocchgi1-obj_descr,
+            p_mail(40).
+SELECTION-SCREEN END OF BLOCK 0.
+
+
+INITIALIZATION.
+***************
+* code before selection screen is displayed
+  ws_pgm_1 = 'RPTIME00'.
+  ws_pgm_2 = 'YAM_HR_EMAIL_SPOOL_IN_HTML'.
+
+
+START-OF-SELECTION.
+*******************
+* Variant DE-TIMESHEETS must exist for RPTEDT00
+* Wouter 200811 --> p_myvar must exist (country
+*   dependent variant
+  PERFORM variant_exists USING ws_pgm_1.
+  IF g_error = 'X'.
+    PERFORM error_management.
+    EXIT.
+  ENDIF.
+* Variant DE-TIMESHEETS must exist for YAM_HR_EMAIL_SPOOL_IN_HTML
+* Wouter 200811 --> p_myvar must exist (country
+*   dependent variant
+
+  PERFORM variant_exists USING ws_pgm_2.
+  IF g_error = 'X'.
+    PERFORM error_management.
+    EXIT.
+  ENDIF.
+
+* begin of insertion MOD-001
+  CLEAR gv_ldest.
+  LOOP AT pnpbukrs.
+    IF NOT pnpbukrs-low IS INITIAL.
+      SELECT SINGLE ldest INTO gv_ldest
+        FROM yse_hr_printer WHERE bukrs = pnpbukrs-low.
+    ENDIF.
+    EXIT.
+  ENDLOOP.
+  IF gv_ldest IS INITIAL.
+    gv_ldest = 'LOCL'.
+  ENDIF.
+* end of insertion MOD-001
+
+GET pernr.
+**********
+  CLEAR g_error.
+  PERFORM fill_variant_1 TABLES i_params
+             USING pernr-pernr p_date.
+  CHECK ( g_error IS INITIAL ).
+
+* begin of change MOD-001
+*  CONCATENATE 'TM' pernr-pernr INTO ws_spool_name.
+  CONCATENATE pernr-pernr+2(6) sy-uzeit into ws_spool_name.
+* end of change MOD-001
+  CALL FUNCTION 'GET_PRINT_PARAMETERS'
+    EXPORTING
+* begin of change MOD-001
+*      destination            = 'LOCL'
+      destination            = gv_ldest
+* end of change MOD-001
+      immediately            = ' '
+      release                = ' '
+      new_list_id            = 'X'
+      no_dialog              = 'X'
+      line_count             = 65
+      line_size              = 82
+      list_name              = ws_spool_name
+      expiration             = 1
+    IMPORTING
+      out_parameters         = params
+      valid                  = valid
+    EXCEPTIONS
+      archive_info_not_found = 1
+      invalid_print_params   = 2
+      invalid_archive_params = 3
+      OTHERS                 = 4.
+
+  IF sy-subrc <> 0.
+    g_error = 'X'.
+    messtab-msgspra = sy-langu.     " language
+    messtab-msgid   = 'YAM_AFRU'.   " class
+    messtab-msgnr   = '008'.        " number
+    messtab-msgv1   = pernr-pernr.
+    messtab-msgv2   = sy-subrc.
+    APPEND messtab. CLEAR messtab.
+  ENDIF.
+
+  CHECK ( g_error IS INITIAL ).
+
+  IF valid <> space.
+    lv_linsz = 82. " width of list
+    lv_linct = 65. " page length of list
+
+    CONCATENATE 'X_' lv_linct '_' lv_linsz INTO lv_paart.
+    CONDENSE lv_paart NO-GAPS.
+    SHIFT lv_paart LEFT DELETING LEADING space.
+    params-paart = lv_paart+0(16).
+
+*     RPTIME00 is executed with the variant selected above
+*     Results are stored into the spool
+    SUBMIT rptime00 WITH  SELECTION-TABLE i_params
+                    TO SAP-SPOOL WITHOUT SPOOL DYNPRO
+                    SPOOL PARAMETERS params
+                    AND RETURN.
+
+  ENDIF.
+
+  IF sy-batch = 'X'.
+    COMMIT WORK AND WAIT.
+  ENDIF.
+*--------------------------------------------------------------
+*   time evaluation is executed and report is created, now we
+*   are going to send the report in HTML format as attachment
+*   to an email.
+*--------------------------------------------------------------
+  IF p_mail <> 'N'.
+*      get the spool-number.
+    PERFORM get_spool_request.
+    CHECK ( g_error IS INITIAL ).
+
+*      get the email address of employee of from parameter.
+    PERFORM get_email_address.
+    CHECK ( g_error IS INITIAL ).
+
+*      call the program with correct parameters
+    PERFORM fill_variant_2 TABLES i_params.
+    CHECK ( g_error IS INITIAL ).
+
+    SUBMIT yam_hr_email_spool_in_html
+       WITH  SELECTION-TABLE i_params
+       TO SAP-SPOOL WITHOUT SPOOL DYNPRO
+       SPOOL PARAMETERS params
+       AND RETURN.
+  ENDIF.              "IF p_mail <> 'N'.
+
+END-OF-SELECTION.
+*****************
+  PERFORM error_management.
+  WRITE:/ 'Program ended'.
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  fill_variant1  (RPTIME00)
+*&---------------------------------------------------------------------*
+*----------------------------------------------------------------------*
+*      -->P_i_params
+*      -->P_PERNR_PERNR
+*      -->P_DATE
+*----------------------------------------------------------------------*
+FORM fill_variant_1  TABLES   p_i_variant STRUCTURE i_params
+                     USING    p_pernr-pernr p_date.
+
+  DATA: i_data TYPE STANDARD TABLE OF rsparams WITH HEADER LINE.
+
+* DE-TIMESHEETS variant parameters that we need.
+  DATA: v_variant LIKE rsparams-low,    " Time statement variant
+        v_schema LIKE rsparams-low,     " Evaluation schema
+        v_begdate LIKE sy-datum,        " Forced recalculation date
+        v_enddate LIKE rsparams-low,    " Evaluation up to date
+        v_layout LIKE rsparams-low.     " Layout for log
+
+  REFRESH i_params. CLEAR i_params.
+* To avoid to send out reports without any data, we call the RPTIME00
+* but with 'Forced recalculation as of' = first day of month is that
+* parameter (p_date) is blank.
+  IF p_date IS INITIAL.
+    v_begdate = sy-datum.
+    REPLACE SECTION OFFSET 6 OF v_begdate WITH '01'.
+  ELSE.
+    v_begdate = p_date.
+  ENDIF.
+
+* We store the DE-TIMESHEETS variant content in i_data
+* Wouter 200811 - Now store the variant (per country!)
+  CALL FUNCTION 'RS_VARIANT_CONTENTS'
+    EXPORTING
+      report                      = 'RPTIME00'
+      variant                     = p_myvar                 "BDB 200810
+*   MOVE_OR_WRITE               = 'W'
+*   NO_IMPORT                   = ' '
+*   EXECUTE_DIRECT              = ' '
+* IMPORTING
+*   SP                          =
+    TABLES
+*   L_PARAMS                    =
+*   L_PARAMS_NONV               =
+*   L_SELOP                     =
+*   L_SELOP_NONV                =
+      valutab                     = i_data
+*   OBJECTS                     =
+*   FREE_SELECTIONS_DESC        =
+*   FREE_SELECTIONS_VALUE       =
+ EXCEPTIONS
+   variant_non_existent        = 1
+   variant_obsolete            = 2
+   OTHERS                      = 3
+            .
+  IF sy-subrc <> 0.
+    g_error = 'X'.
+    messtab-msgspra = sy-langu.     " language
+    messtab-msgid   = 'YAM_AFRU'.   " class
+    messtab-msgnr   = '006'.        " number
+    messtab-msgv1   = pernr-pernr.
+    messtab-msgv2   = sy-subrc.
+    APPEND messtab. CLEAR messtab.
+    EXIT.
+  ENDIF.
+
+* We only keep values needed by us
+* Dates are stored into i_data in a dd.mm.yyyy format, we need to
+* convert it to yyyymmdd format (the format returned by
+* RS_REFRESH_FROM_SELECTOPTIONS)
+* To do this we use the FM CONVERSION_EXIT_BEGDA_INPUT to make the
+* reformat
+* Note: CONVERSION_EXIT_BEGDA_INPUT gives an error if input date is
+* "00.00.0000"
+  LOOP AT i_data.
+    CASE i_data-selname.
+*      WHEN 'BEGDATE'.
+*        IF i_data-low <> '00.00.0000'.
+*          CALL FUNCTION 'CONVERSION_EXIT_BEGDA_INPUT'
+*            EXPORTING
+*              INPUT  = i_data-low
+*            IMPORTING
+*              OUTPUT = v_begdate.
+*        ELSE.
+*          v_begdate = '00000000'.
+*        ENDIF.
+      WHEN 'ENDDATE'.
+        IF i_data-low <> '00.00.0000'.
+          CALL FUNCTION 'CONVERSION_EXIT_BEGDA_INPUT'
+            EXPORTING
+              input  = i_data-low
+            IMPORTING
+              output = v_enddate.
+        ELSE.
+          v_enddate = '00000000'.
+        ENDIF.
+      WHEN 'P_VANAM'.
+        v_layout = i_data-low.
+      WHEN 'VAR_EDT'.
+        v_variant = i_data-low.
+      WHEN 'SCHEMA'.
+        v_schema = i_data-low.
+    ENDCASE.
+  ENDLOOP.
+
+* We store in i_param current contents of selection screen
+  CALL FUNCTION 'RS_REFRESH_FROM_SELECTOPTIONS'
+    EXPORTING
+      curr_report     = 'RPTIME00'
+    TABLES
+      selection_table = i_params
+    EXCEPTIONS
+      not_found       = 1
+      no_report       = 2
+      OTHERS          = 3.
+  IF sy-subrc <> 0.
+    g_error = 'X'.
+    messtab-msgspra = sy-langu.     " language
+    messtab-msgid   = 'YAM_AFRU'.   " class
+    messtab-msgnr   = '007'.        " number
+    messtab-msgv1   = pernr-pernr.
+    messtab-msgv2   = sy-subrc.
+    APPEND messtab. CLEAR messtab.
+    EXIT.
+  ENDIF.
+
+* We add the variant values and the personnel number
+  LOOP AT i_params.
+    CASE i_params-selname.
+      WHEN 'P_VANAM'.
+        i_params-sign = 'I'.
+        i_params-option = 'EQ'.
+        i_params-low = v_layout.          " Layout for log
+        MODIFY i_params INDEX sy-tabix.
+      WHEN 'BEGDATE'.
+        i_params-sign = 'I'.
+        i_params-option = 'EQ'.
+        i_params-low = v_begdate.         " Forced recalculation date
+        MODIFY i_params INDEX sy-tabix.
+      WHEN 'ENDDATE'.
+        i_params-sign = 'I'.
+        i_params-option = 'EQ'.
+        i_params-low = v_enddate.         " Evaluation up to date
+        MODIFY i_params INDEX sy-tabix.
+      WHEN 'VAR_EDT'.
+        i_params-sign = 'I'.
+        i_params-option = 'EQ'.
+        i_params-low = v_variant.         " Time statement variant
+        MODIFY i_params INDEX sy-tabix.
+      WHEN 'SCHEMA'.
+        i_params-sign = 'I'.
+        i_params-option = 'EQ'.
+        i_params-low = v_schema.
+        MODIFY i_params INDEX sy-tabix.   " Evaluation schema
+      WHEN 'PNPPERNR'.
+        i_params-sign = 'I'.
+        i_params-option = 'EQ'.
+        i_params-low = p_pernr-pernr.     " Personnel number
+        MODIFY i_params INDEX sy-tabix.
+    ENDCASE.
+
+  ENDLOOP.
+
+ENDFORM.                    " fill_variant1
+
+*&---------------------------------------------------------------------*
+*&      Form  fill_variant2  (YAM_HR_EMAIL_SPOOL_IN_HTML)
+*&---------------------------------------------------------------------*
+FORM fill_variant_2  TABLES p_i_variant STRUCTURE i_params.
+*  DATA: i_data TYPE STANDARD TABLE OF rsparams WITH HEADER LINE.
+  DATA: tmp_spool_num(10).
+
+  REFRESH i_params.
+
+  CLEAR i_params.
+  i_params-selname = 'S_SPOOL'.
+  i_params-kind = 'S'.
+  i_params-sign = 'I'.
+  i_params-option = 'EQ'.
+  MOVE ws_spool_num TO tmp_spool_num.
+  i_params-low = tmp_spool_num.     " spoolnumber
+  APPEND i_params.
+
+  CLEAR i_params.
+  i_params-selname = 'P_DES'.
+  i_params-kind = 'P'.
+  i_params-low = p_sub.             " subject of email
+  APPEND i_params.
+
+  CLEAR i_params.
+  i_params-selname = 'S_EMAILS'.
+  i_params-kind = 'S'.
+  i_params-sign = 'I'.
+  i_params-option = 'EQ'.
+  i_params-low = ws_mail.            " email receiver 1
+  APPEND i_params.
+
+ENDFORM.                    " fill_variant2
+
+*&---------------------------------------------------------------------*
+*&      Form  variant_exists
+*&---------------------------------------------------------------------*
+*   Variant existence check
+*----------------------------------------------------------------------*
+FORM variant_exists USING ws_pgm LIKE rsvar-report.
+
+  CALL FUNCTION 'RS_VARIANT_EXISTS'
+    EXPORTING
+      report              = ws_pgm
+      variant             = p_myvar                         "BDB 200810
+    IMPORTING
+      r_c                 = rc
+    EXCEPTIONS
+      not_authorized      = 1
+      no_report           = 2
+      report_not_existent = 3
+      report_not_supplied = 4
+      OTHERS              = 5.
+  IF rc <> 0.
+    g_error = 'X'.
+    messtab-msgspra = sy-langu.    " language
+    messtab-msgid   = 'YAM_AFRU'.  " class
+* Variant DE-TIMESHEETS for RPTEDT00 program does not exist.
+* Wouter 200811- Variant of country does not exist
+    messtab-msgnr   = 'Variant for RPTEDT00 does not exist'(008).   " number
+    APPEND messtab.
+    CLEAR messtab.
+  ENDIF.
+
+ENDFORM.                    " variant_exists
+
+*&---------------------------------------------------------------------*
+*&      Form error_management
+*&---------------------------------------------------------------------*
+FORM error_management .
+  LOOP AT messtab.
+    SELECT SINGLE text FROM t100
+                       INTO l_mstring
+                       WHERE ( sprsl = messtab-msgspra ) AND
+                             ( arbgb = messtab-msgid ) AND
+                             ( msgnr = messtab-msgnr ).
+    IF sy-subrc = 0.
+      IF l_mstring CS '&1'.
+        REPLACE '&1' WITH messtab-msgv1 INTO l_mstring.
+        REPLACE '&2' WITH messtab-msgv2 INTO l_mstring.
+        REPLACE '&3' WITH messtab-msgv3 INTO l_mstring.
+        REPLACE '&4' WITH messtab-msgv4 INTO l_mstring.
+      ELSE.
+        REPLACE '&' WITH messtab-msgv1 INTO l_mstring.
+        REPLACE '&' WITH messtab-msgv2 INTO l_mstring.
+        REPLACE '&' WITH messtab-msgv3 INTO l_mstring.
+        REPLACE '&' WITH messtab-msgv4 INTO l_mstring.
+      ENDIF.
+
+      CONDENSE l_mstring.
+    ELSE.
+
+    ENDIF.
+    WRITE l_mstring.
+
+  ENDLOOP.
+
+ENDFORM.                    " management_errors
+
+*&---------------------------------------------------------------------*
+*& Form  get_spool_request
+*&      Retrieves the correct spool-number. This is depending whether
+*&      program is submitted in foreground or background.
+*& returns: ws_spool_num
+*&---------------------------------------------------------------------*
+FORM get_spool_request .
+  ws_spool_num = 0.
+
+* begin of deletion MOD-001
+*  IF sy-batch = 'X'.
+**     We need the second register because in batch mode, it generates an
+**     extra spool request that it's the first register.
+*    SELECT * UP TO 2 ROWS
+*           INTO wa_tsp01
+*           FROM tsp01
+*           WHERE rqclient = sy-mandt         AND
+*                 rq1name  = 'LOCL'           AND
+*                 rq2name  = ws_spool_name    AND
+*                 rqowner  = sy-uname
+*           ORDER BY rqident DESCENDING
+*                    rqcretime DESCENDING.
+*    ENDSELECT.
+*    IF sy-subrc <> 0.
+*      g_error = 'X'.
+*      messtab-msgspra = sy-langu.     " language
+*      messtab-msgid   = 'YAM_AFRU'.   " class
+*      messtab-msgnr   = '009'.        " number
+*      messtab-msgv1   = pernr-pernr.
+*      messtab-msgv2   = sy-subrc.
+*      APPEND messtab. CLEAR messtab.
+*      EXIT.
+*    ENDIF.
+*
+*  ELSE.
+*
+*  SELECT * UP TO 1 ROWS
+*    INTO wa_tsp01
+*    FROM tsp01
+*    WHERE rqclient = sy-mandt       AND
+*          rq1name  = 'LOCL'         AND
+*          rq2name = ws_spool_name   AND
+*          rqowner  = sy-uname
+*    ORDER BY rqident DESCENDING
+*             rqcretime DESCENDING.
+*  ENDSELECT.
+* end of deletion MOD-001
+* begin of insertion MOD-001
+  SELECT MIN( rqident ) INTO wa_tsp01-rqident
+    FROM tsp01
+      WHERE rqclient = sy-mandt       AND
+            rq1name = gv_ldest        AND
+            rq2name = ws_spool_name   AND
+            rqowner  = sy-uname.
+* end of insertion MOD-001
+  IF sy-subrc <> 0.
+    g_error = 'X'.
+    messtab-msgspra = sy-langu.     " language
+    messtab-msgid   = 'YAM_AFRU'.   " class
+    messtab-msgnr   = '009'.        " number
+    messtab-msgv1   = pernr-pernr.
+    messtab-msgv2   = sy-subrc.
+    APPEND messtab. CLEAR messtab.
+    EXIT.
+  ENDIF.
+* begin of deletion MOD-001
+*  ENDIF.
+* end of deletion MOD-001
+
+  ws_spool_num = wa_tsp01-rqident.
+ENDFORM.                    " get_spool_request
+
+*&---------------------------------------------------------------------*
+*& Form  get_email_address
+*&      p_mail = 'N'              no emails are sent
+*&             = (blank)          email sent to employee of timesheet
+*&             = (email-address)  email only send to this email-address
+*& returns ws_mail.
+*&---------------------------------------------------------------------*
+FORM get_email_address.
+  DATA: v_userid TYPE alm_me_d997-userid,
+        v_center TYPE pa0105-usrid,
+        v_endda TYPE pa0105-endda.
+
+  ws_mail = ''.
+  REFRESH i_smtp. CLEAR i_smtp.
+  v_endda = sy-datum - 35.
+
+  IF p_mail IS INITIAL.
+*    Get work center using personnel number
+    SELECT SINGLE usrid INTO v_center
+    FROM pa0105  WHERE subty = 'WCTR'
+                   AND pernr = pernr-pernr
+                   AND endda > v_endda.
+
+*    Get user name using work center
+    IF v_center > ''.
+      SELECT SINGLE userid INTO v_userid
+      FROM alm_me_d997 WHERE arbpl = v_center.
+    ENDIF.
+
+*    Get e-mail address
+    IF v_userid > ''.
+      CALL FUNCTION 'BAPI_USER_GET_DETAIL'
+        EXPORTING
+          username = v_userid
+        IMPORTING
+          address  = i_addr
+        TABLES
+          return   = i_return
+          addsmtp  = i_smtp.
+*       We store the employee's e-mails.
+      LOOP AT i_smtp.
+        ws_mail = i_smtp-e_mail.
+      ENDLOOP.
+    ENDIF.
+  ELSE.
+    ws_mail = p_mail.
+  ENDIF.
+
+  IF ws_mail = ''.
+    g_error = 'X'.
+  ENDIF.
+ENDFORM.                    " get_email_address
+
+*Text symbol text£º
+*001:Time Evaluation
+*002:Weekly Timesheet
+*003:Attachment
+*004:Attached is the time-sheet for:
+*005:Employee:
+*006:Email:
+*007:Spoolnr:
+
+*008:Variant DE-TIMESHEETS for RPTEDT00 program does not exist
+*Selection text£º
+*P_DATE:        Forced recalculation as of
+*P_MAIL:        Email address
+*P_MYVAR:        Variant for RPTIM00 & RPTEDT00
+*P_SUB:        Subject of email

@@ -1,0 +1,277 @@
+*&---------------------------------------------------------------------*
+*&  Include           YSE_FICO_SDI_SETT_RRB_EV                         *
+*&---------------------------------------------------------------------*
+
+start-of-selection.
+
+* BEGIN MOD-1 Wouter 2012-02-03
+* Prevent program from being executed
+
+  WRITE: / text-z99.
+  EXIT.
+
+* END MOD-1 Wouter 2012-02-03
+
+
+*Get the company code of the sales organization, this is also an input check on sales org.
+  clear gv_bukrs.
+  select single bukrs
+    into gv_bukrs
+    from tvko
+    where vkorg in so_vkorg.
+
+  if sy-subrc ne 0.
+    message s000(yse_fico_sdi) with so_vkorg-low.
+    exit.
+  endif.
+*Get last day of period used
+  perform get_last_date_of_period.
+
+*If company code found, also get non taxable tax code
+  select single MWSKA from T001
+    into gv_tax_code
+      where bukrs eq gv_bukrs.
+
+*Get the company code currency
+  clear gv_waers.
+  select single waers
+    into gv_waers
+    from t001
+    where bukrs eq gv_bukrs.
+
+*Get all DMR's from vbak and vbap, no further restriction is possible therefore all dmr's have to be selected every time
+  select vbak~vbeln vbak~vbtyp vbak~auart vbak~vkorg vbak~vtweg vbak~spart  vbak~waerk
+         vbap~posnr vbap~matnr vbap~vgbel vbap~vgpos vbap~werks vbap~netwr vbap~stcur      "vbap~wavwr
+    from vbak inner join vbap
+    on vbak~vbeln eq vbap~vbeln
+    into corresponding fields of table gt_dmr
+    where vbak~vbtyp in so_vbtyp
+    and vbak~vkorg in so_vkorg
+    and vbak~vtweg in so_vtweg
+    and vbak~spart in so_spart
+    and vbak~vbeln in so_vbeln
+    and vbap~pstyv in so_pstyv.
+
+  if sy-subrc ne 0.
+    message s001(yse_fico_sdi) with so_vkorg-low so_vtweg-low so_spart-low.
+    exit.
+  endif.
+
+
+**Check every material for raw material by checking the dip profile
+**If a material is in the dip profile table, delete the entry from our main internal table
+*  data: lv_tmp type AD01INVMAT.
+*  select inv_mat from ad01c_mat into lv_tmp for all entries in gt_dmr
+*    where inv_mat eq gt_dmr-matnr.
+*    delete gt_dmr where matnr eq lv_tmp.
+*  endselect.
+
+**Check every material for raw material by checking the material group, only repost zmat
+  data: lv_matnr type matnr,
+        lv_mtart type mtart.
+  select matnr mtart from mara into (lv_matnr, lv_mtart)
+    for all entries in gt_dmr
+    where matnr = gt_dmr-matnr.
+    if lv_mtart <> 'ZMAT'.
+      delete gt_dmr where matnr eq lv_matnr.
+    endif.
+  endselect.
+
+
+
+*Check if any dmr to process
+  describe table gt_dmr lines gv_count.
+  if gv_count eq 0.
+    message s002(yse_fico_sdi).
+    exit.
+  endif.
+
+*Move the entries per SDI item to internal table
+
+*Loop over the dmr entries found so far and perform some additional checks and data selection and calculations
+
+  data: lv_vbeln type vbeln.
+  loop at gt_dmr into gs_dmr.
+*Check if there is any cost based billing done per SDI sales order line item, if none delete entry from DMR main table
+    select single vbeln from vbkd
+      into lv_VBELN
+      where vbeln eq gs_dmr-vgbel
+      and posnr eq gs_dmr-vgpos
+      AND faktf eq gc_billingtype.
+    if sy-subrc ne 0.
+      delete gt_dmr where vbeln eq gs_dmr-vbeln
+                            and posnr eq gs_dmr-posnr.      "If no correct billing form found, delete the dmr entry
+      continue.
+    endif.
+*Get all invoices linked to this DMR.
+    select vbeln from vbfa into table gt_billing
+      where vbelv = gs_dmr-vbeln  "DMR is preceding doc
+        and posnv = gs_dmr-posnr
+        and vbtyp_n = 'M'.  "Billing doc
+    if not sy-subrc eq 0.  "No billing done yet so delete entry
+      write: 'No billing document found for DMR ', gs_dmr-vbeln, gs_dmr-posnr.
+      delete gt_dmr where vbeln eq gs_dmr-vbeln
+                              and posnr eq gs_dmr-posnr.      "If no billing doc's found, delete the dmr entry
+      continue.
+    else.    "Billing doc's found so check if multiple, this could mean we have cancellations
+      select vbeln vbelv from vbfa into table gt_cancel
+        for all entries in gt_billing
+        where vbelv = gt_billing-vbeln.
+      if sy-subrc ne 0.
+        "No cancelation so continue with reposting
+      else.  "Cancellations found so filter out the billing doc that has not been cancelled
+        loop at gt_billing into gs_billing.
+          read table gt_cancel into gs_cancel
+            with key vbeln = gs_billing-vbeln.
+          if sy-subrc eq 0.
+            "Means a cancellation has been found for the billling doc so delete it
+            delete gt_billing where vbeln = gs_billing-vbeln.
+            write: 'No reposting to do because of cancellation for billing doc ', gs_billing-vbeln.
+          endif.
+        endloop.
+      endif.
+    endif.
+
+* Now check if a (one) billing doc without a cancellation has been found
+    loop at gt_billing assigning <fs_billing>.
+      move: <fs_billing>-vbeln to gs_dmr-billing_doc.
+    endloop.
+    if sy-subrc eq 0.
+
+    else.
+      write: 'No suitable billing docs found for DMR: ', gs_dmr-vbeln, gs_dmr-posnr.
+      delete gt_dmr where vbeln eq gs_dmr-vbeln
+                              and posnr eq gs_dmr-posnr.      "If no billing doc's found, delete the dmr entry
+      continue.
+    endif.
+
+*Check if a repost entry exists in the custom table, if a repost already was done no further action has to be taken since
+* a dmr can't be changed, only when the flag is set, the original repostings will be reversed and again reposted this could be due to
+    select single obj_key obj_typ obj_sys gjahr bus_act OBJ_KEY_REV
+      from YSE_COBRB_PROCES
+      into (gs_dmr-orig_repost, gs_dmr-orig_type, gs_dmr-orig_sys, gs_dmr-orig_gjahr, gs_dmr-orig_bus_act, gs_dmr-OBJ_KEY_REV)
+      where kdauf eq gs_dmr-vbeln
+      and kdpos eq gs_dmr-posnr
+      and billing_doc eq gs_dmr-billing_doc.
+*      and OBJ_KEY_REV eq ' '.
+
+    if sy-subrc eq 0.
+      if gs_dmr-OBJ_KEY_REV = ' ' and not p_rev_re is initial.    "Means a manual reversal of a previous repost is required
+
+      else.        "If repost already has been done, delete entry.
+        write: 'No reposting required, DMR already reposted.', gs_dmr-vbeln, gs_dmr-posnr.
+        delete gt_dmr where vbeln eq gs_dmr-vbeln
+                            and posnr eq gs_dmr-posnr.
+        continue.
+      endif.
+    endif.
+
+    describe table gt_dmr lines gv_dmr.
+    check gv_dmr > 0.
+
+*Check if a cobrb entry is found
+**First get the objnr from vbap for the SDI line related
+    select single objnr into gs_dmr-objnr
+      from vbap
+      where vbeln eq gs_dmr-vgbel
+      and posnr eq gs_dmr-vgpos.
+
+    select single paobjnr from cobrb
+      into gs_dmr-paobjnr
+      where objnr eq gs_dmr-objnr
+      and letja in so_letja
+      and letpe in so_letpe.
+    if sy-subrc ne 0.
+      write: 'No settlement entry found for DMR: ', gs_dmr-vbeln, gs_dmr-posnr.
+      delete gt_dmr where vbeln eq gs_dmr-vbeln
+                            and posnr eq gs_dmr-posnr.       "If no settlement entry found, delete the dmr entry
+      continue.
+    endif.
+
+*Get the serial number and the equipment from Maintenance order header via order master data
+    select single afih~serialnr afih~equnr
+      from afih inner join aufk
+      on afih~aufnr eq aufk~aufnr
+      into corresponding fields of gs_dmr
+      where aufk~kdauf eq gs_dmr-vgbel
+      and aufk~kdpos eq gs_dmr-vgpos.
+
+
+*Check if the sales doc currency is the same as the company code currency
+    if gs_dmr-waerk <> gv_waers.    "Sales doc currency <> company code currency
+      CALL FUNCTION 'CONVERT_TO_LOCAL_CURRENCY'
+        EXPORTING
+          DATE             = sy-datum
+          FOREIGN_AMOUNT   = gs_dmr-netwr
+          FOREIGN_CURRENCY = gs_dmr-waerk
+          LOCAL_CURRENCY   = gv_waers
+          RATE             = gs_dmr-stcur
+          TYPE_OF_RATE     = 'M'
+          READ_TCURR       = ' '
+        IMPORTING
+          LOCAL_AMOUNT     = gs_dmr-netwr.
+    endif.
+
+*Get the profit center
+    select single prctr
+      from marc
+      into gs_dmr-prctr
+      where matnr eq gs_dmr-matnr
+      and werks eq gs_dmr-werks.
+
+*Get actual costs
+    select single in_wtgbtr from ad01dlief
+      into gs_dmr-wavwr
+      where vbeln eq gs_dmr-vbeln
+      and vbpos eq gs_dmr-posnr.
+
+
+*Move the company code into the structure
+    move gv_bukrs to gs_dmr-bukrs.
+
+    modify gt_dmr from gs_dmr index sy-tabix.
+  endloop.
+
+
+*Check if any dmr to process
+  describe table gt_dmr lines gv_count.
+  if gv_count eq 0.
+    message s003(yse_fico_sdi).
+    exit.
+  endif.
+
+*Now we have all the relevant DMR, loop over all DMR's, find the new PC, PLC, GAC and PGC
+*and post the adjustments against these new characteristics.
+
+  loop at gt_dmr into gs_dmr.
+    move gs_dmr to gs_last_dmr.
+    clear: gs_ce41000, gt_criteria[], gt_valuefield[], gt_accountgl[], gt_currencyamount[], gs_documentheader,gt_return[], gt_ce11000[], gt_items[].
+
+*Get copa ce4 key field
+    select single ce4key                                    "#EC *
+      from ce41000_acct
+      into gs_dmr-ce4key
+      where paobjnr eq gs_dmr-paobjnr.
+    check sy-subrc eq 0.
+*Get the old characteristics from CE41000
+    select single * from ce41000                            "#EC *
+      into gs_ce41000
+      where paobjnr eq gs_dmr-ce4key.
+    check sy-subrc eq 0.
+*Copy all the characteristics to the bapi internal table.
+
+
+    perform create_line_10.
+    perform create_line_20.
+    perform create_line_30.
+    perform create_line_40.
+
+    perform create_header.
+
+    perform execute_repost.
+
+    at end of vbeln.
+      perform execute_copa_repost_sdi.
+    endat.
+
+  endloop.

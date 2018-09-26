@@ -1,0 +1,191 @@
+*&---------------------------------------------------------------------*
+*& Report  ZAFRC                                                       *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+*&                                                                     *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+
+REPORT ZAFRC MESSAGE-ID RU.
+*---------------------------------------------------------------------*
+* This report transfers the postprocessing records for costs (table   *
+* AFRC) to table AFRP3 which triggers the costcalculation             *
+* process.                                                            *
+* In addition the program is able to set a new posting date           *
+* into the confirmation record for records with closed posting        *
+* periods                                                             *
+* After running program ZAFRC the report CORUPROC must be started     *
+*                                                                     *
+* Attention:                                                          *
+* ==========                                                          *
+* OSS-note 214214 must be implemented before starting CORUPROC        *
+*---------------------------------------------------------------------*
+
+TABLES: AFRC,
+        AFRP3.
+
+PARAMETERS: NUMBER   LIKE SY-TABIX,
+            PDAT_TO  LIKE AFRU-BUDAT,
+            PDAT_NEW LIKE AFRU-BUDAT,
+            ORDERTYP LIKE AFRC-AUTYP,
+            PROTOCOL AS CHECKBOX,
+TESTRUN AS CHECKBOX DEFAULT 'X'.
+
+DATA: TMP_CMFMSG LIKE CMFMSG OCCURS 0 WITH HEADER LINE.
+DATA: TMP_AFRC   LIKE AFRC   OCCURS 0 WITH HEADER LINE.
+DATA: TMP_NUMBER LIKE SY-TABIX.
+DATA: BEGIN OF MESSAGES OCCURS 0,
+        TEXT(132) TYPE C,
+        MSGID     LIKE CMFMSG-ARBGB,
+        MSGNO     LIKE CMFMSG-MSGNR,
+      END OF MESSAGES.
+* Check parameters
+  IF NOT PDAT_NEW IS INITIAL AND PDAT_TO  IS INITIAL OR
+     NOT PDAT_TO  IS INITIAL AND PDAT_NEW IS INITIAL.
+    WRITE 'Please specify both PDAT_NEW and PDAT_TO'.
+    EXIT.
+  ENDIF.
+  IF ( NOT PDAT_NEW IS INITIAL OR NOT PDAT_TO IS INITIAL )
+     AND NOT TESTRUN IS INITIAL.
+    WRITE 'Please remove testrun for update of posting date'.
+    EXIT.
+  ENDIF.
+* Read all postprocessing records for costs
+SELECT * FROM AFRC.
+* check order type
+  IF NOT ORDERTYP IS INITIAL.
+    CHECK ORDERTYP EQ AFRC-AUTYP.
+  ENDIF.
+* Check number
+  IF NOT NUMBER IS INITIAL.
+    TMP_NUMBER = TMP_NUMBER + 1.
+    IF TMP_NUMBER > NUMBER.
+      EXIT.
+    ENDIF.
+  ENDIF.
+* Create AFRP3-Record for the cost calculation process
+  IF TESTRUN IS INITIAL.
+    MOVE-CORRESPONDING AFRC TO AFRP3.
+    INSERT AFRP3.
+    IF NOT SY-SUBRC IS INITIAL.
+      MESSAGE A888 WITH 'Insert AFRP3'.
+    ENDIF.
+  ENDIF.
+
+* Set new posting date into confirmation record
+  IF TESTRUN IS INITIAL.
+    IF NOT PDAT_NEW IS INITIAL AND
+       NOT PDAT_TO  IS INITIAL.
+      UPDATE AFRU SET BUDAT  = PDAT_NEW
+             WHERE    RUECK  = AFRC-RUECK
+             AND      RMZHL  = AFRC-RMZHL
+             AND      BUDAT  < PDAT_TO.
+    ENDIF.
+  ENDIF.
+
+* Read log if required
+  IF NOT PROTOCOL IS INITIAL.
+* Initialize log is required
+    CALL FUNCTION 'CM_F_INITIALIZE'
+         EXPORTING
+              APLID                  = 'PPRU'
+         EXCEPTIONS
+              MESSAGE_TYPE_NOT_VALID = 1
+              UNKNOWN_APLID          = 2
+              UNKNOWN_OBJECT_ID      = 3
+              OTHERS                 = 4.
+    IF NOT SY-SUBRC IS INITIAL.
+      MESSAGE A888 WITH 'Initialize Log'.
+    ENDIF.
+* Read log
+    CALL FUNCTION 'CM_F_LOAD'
+         EXPORTING
+              CMF_NR             = AFRC-CMFNR
+         EXCEPTIONS
+              NOT_ACTIVE         = 1
+              PROTOCOL_NOT_FOUND = 2
+              WRONG_OBJECT_ID    = 3
+              OTHERS             = 4.
+    IF SY-SUBRC IS INITIAL.
+* Get messages out of log
+      CALL FUNCTION 'CM_F_MESSAGES_GET'
+           EXPORTING
+                APLID      = 'PPRU'
+           TABLES
+                E_MSGPROT  = TMP_CMFMSG
+           EXCEPTIONS
+                NOT_ACTIVE = 1
+                OTHERS     = 2.
+      IF NOT SY-SUBRC IS INITIAL.
+        MESSAGE A888 WITH 'Get Log'.
+      ENDIF.
+* Transform messages
+      LOOP AT TMP_CMFMSG.
+        SY-MSGNO = TMP_CMFMSG-MSGNR.
+        CALL FUNCTION 'K_MESSAGE_TRANSFORM'
+             EXPORTING
+                  PAR_MSGID         = TMP_CMFMSG-ARBGB
+                  PAR_MSGNO         = SY-MSGNO
+                  PAR_MSGTY         = TMP_CMFMSG-MSGTY
+                  PAR_MSGV1         = TMP_CMFMSG-MSGV1
+                  PAR_MSGV2         = TMP_CMFMSG-MSGV2
+                  PAR_MSGV3         = TMP_CMFMSG-MSGV3
+                  PAR_MSGV4         = TMP_CMFMSG-MSGV4
+             IMPORTING
+                  PAR_MSGTX         = MESSAGES-TEXT
+             EXCEPTIONS
+                  NO_MESSAGE_FOUND  = 1
+                  PAR_MSGID_MISSING = 2
+                  PAR_MSGNO_MISSING = 3
+                  PAR_MSGTY_MISSING = 4
+                  OTHERS            = 5.
+        IF NOT SY-SUBRC IS INITIAL.
+          MESSAGE A888 WITH 'Transform message'.
+        ENDIF.
+        MESSAGES-MSGID = TMP_CMFMSG-ARBGB.
+        MESSAGES-MSGNO = TMP_CMFMSG-MSGNR.
+        COLLECT MESSAGES.
+      ENDLOOP.
+    ENDIF.
+  ENDIF.
+
+* Delete error log on DB
+  IF TESTRUN IS INITIAL.
+    CALL FUNCTION 'CM_F_DELETE_LOG_ON_DB'
+         EXPORTING
+              APLID  = 'PPRU'
+              CMF_NR = AFRC-CMFNR
+         EXCEPTIONS
+              OTHERS = 1.
+    IF NOT SY-SUBRC IS INITIAL.
+      MESSAGE A888 WITH 'Delete Log'.
+    ENDIF.
+  ENDIF.
+
+* Delete postprocessing record for costs
+  IF TESTRUN IS INITIAL.
+    DELETE AFRC.
+    IF NOT SY-SUBRC IS INITIAL.
+      MESSAGE A888 WITH 'Delete AFRC'.
+    ENDIF.
+  ENDIF.
+
+ENDSELECT.
+
+* Write Protocol
+IF NOT PROTOCOL IS INITIAL.
+  LOOP AT MESSAGES.
+    WRITE: MESSAGES-MSGID,
+           MESSAGES-MSGNO,
+           MESSAGES-TEXT.
+    ULINE.
+  ENDLOOP.
+ENDIF.
+
+*Selection text£º
+*NUMBER:D       .
+*ORDERTYP:D       .
+*PDAT_NEW:D       .
+*PDAT_TO:D       .
+*PROTOCOL:        Log
+*TESTRUN:        TEST

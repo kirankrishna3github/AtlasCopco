@@ -1,0 +1,165 @@
+*&---------------------------------------------------------------------*
+*&  Include           J_3RF_BBK_INC_CL
+*&---------------------------------------------------------------------*
+*----------------------------------------------------------------------*
+*       CLASS lcl_buy_book DEFINITION
+*----------------------------------------------------------------------*
+*    Routines for Purchase Ledger
+*----------------------------------------------------------------------*
+CLASS lcl_buy_book DEFINITION.
+  PUBLIC SECTION.
+    CLASS-DATA:
+*     selection screen parameters
+      g_par_col      TYPE flag,
+      g_adobe_extnum TYPE flag,
+      g_ext_prn      TYPE j_3rf_print_ext_num.
+
+    CLASS-METHODS:
+*     returns 'X' if the external number should be printed
+      if_ext_number IMPORTING is_book  TYPE j_3rbuy
+                              i_xblnr  TYPE j_3rf_bue_refnum
+                              i_xblnr1 TYPE j_3rf_bue_refnum
+                              i_xblnr2 TYPE j_3rf_bue_refnum_dp_out
+                    RETURNING value(e_ext) TYPE abap_bool.
+
+  PRIVATE SECTION.
+    TYPES:
+      BEGIN OF ty_t007a,
+        bukrs TYPE bkpf-bukrs,
+        mwskz TYPE t007a-mwskz,
+        mwart TYPE t007a-mwart,
+      END OF ty_t007a,
+      ty_t_t007a TYPE HASHED TABLE OF ty_t007a
+                 WITH UNIQUE KEY bukrs mwskz,
+      BEGIN OF ty_bkpf_mwskz,
+        bukrs TYPE bkpf-bukrs,
+        belnr TYPE bkpf-belnr,
+        gjahr TYPE bkpf-gjahr,
+        mwart TYPE t007a-mwart,
+      END OF ty_bkpf_mwskz,
+      ty_t_bkpf_mwskz TYPE HASHED TABLE OF ty_bkpf_mwskz
+                      WITH UNIQUE KEY bukrs belnr gjahr.
+
+    CLASS-DATA:
+      gt_t007a      TYPE ty_t_t007a,
+      gt_bkpf_mwskz TYPE ty_t_bkpf_mwskz.
+
+    CLASS-METHODS:
+*     returns tax type (t007a-mwskz)
+      get_tax_mwart IMPORTING is_book  TYPE j_3rbuy
+                     RETURNING value(e_mwart) TYPE t007a-mwart.
+
+ENDCLASS.                    "lcl_buy_book DEFINITION
+*----------------------------------------------------------------------*
+*       CLASS lcl_buy_book IMPLEMENTATION
+*----------------------------------------------------------------------*
+*
+*----------------------------------------------------------------------*
+CLASS lcl_buy_book IMPLEMENTATION.
+
+  METHOD if_ext_number.
+*   method returns ABAP_TRUE if the external number should be printed
+*     i_xblnr  - print external number for incoming invoices
+*     i_xblnr1 - print external number for outgoing invoices
+*     i_xblnr2 - print external number for outgoing down payments
+
+    CLEAR e_ext.
+    IF g_ext_prn = 'X'          AND          " 1909868 - always use external number if set
+       ( is_book-ext_text_orig = 'X' OR
+         is_book-ext_text_corr = 'X' ).
+      e_ext = 'X'.
+    ELSEIF is_book-corr_book IS INITIAL.     "  Purchase Ledger
+      IF is_book-flg_belnr_trn = 'A'.
+*       get tax direction
+        IF get_tax_mwart( is_book ) = 'A'.  "output tax
+          e_ext = i_xblnr2.  " Outgoing down payments
+        ELSE.
+          e_ext = i_xblnr.   " Incoming down payments
+        ENDIF.
+      ELSE.
+        e_ext = i_xblnr.   " Incoming invoices
+      ENDIF.
+    ELSE.                                " Sales Ledger (negative corrections)
+      e_ext = i_xblnr1.    " Outgoing invoices
+    ENDIF.
+
+  ENDMETHOD.                    "if_ext_number
+
+  METHOD get_tax_mwart.
+*   get tax type
+    DATA: ls_t007a      TYPE ty_t007a,
+          ls_t001       TYPE t001,
+          l_kalsm       TYPE t005-kalsm,
+          l_mwskz       TYPE t007a-mwskz,
+          ls_bkpf_mwskz TYPE ty_bkpf_mwskz.
+
+    CLEAR e_mwart.
+    CHECK NOT is_book-bukrs IS INITIAL.
+
+    l_mwskz = is_book-mwskz.
+
+*   get tax code from buffer when tax summarization is on
+    IF l_mwskz IS INITIAL   AND
+       g_par_col      = 'X' AND
+       g_adobe_extnum = 'X' AND
+       NOT gt_bkpf_mwskz[] IS INITIAL.
+      READ TABLE gt_bkpf_mwskz INTO ls_bkpf_mwskz
+        WITH TABLE KEY bukrs = is_book-bukrs
+                       belnr = is_book-belnr_inv
+                       gjahr = is_book-gjahr_inv.
+      IF sy-subrc = 0.
+        e_mwart = ls_bkpf_mwskz-mwart.
+      ENDIF.
+      RETURN.
+    ENDIF.
+
+    READ TABLE gt_t007a INTO ls_t007a
+      WITH TABLE KEY bukrs = is_book-bukrs
+                     mwskz = l_mwskz.
+    IF sy-subrc <> 0.
+      CLEAR ls_t007a.
+      ls_t007a-bukrs = is_book-bukrs.
+      ls_t007a-mwskz = l_mwskz.
+      CALL FUNCTION 'FI_COMPANY_CODE_DATA'
+        EXPORTING
+          i_bukrs      = ls_t007a-bukrs
+        IMPORTING
+          e_t001       = ls_t001
+        EXCEPTIONS
+          system_error = 1
+          OTHERS       = 2.
+      IF sy-subrc = 0.
+        SELECT SINGLE kalsm FROM t005
+          INTO l_kalsm
+          WHERE land1 = ls_t001-land1.
+        IF sy-subrc = 0.
+          SELECT SINGLE mwart FROM t007a
+            INTO ls_t007a-mwart
+            WHERE kalsm = l_kalsm AND
+                  mwskz = l_mwskz.
+        ENDIF.
+      ENDIF.
+      INSERT ls_t007a INTO TABLE gt_t007a.
+    ENDIF.
+    e_mwart = ls_t007a-mwart.
+
+*   save document tax for adobe output after compress data
+    IF NOT is_book-mwskz IS INITIAL AND
+       g_par_col      = 'X'   AND
+       g_adobe_extnum = 'X'.
+      READ TABLE gt_bkpf_mwskz TRANSPORTING NO FIELDS
+        WITH TABLE KEY bukrs = is_book-bukrs
+                       belnr = is_book-belnr_inv
+                       gjahr = is_book-gjahr_inv.
+      IF sy-subrc <> 0.
+        ls_bkpf_mwskz-bukrs = is_book-bukrs.
+        ls_bkpf_mwskz-belnr = is_book-belnr_inv.
+        ls_bkpf_mwskz-gjahr = is_book-gjahr_inv.
+        ls_bkpf_mwskz-mwart = e_mwart.
+        INSERT ls_bkpf_mwskz INTO TABLE gt_bkpf_mwskz.
+      ENDIF.
+    ENDIF.
+
+  ENDMETHOD.                    "get_tax_mwart
+
+ENDCLASS.                    "lcl_buy_book IMPLEMENTATION

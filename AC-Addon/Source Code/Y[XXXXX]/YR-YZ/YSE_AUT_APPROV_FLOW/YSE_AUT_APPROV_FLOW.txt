@@ -1,0 +1,247 @@
+*&---------------------------------------------------------------------*
+*& Report  YSE_AUT_APPROV_FLOW                                         *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+*&                                                                     *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+**********************************************************************
+* Dev request     : CD1K909348
+* Descr           : 070115-SE-UXT-D176- cust.serv. automatic approval
+*                   flow
+* Author          : Christophe Geerts
+* Date            : 15/01/2007
+* Functional spec : D176
+* Description     :
+*   This program is called in the include YSE_AUT_APPROV_FLOW_AM in the
+*   program MV45AFZZ in the form USEREXIT_SAVE_DOCUMENT_PREPARE
+*   This program will mainly do a price simulation and return the result
+*=====================================================================*
+* Change History Log                                                  *
+*---------------------------------------------------------------------*
+* Mod. no.|  Date    | Name           | Correction Number | Change Ref*
+*---------------------------------------------------------------------*
+* MOD-001 |dd/mm/yyyy| xxxxxxxxxxxxxx | XXXXxxxxxx        | XXXXxxxxxx*
+*                                                                     *
+* Description:                                                        *
+*---------------------------------------------------------------------*
+* MOD-002 |dd/mm/yyyy| xxxxxxxxxxxxxx | XXXXxxxxxx                    *
+*                                                                     *
+* Description:                                                        *
+***********************************************************************
+
+REPORT  YSE_AUT_APPROV_FLOW                     .
+
+TYPES:
+  BEGIN OF LT_VAR.
+    INCLUDE    STRUCTURE VBAK. TYPES:
+    MATNR      TYPE      MATNR,
+    ARBPL      TYPE      LGWID,
+    NETWR_VBAP TYPE      NETWR_AP,
+    WAERK_VBAP TYPE      WAERK,
+  END OF LT_VAR.
+
+DATA:
+  BEGIN OF WA_RETURN_VAR,
+    MATNR_EQUNR TYPE MATNR,
+    NETWR_EQUNR TYPE NETWR_AP,
+    PERC_CUST   TYPE APPRZ,
+    PERC        TYPE APPRZ,
+    UNBLOCK     TYPE C,
+  END OF WA_RETURN_VAR,
+  WA_VAR       TYPE LT_VAR,
+  WA_AUTFLOW   TYPE YSE_PERC_AUTFLOW,
+  WA_SALES     TYPE BAPISDHD1,
+  WA_SALES_IN  TYPE BAPISDITM,
+  WA_PARTNERS  TYPE BAPIPARNR,
+  WA_SCHEDULES TYPE BAPISCHDL,
+  WA_SALES_OUT TYPE BAPISDHD,
+  WA_RETURN    TYPE BAPIRET2,
+
+  IT_SALES_IN  TYPE TABLE OF BAPISDITM,
+  IT_PARTNERS  TYPE TABLE OF BAPIPARNR,
+  IT_SCHEDULES TYPE TABLE OF BAPISCHDL,
+  IT_RETURN    TYPE TABLE OF BAPIRET2,
+
+  LV_PRODH     TYPE PRODH_D,
+  LV_LSTAR     TYPE LSTAR,
+  LV_PERC      TYPE NETWR_AK,
+  LV_PERC_CUST TYPE NETWR_AK,
+  LV_FOUND     TYPE C.
+
+CONSTANTS: CT_OBJTYPE      TYPE BAPISDHD1-REFOBJTYPE VALUE 'BUS2032',
+           CT_DOC_TYPE     TYPE BAPISDHD1-DOC_TYPE VALUE 'ZOR',
+           CT_VTWEG        TYPE BAPISDHD1-DISTR_CHAN VALUE '01',
+           CT_DEFAULT_ITEM TYPE BAPISDITM-ITM_NUMBER VALUE '000010',
+           CT_SOLD_TO      TYPE BAPIPARNR-PARTN_ROLE VALUE 'AG',
+           CT_WORKCENTER   TYPE CR_OBJTY VALUE 'A',
+           CT_SPACE_18     TYPE PRODH_D VALUE '                  '.
+
+* By default the field WA_RETURN_VAR-UNBLOCK is blank
+
+* Get variables from memory
+  IMPORT WA_VAR FROM MEMORY ID 'YSE_AUT_FLOW'.
+
+* Only do s'th when variables found
+  IF SY-SUBRC EQ 0.
+
+*   Check if the customer has a percentage specified
+    PERFORM GET_CUST_PERC.
+*   This should leave is in either of following situations:
+*   1/ Customer percentage found (LV_FOUND = X and LV_PERC_CUST filled)
+*   2/ Customer percentage not found (LV_FOUND and LV_PERC_CUST initial)
+
+*   If customer percentage not found
+    IF LV_FOUND IS INITIAL.
+*     Assign var to wa to be exported
+      WA_RETURN_VAR-MATNR_EQUNR = WA_VAR-MATNR.
+      CLEAR WA_RETURN_VAR-NETWR_EQUNR.
+      CLEAR WA_RETURN_VAR-PERC_CUST.
+      CLEAR WA_RETURN_VAR-PERC.
+      CLEAR WA_RETURN_VAR-UNBLOCK.
+
+*   If percentage found, calculate normal price
+    ELSE.
+
+*     Get equipment price and calculate percentage into LV_PERC
+      PERFORM GET_EQUIP_PRICE.
+*     Assign var to wa to be exported
+      WA_RETURN_VAR-MATNR_EQUNR = WA_VAR-MATNR.
+      WA_RETURN_VAR-NETWR_EQUNR = WA_SALES_OUT-NET_VAL_HD.
+      WA_RETURN_VAR-PERC_CUST   = LV_PERC_CUST.
+      IF LV_PERC > 99.
+        WA_RETURN_VAR-PERC        = 99.
+      ELSE.
+        WA_RETURN_VAR-PERC        = LV_PERC.
+      ENDIF.
+
+*     Compare the allowed percentage with the calculated percentage
+      IF LV_PERC <= LV_PERC_CUST.
+        WA_RETURN_VAR-UNBLOCK = 'X'.
+      ELSE.
+        WA_RETURN_VAR-UNBLOCK = ''.
+      ENDIF.
+
+    ENDIF.
+  ENDIF.
+
+* Export return values to memory ID
+  EXPORT WA_RETURN_VAR TO MEMORY ID 'YSE_AUT_FLOW_RETURN'.
+
+*&---------------------------------------------------------------------*
+*&      Form  get_cust_perc
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM GET_CUST_PERC .
+
+* Get percentage that is allowed
+
+* Get activity type using Constant 'A' (Workcenter) and ARBPL from Quot
+* Item
+  SELECT SINGLE LSTAR
+           FROM CRCO
+           INTO LV_LSTAR
+          WHERE OBJTY EQ CT_WORKCENTER AND
+                OBJID EQ WA_VAR-ARBPL AND
+                LSTAR NE '      '.
+
+* Get product hierarchy from material Sales view using sales area
+* from Quot
+  SELECT SINGLE PRODH
+           FROM MVKE
+           INTO LV_PRODH
+          WHERE MATNR EQ WA_VAR-MATNR AND
+                VKORG EQ WA_VAR-VKORG AND
+                VTWEG EQ WA_VAR-VTWEG.
+
+* First try the 4 field key
+  SELECT      *
+         FROM YSE_PERC_AUTFLOW
+         INTO WA_AUTFLOW
+        WHERE VKORG EQ WA_VAR-VKORG
+          AND LSTAR EQ LV_LSTAR
+          AND KUNNR EQ WA_VAR-KUNNR
+          AND PRODH NE CT_SPACE_18.
+
+    IF WA_AUTFLOW-PRODH(3) EQ LV_PRODH(3).
+      LV_FOUND = 'X'.
+      LV_PERC_CUST = WA_AUTFLOW-PERCENTAGE.
+      EXIT.
+    ENDIF.
+    CLEAR WA_AUTFLOW.
+  ENDSELECT.
+
+* If no hit found using 4 key fields, try with only 3 now
+  IF LV_FOUND IS INITIAL.
+    CLEAR WA_AUTFLOW.
+    SELECT SINGLE      *
+                  FROM YSE_PERC_AUTFLOW
+                  INTO WA_AUTFLOW
+                 WHERE VKORG EQ WA_VAR-VKORG
+                   AND LSTAR EQ LV_LSTAR
+                   AND KUNNR EQ WA_VAR-KUNNR.
+    IF SY-SUBRC EQ 0.
+      LV_FOUND = 'X'.
+      LV_PERC_CUST = WA_AUTFLOW-PERCENTAGE.
+    ENDIF.
+  ENDIF.
+
+* This should leave is in either of following situations:
+* 1/ Customer percentage found (LV_FOUND = X and LV_PERC_CUST filled)
+* 2/ Customer percentage not found (LV_FOUND and LV_PERC_CUST initial)
+
+ENDFORM.                    " GET_CUST_PERC
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_EQUIP_PRICE
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM GET_EQUIP_PRICE .
+
+* Fill material
+  WA_SALES_IN-ITM_NUMBER = CT_DEFAULT_ITEM.
+  WA_SALES_IN-MATERIAL = WA_VAR-MATNR.   "'000000008170008380'.
+  APPEND WA_SALES_IN TO IT_SALES_IN.
+* Fill Sold-to
+  WA_PARTNERS-PARTN_ROLE = CT_SOLD_TO.
+  WA_PARTNERS-PARTN_NUMB = WA_VAR-KUNNR. "'0101200012'.
+  APPEND WA_PARTNERS TO IT_PARTNERS.
+* Fill schedule line
+  WA_SCHEDULES-ITM_NUMBER = CT_DEFAULT_ITEM.
+  WA_SCHEDULES-REQ_QTY = '1'.
+  APPEND WA_SCHEDULES TO IT_SCHEDULES.
+* Assign parameters
+  WA_SALES-REFOBJTYPE = CT_OBJTYPE.
+  WA_SALES-DOC_TYPE = CT_DOC_TYPE.
+  WA_SALES-SALES_ORG = WA_VAR-VKORG.  "'PL01'.
+  WA_SALES-DISTR_CHAN = CT_VTWEG.
+  WA_SALES-DIVISION = WA_VAR-SPART.
+  WA_SALES-PURCH_NO_C = 'TEST'.
+  WA_SALES-PMNTTRMS = 'Y000'.
+* Perform pricing simulation
+  CALL FUNCTION 'YSE_BAPI_SALDOC_CREATEFROMDAT2'
+    EXPORTING
+      SALES_HEADER_IN               = WA_SALES
+      TESTRUN                       = 'X'
+    IMPORTING
+      SALES_HEADER_OUT              = WA_SALES_OUT
+    TABLES
+      RETURN                        = IT_RETURN
+      SALES_ITEMS_IN                = IT_SALES_IN
+      SALES_PARTNERS                = IT_PARTNERS
+      SALES_SCHEDULES_IN            = IT_SCHEDULES.
+* Check if error message logged
+  READ TABLE IT_RETURN INTO WA_RETURN WITH KEY TYPE = 'E'.
+* When no error occured during pricing simulation
+  IF NOT SY-SUBRC EQ 0.
+* Compare vbak-netwr with the value for the article in the equipment
+    IF       NOT WA_SALES_OUT-NET_VAL_HD IS INITIAL
+             AND WA_SALES_OUT-NET_VAL_HD GT 0.
+*     Calculate percentage
+      LV_PERC = WA_VAR-NETWR_VBAP / WA_SALES_OUT-NET_VAL_HD * 100.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    " GET_EQUIP_PRICE

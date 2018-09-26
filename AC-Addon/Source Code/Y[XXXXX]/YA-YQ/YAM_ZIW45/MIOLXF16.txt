@@ -1,0 +1,2410 @@
+***INCLUDE MIOLXF16 .
+*** this Include replaces MIOLXF10 with relaease 40                 ***
+*---------------------------------------------------------------------*
+*       FORM USER_COMMAND_F16                                         *
+*---------------------------------------------------------------------*
+*       Zentrale OK-Codes                                             *
+*---------------------------------------------------------------------*
+FORM user_command_f16 USING p_ucomm LIKE sy-ucomm
+                            p_selfield TYPE slis_selfield.
+
+  CASE p_ucomm.
+    WHEN 'LEAV'.                       "Back
+*--- Listbild verlassen ---------------------------------------------
+      IF sy-calld IS INITIAL OR g_selmod = selmod_s.
+        LEAVE TO TRANSACTION sy-tcode.
+      ELSE.
+        LEAVE PROGRAM.
+      ENDIF.
+    WHEN '+LOC'.
+*--- Ortinfomationen aufrufen (z.B. Map & Guide) --------------------
+      PERFORM check_object_tab_marked_f14 USING p_ucomm
+                                                p_selfield.
+      p_selfield-refresh = space.
+      PERFORM call_locinfo_f16.
+    WHEN 'IGRA'.
+*--- Balkengrafik aufrufen ------------------------------------------
+      p_selfield-refresh = space.
+      PERFORM graphics_f16 USING p_selfield.
+    WHEN 'IPOR'.
+*--- Portfoliografik aufrufen ---------------------------------------
+      p_selfield-refresh = space.
+      PERFORM portfolio_f16 USING p_selfield.
+    WHEN 'IVAR'.
+*--- Benutzervariante f¨¹r Selektionsbild einstellen -----------------
+      p_selfield-refresh = space.
+      PERFORM variant_f16.
+    WHEN 'ISEL'.
+*--- Objekt ausw#hlen (wenn Report als Matchcode aufgerufen ) -------
+      PERFORM check_object_tab_marked_f14 USING p_ucomm
+                                                p_selfield.
+      PERFORM select_object_f16 USING p_ucomm
+                                      p_selfield.
+    WHEN 'V-A '.
+*--- #ndern PF-Status #ndern -> Anzeigen ----------------------------
+      p_selfield-refresh = g_x.
+      PERFORM change_aktyp_f16.
+    WHEN 'A-V '.
+*--- #ndern PF-Status Anezeigen -> #ndern ---------------------------
+      p_selfield-refresh = g_x.
+      PERFORM change_aktyp_f16.
+    WHEN 'XXL '.
+*--- Aufruf Tabellenkalkulation --------------------------------------
+      p_selfield-refresh = space.
+      PERFORM xxl_call_f16.
+    WHEN 'DOWN'.
+*--- Download Daten nach MS-Access -----------------------------------
+      PERFORM check_object_tab_marked_f14 USING p_ucomm
+                                                p_selfield.
+      p_selfield-refresh = space.
+      PERFORM download_f16.
+    WHEN g_ilt.
+*--- Filter setzten/l#schen -----------------------------------------
+      CALL FUNCTION 'REUSE_ALV_LIST_LAYOUT_INFO_GET'
+        IMPORTING
+          et_filter = g_filter_tab[]
+        EXCEPTIONS
+          OTHERS    = 1.
+      CLEAR p_selfield-row_stable.
+    WHEN g_sal.
+*--- Markierungen L#schen
+      PERFORM delete_selected_marks_f16 USING p_selfield.
+    WHEN tzs1_fcode_button.
+*--- time zone button
+*--- dynamic perform because include MIOLXF90 only available in supported programs
+      PERFORM time_zone_button_on_list_f90 IN PROGRAM (sy-repid) IF FOUND.
+
+  ENDCASE.
+
+ENDFORM.                    "user_command_f16
+
+*eject
+*---------------------------------------------------------------------*
+*       FORM INIT_SELECTION_SCREEN_F16                                *
+*---------------------------------------------------------------------*
+*       Titlebar wird auf dem Selektionsbild wird gesetzt             *
+*       Die #berschriften auf dem Selektionsbild werden hell          *
+*       angezeigt.                                                    *
+*---------------------------------------------------------------------*
+FORM init_selection_screen_f16.
+
+  PERFORM determine_g_tcode_f16.
+*--- Titlebar setzen, Transaktionstext ermitteln --------------------*
+  IF sy-tcode <> 'SE38' AND sy-tcode <> 'SA38'.
+    SELECT SINGLE * FROM tstct WHERE sprsl = sy-langu
+                               AND   tcode = g_tcode.
+    IF NOT sy-subrc IS INITIAL.
+      tstct-ttext = sy-title.
+    ENDIF.
+  ELSE.
+    tstct-ttext = sy-title.
+  ENDIF.
+
+  SET TITLEBAR 'SBI' WITH tstct-ttext.                  "#EC *  "1615433
+
+ENDFORM.                    "init_selection_screen_f16
+
+*eject
+*---------------------------------------------------------------------*
+*       FORM DETERMINE_G_TCODE_F16                                    *
+*---------------------------------------------------------------------*
+*       G_tcode bestimmen (Submit und Varianten ber¨¹cksichtigen)      *
+*---------------------------------------------------------------------*
+FORM determine_g_tcode_f16.
+
+*--- Tcode aus Parameter¨¹bergabe sichern -----------------------------*
+  IF g_tcode IS INITIAL.
+    IF dy_tcode IS INITIAL.
+      IF sy-tcode <> 'SE38' AND sy-tcode <> 'SA38'.
+        g_tcode = sy-tcode.
+      ENDIF.
+    ELSE.
+      g_tcode = dy_tcode.
+    ENDIF.
+  ENDIF.
+*--- Parameter gleicher Wert wie globales Feld -----------------------*
+  dy_tcode = g_tcode.
+*--- Selektionsmodus aus Parameter¨¹bergabe sichern (Default = 0) -----*
+  IF g_selmod IS INITIAL.
+    IF dy_selm IS INITIAL.
+      g_selmod = selmod_0.
+    ELSE.
+      g_selmod = dy_selm.
+    ENDIF.
+  ENDIF.
+*--- Parameter gleicher Wert wie globlen Feld -----------------------*
+  dy_selm = g_selmod.
+
+ENDFORM.                    "determine_g_tcode_f16
+
+*eject
+*---------------------------------------------------------------------*
+*       FORM CHANGE_AKTYP_F16                                         *
+*---------------------------------------------------------------------*
+*       Aktivit#tstyp #ndern                                          *
+*---------------------------------------------------------------------*
+FORM change_aktyp_f16.
+
+  DATA:   h_tabarg LIKE t370a-tabarg.
+  DATA:   h_programm LIKE t370a-programm.
+  DATA:   h_retc LIKE sy-subrc.
+  DATA:   h_tcode LIKE t370a-tcode.
+
+*--- Daten aus Kopfzeile Tabelle merken ----------------------------*
+  h_tabarg   = t370a-tabarg.
+  h_programm = t370a-programm.
+  h_tcode    = t370a-tcode.
+
+*--- Sonderfall wenn t-code CF25 - CF29 Verwendungsnachweis FHM ---  *
+*--- wenn im #nderungsmodus dann in 'IW38' spingen ----------------  *
+*--- wenn im Anzeigemodus dann zur¨¹ck in 'CF**' springen ----------  *
+  IF sy-tcode = 'CF25'
+     OR sy-tcode = 'CF26'
+     OR sy-tcode = 'CF27'
+     OR sy-tcode = 'CF28'.
+    IF g_aktyp = 'A'.
+      SELECT SINGLE * FROM  t370a                       "#EC CI_GENBUFF
+             WHERE  programm    = h_programm
+             AND    tabarg      = h_tabarg
+             AND    aktyp      <> g_aktyp.
+    ELSE.
+      SELECT SINGLE * FROM  t370a
+             WHERE  tcode       = sy-tcode
+             AND    tabarg      = h_tabarg
+             AND    aktyp      <> g_aktyp.
+    ENDIF.
+  ELSE.
+    SELECT SINGLE * FROM  t370a                         "#EC CI_GENBUFF
+           WHERE  programm    = h_programm
+           AND    tabarg      = h_tabarg
+           AND    aktyp      <> g_aktyp
+           AND    tcode      <> 'CF25'
+           AND    tcode      <> 'CF26'
+           AND    tcode      <> 'CF27'
+           AND    tcode      <> 'CF28'.
+  ENDIF.
+  CHECK sy-subrc = 0.
+*--- nur umschalten wenn Berechtigung Tcode ok ----------------------*
+  PERFORM auth_check_tcode_f16 USING t370a-tcode
+                               CHANGING h_retc.
+  IF h_retc IS INITIAL.
+*--- Berechtigung ok ------------------------------------------------*
+    SELECT SINGLE * FROM tstct WHERE sprsl = sy-langu
+                               AND   tcode = t370a-tcode.
+  ELSE.
+*--- keine Berecht. -> Kopfzeile mu# ursp¨¹nglichen Eintrag haben ----*
+    SELECT SINGLE * FROM t370a WHERE tcode = h_tcode.
+  ENDIF.
+*--- globaler Aktivit#tstyp setzten ---------------------------------*
+  g_aktyp  = t370a-aktyp.
+  dy_tcode = t370a-tcode.
+
+ENDFORM.                    "change_aktyp_f16
+
+*eject
+*---------------------------------------------------------------------*
+*       FORM SELECT_OBJECT_F16                                        *
+*---------------------------------------------------------------------*
+*       Ein Objekt aus der Liste wird ausgew#hlt                      *
+*       Die Liste wird verlassen                                      *
+*---------------------------------------------------------------------*
+*  -->  F_OBJECT                                                      *
+*---------------------------------------------------------------------*
+FORM select_object_f16 USING p_ucomm    LIKE sy-ucomm
+                             p_selfield TYPE slis_selfield.
+
+*### Datenvereinbarungen#############################################*
+
+  FIELD-SYMBOLS: <h_field>.
+  ASSIGN (t370a-tabname) TO <h_field>.
+
+*### Verarbeitung ###################################################*
+
+*--- Selektionskennzeichen #ndern -----------------------------------*
+*    Pr¨¹fung, ob Objekt selektiert werden darf
+*    Selektionskennzeichen setzen
+*    In Selektionstabelle eintragen
+
+*--- Fcode verbiegen, wenn im Auswahlmodus PF2 -> Object Auswahlen ---*
+*---                  falls nicht dann     PF2 -> Object Anzeigen ----*
+  IF g_selmod = selmod_0 OR g_selmod = selmod_s.
+    READ TABLE object_tab INDEX g_index.
+    <h_field> = object_tab.
+    PERFORM master_data_f16 USING p_ucomm
+                                  p_selfield.
+  ELSE.
+    READ TABLE object_tab WITH KEY selected = g_x
+                          TRANSPORTING NO FIELDS.
+    IF sy-subrc IS INITIAL.
+*--- seltab f¨¹llen und ins memory stellen, programm beenden ----------
+      PERFORM fill_seltab_f16.
+    ELSE.
+      MESSAGE i011(ih).
+      EXIT.
+    ENDIF.
+  ENDIF.
+ENDFORM.                    "select_object_f16
+
+*---------------------------------------------------------------------*
+*       FORM FILL_SELTAB_F16                                          *
+*---------------------------------------------------------------------*
+*       Selektionstabelle f¨¹llen und exportieren                      *
+*---------------------------------------------------------------------*
+FORM fill_seltab_f16.
+  DATA: h_lines    LIKE sy-tabix.
+
+  FIELD-SYMBOLS: <ls_object_tab> LIKE LINE OF object_tab.
+
+  IF g_selmod <> selmod_0 AND g_selmod <> selmod_s.
+    REFRESH sel_tab.
+    LOOP AT object_tab ASSIGNING <ls_object_tab> WHERE selected = g_x.
+      MOVE-CORRESPONDING <ls_object_tab> TO sel_tab.
+
+*--- if output converted to time zone -> convert back
+      PERFORM convert_output_to_sys_timezone IN PROGRAM (sy-repid) IF FOUND CHANGING sel_tab.
+
+      APPEND sel_tab.
+    ENDLOOP.
+    IF g_selmod = selmod_1.
+      DESCRIBE TABLE sel_tab LINES h_lines.
+      IF h_lines > 1.
+        MESSAGE i037(ih).
+        EXIT.
+      ENDIF.
+    ENDIF.
+    DESCRIBE TABLE object_tab LINES h_lines.
+    IF h_lines = 0.
+      ind_empty = 'X'.
+    ELSE.
+      ind_empty = ' '.
+    ENDIF.
+    EXPORT sel_tab ind_empty TO MEMORY ID sy-repid.
+    LEAVE PROGRAM.
+  ENDIF.
+
+ENDFORM.                    "fill_seltab_f16
+
+*---------------------------------------------------------------------*
+*       FORM CALL_LOCINFO_F16                                         *
+*---------------------------------------------------------------------*
+*       Ortsinfo aufrufen                                             *
+*---------------------------------------------------------------------*
+FORM call_locinfo_f16.
+
+  DATA: BEGIN OF h_loc_data OCCURS 0.
+          INCLUDE STRUCTURE rihloc.
+  DATA: END OF h_loc_data.
+
+  DATA:
+     BEGIN OF h_sortfeld,
+*      filler(10) VALUE 'OBJECT_TAB',                         "1096066
+       filler(15) VALUE '<LS_OBJECT_TAB>',                    "1096066
+       field(21),
+     END OF h_sortfeld,
+
+     BEGIN OF h_field,
+*      filler(11) VALUE 'OBJECT_TAB-',                        "1096066
+       filler(16) VALUE '<LS_OBJECT_TAB>-',                   "1096066
+       field LIKE dfies-fieldname,
+     END OF h_field,
+
+     BEGIN OF h_ddname,
+       tabname LIKE dfies-tabname,
+       fieldname LIKE dfies-fieldname,
+     END OF h_ddname.
+
+  DATA: h_value_flag.
+  DATA: h_key_reptext LIKE  dfies-reptext.
+  DATA: h_key_scrtext_m LIKE  dfies-scrtext_m.
+  DATA: h_text_reptext LIKE  dfies-reptext.
+  DATA: h_text_scrtext_m LIKE  dfies-scrtext_m.
+  DATA: h_value1_reptext LIKE  dfies-reptext.
+  DATA: h_value1_scrtext_m LIKE  dfies-scrtext_m.
+
+  FIELD-SYMBOLS:
+     <h_field>,
+     <h_key>,
+     <h_text>,
+     <ls_object_tab> LIKE LINE OF object_tab.
+
+*### Verarbeitung ####################################################*
+* h_field-field = g_key.                                      "1096066
+* ASSIGN (h_field) TO <h_key>.                                "1096066
+  READ TABLE header_tab WITH KEY fieldname = g_key.
+  h_key_reptext = header_tab-reptext.
+  h_key_scrtext_m = header_tab-scrtext_m.
+
+* h_field-field = g_text.                                     "1096066
+* ASSIGN (h_field) TO <h_text>.                               "1096066
+  READ TABLE header_tab WITH KEY fieldname = g_text.
+  h_text_reptext = header_tab-reptext.
+  h_text_scrtext_m = header_tab-scrtext_m.
+
+*--- Wertspalte gesetzt ? -------------------------------------------
+* READ TABLE object_tab INDEX g_index.                          "1096066
+  READ TABLE object_tab assigning <ls_object_tab> INDEX g_index."1096066
+  GET CURSOR FIELD h_sortfeld-field.
+
+  SEARCH h_sortfeld-field FOR '-'.
+  IF sy-subrc = 0.
+    h_ddname-tabname = h_sortfeld-field.
+    WRITE '            ' TO h_ddname-tabname+sy-fdpos.
+    SHIFT h_sortfeld-field BY sy-fdpos PLACES.
+    h_ddname-fieldname = h_sortfeld-field.
+    SHIFT h_ddname-fieldname BY 1 PLACES.
+    READ TABLE header_tab WITH KEY fieldname = h_ddname-fieldname.
+    MOVE h_sortfeld-field TO g_feldlist-s_field.
+    ASSIGN (h_sortfeld) TO <h_field>.
+    IF sy-subrc = 0.
+      h_value1_reptext = header_tab-reptext.
+      h_value1_scrtext_m = header_tab-scrtext_m.
+      h_value_flag = yes.
+    ELSE.
+      h_value_flag = no.
+    ENDIF.
+  ELSE.
+    h_value_flag = no.
+  ENDIF.
+  LOOP AT object_tab ASSIGNING <ls_object_tab> WHERE selected = g_x.
+    CLEAR h_loc_data.
+    MOVE-CORRESPONDING <ls_object_tab> TO h_loc_data.
+    h_field-field = g_key.                                      "1096066
+    ASSIGN (h_field) TO <h_key>.                                "1096066
+    h_field-field = g_text.                                     "1096066
+    ASSIGN (h_field) TO <h_text>.                               "1096066
+    h_loc_data-key  = <h_key>.
+    h_loc_data-text = <h_text>.
+    IF h_value_flag = yes.
+      ASSIGN (h_sortfeld) TO <h_field>.                         "1096066
+      h_loc_data = <h_field>.
+    ENDIF.
+    APPEND h_loc_data.
+  ENDLOOP.
+
+  CALL FUNCTION 'PM_LOCATION_INFO'
+    EXPORTING
+      key_reptext      = h_key_reptext
+      key_scrtext_m    = h_key_scrtext_m
+      text_reptext     = h_text_reptext
+      text_scrtext_m   = h_text_scrtext_m
+      value1_reptext   = h_value1_reptext
+      value1_scrtext_m = h_value1_scrtext_m
+    TABLES
+      loc_data         = h_loc_data.
+
+ENDFORM.                    "call_locinfo_f16
+
+*eject
+*---------------------------------------------------------------------*
+*       FORM Graphics_F16                                           *
+*---------------------------------------------------------------------*
+*       Anzahl/Anteil pro Feld                                        *
+*---------------------------------------------------------------------*
+FORM graphics_f16 USING f_selfield TYPE slis_selfield.
+
+  DATA h_filtered_entries_tab TYPE slis_t_filtered_entries.
+
+  DATA:
+     BEGIN OF h_statistics OCCURS 0,
+       field(40),
+       count TYPE p,
+     END OF h_statistics,
+     h_count TYPE p,
+     h_lines LIKE sy-tabix,
+
+     BEGIN OF h_object_wa,
+       filler(11) VALUE 'OBJECT_TAB-',
+       field(30),                      "Feld zur markierten Spalte
+     END OF h_object_wa,
+
+     h_fieldcat_wa TYPE slis_fieldcat_alv.
+
+  FIELD-SYMBOLS:
+     <h_field>.
+
+*--- aktuelle ALV-Daten holen (Filter) ------------------------------
+  PERFORM get_fieldcat_actual_info_f14.
+
+  PERFORM get_column_marked_f16 USING
+                             h_fieldcat_wa
+                             h_object_wa-field.
+
+  IF NOT h_object_wa-field IS INITIAL.
+    ASSIGN (h_object_wa) TO <h_field>.
+    REFRESH h_statistics.
+*--- Statistiktabelle wird aufgebaut --------------------------------
+    LOOP AT object_tab WHERE selected = g_x.
+      WRITE <h_field> TO h_statistics-field.
+      h_statistics-count = 1.
+      COLLECT h_statistics.
+    ENDLOOP.
+*--- keine Zeilen markiert -> es wird alles ¨¹bernommen ------------
+    IF NOT sy-subrc IS INITIAL.
+*--- Filter aus Listviewer mu# ber¨¹cksichtigt werden --------------
+      IF g_filter_tab[] IS INITIAL.
+        LOOP AT object_tab.
+          WRITE <h_field> TO h_statistics-field.
+          h_statistics-count = 1.
+          COLLECT h_statistics.
+        ENDLOOP.
+      ELSE.
+*--- Filter lesen und abgleichen mit itab -------------------------
+        PERFORM get_filtered_entries_f16 TABLES h_filtered_entries_tab.
+        LOOP AT object_tab.
+*--- in filter_entries_tab stehen alle indizes von ausgefilterten
+*--- zeilen
+          READ TABLE h_filtered_entries_tab TRANSPORTING NO FIELDS
+                                            WITH KEY = sy-tabix
+                                                     BINARY SEARCH.
+          CHECK NOT sy-subrc IS INITIAL.
+          WRITE <h_field> TO h_statistics-field.
+          h_statistics-count = 1.
+          COLLECT h_statistics.
+        ENDLOOP.
+      ENDIF.
+    ENDIF.
+    SORT h_statistics BY count DESCENDING.
+    DESCRIBE TABLE h_statistics LINES h_lines.
+*   IF h_lines > 20.                          "N_1744721
+    IF h_lines > 32.                          "N_1744721
+      LOOP AT h_statistics.
+*       IF sy-tabix > 20.                     "N_1744721
+        IF sy-tabix > 32.                     "N_1744721
+          h_count = h_statistics-count.
+          DELETE h_statistics.
+*         READ TABLE h_statistics INDEX 20.
+          READ TABLE h_statistics INDEX 32.   "N_1744721
+          h_statistics-count = h_statistics-count + h_count.
+          h_statistics-field = 'Sonstige'(son).
+          MODIFY h_statistics INDEX 20.
+        ENDIF.
+      ENDLOOP.
+    ENDIF.
+    CALL FUNCTION 'GRAPH_2D'
+      EXPORTING
+        valt       = 'Anzahl'(anz)
+        mail_allow = 'X'
+        titl       = h_fieldcat_wa-seltext_m
+      TABLES
+        data       = h_statistics.
+  ENDIF.
+
+ENDFORM.                    "graphics_f16
+
+*eject
+*---------------------------------------------------------------------*
+*       FORM PORTFOLIO_F16                                            *
+*---------------------------------------------------------------------*
+*       Portfolio (Anzahl S#tze/Kriterium aus Liste)                  *
+*---------------------------------------------------------------------*
+FORM portfolio_f16 USING f_selfield TYPE slis_selfield.
+
+  DATA h_filtered_entries_tab TYPE slis_t_filtered_entries.
+
+  DATA: BEGIN OF axis OCCURS 4.
+          INCLUDE STRUCTURE gpoaxis.
+  DATA: END OF axis.
+  DATA: BEGIN OF objt OCCURS 1.        "// Objekt-Attibute
+          INCLUDE STRUCTURE gpoobjt.
+  DATA: END OF objt.
+  DATA: BEGIN OF col_text OCCURS 1,
+          c(40),
+        END OF col_text.
+  DATA: BEGIN OF values OCCURS 1,      "// Objekt-Kennzahlen
+          count TYPE p,
+          value TYPE p,
+  END OF values.
+  DATA: BEGIN OF area_tab OCCURS 1.
+          INCLUDE STRUCTURE gpoarea.
+  DATA: END OF area_tab,
+
+  BEGIN OF h_statistics OCCURS 0,
+    field(40),
+    value TYPE p,
+    count TYPE p,
+  END OF h_statistics,
+
+  BEGIN OF h_sortfeld,
+    filler(11) VALUE 'OBJECT_TAB-',
+    field LIKE dfies-fieldname,
+  END OF h_sortfeld,
+
+  BEGIN OF h_sortfeld2,
+    filler(11) VALUE 'OBJECT_TAB-',
+    field LIKE dfies-fieldname,
+  END OF h_sortfeld2,
+
+  h_value_low TYPE p,
+  h_value_high TYPE p,
+  h_value_low2 TYPE p,
+  h_value_high2 TYPE p,
+  h_value_ticks TYPE p,
+  h_value_scale TYPE p,
+  h_count_low TYPE p,
+  h_count_high TYPE p,
+  h_count_low2 TYPE p,
+  h_count_high2 TYPE p,
+  h_count_scale TYPE p,
+  h_count_ticks TYPE p,
+
+  h_fieldcat_wa TYPE slis_fieldcat_alv.
+
+  FIELD-SYMBOLS:
+     <h_field>,
+     <h_field2>.
+
+*--- markierte Spalte holen -----------------------------------------
+  PERFORM get_column_marked_f16 USING
+                             h_fieldcat_wa
+                             h_sortfeld-field.
+
+  IF NOT h_sortfeld-field IS INITIAL.
+    ASSIGN (h_sortfeld) TO <h_field>.
+    IF sy-subrc = 0.
+      h_sortfeld2-field = g_second_value.
+      ASSIGN (h_sortfeld2) TO <h_field2>.
+      REFRESH h_statistics.
+      LOOP AT object_tab WHERE selected = g_x.
+        WRITE <h_field> TO h_statistics-field.
+        h_statistics-count = 1.
+        h_statistics-value = <h_field2>.
+        COLLECT h_statistics.
+      ENDLOOP.
+*--- keine Zeilen markiert -> alles ¨¹bernehmen -------------------
+      IF NOT sy-subrc IS INITIAL.
+*--- Filter aus Listviewer mu# ber¨¹cksichtigt werden --------------
+        IF g_filter_tab[] IS INITIAL.
+          LOOP AT object_tab.
+            WRITE <h_field> TO h_statistics-field.
+            h_statistics-count = 1.
+            h_statistics-value = <h_field2>.
+            COLLECT h_statistics.
+          ENDLOOP.
+        ELSE.
+*--- Filter lesen und abgleichen mit itab -------------------------
+          PERFORM get_filtered_entries_f16 TABLES
+                                           h_filtered_entries_tab.
+          LOOP AT object_tab.
+*--- in filter_entries_tab stehen alle indizes von ausgefilterten
+*--- zeilen
+            READ TABLE h_filtered_entries_tab TRANSPORTING NO FIELDS
+                                              WITH KEY = sy-tabix
+                                              BINARY SEARCH.
+            CHECK NOT sy-subrc IS INITIAL.
+            WRITE <h_field> TO h_statistics-field.
+            h_statistics-count = 1.
+            h_statistics-value = <h_field2>.
+            COLLECT h_statistics.
+          ENDLOOP.
+        ENDIF.
+      ENDIF.
+*--- Achsen ----------------------------------------------------------
+      h_value_low =  9999999.
+      h_value_high = -9999999.
+      h_count_low =  9999999.
+      h_count_high = -9999999.
+      LOOP AT h_statistics.
+        IF h_statistics-count > h_count_high.
+          h_count_high = h_statistics-count.
+        ENDIF.
+        IF h_statistics-count < h_count_low.
+          h_count_low = h_statistics-count.
+        ENDIF.
+        IF h_statistics-value > h_value_high.
+          h_value_high = h_statistics-value.
+        ENDIF.
+        IF h_statistics-value < h_value_low.
+          h_value_low = h_statistics-value.
+        ENDIF.
+      ENDLOOP.
+      IF h_value_low =  9999999.
+        h_value_low = -1.
+      ENDIF.
+      IF h_value_high = -9999999.
+        h_value_high = 1.
+      ENDIF.
+      IF h_count_low =  9999999.
+        h_count_low = -1.
+      ENDIF.
+      IF h_count_high = -9999999.
+        h_count_high = 1.
+      ENDIF.
+
+*--- Intervallgrenzen m¨¹ssen sich immer unterscheiden ---------------
+      IF h_count_high = h_count_low.
+        h_count_high = h_count_low + 1.
+      ENDIF.
+      IF h_value_high = h_value_low.
+        h_value_high = h_value_low + 1.
+      ENDIF.
+
+*--- Orginalwerte merken (GET_SCALE rundet) ---------------------------
+      h_value_high2 = h_value_high.
+      h_value_low2 = h_value_low.
+      h_count_high2 = h_count_high.
+      h_count_low2 = h_count_low.
+
+      PERFORM get_scale_f16 USING h_value_high  h_value_low
+                                  h_value_scale h_value_ticks.
+
+      PERFORM get_scale_f16 USING h_count_high  h_count_low
+                                  h_count_scale h_count_ticks.
+      REFRESH axis.
+      axis-pos     = 'RIGHT'.
+      axis-backclr = 'DARKGRAY'.
+      axis-textclr = 'WHITE'.
+      axis-scalclr = 'WHITE'.
+      axis-shadow  = 'N'.
+      axis-ticks   = h_count_ticks.
+      axis-start   = h_count_low.
+      axis-end     = h_count_high.
+      APPEND axis.
+      axis-pos     = 'TOP'.
+      axis-backclr = 'DARKGRAY'.
+      axis-textclr = 'WHITE'.
+      axis-scalclr = 'WHITE'.
+      axis-shadow  = space.
+      axis-ticks   = h_value_ticks.
+      axis-start   = h_value_low.
+      axis-end     = h_value_high.
+      APPEND axis.
+      axis-pos     = 'LEFT'.
+      axis-backclr = 'DARKGRAY'.
+      axis-textclr = 'WHITE'.
+      axis-scalclr = 'WHITE'.
+      axis-shadow  = 'N'.
+      axis-ticks   = h_count_ticks.
+      axis-start   = h_count_low.
+      axis-end     = h_count_high.
+      APPEND axis.
+      axis-pos     = 'BOTTOM'.
+      axis-backclr = 'DARKGRAY'.
+      axis-textclr = 'WHITE'.
+      axis-scalclr = 'WHITE'.
+      axis-shadow  = 'N'.
+      axis-ticks   = h_value_ticks.
+      axis-start   = h_value_low.
+      axis-end     = h_value_high.
+      APPEND axis.
+
+*--- Spaltentexte ---------------------------------------------------
+      col_text = 'Anzahl'(anz).
+      APPEND col_text.
+      col_text = g_port_value_text.
+      APPEND col_text.
+
+*--- Objekte und Werte ----------------------------------------------
+      LOOP AT h_statistics.
+        objt-form = 'CIRCLE'.
+        objt-fillclr = 'BLUE'.
+        objt-textclr = 'BLACK'.
+        objt-title = h_statistics-field.
+        APPEND objt.
+        values-count = h_statistics-count.
+        values-value = h_statistics-value.
+        APPEND values.
+      ENDLOOP.
+*--- Titel ----------------------------------------------------------
+      area_tab-align = 'CENTERCENTER'.
+      area_tab-textclr = 'WHITE'.
+      area_tab-form = 'RECTANGLE'.
+      area_tab-title = g_port_title1.  "Oben rechts
+      area_tab-yfrom     = h_count_low2 +
+                           ( h_count_high2 - h_count_low2 ) / 2.
+      area_tab-xfrom     = h_value_low2 +
+                           ( h_value_high2 - h_value_low2 ) / 2.
+      area_tab-yto       = h_count_high2.
+      area_tab-xto       = h_value_high2.
+      area_tab-fillclr   = 'DARKYELLOW'.
+      APPEND area_tab.
+      area_tab-title = g_port_title2.  "Oben links
+      area_tab-yfrom     = h_count_low2.
+      area_tab-xfrom     = h_value_low2 +
+                           ( h_value_high2 - h_value_low2 ) / 2.
+      area_tab-yto       = h_count_low2 +
+                           ( h_count_high2 - h_count_low2 ) / 2.
+      area_tab-xto       = h_value_high2.
+      area_tab-fillclr   = 'DARKMAGENTA'.
+      APPEND area_tab.
+      area_tab-title = g_port_title3.  "Unten rechts
+      area_tab-yfrom     = h_count_low2 +
+                           ( h_count_high2 - h_count_low2 ) / 2.
+      area_tab-xfrom     = h_value_low2.
+      area_tab-yto       = h_count_high2.
+      area_tab-xto       = h_value_low2 +
+                           ( h_value_high2 - h_value_low2 ) / 2.
+      area_tab-fillclr   = 'DARKCYAN'.
+      APPEND area_tab.
+      area_tab-title = g_port_title4.  "Unten links
+      area_tab-yfrom     = h_count_low2.
+      area_tab-xfrom     = h_value_low2.
+      area_tab-yto       = h_count_low2 +
+                           ( h_count_high2 - h_count_low2 ) / 2.
+      area_tab-xto       = h_value_low2 +
+                           ( h_value_high2 - h_value_low2 ) / 2.
+      area_tab-fillclr   = 'DARKGREEN'.
+      APPEND area_tab.
+
+      CALL FUNCTION 'GRAPH_PORT'
+        EXPORTING
+          title_title   = h_fieldcat_wa-seltext_m
+          title_textclr = 'YELLOW'
+          title_backclr = 'DARKGRAY'
+          title_size    = '6'
+          frm_backclr   = 'GRAY'
+          frm_scalclr   = 'WHITE'
+          frm_scalmod   = 'LONGDASH'
+          frm_gridx     = '10'
+          frm_shadow    = 'X'
+          obj_xval      = '1'
+          obj_yval      = '0'
+          obj_sval      = '2'
+          obj_size      = '2'
+        TABLES
+          axis          = axis
+          col_text      = col_text
+          objt          = objt
+          values        = values
+          area_tab      = area_tab.
+    ELSE.
+      MESSAGE i081(ih).
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    "portfolio_f16
+
+*---------------------------------------------------------------------*
+*       FORM GET_SCALE_F16                                            *
+*---------------------------------------------------------------------*
+*       Skalierung berechnen                                          *
+*---------------------------------------------------------------------*
+*  -->  F_SCALE                                                       *
+*  -->  F_TICKS                                                       *
+*---------------------------------------------------------------------*
+FORM get_scale_f16 USING f_high  TYPE p
+                         f_low   TYPE p
+                         f_scale TYPE p
+                         f_ticks TYPE p.
+
+  DATA: h_low       TYPE f.
+  DATA: h_high      TYPE f.
+  DATA: h_scale     TYPE f.
+  DATA: h_intervall TYPE f.
+  DATA: h_log       TYPE f.
+
+*--- Auf das Intervall 10-100 normieren -----------------------------
+  f_scale = f_high - f_low.
+  h_log   = FLOOR( LOG10( f_scale ) ) - 1.
+  h_scale = f_scale / ( 10 ** h_log ).
+
+*--- sonst 10-Schritte (also 6 - 10) --------------------------------
+  IF h_scale <= 100.
+    h_intervall = 10.
+  ENDIF.
+*--- Bis 60 5-Schritte (also 5 - 12) --------------------------------
+  IF h_scale <= 60.
+    h_intervall = 5.
+  ENDIF.
+*--- Bis 24 2-Schritte (also 5 - 12) --------------------------------
+  IF h_scale <= 24.
+    h_intervall = 2.
+  ENDIF.
+
+*--- Intervallgrenzen runden -------------------------------
+  h_low   =  f_low / ( 10 ** h_log ).
+  h_low   = FLOOR( h_low / h_intervall ) * h_intervall.
+  h_high  =  f_high / ( 10 ** h_log ).
+  h_high  = CEIL( h_high / h_intervall ) * h_intervall.
+  h_scale = h_high - h_low.
+
+*--- Werte zur¨¹ckliefern ----------------------------------
+  f_ticks = ( h_scale / h_intervall ).
+  f_scale = h_scale * ( 10 ** h_log ).
+  f_low   = h_low   * ( 10 ** h_log ).
+  f_high  = h_high  * ( 10 ** h_log ).
+
+ENDFORM.                    "get_scale_f16
+*eject
+*---------------------------------------------------------------------*
+*       FORM FCODES_WITH_MARK_F16                                     *
+*---------------------------------------------------------------------*
+*       FCode f¨¹r alle markierten Objekte ausf¨¹hren                   *
+*---------------------------------------------------------------------*
+FORM fcodes_with_mark_f16 USING f_ucomm LIKE sy-ucomm
+                                f_selfield TYPE slis_selfield.
+*### Datenvereinbarungen #############################################*
+  DATA:
+    answer,                            " popup answer
+    h_loop_succ.
+* DATA: lv_count TYPE i.                          "Note 1879620"1957961
+
+  PERFORM check_object_tab_marked_f14 USING f_ucomm
+                                            f_selfield.
+
+  h_loop_succ = no.
+  return_code = 0.  "Call status. 0=posted, 4=not saved 12 = Escape
+*...                "             8=Escape popup required
+*...                "             16 =No Authority
+* lv_count = 1.                                   "Note 1879620"1957961
+  LOOP AT object_tab WHERE selected = g_x.
+    h_loop_succ = yes.
+    IF return_code <> 12.              " did user request abort from all
+*     EXPORT object_tab[] TO MEMORY ID 'OBJECT_TAB'.   "1879620"1957961
+      object_tab-selected = space.     " remove selection-flag
+      MODIFY object_tab.
+*     EXPORT lv_count TO MEMORY ID 'COUNTER'.     "Note 1879620"1957961
+      PERFORM fcodes_with_mark_l USING f_ucomm
+                                       f_selfield.
+*     lv_count = lv_count + 1.                    "Note 1879620"1957961
+    ENDIF.
+    IF return_code = 8.                " Abort popup requested.
+*--- #berhaupt noch Objekte selektiert ------------------------------
+      READ TABLE object_tab WITH KEY selected = g_x
+                            TRANSPORTING NO FIELDS.
+      IF sy-subrc = 0.
+        CALL FUNCTION 'POPUP_TO_DECIDE'
+          EXPORTING
+            defaultoption = '1'
+            textline1     = 'Wollen Sie die Verarbeitung f¨¹r'(701)
+            textline2     = 'alle noch nicht bearbeiteten'(702)
+            textline3     = 'selektierten Objekte abbrechen?'(703)
+            text_option1  = 'Nein'(705)
+            text_option2  = 'Ja'(706)
+            titel         = 'Abbrechen in Listverarbeitung '(704)
+          IMPORTING
+            answer        = answer.
+        IF answer = '2'.
+          return_code = 12. EXIT.
+        ELSE.
+          CLEAR return_code.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+  IF return_code = 12.
+    MESSAGE s066(ih).                  " verarbeitung abgebrochen
+  ENDIF.
+  IF h_loop_succ = no.
+    MESSAGE i011(ih).
+  ENDIF.
+
+*--- ok-code l#schen damit Funktion nicht mehrmals ausgef¨¹hrt -----*
+  CLEAR f_ucomm.
+
+ENDFORM.                    "fcodes_with_mark_f16
+
+*---------------------------------------------------------------------*
+*       FORM DUMMY-TEXT                                               *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+FORM dummy_text.
+  DATA dummy_text(60).
+  dummy_text = '**** LINES 701, 702, 703 are one sentence.'(700).
+ENDFORM.                    "dummy_text
+*eject
+*---------------------------------------------------------------------*
+*       FORM MASTER_DATA_F16                                          *
+*---------------------------------------------------------------------*
+*       Objektstammsatz anzeigen                                      *
+*---------------------------------------------------------------------*
+FORM master_data_f16 USING p_ucomm    LIKE sy-ucomm
+                           p_selfield TYPE slis_selfield.
+
+  DATA h_datenfeld LIKE t354s-initfield.
+  DATA h_feld(61).
+
+  DATA: BEGIN OF h_struc,
+         tabname   LIKE t370a-tabname,
+         filler    VALUE '-',
+         fieldname LIKE t370a-tabname,
+        END OF h_struc.
+
+  IF p_selfield-tabindex IS INITIAL OR
+     p_selfield-sel_tab_field = 'G_MARK'.
+*--- ¨¹ber checkbox markiert -> Prim#robjekt anzeigen -----------------*
+    PERFORM fcodes_with_mark_f16 USING p_ucomm p_selfield.
+  ELSE.
+*--- Cusor in Liste -> Objektanzeige ---------------------------------*
+    p_selfield-refresh = space.
+    READ TABLE object_tab INDEX p_selfield-tabindex.
+    MOVE t370a-tabname TO h_struc-tabname.
+*   move p_selfield-sel_tab_field+11(19) to h_struc-fieldname.
+    MOVE p_selfield-fieldname TO h_struc-fieldname.
+    h_feld = h_struc.
+    CONDENSE h_feld NO-GAPS.
+    h_datenfeld = h_feld.
+*                                                            v n1750107
+* for work centre we need to get plant instead of planning plant
+    IF ( h_datenfeld = 'RIHMHIO-GEWRK' OR
+         h_datenfeld = 'RIHMPOS-GEWRK' ).
+
+      DATA: lv_gewrk TYPE mpos-gewrk,
+            lv_field_wapos TYPE char16,
+            lv_field_iwerk TYPE char16.
+
+      CONCATENATE h_struc-tabname '-WAPOS' INTO lv_field_wapos.
+      FIELD-SYMBOLS: <fs_wapos> TYPE mpos-wapos.
+      ASSIGN (lv_field_wapos) TO <fs_wapos>.
+
+      CONCATENATE h_struc-tabname '-IWERK' INTO lv_field_iwerk.
+      FIELD-SYMBOLS: <fs_iwerk> TYPE mpos-iwerk.
+      ASSIGN (lv_field_iwerk) TO <fs_iwerk>.
+
+      SELECT gewrk FROM mpos INTO lv_gewrk
+        WHERE wapos = <fs_wapos>.
+      ENDSELECT.
+
+      CALL FUNCTION 'CR_WORKSTATION_READ'
+        EXPORTING
+          ID              = lv_gewrk
+        IMPORTING
+          WERKS           = <fs_iwerk>.
+
+    ENDIF.
+*                                                            ^ n1750107
+
+    CALL FUNCTION 'MASTER_DATA'
+      EXPORTING
+        datenfeld = h_datenfeld.
+
+    CLEAR object_tab-selected.
+    MODIFY object_tab INDEX p_selfield-tabindex.
+  ENDIF.
+ENDFORM.                    "master_data_f16
+*---------------------------------------------------------------------*
+*       FORM STATUS_CHECK_F16                                         *
+*---------------------------------------------------------------------*
+*       Statusschema pr¨¹fen                                           *
+*---------------------------------------------------------------------*
+FORM status_check_f16 USING f_selschem TYPE selid.
+
+  FIELD-SYMBOLS: <objnr>.
+  DATA: h_status_selected LIKE rc27x-flg_sel.
+  DATA: h_objnr_name(16) VALUE 'OBJECT_TAB-OBJNR'.
+  DATA: BEGIN OF objnr_tab OCCURS 0.
+          INCLUDE STRUCTURE jsto_pre.
+  DATA: END OF objnr_tab.
+
+
+  CHECK NOT f_selschem IS INITIAL.
+  CLEAR objnr_tab.
+  REFRESH objnr_tab.
+  ASSIGN (h_objnr_name) TO <objnr>.
+  LOOP AT object_tab.
+    objnr_tab-objnr = <objnr>.
+    APPEND objnr_tab.
+  ENDLOOP.
+
+  CALL FUNCTION 'STATUS_CHECK_BY_SELSCHEM_MULTI'
+    EXPORTING
+      selschem               = f_selschem
+    IMPORTING
+      status_objects_deleted = h_status_selected
+    TABLES
+      objnr_tab              = objnr_tab
+    EXCEPTIONS
+      no_stat_scheme         = 01.
+
+  IF NOT h_status_selected IS INITIAL.
+    SORT objnr_tab.
+    LOOP AT object_tab.
+      READ TABLE objnr_tab WITH KEY objnr = <objnr> BINARY SEARCH.
+      IF sy-subrc <> 0.
+        DELETE object_tab.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+
+ENDFORM.                    "status_check_f16
+
+*---------------------------------------------------------------------*
+*       FORM XXL_CALL_F16                                             *
+*---------------------------------------------------------------------*
+*       Excel-Aufruf                                                  *
+*---------------------------------------------------------------------*
+FORM xxl_call_f16.
+
+  DATA h_filtered_entries_tab TYPE slis_t_filtered_entries.
+
+  DATA h_hkey        LIKE gxxlt_h OCCURS 90 WITH HEADER LINE.
+  DATA h_vkey        LIKE gxxlt_v OCCURS 90 WITH HEADER LINE.
+  DATA h_print_text  LIKE gxxlt_p OCCURS 90 WITH HEADER LINE.
+  DATA h_online_text LIKE gxxlt_o OCCURS 90 WITH HEADER LINE.
+  DATA h_sema        LIKE gxxlt_s OCCURS 90 WITH HEADER LINE.
+  DATA h_fieldtab    LIKE dfies   OCCURS 80 WITH HEADER LINE.
+  DATA h_itab        LIKE object_tab OCCURS 50 WITH HEADER LINE.
+
+  DATA h_n_att_cols LIKE sy-tabix.
+  DATA h_repid      LIKE gxxlt_f-file.
+  DATA h_title      LIKE gxxlt_p-text.
+  DATA h_so_title   LIKE gxxlt_f-so_title.
+  DATA h_index      LIKE sy-index.
+  DATA h_n_vrt_keys TYPE n VALUE '2'.
+  DATA h_tabname    LIKE dfies-tabname.
+  DATA h_column     LIKE sy-tabix VALUE 1.
+
+  DATA h_fieldcat_wa TYPE slis_fieldcat_alv.
+
+  data ls_fieldtab  LIKE dfies.                               "1487188
+
+  h_tabname = t370a-tabname.
+
+  CALL FUNCTION 'DDIF_NAMETAB_GET'
+    EXPORTING
+      tabname   = h_tabname
+      all_types = g_x
+    TABLES
+      dfies_tab = h_fieldtab
+    EXCEPTIONS
+      not_found = 1
+      OTHERS    = 2.
+
+*--- Sonderfall Klassifizierungsdaten eingeblendet f¨¹r Download ----
+  IF g_class_on = yes.
+    PERFORM add_classfields_fieldtab_f16 TABLES h_fieldtab.
+  ENDIF.
+*--- Semantik ------------------------------------------------------
+  SORT h_fieldtab BY fieldname.
+*--- aktuelle Feldkatalog aus Liste holen --------------------------
+  PERFORM get_fieldcat_actual_info_f14.
+
+  SORT g_fieldcat_tab BY no_out ASCENDING
+                         tech ASCENDING
+                         col_pos ASCENDING.
+
+  PERFORM del_pm_selected_fieldcat_f14.
+
+  h_index = 1.
+  DO.
+    READ TABLE g_fieldcat_tab INTO h_fieldcat_wa INDEX h_index.
+    IF sy-subrc IS INITIAL AND h_fieldcat_wa-no_out = space
+     AND h_fieldcat_wa-tech = space.
+      READ TABLE h_fieldtab WITH KEY
+                               tabname   = h_tabname
+                               fieldname = h_fieldcat_wa-fieldname
+                               BINARY SEARCH.
+      IF sy-subrc IS INITIAL.
+        CLEAR h_sema.
+        h_sema-col_no   = h_column.                  "Spalte auf Screen
+        h_sema-col_src  = h_fieldtab-position.       "Position in itab
+        CASE h_fieldtab-inttype.
+          WHEN 'Z'.
+            h_sema-col_typ  = 'NUM'.
+            h_sema-col_ops  = 'AVG'.
+          WHEN 'C'.
+            h_sema-col_typ  = 'STR'.
+            h_sema-col_ops  = 'NOP'.
+          WHEN 'X'.
+            h_sema-col_typ  = 'STR'.
+            h_sema-col_ops  = 'NOP'.
+          WHEN 'T'.
+            h_sema-col_typ  = 'STR'.
+            h_sema-col_ops  = 'NOP'.
+          WHEN 'P'.
+            h_sema-col_typ  = 'NUM'.
+            h_sema-col_ops  = 'ADD'.
+          WHEN 'F'.
+            h_sema-col_typ  = 'NUM'.
+            h_sema-col_ops  = 'ADD'.
+          WHEN 'I'.
+            h_sema-col_typ  = 'NUM'.
+            h_sema-col_ops  = 'ADD'.
+          WHEN 'N'.
+            h_sema-col_typ  = 'STR'.
+            h_sema-col_ops  = 'NOP'.
+          WHEN 'D'.
+            h_sema-col_typ  = 'DAT'.
+            h_sema-col_ops  = 'NOP'.
+          WHEN OTHERS.
+            h_sema-col_typ  = 'STR'.
+            h_sema-col_ops  = 'NOP'.
+        ENDCASE.
+        IF h_fieldtab-datatype = 'CURR'.
+*         READ TABLE h_fieldtab WITH KEY                      "1487188
+*                                     datatype = 'CUKY'.      "1487188
+*         h_sema-col_cur = h_fieldtab-position.               "1487188
+          READ TABLE h_fieldtab                               "1487188
+                into ls_fieldtab                              "1487188
+            WITH KEY tabname   = h_fieldtab-reftable          "1487188
+                     fieldname = h_fieldtab-reffield          "1487188
+            BINARY SEARCH.                                    "1487188
+          if sy-subrc = 0.                                    "1481788
+            h_sema-col_cur = ls_fieldtab-position.            "1481788
+          endif.                                              "1481788
+        ENDIF.
+        APPEND h_sema.
+*--- Spalten¨¹berschriften ------------------------------------------
+        h_hkey-col_no   = h_column.
+        h_hkey-row_no   = 1.
+        h_hkey-col_name = h_fieldcat_wa-seltext_m.
+        APPEND h_hkey.
+*--- Spalte wird int.ermittelt, nich aus ALV ¨¹bernommen (int. Felder)
+*--- ALV kann mehrzeilig sein, XXL jedoch nicht
+        h_column = h_column + 1.
+      ENDIF.
+      h_index = h_index + 1.
+    ELSE.
+      EXIT.
+    ENDIF.
+  ENDDO.
+
+  DESCRIBE TABLE h_sema LINES h_n_att_cols.
+  h_repid = sy-repid.
+* enth#lt der Reportname das Zeichen / so bleibt der Excelaufruf
+* h#ngen
+  IF h_repid CA '/'.
+    REPLACE '/' WITH space INTO h_repid.
+    CONDENSE h_repid.
+  ENDIF.
+
+  h_title = sy-title.
+  h_so_title = sy-title.
+
+*--- Texttabellen ---------------------------------------------------
+*    Report¨¹berschrift
+*    Username
+*    Datum
+  h_tabname = 'SYST'.
+
+  REFRESH h_fieldtab.
+  CLEAR   h_fieldtab.
+  CALL FUNCTION 'GET_FIELDTAB'
+       EXPORTING
+            langu         = sy-langu
+            tabname       = h_tabname
+            withtext      = 'X'
+       TABLES
+            fieldtab      = h_fieldtab
+       EXCEPTIONS
+            no_texts_found.
+
+  h_online_text-line_no    = 1.
+  READ TABLE h_fieldtab WITH KEY fieldname = 'TITLE'.
+  h_online_text-info_name  = h_fieldtab-scrtext_l.
+  h_online_text-info_value = sy-title.
+  APPEND h_online_text.
+  h_print_text-hf          = 'F'.
+  h_print_text-lcr         = 'R'.
+  h_print_text-line_no     = 1.
+  h_print_text-text        = sy-title.
+  APPEND h_print_text.
+  h_online_text-line_no    = 2.
+  READ TABLE h_fieldtab WITH KEY fieldname = 'UNAME'.
+  h_online_text-info_name  = h_fieldtab-scrtext_l.
+  h_online_text-info_value = sy-uname.
+  APPEND h_online_text.
+  h_print_text-hf          = 'F'.
+  h_print_text-lcr         = 'R'.
+  h_print_text-line_no     = 2.
+  h_print_text-text        = sy-uname.
+  APPEND h_print_text.
+  h_online_text-line_no    = 3.
+  READ TABLE h_fieldtab WITH KEY fieldname = 'DATUM'.
+  h_online_text-info_name  = h_fieldtab-scrtext_l.
+  WRITE sy-datlo TO h_online_text-info_value.
+  APPEND h_online_text.
+  h_print_text-hf          = 'F'.
+  h_print_text-lcr         = 'R'.
+  h_print_text-line_no     = 3.
+  WRITE sy-datlo TO h_print_text-text.
+  APPEND h_print_text.
+
+  CALL FUNCTION 'PM_NUMBER_OF_KEY_COL'
+    EXPORTING
+      key_col_default = 1
+      key_col_max     = h_n_att_cols
+    IMPORTING
+      key_col         = h_n_vrt_keys
+    EXCEPTIONS
+      cancel          = 01.
+
+  IF sy-subrc <> 0.
+    EXIT.
+  ENDIF.
+
+  CLEAR h_index.
+*--- Eine Schl¨¹sselspalte mehr --------------------------------------
+  DO h_n_vrt_keys TIMES.
+    h_index = sy-index.
+*--- Semantik korrigieren -------------------------------------------
+    READ TABLE h_sema INDEX h_index.
+    h_sema-col_ops = 'DFT'.
+    MODIFY h_sema INDEX h_index.
+*--- Schl¨¹sselspalte von HKEY nach VKEY -----------------------------
+    READ TABLE h_hkey INDEX 1.
+    h_vkey-col_no = h_index.
+    h_vkey-col_name = h_hkey-col_name.
+    APPEND h_vkey.
+    DELETE h_hkey INDEX 1.
+  ENDDO.
+
+  h_n_att_cols = h_n_att_cols - h_n_vrt_keys.
+  LOOP AT h_hkey.
+    h_hkey-col_no = h_hkey-col_no - h_n_vrt_keys.
+    MODIFY h_hkey.
+  ENDLOOP.
+*--- Falls Objekte Markiert nur diese #bernehmen sonst alle -------
+  LOOP AT object_tab WHERE selected = g_x.
+    h_itab = object_tab.
+    APPEND h_itab.
+  ENDLOOP.
+  IF NOT sy-subrc IS INITIAL.
+*--- Filter aus Listviewer mu# ber¨¹cksichtigt werden --------------
+    IF g_filter_tab[] IS INITIAL.
+      h_itab[] = object_tab[].
+    ELSE.
+*--- Filter lesen und abgleichen mit itab -------------------------
+      PERFORM get_filtered_entries_f16 TABLES
+                                       h_filtered_entries_tab.
+      LOOP AT object_tab.
+*--- in filter_entries_tab stehen alle indizes von ausgefilterten
+*--- zeilen
+        READ TABLE h_filtered_entries_tab TRANSPORTING NO FIELDS
+                                          WITH KEY = sy-tabix
+                                                   BINARY SEARCH.
+        CHECK NOT sy-subrc IS INITIAL.
+        h_itab = object_tab.
+        APPEND h_itab.
+      ENDLOOP.
+    ENDIF.
+  ENDIF.
+*--- Excel starten ------------------------------------------------
+  CALL FUNCTION 'XXL_FULL_API'
+    EXPORTING
+      sema_type         = 'X'
+      filename          = h_repid
+      header_1          = h_title
+      so_title          = h_so_title
+      no_dialog         = ' '
+      no_start          = ' '
+      n_att_cols        = h_n_att_cols
+      n_hrz_keys        = 1
+      n_vrt_keys        = h_n_vrt_keys
+    TABLES
+      data              = h_itab
+      hkey              = h_hkey
+      online_text       = h_online_text
+      print_text        = h_print_text
+      sema              = h_sema
+      vkey              = h_vkey
+    EXCEPTIONS
+      cancelled_by_user = 01
+      data_too_big      = 02
+      dim_mismatch_data = 03
+      dim_mismatch_sema = 04
+      dim_mismatch_vkey = 05
+      error_in_hkey     = 06
+      error_in_sema     = 07
+      file_open_error   = 08
+      file_write_error  = 09
+      inv_data_range    = 10
+      inv_winsys        = 11
+      inv_xxl           = 12.
+
+  IF sy-subrc = 2.                                   "note 336955
+    MESSAGE i020(pc).
+  ENDIF.
+
+ENDFORM.                    "xxl_call_f16
+
+*eject
+*---------------------------------------------------------------------*
+*       FORM VARIANT_START_F16                                        *
+*---------------------------------------------------------------------*
+*       Start ¨¹ber Variante                                           *
+*---------------------------------------------------------------------*
+FORM variant_start_f16.
+
+  DATA: h_subrc   LIKE sy-subrc.
+  DATA: h_repid   LIKE rsvar-report.
+  DATA: h_variant LIKE rsvar-variant.
+  DATA: h_tcode   LIKE sy-tcode.
+
+*--- Tcode merken, kann durch Varainte ¨¹berschrieben werden
+  h_tcode  = dy_tcode.
+*--- Einstiegsvarianten nicht bei Submit m#glich da zum Zeitpunkt
+*--- INITIALISATION dy-tcode nicht bekannt und sy-tcode = T-code
+*--- des Aufrufers ist
+*--- desweiteren k#nnten interne Parameter wie DY_SELMD durch
+*--- Variante ¨¹berschrieben werden
+  IF sy-slset              IS INITIAL AND
+     sy-calld              IS INITIAL AND
+     g_feldlist-g_var_flag IS INITIAL AND
+     sy-tcode <> 'SE38'               AND
+     sy-tcode <> 'SA38'.
+
+    g_selmod = selmod_0.
+    h_repid = sy-repid.
+    CLEAR h_variant.
+    h_variant = 'U_'.
+    WRITE sy-uname TO h_variant+2.
+*--- User specific variant
+    CALL FUNCTION 'RS_VARIANT_EXISTS'
+      EXPORTING
+        report  = h_repid
+        variant = h_variant
+      IMPORTING
+        r_c     = h_subrc.
+    IF NOT h_subrc IS INITIAL.
+*--- customizing variant
+      CLEAR h_variant.
+      h_variant = 'SAP_TCODE_'.
+      WRITE sy-tcode TO h_variant+10.
+      CALL FUNCTION 'RS_VARIANT_EXISTS'
+        EXPORTING
+          report  = h_repid
+          variant = h_variant
+        IMPORTING
+          r_c     = h_subrc.
+      IF NOT h_subrc IS INITIAL.
+*--- system variant
+        CLEAR h_variant.
+        h_variant = 'SAP&TCODE_'.
+        WRITE sy-tcode TO h_variant+10.
+        CALL FUNCTION 'RS_VARIANT_EXISTS'
+          EXPORTING
+            report  = h_repid
+            variant = h_variant
+          IMPORTING
+            r_c     = h_subrc.
+      ENDIF.
+    ENDIF.
+    IF h_subrc = 0.
+      g_feldlist-g_var_flag = 'X'.
+      CALL FUNCTION 'RS_SUPPORT_SELECTIONS'
+        EXPORTING
+          report               = h_repid
+          variant              = h_variant
+        EXCEPTIONS
+          variant_not_existent = 01
+          variant_obsolete     = 02.
+    ENDIF.
+  ENDIF.
+
+  dy_tcode = h_tcode.                  "gemerkter T-code zur¨¹ckschreiben
+
+ENDFORM.                    "variant_start_f16
+
+*---------------------------------------------------------------------*
+*       FORM VARIANT_F16                                              *
+*---------------------------------------------------------------------*
+*       Benutzervariante einstellen                                   *
+*---------------------------------------------------------------------*
+FORM variant_f16.
+
+  DATA: h_repid LIKE sy-repid.
+
+  h_repid = sy-repid.
+  CALL FUNCTION 'PM_CHANGE_SELOPT'
+    EXPORTING
+      repname = h_repid
+      tcode   = ' '
+      uname   = sy-uname.
+
+ENDFORM.                    "variant_f16
+
+*eject
+*---------------------------------------------------------------------*
+*       FORM DOWNLOAD_F20                                             *
+*---------------------------------------------------------------------*
+*       Download Objekttabelle                                        *
+*---------------------------------------------------------------------*
+FORM download_f16.
+
+  TABLES: t390d.
+  DATA: h_tabname LIKE dfies-tabname.
+  DATA: BEGIN OF h_data_tab OCCURS 0.
+          INCLUDE STRUCTURE access_com.
+  DATA: END OF h_data_tab.
+  FIELD-SYMBOLS: <table>.
+
+*--- Tabelle exportieren --------------------------------------------
+  SELECT SINGLE * FROM t390d WHERE pm_appl = 'L'.
+  IF sy-subrc <> 0.
+    SELECT SINGLE * FROM t390d WHERE pm_appl = ' '.
+  ENDIF.
+  IF sy-subrc <> 0.
+    CLEAR t390d.
+  ENDIF.
+  REFRESH h_data_tab.
+  CLEAR h_data_tab.
+  LOOP AT object_tab WHERE selected = g_x.
+    h_tabname = t370a-tabname.
+    ASSIGN (h_tabname) TO <table>.
+    <table> = object_tab.
+    CALL FUNCTION 'TABLE_CONVERT_FOR_MSACCESS'
+      EXPORTING
+        structimport     = <table>
+        tabname          = h_tabname
+      IMPORTING
+        structexport     = h_data_tab
+      EXCEPTIONS
+        wrong_table      = 1
+        struct_toolong   = 2
+        unknown_datatype = 3
+        OTHERS           = 4.
+
+    IF sy-subrc = 2.
+      MESSAGE a666(ih) WITH h_tabname.
+*   Struktur zu breit f¨¹r Download nach MS Access (max. 2048 Zeichen)
+    ENDIF.
+    APPEND h_data_tab.
+  ENDLOOP.
+
+  CALL FUNCTION 'TABLE_EXPORT_TO_MSACCESS_RFC'
+    EXPORTING
+      langu  = sy-langu
+      dbname = t390d-dbname
+      dest   = t390d-dest
+    TABLES
+      data   = h_data_tab.
+
+ENDFORM.                    "download_f16
+
+*eject
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_PF_WITH_OBJECT
+*&---------------------------------------------------------------------*
+*       PF2 umbiegen je nach Modus                                     *
+*----------------------------------------------------------------------*
+FORM check_pf2_with_object_f16 USING p_ucomm LIKE sy-ucomm.
+
+  CHECK p_ucomm = g_ic1.
+
+*--- Fcode verbiegen: wenn Anzeigenmodus PF2 -> Object anzeigen    ---*
+*---               -> bei Prim#robject anzeigen/#ndern nach Akt-typ --*
+*---               -> bei Sekund#robject immer ins anzeigen springen -*
+*---                  wenn Auswahlmodus PF2 -> Prim#robject ausw#hlen-*
+  IF g_selmod = selmod_0 OR g_selmod = selmod_s.
+    p_ucomm = 'IOBJ'.
+  ELSE.
+    p_ucomm = 'ISEL'.
+  ENDIF.
+
+ENDFORM.                               " CHECK_PF_WITH_OBJECT
+
+*---------------------------------------------------------------------*
+*       FORM CHECK_OBJECT_DISPLAY_F16                                 *
+*---------------------------------------------------------------------*
+*       bei Detail auf Prim#robjekt in #nderungs/Anzeigetransaktion   *
+*---------------------------------------------------------------------*
+*  -->  P_UCOMM                                                       *
+*  -->  'OBJECT_TAB-QMNUM'                                            *
+*  -->  'MELD'                                                        *
+*---------------------------------------------------------------------*
+FORM check_object_display_f16 USING f_ucomm LIKE sy-ucomm
+                                    f_selfield TYPE slis_selfield
+                                    f_field TYPE c
+                                    f_code  TYPE c.
+
+  IF f_ucomm = 'IOBJ' AND
+     f_selfield-sel_tab_field = f_field.
+    f_ucomm = f_code.
+  ENDIF.
+
+ENDFORM.                    "check_object_display_f16
+*---------------------------------------------------------------------*
+*       FORM AUTH_CHECK_TCODE                                         *
+*---------------------------------------------------------------------*
+*       Berechtigungspr¨¹fung Tcode (vor call transaction)             *
+*---------------------------------------------------------------------*
+*  -->  H_TCODE                                                       *
+*  <--  H_RETC  ( = 1 wenn keine Tcode Berechtigung )                 *
+*---------------------------------------------------------------------*
+FORM auth_check_tcode_f16 USING h_tcode   TYPE sytcode
+                          CHANGING h_retc TYPE sysubrc.
+  DATA: h_aktyp(2).
+
+  CLEAR h_retc.
+
+  CASE h_tcode.
+    WHEN 'IH09'.
+      h_aktyp = '03'.
+*--- Berechtigungsobject h_mate_sta -----(Materialliste)----------
+      AUTHORITY-CHECK OBJECT 'M_MATE_STA'
+                          ID 'ACTVT' FIELD h_aktyp
+                          ID 'STATM' DUMMY.
+      IF NOT sy-subrc IS INITIAL.
+        h_retc = '1'.
+      ENDIF.
+    WHEN 'MM02'.
+*--- Sonderfall Materialstamm -> keine Vorabpr¨¹fung --------------*
+      EXIT.
+    WHEN 'MM03'.
+*--- Sonderfall Materialstamm -> keine Vorabpr¨¹fung --------------*
+      EXIT.
+    WHEN 'IA08'.
+*--- Berechtigungsobject I_ROUT -----(Arbeitsplanliste)------------*
+      h_aktyp = '02'.
+      AUTHORITY-CHECK OBJECT 'I_ROUT'
+                          ID 'ACTVT' FIELD h_aktyp.
+      IF NOT sy-subrc IS INITIAL.
+        h_retc = '1'.
+      ENDIF.
+    WHEN 'IA09'.
+*--- Berechtigungsobject I_ROUT -----(Arbeitsplanliste)--------*
+      h_aktyp = '03'.
+      AUTHORITY-CHECK OBJECT 'I_ROUT'
+                          ID 'ACTVT' FIELD h_aktyp.
+      IF NOT sy-subrc IS INITIAL.
+        h_retc = '1'.
+      ENDIF.
+    WHEN 'IA02'.
+*--- Berechtigungsobject I_ROUT -----(Arbeitsplan Equi)-------*
+      h_aktyp = '02'.
+      AUTHORITY-CHECK OBJECT 'I_ROUT'
+                          ID 'ACTVT' FIELD h_aktyp.
+      IF NOT sy-subrc IS INITIAL.
+        h_retc = '1'.
+      ENDIF.
+    WHEN 'IA03'.
+*--- Berechtigungsobject I_ROUT -----(Arbeitsplan Equi)-------*
+      h_aktyp = '03'.
+      AUTHORITY-CHECK OBJECT 'I_ROUT'
+                          ID 'ACTVT' FIELD h_aktyp.
+      IF NOT sy-subrc IS INITIAL.
+        h_retc = '1'.
+      ENDIF.
+    WHEN 'IA12'.
+*--- Berechtigungsobject I_ROUT -----(Arbeitsplan T.P)-------*
+      h_aktyp = '02'.
+      AUTHORITY-CHECK OBJECT 'I_ROUT'
+                          ID 'ACTVT' FIELD h_aktyp.
+      IF NOT sy-subrc IS INITIAL.
+        h_retc = '1'.
+      ENDIF.
+    WHEN 'IA13'.
+*--- Berechtigungsobject I_ROUT -----(Arbeitsplan T.P)-------*
+      h_aktyp = '03'.
+      AUTHORITY-CHECK OBJECT 'I_ROUT'
+                          ID 'ACTVT' FIELD h_aktyp.
+      IF NOT sy-subrc IS INITIAL.
+        h_retc = '1'.
+      ENDIF.
+    WHEN 'IA06'.
+*--- Berechtigungsobject I_ROUT -----(Arbeitsanleitung)-------*
+      h_aktyp = '02'.
+      AUTHORITY-CHECK OBJECT 'I_ROUT'
+                          ID 'ACTVT' FIELD h_aktyp.
+      IF NOT sy-subrc IS INITIAL.
+        h_retc = '1'.
+      ENDIF.
+    WHEN 'IA07'.
+*--- Berechtigungsobject I_ROUT -----(Arbeitsanleitung)-------*
+      h_aktyp = '03'.
+      AUTHORITY-CHECK OBJECT 'I_ROUT'
+                          ID 'ACTVT' FIELD h_aktyp.
+      IF NOT sy-subrc IS INITIAL.
+        h_retc = '1'.
+      ENDIF.
+    WHEN 'CO11'.
+*--- Berechtigungsobject C_AFKO_ATY --(R¨¹ckmelden Fert.Auftr.)----*
+      h_aktyp = '01'.
+      AUTHORITY-CHECK OBJECT 'C_AFKO_ATY'
+                          ID 'ACTVT' FIELD h_aktyp
+                          ID 'AUTYP' FIELD '10'.
+      IF NOT sy-subrc IS INITIAL.
+        h_retc = '1'.
+      ENDIF.
+    WHEN 'CO03'.
+*--- Berechtigungsobject C_AFKO_ATY --(Anzeigen Fert.Auftr.)
+      h_aktyp = '03'.
+      AUTHORITY-CHECK OBJECT 'C_AFKO_ATY'
+                          ID 'ACTVT' FIELD h_aktyp
+                          ID 'AUTYP' FIELD '10'.
+      IF NOT sy-subrc IS INITIAL.
+        h_retc = '1'.
+      ENDIF.
+    WHEN 'COR3'.
+*--- Berechtigungsobject C_AFKO_ATY --(Anzeigen Proz.Auftr.)
+      h_aktyp = '03'.
+      AUTHORITY-CHECK OBJECT 'C_AFKO_ATY'
+                          ID 'ACTVT' FIELD h_aktyp
+                          ID 'AUTYP' FIELD '40'.
+      IF NOT sy-subrc IS INITIAL.
+        h_retc = '1'.
+      ENDIF.
+    WHEN 'CN22'.
+*--- Berechtigungsobject C_PROJ_TCD --(#ndern Netzplan)
+      AUTHORITY-CHECK OBJECT 'C_PROJ_TCD'
+                          ID 'PSARG' FIELD '0201'
+                          ID 'TRTYP' FIELD 'V'.
+      IF NOT sy-subrc IS INITIAL.
+        h_retc = '1'.
+      ENDIF.
+    WHEN 'CN23'.
+*--- Berechtigungsobject C_PROJ_TCD --(Anzeigen Netzplan)
+      AUTHORITY-CHECK OBJECT 'C_PROJ_TCD'
+                          ID 'PSARG' FIELD '0201'
+                          ID 'TRTYP' FIELD 'A'.
+      IF NOT sy-subrc IS INITIAL.
+        h_retc = '1'.
+      ENDIF.
+    WHEN 'CN25'.
+*--- Berechtigungsobject C_PROJ_TCD --(R¨¹ckmelden Netzplan)----*
+      AUTHORITY-CHECK OBJECT 'C_PROJ_TCD'
+                          ID 'PSARG' FIELD '0203'
+                          ID 'TRTYP' FIELD 'H'.
+      IF NOT sy-subrc IS INITIAL.
+        h_retc = '1'.
+      ENDIF.
+    WHEN 'MB01'.
+*--- Berechtigungsobject M_MSEG_WWE --(WE zu Bestellung)-------*
+      h_aktyp = '01'.
+      AUTHORITY-CHECK OBJECT 'M_MSEG_WWE'
+                          ID 'ACTVT' FIELD h_aktyp
+                          ID 'WERKS' DUMMY.
+      IF NOT sy-subrc IS INITIAL.
+        h_retc = '1'.
+      ENDIF.
+    WHEN 'MB03'.
+      h_aktyp = '03'.
+*--- Berechtigungsobject M_MSEG_WMB -----(Materialbeleg)----------*
+      AUTHORITY-CHECK OBJECT 'M_MSEG_WMB'
+                          ID 'ACTVT' FIELD h_aktyp
+                          ID 'WERKS' DUMMY.
+      IF NOT sy-subrc IS INITIAL.
+        h_retc = '1'.
+      ENDIF.
+    WHEN 'MMBE'.
+      h_aktyp = '03'.
+*--- Berechtigungsobject M_MSEG_WMB -----(Bestands¨¹bersicht)----------*
+      AUTHORITY-CHECK OBJECT 'M_MATE_WRK'
+                          ID 'ACTVT' FIELD h_aktyp
+                          ID 'WERKS' DUMMY.
+      IF NOT sy-subrc IS INITIAL.
+        h_retc = '1'.
+      ENDIF.
+    WHEN OTHERS.
+      IF h_tcode CP 'Q*'.
+*--- Berechtigungsobject Q_Tcode  ------------------------------*
+        AUTHORITY-CHECK OBJECT 'Q_TCODE'
+                            ID 'TCD' FIELD h_tcode.
+      ELSE.
+*--- Berechtigungsobject I_Tcode  ------------------------------*
+        AUTHORITY-CHECK OBJECT 'I_TCODE'
+                            ID 'TCD' FIELD h_tcode.
+      ENDIF.
+      IF NOT sy-subrc IS INITIAL.
+        h_retc = '1'.
+      ENDIF.
+  ENDCASE.
+
+  IF NOT h_retc IS INITIAL.
+    MESSAGE ID '00' TYPE 'S' NUMBER '172' WITH h_tcode.
+  ENDIF.
+
+ENDFORM.                    "auth_check_tcode_f16
+*&---------------------------------------------------------------------*
+*&      Form  EXPORT_SELTAB_MEM_F16
+*&---------------------------------------------------------------------*
+*       Seltab wird exportiert                                         *
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM export_seltab_mem_f16.
+
+  IF g_selmod <> selmod_0.
+    EXPORT sel_tab TO MEMORY ID sy-repid.
+  ENDIF.
+
+ENDFORM.                               " EXPORT_SELTAB_MEM_F16
+*&---------------------------------------------------------------------*
+*&      Form  DISPLAY_LONGTEXT_F16     new with  P30K093741
+*&---------------------------------------------------------------------*
+*       Der Langtest zum Listobject wird angezeigt                    *
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM display_longtext_f16 USING h_object        TYPE tdobject
+                                h_object_nr     TYPE objnr_tx
+                                h_spras         TYPE spras
+                                h_txtid         TYPE tdid
+                                h_count_inline  TYPE c
+                                h_save_mode     TYPE c
+                                h_text_history  TYPE c
+                                h_text_property TYPE c.
+
+  DATA h_result LIKE itcer.
+
+  IF h_spras IS INITIAL.
+    h_spras = sy-langu.
+  ENDIF.
+
+  CALL FUNCTION 'LANGTEXT_ONLY'
+    EXPORTING
+      object        = h_object
+      object_nr     = h_object_nr
+      spras         = h_spras
+      txtid         = h_txtid
+      x_xaktyp      = 'A'
+      count_inline  = h_count_inline
+      save_mode     = h_save_mode
+      text_history  = h_text_history
+      text_property = h_text_property
+    IMPORTING
+      RESULT        = h_result
+    EXCEPTIONS
+      OTHERS        = 1.
+
+*--- Longtext left with pf15 -> end of loop session (popup)
+  IF h_result-userexit = 'E'.
+    return_code = 8.
+  ENDIF.
+
+ENDFORM.                    "display_longtext_f16
+
+*---------------------------------------------------------------------*
+*       FORM GET_COLUMN_MARKED_F16                                    *
+*---------------------------------------------------------------------*
+*       Feld zur markierten Spalte wird ermittelt                     *
+*       bei mehr als einer Spalte -> I-Message
+*---------------------------------------------------------------------*
+*  -->  F_SELFIELD                                                    *
+*  -->  F_FIELDCAT_WA                                                 *
+*---------------------------------------------------------------------*
+FORM get_column_marked_f16 USING
+                           f_fieldcat_wa TYPE slis_fieldcat_alv
+                           f_field       LIKE dfies-fieldname.
+
+  DATA h_fieldcat_tab TYPE slis_t_fieldcat_alv.
+
+  CLEAR f_field.
+
+  IF g_grid IS INITIAL.
+    CALL FUNCTION 'REUSE_ALV_GRID_LAYOUT_INFO_GET'
+      IMPORTING
+        et_marked_columns = h_fieldcat_tab[]
+      EXCEPTIONS
+        no_infos          = 1
+        program_error     = 2
+        OTHERS            = 3.
+  ELSE.
+    CALL FUNCTION 'REUSE_ALV_LIST_LAYOUT_INFO_GET'
+      IMPORTING
+        et_marked_columns = h_fieldcat_tab
+      EXCEPTIONS
+        no_infos          = 1
+        program_error     = 2
+        OTHERS            = 3.
+  ENDIF.
+  IF sy-subrc <> 0.
+* MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*         WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+  ENDIF.
+*--- selection of one column supported only
+  DESCRIBE TABLE h_fieldcat_tab LINES sy-tabix.
+  IF sy-tabix = 1.
+    READ TABLE h_fieldcat_tab INDEX 1 INTO f_fieldcat_wa.
+    f_field = f_fieldcat_wa-fieldname.
+  ELSE.
+    MESSAGE i081(ih).
+  ENDIF.
+
+ENDFORM.                    "get_column_marked_f16
+*&---------------------------------------------------------------------*
+*&      Form  MARK_ALL_F16
+*&---------------------------------------------------------------------*
+*       mark all entries in OBJECT_TAB
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM mark_all_f16.
+
+  FIELD-SYMBOLS: <ls_object_tab> LIKE LINE OF object_tab.
+
+  LOOP AT object_tab ASSIGNING <ls_object_tab>.
+    <ls_object_tab>-selected = g_x.
+  ENDLOOP.
+
+ENDFORM.                               " MARK_ALL_F16
+
+*---------------------------------------------------------------------*
+*       FORM GET_USER_F16                                             *
+*---------------------------------------------------------------------*
+*       get user data for sapphone                                    *
+*---------------------------------------------------------------------*
+*  -->  UNAME                                                         *
+*---------------------------------------------------------------------*
+FORM get_user_f16 USING uname LIKE usr01-bname.
+
+  DATA h_address LIKE addr3_val.
+
+  IF NOT uname IS INITIAL.
+    CALL FUNCTION 'SUSR_USER_ADDRESS_READ'
+         EXPORTING
+              user_name              = uname
+         IMPORTING
+              user_address           = h_address
+*         user_usr03             =
+         EXCEPTIONS
+              user_address_not_found = 1
+              OTHERS                 = 2.
+    IF sy-subrc IS INITIAL.
+      telefon-name    = h_address-name_text.
+      telefon-number  = h_address-tel_number.
+      telefon-country = h_address-country.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    "get_user_f16
+
+*---------------------------------------------------------------------*
+*       FORM GET_CUSTOMER_DATA_F16                                    *
+*---------------------------------------------------------------------*
+*       get customer data for sapphone                                *
+*---------------------------------------------------------------------*
+*  -->  KUNUM                                                         *
+*---------------------------------------------------------------------*
+FORM get_customer_data_f16 USING kunum LIKE kna1-kunnr.
+
+  DATA h_comwa LIKE vtcom.
+  DATA h_pawa  LIKE kupav.
+
+  IF NOT kunum IS INITIAL.
+    h_comwa-kunnr = kunum.
+    h_comwa-nrart = 'KU'.
+    CALL FUNCTION 'VIEW_KUPAV'
+         EXPORTING
+              comwa               = h_comwa
+*             PRIVATADRESSE_LESEN = ' '
+         IMPORTING
+*             KNVK_WA             =
+              pawa                = h_pawa
+*             SUBRC_PRIVATADRESSE =
+*             TPAR_WA             =
+         EXCEPTIONS
+              no_kna1             = 1
+              no_knvk             = 2
+              no_lfa1             = 3
+              no_pernr            = 4
+              OTHERS              = 5.
+    IF sy-subrc IS INITIAL.
+      telefon-name    = h_pawa-name_list.
+      telefon-number  = h_pawa-telf1.
+      telefon-country = h_pawa-land1.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    "get_customer_data_f16
+*&---------------------------------------------------------------------*
+*&      Form  GET_PARTNER_DATA_F16
+*&---------------------------------------------------------------------*
+*       get partner data for sapphone
+*----------------------------------------------------------------------*
+*      -->P_OBJECT_TAB-PARNR_INT  text                                 *
+*      -->P_T_TQ80-PARVW_INT  text                                     *
+*----------------------------------------------------------------------*
+FORM get_partner_data_f16 USING p_parnr LIKE ihpa-parnr
+                                p_parvw LIKE ihpa-parvw.
+
+  DATA h_diadr_wa LIKE diadr.
+
+  IF NOT p_parnr IS INITIAL AND NOT p_parvw IS INITIAL.
+    CALL FUNCTION 'PM_PARTNER_READ'
+         EXPORTING
+              parvw                  = p_parvw
+              parnr                  = p_parnr
+              check_debitor          = space
+*               NRART                  = ' '
+         IMPORTING
+*                parnr_exp              =
+*                diadrc_wa              =
+*                diadrp_wa              =
+               diadr_wa               = h_diadr_wa
+*                xcpdk                  =
+*                e_nrart                =
+*                ktokd                  =
+*                vtext                  =
+*                customer_contact       =
+         EXCEPTIONS
+              no_valid_parnr         = 1
+              no_valid_parnr_today   = 2
+              no_authority           = 3
+              parvw_and_nrart_inital = 4
+              OTHERS                 = 5.
+    IF sy-subrc IS INITIAL.
+      telefon-name    = h_diadr_wa-name_list.
+      telefon-number  = h_diadr_wa-tel_number.
+      telefon-country = h_diadr_wa-country.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                               " GET_PARTNER_DATA_F16
+*&---------------------------------------------------------------------*
+*&      Form  GET_VENDOR_DATA_F16
+*&---------------------------------------------------------------------*
+*        get vendor data for sapphone
+*----------------------------------------------------------------------*
+*      --> LIFNUM                                                      *
+*----------------------------------------------------------------------*
+FORM get_vendor_data_f16 USING  lifnum LIKE lfa1-lifnr .
+
+  DATA h_comwa LIKE vtcom.
+  DATA h_pawa  LIKE kupav.
+
+  IF NOT lifnum IS INITIAL.
+    h_comwa-lifnr = lifnum.
+    h_comwa-nrart = 'LI'.
+    CALL FUNCTION 'VIEW_KUPAV'
+         EXPORTING
+              comwa               = h_comwa
+*             privatadresse_lesen = ' '
+         IMPORTING
+*             knvk_wa             =
+              pawa                = h_pawa
+*             subrc_privatadresse =
+*             tpar_wa             =
+         EXCEPTIONS
+              no_kna1             = 1
+              no_knvk             = 2
+              no_lfa1             = 3
+              no_pernr            = 4
+              OTHERS              = 5.
+    IF sy-subrc IS INITIAL.
+      telefon-name    = h_pawa-name_list.
+      telefon-number  = h_pawa-telf1.
+      telefon-country = h_pawa-land1.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                               " GET_VENDOR_DATA_F16
+*&---------------------------------------------------------------------*
+*&      Form  ADD_CLASSFIELDS_FIELDTAB_F16
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_H_FIELDTAB  text                                           *
+*----------------------------------------------------------------------*
+FORM add_classfields_fieldtab_f16
+                              TABLES p_fieldtab STRUCTURE dfies.
+  DATA h_index LIKE sy-tabix.
+
+  DATA: BEGIN OF h_fieldname,
+      filler(4) VALUE 'CLDA',
+      counter(2),
+        END OF h_fieldname.
+
+*--- Form nur f¨¹r Reports mit Klassifizierung relevant ---------------
+  CHECK g_class_on = yes.
+*--- In Feldkatalog zus#tzlich 20 Felder f¨¹r Klassenmerkmale stellen -
+  DESCRIBE TABLE p_fieldtab LINES h_index.
+  READ TABLE p_fieldtab INDEX h_index.
+  h_index = h_index + 1.
+  h_fieldname-counter = 1.
+  DO 20 TIMES.
+    p_fieldtab-fieldname = h_fieldname.
+    p_fieldtab-position  = h_index.
+    p_fieldtab-inttype   = 'C'.
+    APPEND p_fieldtab.
+    h_fieldname-counter = h_fieldname-counter + 1.
+    h_index             = h_index + 1.
+  ENDDO.
+
+ENDFORM.                               " ADD_CLASSFIELDS_FIELDTAB_F16
+*&---------------------------------------------------------------------*
+*&      Form  SET_P_SELFIELD_GENERAL_F16
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_P_SELFIELD  text                                           *
+*----------------------------------------------------------------------*
+FORM set_p_selfield_general_f16 USING f_selfield TYPE slis_selfield.
+
+*--- nach Ausflug Liste immer mit alter Position wieder anzeigen
+  f_selfield-col_stable = g_x.
+  f_selfield-row_stable = g_x.
+
+ENDFORM.                               " SET_P_SELFIELD_GENERAL_F16
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_TPLNR_F16
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_STRNO  text
+*      -->P_TPLNR  text
+*----------------------------------------------------------------------*
+FORM check_tplnr_f16 TABLES p_strno
+                            p_tplnr
+                     USING  p_check TYPE char01.
+
+*--- Konvertierungsexit T.P. ber¨¹cksichtigen ------------------------*
+  CALL FUNCTION 'IREP1_LOCATION_CONVERSION'
+    EXPORTING
+      check_maxcount = p_check
+    TABLES
+      i_strno_tab    = p_strno
+      e_tplnr_tab    = p_tplnr
+    EXCEPTIONS
+      OTHERS         = 1.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+    EXIT.                              "N1025866
+  endif.
+ENDFORM.                               " CHECK_TPLNR_F16
+*---------------------------------------------------------------------*
+*       FORM CONVERSION_EXIT_TPLNR_OUTP_F16                           *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  P_TPLNR                                                       *
+*  -->  P_STRNO                                                       *
+*---------------------------------------------------------------------*
+FORM conversion_exit_tplnr_outp_f16 TABLES p_tplnr
+                                           p_strno.
+
+  STATICS h_flag.
+*--- Konvertierung aus interner Platznummer in externe Kennzeichnung
+*--- Wird durchgef¨¹hrt wenn Pl#tze in TPLNR durch submit ¨¹bergeben
+*--- werden und auf Selektionsbild dargestellt werden sollen
+*--- Konvertierung soll nur einmal im PBO Selektionbild ablaufen
+  IF NOT sy-calld IS INITIAL AND h_flag IS INITIAL.
+    IF NOT p_tplnr[] IS INITIAL.
+      CLEAR p_strno. REFRESH p_strno.
+      CALL FUNCTION 'IREP1_LOCATION_CONVERSION_OUTP'
+        TABLES
+          i_tplnr_tab = p_tplnr
+          e_strno_tab = p_strno.
+*--- wenn externe Kennzeichnung gefunden, int.Platznummer l#schen
+      IF NOT p_strno[] IS INITIAL.
+        CLEAR p_tplnr. REFRESH p_tplnr.
+      ENDIF.
+*--- Hilfsflag f¨¹r einmaligen Aufruf
+      h_flag = g_x.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    "conversion_exit_tplnr_outp_f16
+*---------------------------------------------------------------------*
+*       FORM MARK_SELECTED_F16                                        *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  P_CHECKBOX                                                    *
+*  -->  P_SELECTED                                                    *
+*---------------------------------------------------------------------*
+FORM mark_selected_f16 CHANGING p_checkbox TYPE c
+                                p_selected TYPE pm_selected.
+
+*--- Dieses Feld wird auf Liste als Haken ausgegeben
+  p_selected = sym_check_mark.
+*--- checkbox wird gel#scht
+  p_checkbox = space.
+  MODIFY object_tab.
+
+ENDFORM.                    "mark_selected_f16
+*---------------------------------------------------------------------*
+*       FORM MARK_SELECTED_F16                                        *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  P_CHECKBOX                                                    *
+*  -->  P_SELECTED                                                    *
+*---------------------------------------------------------------------*
+FORM mark_printed_f16 CHANGING p_checkbox TYPE c
+                               p_selected TYPE pm_selected.
+
+*--- Dieses Feld wird auf Liste als Haken ausgegeben
+  p_selected = sym_printer.
+*--- checkbox wird gel#scht
+  p_checkbox = space.
+  MODIFY object_tab.
+
+ENDFORM.                    "mark_printed_f16
+*&---------------------------------------------------------------------*
+*&      Form  DELETE_SELECTED_MARKS_F16
+*&---------------------------------------------------------------------*
+*       Alle Markierungen l#schen
+*       Wenn Checkbox markiert -> Checkboxen l#schen (¨¹ber ALV)
+*       Sonst Merker f¨¹r zuletzt markierte Objekte l#schen
+*----------------------------------------------------------------------*
+*      -->P_SELFIELD  text
+*----------------------------------------------------------------------*
+FORM delete_selected_marks_f16 USING p_selfield TYPE slis_selfield.
+
+  FIELD-SYMBOLS: <ls_object_tab> LIKE LINE OF object_tab.
+
+  p_selfield-refresh = space.
+
+*--- Checkbox aktiv -> wenn ja zur¨¹ck an ALV
+  READ TABLE object_tab WITH KEY selected = g_x.
+  IF sy-subrc IS INITIAL.
+    EXIT.
+  ELSE.
+*--- Merker f¨¹r zuletzt markierte Objekte l#schen
+    LOOP AT object_tab ASSIGNING <ls_object_tab>
+                       WHERE pm_selected <> space.
+      CLEAR <ls_object_tab>-pm_selected.
+    ENDLOOP.
+*--- Liste mu# von ALV neu aufgebaut werden
+    IF sy-subrc IS INITIAL.
+      p_selfield-refresh = g_x.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                               " DELETE_SELECTED_MARKS_F16
+*&---------------------------------------------------------------------*
+*&      Form  PREPARE_DOWNLOAD_F16
+*&---------------------------------------------------------------------*
+*      Initialisieren des Downloads
+*
+*----------------------------------------------------------------------*
+* Alle Tabelleneintr#ge, die nach Access geladen werden sollen
+* werden in einer Tabelle gesammelt ( Pm_export_buffer_add )
+*
+*----------------------------------------------------------------------*
+FORM prepare_download_f16.
+
+  CALL FUNCTION 'PM_EXPORT_BUFFER_INIT'.
+
+
+ENDFORM.                               " PREPARE_DOWNLOAD_F16
+*&---------------------------------------------------------------------*
+*&      Form  FINISH_DOWNLOAD_F16
+*&---------------------------------------------------------------------*
+*       Durchf¨¹hrung des Downloads
+*----------------------------------------------------------------------*
+*  Alle gesammelten Tabelleneintr#ge werden nun nach Access
+*  geladen
+*----------------------------------------------------------------------*
+FORM finish_download_f16 USING p_appl LIKE t390d-pm_appl.
+
+  DATA: h_data LIKE access_com OCCURS 1 WITH HEADER LINE.
+
+  SELECT SINGLE * FROM t390d WHERE pm_appl = p_appl.
+
+  CALL FUNCTION 'PM_EXPORT_BUFFER_GET'
+    TABLES
+      data = h_data.
+
+  SORT h_data BY tabnam.
+
+  CALL FUNCTION 'TABLE_EXPORT_TO_MSACCESS_RFC'
+    EXPORTING
+      dbname         = t390d-dbname
+      langu          = sy-langu
+      flg_append     = ' '
+      dest           = t390d-dest
+    TABLES
+      data           = h_data
+    EXCEPTIONS
+      wrong_winsys   = 1
+      system_failure = 2
+      comm_failure   = 3
+      OTHERS         = 4.
+  IF sy-subrc <> 0.
+* MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*         WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+  ENDIF.
+
+ENDFORM.                               " FINISH_DOWNLOAD_F16
+
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_G_SELFIELDS_TAB_F16
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_G_SELFIELDS_TAB  text
+*      -->P_0780   text
+*----------------------------------------------------------------------*
+FORM check_g_selfields_tab_f16
+                    TABLES p_selfields_tab STRUCTURE g_selfields_tab
+                    USING  p_tabname       LIKE      dcobjdef-name.
+
+  STATICS h_dfies_tab LIKE dfies OCCURS 100 WITH HEADER LINE.
+*--- if buffer not field read nametab to view/table
+  READ TABLE h_dfies_tab INDEX 1.
+  IF h_dfies_tab-tabname <> p_tabname.
+    CALL FUNCTION 'DDIF_NAMETAB_GET'
+      EXPORTING
+        tabname   = p_tabname
+      TABLES
+        dfies_tab = h_dfies_tab
+      EXCEPTIONS
+        not_found = 1
+        OTHERS    = 2.
+    SORT h_dfies_tab BY fieldname.
+  ENDIF.
+*--- delete all fields in p_selfields_tab which are not in view/table
+  LOOP AT p_selfields_tab.
+    READ TABLE h_dfies_tab WITH KEY
+               fieldname = p_selfields_tab-field
+               TRANSPORTING NO FIELDS
+               BINARY SEARCH.
+    IF NOT sy-subrc IS INITIAL.
+      DELETE p_selfields_tab.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                               " CHECK_G_SELFIELDS_TAB_F16
+*---------------------------------------------------------------------*
+*       FORM get_filtered_entries_f16                                 *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  h_filtered_entries_tab                                        *
+*---------------------------------------------------------------------*
+FORM get_filtered_entries_f16 TABLES p_filtered_entries_tab
+                              TYPE   slis_t_filtered_entries.
+
+  IF g_grid IS INITIAL.
+    CALL FUNCTION 'REUSE_ALV_GRID_LAYOUT_INFO_GET'
+      IMPORTING
+        et_filtered_entries = p_filtered_entries_tab[]
+      EXCEPTIONS
+        no_infos            = 1
+        program_error       = 2
+        OTHERS              = 3.
+  ELSE.
+    CALL FUNCTION 'REUSE_ALV_LIST_LAYOUT_INFO_GET'
+      IMPORTING
+        et_filtered_entries = p_filtered_entries_tab[]
+      EXCEPTIONS
+        no_infos            = 1
+        program_error       = 2
+        OTHERS              = 3.
+  ENDIF.
+
+ENDFORM.                    "get_filtered_entries_f16
+
+*&---------------------------------------------------------------------*
+*&      Form  FILL_ADDITIONAL_FIELDS_F16
+*&---------------------------------------------------------------------*
+*       fill additonal fields added with APPEND structures using
+*       BAdI BADI_EAM_SINGLELEVEL_LIST
+*----------------------------------------------------------------------*
+*      -->IV_STRUCTURE_NAME name of DDIC structure for ALV output
+*      <->CS_OBJECT         One line of result table
+*----------------------------------------------------------------------*
+FORM fill_additional_fields_f16  USING    iv_structure_name TYPE strukname
+                                 CHANGING cs_object         LIKE LINE OF object_tab.
+
+  STATICS: lt_dd03p          TYPE TABLE OF dd03p,
+           lv_structure_name TYPE strukname.
+
+  DATA: lr_structure     TYPE REF TO data,
+        lr_structure_old TYPE REF TO data,
+        lr_append        TYPE REF TO data.
+
+  FIELD-SYMBOLS: <ls_structure>     TYPE ANY,
+                 <ls_structure_old> TYPE ANY,
+                 <ls_append>        TYPE ANY,
+                 <ls_dd03p>         TYPE dd03p.
+
+*--- only if BAdI BADI_EAM_SINGLELEVEL_LIST is active
+  IF cl_badi_query=>number_of_implementations( gb_badi_eam_singlelevel_list ) = 0.
+    RETURN.
+  ENDIF.
+
+*--- only use fields of output structure for BAdI call.
+  CREATE DATA lr_structure TYPE (iv_structure_name).
+  ASSIGN lr_structure->* TO <ls_structure>.
+  MOVE-CORRESPONDING cs_object TO <ls_structure>.
+
+*--- create data twice to check if something was changed by BAdI
+  CREATE DATA lr_structure_old TYPE (iv_structure_name).
+  ASSIGN lr_structure_old->* TO <ls_structure_old>.
+  <ls_structure_old> = <ls_structure>.
+
+*--- call BAdI
+  CALL BADI gb_badi_eam_singlelevel_list->fill_add_fields
+    EXPORTING
+      iv_structure_name = iv_structure_name
+    CHANGING
+      cs_object         = <ls_structure>.
+
+  IF <ls_structure_old> = <ls_structure>.
+*--- nothing changed
+    RETURN.
+  ENDIF.
+
+  IF iv_structure_name NE lv_structure_name.
+*--- only change fields of APPEND-structures (only once)
+    CALL FUNCTION 'DDIF_TABL_GET'
+      EXPORTING
+        name          = iv_structure_name
+      TABLES
+        dd03p_tab     = lt_dd03p
+      EXCEPTIONS
+        illegal_input = 1
+        OTHERS        = 2.
+    IF sy-subrc <> 0.
+      RETURN.
+    ENDIF.
+    lv_structure_name = iv_structure_name.
+  ENDIF.
+
+*--- find APPEND structures (only direct APPEND structures)
+  LOOP AT lt_dd03p ASSIGNING <ls_dd03p>
+                   WHERE fieldname = '.INCLU--AP'
+                     AND adminfield = '0'.
+    CREATE DATA lr_append TYPE (<ls_dd03p>-precfield).
+    ASSIGN lr_append->* TO <ls_append>.
+    MOVE-CORRESPONDING <ls_structure> TO <ls_append>.
+    MOVE-CORRESPONDING <ls_append>    TO cs_object.
+  ENDLOOP.
+
+ENDFORM.                    " FILL_ADDITIONAL_FIELDS_F16
+
+*&---------------------------------------------------------------------*
+*&      Form  FILL_ADDITIONAL_FIELDS_2_F16
+*&---------------------------------------------------------------------*
+*       new with note 1592818
+*       fill additonal fields added with APPEND structures using
+*       BAdI BADI_EAM_SINGLELEVEL_LIST_INT
+*----------------------------------------------------------------------*
+*      -->IV_STRUCTURE_NAME name of DDIC structure for ALV output
+*      <->CS_OBJECT         One line of result table
+*----------------------------------------------------------------------*
+FORM FILL_ADDITIONAL_FIELDS_2_F16 USING    iv_structure_name TYPE strukname
+                                           iv_qmnum          TYPE qmnum
+                                  CHANGING cs_object         LIKE LINE OF object_tab.
+
+  STATICS: lt_dd03p          TYPE TABLE OF dd03p,
+           lv_structure_name TYPE strukname.
+
+  DATA: lr_structure     TYPE REF TO data,
+        lr_structure_old TYPE REF TO data,
+        lr_append        TYPE REF TO data.
+
+  FIELD-SYMBOLS: <ls_structure>     TYPE any,
+                 <ls_structure_old> TYPE any,
+                 <ls_append>        TYPE any,
+                 <ls_dd03p>         TYPE dd03p.
+
+*--- only if BAdI BADI_EAM_SINGLELEVEL_LIST_int is active
+  IF cl_badi_query=>number_of_implementations( gb_badi_eam_singlelevel_int ) = 0.
+    RETURN.
+  ENDIF.
+
+*--- only use fields of output structure for BAdI call.
+  CREATE DATA lr_structure TYPE (iv_structure_name).
+  ASSIGN lr_structure->* TO <ls_structure>.
+  MOVE-CORRESPONDING cs_object TO <ls_structure>.
+
+*--- create data twice to check if something was changed by BAdI
+  CREATE DATA lr_structure_old TYPE (iv_structure_name).
+  ASSIGN lr_structure_old->* TO <ls_structure_old>.
+  <ls_structure_old> = <ls_structure>.
+
+*--- call BAdI
+  CALL BADI gb_badi_eam_singlelevel_int->fill_add_fields
+    EXPORTING
+      iv_qmnum          = iv_qmnum
+      iv_structure_name = iv_structure_name
+    CHANGING
+      cs_object         = <ls_structure>.
+
+  IF <ls_structure_old> = <ls_structure>.
+*--- nothing changed
+    RETURN.
+  ELSE.
+    MOVE-CORRESPONDING <ls_structure> TO cs_object.
+  ENDIF.
+
+ENDFORM.                    " FILL_ADDITIONAL_FIELDS_2_F16

@@ -1,0 +1,174 @@
+*&---------------------------------------------------------------------*
+*& Report  YRD_PP_SUPPLEADJUST                                         *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+*----------------------------------------------------------------------*
+* PROGRAM ID           : YRD_PP_SUPPLEADJUST
+* PROGRAM TITLE        :
+* AUTHOR               : CSC Chris
+* DATE                 : 18/06/2015
+* DEVELOPMENT ID       : EXTCCG
+* TYPE                 :
+* DESCRIPTION          :
+* T-CODE               :
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME     | TRANSPORT NO | CHANGE REFERENCE #    *
+* Initial |18/06/2015| CSC Chris| CD1K985953   | #CR3632               *
+*----------------------------------------------------------------------*
+
+REPORT  yrd_pp_suppleadjust.
+
+*&---------------------------------------------------------------------*
+*& DEFINE TABLES.                                                      *
+*&---------------------------------------------------------------------*
+TABLES: resb.
+
+*&---------------------------------------------------------------------*
+*& DEFINE INNER TABLES.                                                *
+*&---------------------------------------------------------------------*
+DATA: it_yrd_open_wo TYPE TABLE OF yrd_open_wo WITH HEADER LINE.
+DATA: it_yrd_open_wo2 TYPE TABLE OF yrd_open_wo WITH HEADER LINE.
+
+DATA: BEGIN OF it_openso OCCURS 0,
+        matnr TYPE matnr,
+        werks TYPE werks,
+        omeng TYPE omeng,
+      END OF it_openso,
+      BEGIN OF it_relwo OCCURS 0,
+        matnr TYPE matnr,
+        werks TYPE werks,
+        vmeng TYPE vmeng,
+      END OF it_relwo,
+      BEGIN OF it_stock OCCURS 0,
+        matnr TYPE matnr,
+        werks TYPE werks,
+        labst TYPE labst,
+      END OF it_stock.
+
+*&---------------------------------------------------------------------*
+*& INITIALIZATION                                                      *
+*&---------------------------------------------------------------------*
+INITIALIZATION.
+  CLEAR: it_yrd_open_wo,it_yrd_open_wo[],
+         it_yrd_open_wo2,it_yrd_open_wo2[],
+         it_openso,it_openso[],
+         it_relwo,it_relwo[],
+         it_stock,it_stock[].
+
+*&---------------------------------------------------------------------*
+*& START-OF-SELECTION                                                  *
+*&---------------------------------------------------------------------*
+START-OF-SELECTION.
+
+*(1).Clear the DB table
+  SELECT *
+    FROM yrd_open_wo
+    INTO TABLE it_yrd_open_wo.
+  DELETE yrd_open_wo FROM TABLE it_yrd_open_wo.
+  CLEAR: it_yrd_open_wo,it_yrd_open_wo[].
+
+
+*(2).List Open Work Order Shortage Component
+  SELECT *
+    FROM resb
+   WHERE werks = 'CN61'
+     AND matnr <> ''
+     AND bdmng <> 0
+     AND xloek = ''   " Item is Deleted
+     AND xwaok = ''   " Goods Movement for Reservation Allowed
+     AND kzear = ''   " Final Issue for This Reservation
+     AND xfehl = 'X'. " Missing Part
+
+    it_yrd_open_wo-aufnr = resb-aufnr. " Order Number
+    SELECT SINGLE aprio gstrs gstrp    " Order priority / Scheduled start / Basic Start Date
+      FROM afko
+      INTO (it_yrd_open_wo-aprio,it_yrd_open_wo-gstrs,it_yrd_open_wo-gstrp)
+     WHERE aufnr = it_yrd_open_wo-aufnr.
+*         AND ftrmi IS NULL.  " Release Date
+
+    it_yrd_open_wo-posnr = resb-posnr. " BOM item number
+    it_yrd_open_wo-matnr = resb-matnr. " Component Number
+    it_yrd_open_wo-werks = resb-werks. " Plant
+    it_yrd_open_wo-lgort = resb-lgort. " Plant
+    it_yrd_open_wo-bdmng = resb-bdmng. " Requirement Quantity(Reqmt Qty)
+    it_yrd_open_wo-vmeng = resb-vmeng. " Confirmed Quantity(Committed Qty)
+    " Difference Quantity = Committed Qty ¨C Required Quantity
+    it_yrd_open_wo-diffqty = it_yrd_open_wo-vmeng - it_yrd_open_wo-bdmng.
+    APPEND it_yrd_open_wo.
+    CLEAR it_yrd_open_wo.
+  ENDSELECT.
+
+
+*(3).List Component related Qty
+  it_yrd_open_wo2[] = it_yrd_open_wo[].
+  SORT it_yrd_open_wo2 BY matnr werks.
+  DELETE ADJACENT DUPLICATES FROM it_yrd_open_wo2 COMPARING matnr werks.
+
+  LOOP AT it_yrd_open_wo2.
+
+*---List Open Sales Requirement Qty
+    it_openso-matnr = it_yrd_open_wo2-matnr.
+    it_openso-werks = it_yrd_open_wo2-werks.
+    SELECT SINGLE SUM( omeng )
+     FROM vbbe
+     INTO it_openso-omeng
+    WHERE matnr = it_openso-matnr
+      AND werks = it_openso-werks.
+
+    COLLECT it_openso.
+    CLEAR it_openso.
+
+*---List Unrestricted Qty
+    it_stock-matnr = it_yrd_open_wo2-matnr.
+    it_stock-werks = it_yrd_open_wo2-werks.
+    SELECT SINGLE labst
+      FROM mard
+      INTO it_stock-labst
+     WHERE matnr = it_stock-matnr
+       AND werks = it_stock-werks.
+
+    COLLECT it_stock.
+    CLEAR it_stock.
+
+*---List Released but Non-confirmed WO Qty
+    SELECT *
+      FROM resb
+     WHERE matnr = it_yrd_open_wo2-matnr
+       AND werks = it_yrd_open_wo2-werks
+       AND lgort = it_yrd_open_wo2-lgort
+       AND bdmng <> 0
+       AND xloek = ''   " Item is Deleted
+       AND xwaok = 'X'  " Goods Movement for Reservation Allowed
+       AND kzear = ''   " Final Issue for This Reservation
+       AND xfehl = ''.  " Missing Part
+      IF sy-subrc = 0.
+        it_relwo-matnr = resb-matnr.
+        it_relwo-werks = resb-werks.
+        it_relwo-vmeng = resb-vmeng.
+        COLLECT it_relwo.
+        CLEAR it_relwo.
+      ENDIF.
+    ENDSELECT.
+
+  ENDLOOP.
+
+
+*(4).Calculated Estimated Available Qty
+*---estimated available quantity = unrestricted qty ¨C released wo qty  ¨C open sales requirement qty.
+  LOOP AT it_yrd_open_wo.
+    CLEAR: it_stock,it_relwo,it_openso.
+    READ TABLE it_stock WITH KEY matnr = it_yrd_open_wo-matnr werks = it_yrd_open_wo-werks.
+    READ TABLE it_relwo WITH KEY matnr = it_yrd_open_wo-matnr werks = it_yrd_open_wo-werks.
+    READ TABLE it_openso WITH KEY matnr = it_yrd_open_wo-matnr werks = it_yrd_open_wo-werks.
+
+    it_yrd_open_wo-avlqty = it_stock-labst - it_relwo-vmeng - it_openso-omeng.
+    MODIFY it_yrd_open_wo.
+  ENDLOOP.
+
+
+*(5).Update the DB table
+  SORT it_yrd_open_wo ASCENDING BY gstrs aufnr.
+  SORT it_yrd_open_wo STABLE BY aprio DESCENDING.
+  MODIFY yrd_open_wo FROM TABLE it_yrd_open_wo.

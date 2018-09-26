@@ -1,0 +1,2808 @@
+*&---------------------------------------------------------------------*
+*&      Form  ALV_VARIANT_F4
+*&---------------------------------------------------------------------*
+FORM alv_variant_f4 CHANGING pa_vari.
+  DATA: rs_variant LIKE disvariant.
+  DATA nof4 TYPE c.
+
+  CLEAR nof4.
+  LOOP AT SCREEN.
+    IF screen-name = 'PA_VARI'.
+      IF screen-input = 0.
+        nof4 = 'X'.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+  rs_variant-report   = g_repid.
+  rs_variant-username = sy-uname.
+  CALL FUNCTION 'REUSE_ALV_VARIANT_F4'
+    EXPORTING
+      is_variant = rs_variant
+      i_save     = 'A'
+    IMPORTING
+      es_variant = rs_variant
+    EXCEPTIONS
+      OTHERS     = 1.
+  IF sy-subrc = 0 AND nof4 EQ space.
+    pa_vari = rs_variant-variant.
+  ENDIF.
+ENDFORM.                               " ALV_VARIANT_F4
+
+*&---------------------------------------------------------------------*
+*&      Form  CB_ITEM_ALV_USERCOMM
+*&---------------------------------------------------------------------*
+FORM cb_item_alv_usercomm  USING  r_ucomm     LIKE sy-ucomm
+                                  rs_selfield TYPE slis_selfield.
+  DATA: rt_fieldcat TYPE slis_t_fieldcat_alv.
+  DATA: ld_refresh_count    TYPE i,
+        ld_memory_id(40)    TYPE c.
+  DATA: ls_variant          TYPE disvariant,
+        lt_selscreen        LIKE rsparams OCCURS 5 WITH HEADER LINE,
+        ld_memory_id2(40)   TYPE c.
+
+  CASE r_ucomm.
+    WHEN '&OL0' OR '&OAD' OR '&OLX'.
+*.... ALV change display variant. get new field catalog:
+      IF x_grid IS INITIAL.
+        CALL FUNCTION 'REUSE_ALV_LIST_LAYOUT_INFO_GET'
+          IMPORTING
+            et_fieldcat   = rt_fieldcat
+          EXCEPTIONS
+            no_infos      = 1
+            program_error = 2
+            OTHERS        = 3.
+      ELSE.
+        CALL FUNCTION 'REUSE_ALV_GRID_LAYOUT_INFO_GET'
+          IMPORTING
+            et_fieldcat   = rt_fieldcat
+          EXCEPTIONS
+            no_infos      = 1
+            program_error = 2
+            OTHERS        = 3.
+      ENDIF.
+      IF sy-subrc <> 0.
+        EXIT.
+      ENDIF.
+*     analyze new fieldcat:
+      PERFORM analyze_act_fieldcat  TABLES rt_fieldcat.
+*     treat new special fields:
+      PERFORM read_special_tables.
+    WHEN 'REFR' OR 'LTOG'.
+*.... list refresh:
+      IF x_grid IS INITIAL.
+        CALL FUNCTION 'REUSE_ALV_LIST_LAYOUT_INFO_GET'
+          IMPORTING
+            es_variant    = ls_variant
+          EXCEPTIONS
+            no_infos      = 1
+            program_error = 2
+            OTHERS        = 3.
+      ELSE.
+        CALL FUNCTION 'REUSE_ALV_GRID_LAYOUT_INFO_GET'
+          IMPORTING
+            es_variant    = ls_variant
+          EXCEPTIONS
+            no_infos      = 1
+            program_error = 2
+            OTHERS        = 3.
+      ENDIF.
+      IF sy-subrc = 0 AND NOT ls_variant-variant IS INITIAL.
+        ld_memory_id2 = g_repid.
+        WRITE '/LAYO' TO ld_memory_id2+35(5).
+        CONDENSE ld_memory_id2 NO-GAPS.
+        EXPORT layout FROM ls_variant-variant
+               TO MEMORY ID ld_memory_id2.
+      ENDIF.
+      ld_memory_id = g_repid.
+      WRITE '/REFR' TO ld_memory_id+35(5).
+      CONDENSE ld_memory_id NO-GAPS.
+      IMPORT counter TO ld_refresh_count
+             FROM MEMORY ID ld_memory_id.
+      ADD 1 TO ld_refresh_count.
+      EXPORT counter FROM ld_refresh_count
+             TO MEMORY ID ld_memory_id.
+      IF ld_refresh_count > 1.
+        LEAVE PROGRAM.
+      ENDIF.
+      WHILE ld_refresh_count > 0.
+        CLEAR ls_variant.
+        lt_selscreen[] = gt_selscreen[].
+        IMPORT layout TO ls_variant-variant
+               FROM MEMORY ID ld_memory_id2.
+        IF sy-subrc = 0 AND NOT ls_variant-variant IS INITIAL.
+          READ TABLE lt_selscreen WITH KEY selname = 'PA_VARI'.
+          IF sy-subrc = 0.
+            lt_selscreen-low = ls_variant-variant.
+            MODIFY lt_selscreen INDEX sy-tabix.
+          ENDIF.
+        ENDIF.
+        SUBMIT (g_repid) WITH SELECTION-TABLE lt_selscreen
+                         WITH FREE SELECTIONS gt_dyn_texpr
+                         WITH kd_index EQ gt_searchpattern
+                         WITH dd_index EQ gt_searchpattern
+                         WITH sd_index EQ gt_searchpattern
+                         AND RETURN.
+        CLEAR ld_refresh_count.
+        IMPORT counter TO ld_refresh_count
+               FROM MEMORY ID ld_memory_id.
+        IF ld_refresh_count > 0.
+          SUBTRACT 1 FROM ld_refresh_count.
+        ENDIF.
+        EXPORT counter FROM ld_refresh_count
+               TO MEMORY ID ld_memory_id.
+      ENDWHILE.
+      IF gd_dynp_val = 0.
+        SUBMIT (g_repid) WITH SELECTION-TABLE gt_selscreen
+                         WITH FREE SELECTIONS gt_dyn_texpr
+                         WITH kd_index EQ gt_searchpattern
+                         WITH dd_index EQ gt_searchpattern
+                         WITH sd_index EQ gt_searchpattern
+                         VIA SELECTION-SCREEN.
+      ELSE.
+        LEAVE PROGRAM.
+      ENDIF.
+
+  ENDCASE.
+
+ENDFORM.                               " CB_ITEM_ALV_USERCOMM
+
+*&---------------------------------------------------------------------*
+*&      Form  SPECIAL_FIELDS
+*&---------------------------------------------------------------------*
+FORM special_fields_init USING   rs_variant LIKE disvariant.
+  DATA: it_var_fieldcat  TYPE slis_t_fieldcat_alv WITH HEADER LINE,
+        it_max_fieldcat  TYPE slis_t_fieldcat_alv,
+        dummy_layout     TYPE slis_layout_alv.
+
+* ... get existing variant:
+  PERFORM get_existing_variant USING rs_variant.
+*... get fieldcat of initial variant:
+  PERFORM get_initial_fieldcat   TABLES it_var_fieldcat
+                                 USING  rs_variant.
+*... analyze initial fieldcat:
+  PERFORM analyze_act_fieldcat  TABLES it_var_fieldcat.
+*... read required special tables and fill item fields:
+  PERFORM read_special_tables.
+
+ENDFORM.                               " SPECIAL_FIELDS_INIT
+
+*&---------------------------------------------------------------------*
+*&      Form GET_INITIAL_FIELDCAT
+*&---------------------------------------------------------------------*
+FORM get_initial_fieldcat  TABLES rt_var_fieldcat
+                                      TYPE slis_t_fieldcat_alv
+                           USING  rs_variant LIKE disvariant.
+  DATA: it_max_fieldcat  TYPE slis_t_fieldcat_alv,
+        dummy_layout     TYPE slis_layout_alv,
+        ls_variant       TYPE disvariant,
+        ld_exit          TYPE c.
+
+  ls_variant = rs_variant.
+
+*... build maximal fieldcat:
+  CALL FUNCTION 'REUSE_ALV_FIELDCATALOG_MERGE'
+    EXPORTING
+      i_buffer_active        = 'X'
+      i_program_name         = g_repid
+      i_structure_name       = 'RFPOSXEXT'
+    CHANGING
+      ct_fieldcat            = it_max_fieldcat
+    EXCEPTIONS
+      inconsistent_interface = 1
+      program_error          = 2
+      OTHERS                 = 3.
+  IF sy-subrc <> 0.
+    MESSAGE a011.
+  ENDIF.
+*... get variant fieldcat:
+  CALL FUNCTION 'REUSE_ALV_VARIANT_SELECT'
+    EXPORTING
+      i_dialog            = ' '
+      i_user_specific     = 'X'
+      it_default_fieldcat = it_max_fieldcat
+      i_layout            = dummy_layout
+      i_buffer_active     = 'X'
+    IMPORTING
+      e_exit              = ld_exit
+      et_fieldcat         = rt_var_fieldcat[]
+    CHANGING
+      cs_variant          = ls_variant
+    EXCEPTIONS
+      wrong_input         = 1
+      fc_not_complete     = 2
+      not_found           = 3
+      program_error       = 4
+      OTHERS              = 5.
+  IF sy-subrc <> 0.
+*... take maximal fieldcat for special fields:
+    rt_var_fieldcat[] = it_max_fieldcat[].
+  ENDIF.
+
+ENDFORM.                               " GET_INITIAL_FIELDCAT
+
+*&---------------------------------------------------------------------*
+*&      Form  INIT_ADMIN_TABLES
+*&---------------------------------------------------------------------*
+FORM init_admin_tables.
+  DATA: field_n   LIKE dd03p-fieldname,
+        field_n_2 LIKE dd03p-fieldname,
+        table_n   LIKE dd03p-tabname.
+  FIELD-SYMBOLS: <fsym>.
+  DATA: ld_object       TYPE ddobjname,
+        ld_field        LIKE dfies-lfieldname,
+        ls_dfies        TYPE dfies,
+        ld_reffield(10) TYPE c.
+
+*... first get T021S:
+  SELECT * FROM t021s INTO TABLE it_t021s WHERE lstcl = 2.
+* Add field for bill of exchange problems.
+  PERFORM init_admin_tables_boe.
+  SORT it_t021s BY tname fname.
+  DELETE ADJACENT DUPLICATES FROM it_t021s COMPARING tname fname.
+*... now make other administration tables:
+  CLEAR it_spectab.
+  CLEAR it_specfld.
+  CLEAR it_movefld.
+  CLEAR it_moveref.
+  LOOP AT it_t021s.
+    CHECK NOT it_t021s-tname IS INITIAL.
+*... status table of special tables:
+    WRITE it_t021s-tname TO table_n.
+    it_spectab-tname = table_n.
+    APPEND it_spectab.
+*   expiring currencies:
+    IF it_t021s-tname = 'BSEG'.
+      ld_object = it_t021s-tname.
+      ld_field  = it_t021s-fname.
+      CALL FUNCTION 'DDIF_NAMETAB_GET'
+        EXPORTING
+          tabname    = ld_object
+          lfieldname = ld_field
+        IMPORTING
+          dfies_wa   = ls_dfies
+        EXCEPTIONS
+          not_found  = 1
+          OTHERS     = 2.
+      IF sy-subrc = 0.
+        CLEAR ld_reffield.
+        WRITE ls_dfies-reftable TO ld_reffield.
+        WRITE '-'               TO ld_reffield+4.
+        WRITE ls_dfies-reffield TO ld_reffield+5.
+        IF  ls_dfies-datatype = 'CURR'
+        AND ( ld_reffield = 'BKPF-WAERS' OR
+              ld_reffield = 'BSEG-PYCUR' ).
+          gd_expcur_bseg = 'X'.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+*... status table of field names:
+    it_specfld-tname = table_n.
+    WRITE it_t021s-fname TO field_n.
+    it_specfld-fname = field_n.
+    PERFORM extnd_fieldname USING    field_n
+                            CHANGING it_specfld-fname_2.
+    APPEND it_specfld.
+*... move map table:
+    it_movefld-tname = table_n.
+    WRITE it_t021s-fname TO field_n.
+    PERFORM extnd_fieldname USING    field_n
+                            CHANGING field_n_2.
+*   original table work area field:
+    WRITE 'WA_'   TO it_movefld-tabfld.
+    WRITE table_n TO it_movefld-tabfld+4.
+    WRITE '-'     TO it_movefld-tabfld+19.
+    WRITE field_n TO it_movefld-tabfld+20.
+    CONDENSE it_movefld-tabfld NO-GAPS.
+*   item table work area field:
+    WRITE 'IT_POS'   TO it_movefld-tabfld_2.
+    WRITE '-'        TO it_movefld-tabfld_2+19.
+    WRITE field_n_2  TO it_movefld-tabfld_2+20.
+    CONDENSE it_movefld-tabfld_2 NO-GAPS.
+    APPEND it_movefld.
+*... move reference table (parallel to move map table):
+    it_moveref-tname = it_movefld-tname.
+    ASSIGN (it_movefld-tabfld) TO <fsym>.
+    GET REFERENCE OF <fsym> INTO it_moveref-fldref.
+    ASSIGN (it_movefld-tabfld_2) TO <fsym>.
+    GET REFERENCE OF <fsym> INTO it_moveref-fldref_2.
+    APPEND it_moveref.
+*... that's it.
+  ENDLOOP.
+*... document text fields:
+  it_spectab-tname = '_TEXT'.
+  APPEND it_spectab.
+
+  DELETE ADJACENT DUPLICATES FROM it_spectab.
+
+ENDFORM.                               " INIT_ADMIN_TABLES
+
+*&---------------------------------------------------------------------*
+*&      Form  EXTND_FIELDNAME
+*&---------------------------------------------------------------------*
+FORM extnd_fieldname USING    p_fieldn
+                     CHANGING p_fieldn_ext.
+  DATA: text(40)  TYPE c.
+
+  WRITE 'U_' TO text.
+  WRITE p_fieldn TO text+2.
+  WRITE text TO p_fieldn_ext.
+
+ENDFORM.                               " EXTND_FIELDNAME
+
+*&---------------------------------------------------------------------*
+*&      Form  ANALYZE_ACT_FIELDCAT
+*&      Updating status tables it_specfld and it_spectab.
+*&---------------------------------------------------------------------*
+FORM analyze_act_fieldcat TABLES   rt_var_fieldcat
+                                       TYPE slis_t_fieldcat_alv.
+  DATA: prefix(2)  TYPE c,
+        ld_lines   TYPE i,
+        ld_count   TYPE i,
+        ld_bukrs(25) TYPE c.
+
+  STATICS ld_supress_msg(1) TYPE c.
+
+* company code with tranfer prices
+  DESCRIBE TABLE it_tp_auth LINES ld_lines.
+
+  LOOP AT rt_var_fieldcat.
+*   field displayed in variant?
+    IF rt_var_fieldcat-no_out = 'X'.
+      CONTINUE.
+    ENDIF.
+*   company code with tp
+    IF ld_lines GT 0 AND ld_supress_msg = space.
+*     tp field
+      READ TABLE it_tp_fields WITH KEY
+                             fname = rt_var_fieldcat-fieldname.
+      IF sy-subrc EQ 0.
+*       check authority
+        ld_count = 0. ld_bukrs = space.
+        LOOP AT it_tp_auth WHERE auth = space.
+          CONCATENATE ld_bukrs it_tp_auth-bukrs INTO ld_bukrs
+                                                 SEPARATED BY space.
+          ld_count = ld_count + 1.
+          IF ld_count > 3. EXIT. ENDIF.
+        ENDLOOP.
+        IF ld_count > 0.
+          ld_supress_msg = 'X'.
+          MESSAGE i036 WITH ld_bukrs.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+*   document text field?
+    IF rt_var_fieldcat-fieldname = 'TDID' OR
+       rt_var_fieldcat-fieldname = 'XTEXT'.
+      READ TABLE it_spectab WITH KEY tname = '_TEXT'.
+      IF sy-subrc = 0 AND it_spectab-tstat = space.
+        it_spectab-tstat = 'P'.
+        MODIFY it_spectab INDEX sy-tabix.
+      ENDIF.
+      CONTINUE.
+    ENDIF.
+*   special field?
+    WRITE rt_var_fieldcat-fieldname TO prefix(2).
+    IF prefix NE 'U_'.
+      CONTINUE.
+    ENDIF.
+*   check special field status table:
+    READ TABLE it_specfld WITH KEY fname_2 = rt_var_fieldcat-fieldname.
+    IF sy-subrc NE 0.
+*     horror case:
+      MESSAGE w012.
+      EXIT.
+    ENDIF.
+*   special field status = initial?
+    IF it_specfld-fstat = space.
+*     set status 'pending':
+      it_specfld-fstat = 'P'.
+      MODIFY it_specfld INDEX sy-tabix.
+*     check corresponding table status:
+      READ TABLE it_spectab WITH KEY tname = it_specfld-tname.
+      IF sy-subrc NE 0.
+*       horror case:
+        MESSAGE w012.
+        EXIT.
+      ENDIF.
+      IF it_spectab-tstat = space.
+        it_spectab-tstat = 'P'.
+        MODIFY it_spectab INDEX sy-tabix.
+      ENDIF.
+    ENDIF.
+*   Handle additional special fields for bill of exchange.
+    PERFORM analyze_act_fieldcat_boe.
+  ENDLOOP.
+
+ENDFORM.                               " ANALYZE_ACT_FIELDCAT
+
+*&---------------------------------------------------------------------*
+*&      Form  READ_SPECIAL_TABLES
+*&---------------------------------------------------------------------*
+FORM read_special_tables.
+  DATA: posindex   LIKE sy-tabix.
+
+*... check item table filled?
+  READ TABLE it_pos INDEX 1.
+  CHECK sy-subrc = 0.
+*... loop over all pending tables:
+  LOOP AT it_spectab WHERE tstat = 'P'.
+* building additional help tables for BKPF and BSEG for optimized
+* database selections.
+    PERFORM create_performance_tables USING it_spectab-tname.
+    CASE it_spectab-tname.
+      WHEN 'BKPF'.
+        PERFORM special_fields_used USING it_spectab-tname.
+        IF sy-subrc = 0.
+          PERFORM complete_bkpf.
+        ENDIF.
+      WHEN 'BSEG'.
+        PERFORM complete_bseg.
+      WHEN 'BSEGC'.
+        PERFORM special_fields_used USING it_spectab-tname.
+        IF sy-subrc = 0.
+          PERFORM complete_bsegc.
+        ENDIF.
+      WHEN 'BSEC'.
+        PERFORM complete_bsec.
+      WHEN 'BSED'.
+        PERFORM complete_bsed.
+      WHEN 'BSBV'.
+        PERFORM complete_bsbv.
+      WHEN 'PAYR'.
+        PERFORM complete_payr.
+      WHEN '_TEXT'.
+        PERFORM complete_document_text.
+    ENDCASE.
+  ENDLOOP.
+*... final bookkeeping: status of special tables & fields
+  PERFORM upd_special_status.
+
+ENDFORM.                               " READ_SPECIAL_TABLES
+
+*&---------------------------------------------------------------------*
+*&      Form  COMPLETE_BKPF
+*&---------------------------------------------------------------------*
+FORM complete_bkpf.
+
+  DATA:  ld_index  LIKE sy-tabix,
+         ld_indexh LIKE sy-tabix.
+  STATICS: sd_logsys TYPE logsystem,
+           sd_lsflag TYPE c.
+  DATA:    ld_tablename LIKE dd03p-tabname.
+
+
+  CLEAR: wa_bkpf, wa_vbkpf.
+
+  SORT it_pos STABLE BY bukrs belnr gjahr.
+
+* get logical system id once:
+  IF sd_lsflag IS INITIAL.
+    CALL FUNCTION 'OWN_LOGICAL_SYSTEM_GET'
+      IMPORTING
+        own_logical_system = sd_logsys
+      EXCEPTIONS
+        OTHERS             = 1.
+    sd_lsflag = 'X'.
+  ENDIF.
+
+  if gd_usear is initial and gd_usedb is initial.
+    gd_usedb = 'X'.
+  endif.
+
+* reading special fields from archiv infos.
+  IF gd_usear = 'X'.
+    LOOP AT gt_pos_archived ASSIGNING <gfs_pos_reduced>.
+      READ TABLE xbkpf INTO wa_bkpf
+                       WITH TABLE KEY bukrs = <gfs_pos_reduced>-bukrs
+                                      belnr = <gfs_pos_reduced>-belnr
+                                      gjahr = <gfs_pos_reduced>-gjahr.
+*   fill logical system id:
+      IF wa_bkpf-awsys IS INITIAL.
+        wa_bkpf-awsys = sd_logsys.
+      ENDIF.
+*   expiring currencies:
+      IF NOT gd_expcur_flag IS INITIAL.
+        PERFORM item_curr_convert_bkpf USING    gd_expcur_proc
+                                                pa_stida
+                                       CHANGING wa_bkpf.
+      ENDIF.
+*   fill special fields for all lines of document:
+      READ TABLE it_pos WITH KEY bukrs = wa_bkpf-bukrs
+                                 belnr = wa_bkpf-belnr
+                                 gjahr = wa_bkpf-gjahr
+                                 BINARY SEARCH.
+      IF sy-subrc EQ 0.
+        PERFORM move_special_fields USING it_spectab-tname.
+        MODIFY it_pos INDEX sy-tabix.
+        ld_index = sy-tabix + 1.
+        LOOP AT it_pos FROM ld_index.
+          IF it_pos-bukrs = wa_bkpf-bukrs AND
+             it_pos-belnr = wa_bkpf-belnr AND
+             it_pos-gjahr = wa_bkpf-gjahr.
+            PERFORM move_special_fields USING it_spectab-tname.
+            MODIFY it_pos.
+          ELSE.
+            EXIT.
+          ENDIF.
+        ENDLOOP.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+* reading special fields from database
+  IF gd_usedb = 'X'.
+*... first posted items table:
+    IF b0sg-xstan = 'X' AND NOT gt_pos_posted[] IS INITIAL.
+      SELECT       (gt_spec_fields)
+              FROM bkpf
+              INTO CORRESPONDING FIELDS OF wa_bkpf
+               FOR ALL ENTRIES IN gt_pos_posted
+                    WHERE bukrs = gt_pos_posted-bukrs
+                    AND   belnr = gt_pos_posted-belnr
+                    AND   gjahr = gt_pos_posted-gjahr.
+*   fill logical system id:
+        IF wa_bkpf-awsys IS INITIAL.
+          wa_bkpf-awsys = sd_logsys.
+        ENDIF.
+*   expiring currencies:
+        IF NOT gd_expcur_flag IS INITIAL.
+          PERFORM item_curr_convert_bkpf USING    gd_expcur_proc
+                                                  pa_stida
+                                         CHANGING wa_bkpf.
+        ENDIF.
+*   fill special fields for all lines of document:
+        READ TABLE it_pos WITH KEY bukrs = wa_bkpf-bukrs
+                                   belnr = wa_bkpf-belnr
+                                   gjahr = wa_bkpf-gjahr
+                                   BINARY SEARCH.
+        IF sy-subrc EQ 0.
+          PERFORM move_special_fields USING it_spectab-tname.
+          MODIFY it_pos INDEX sy-tabix.
+          ld_index = sy-tabix + 1.
+          LOOP AT it_pos FROM ld_index.
+            IF it_pos-bukrs = wa_bkpf-bukrs AND
+               it_pos-belnr = wa_bkpf-belnr AND
+               it_pos-gjahr = wa_bkpf-gjahr.
+              PERFORM move_special_fields USING it_spectab-tname.
+              MODIFY it_pos.
+            ELSE.
+              EXIT.
+            ENDIF.
+          ENDLOOP.
+        ENDIF.
+
+      ENDSELECT.
+    ENDIF.
+
+*... now parked items table:
+    IF b0sg-xstav = 'X' AND NOT gt_pos_parked[] IS INITIAL.
+      CLEAR wa_bkpf.
+      ld_tablename = 'VBKPF'.
+      PERFORM special_fields_modify USING ld_tablename.
+      SELECT       (gt_spec_fields)
+           FROM vbkpf
+           INTO CORRESPONDING FIELDS OF wa_bkpf
+               FOR ALL ENTRIES IN gt_pos_parked
+             WHERE bukrs = gt_pos_parked-bukrs
+               AND belnr = gt_pos_parked-belnr
+               AND gjahr = gt_pos_parked-gjahr
+               AND budat = gt_pos_parked-budat.
+*   fill logical system id:
+        IF wa_bkpf-awsys IS INITIAL.
+          wa_bkpf-awsys = sd_logsys.
+        ENDIF.
+*   expiring currencies:
+        IF NOT gd_expcur_flag IS INITIAL.
+          PERFORM item_curr_convert_bkpf USING    gd_expcur_proc
+                                                  pa_stida
+                                         CHANGING wa_bkpf.
+        ENDIF.
+*   fill special fields for all lines of document:
+        READ TABLE it_pos WITH KEY bukrs = wa_bkpf-bukrs
+                                   belnr = wa_bkpf-belnr
+                                   gjahr = wa_bkpf-gjahr
+                                   budat = wa_bkpf-budat
+                                   BINARY SEARCH.
+        IF sy-subrc EQ 0.
+          PERFORM move_special_fields USING it_spectab-tname.
+          MODIFY it_pos INDEX sy-tabix.
+          ld_index = sy-tabix + 1 .
+          LOOP AT it_pos FROM ld_index.
+            IF it_pos-bukrs = wa_bkpf-bukrs AND
+               it_pos-belnr = wa_bkpf-belnr AND
+               it_pos-gjahr = wa_bkpf-gjahr AND
+               it_pos-budat = wa_bkpf-budat.
+              PERFORM move_special_fields USING it_spectab-tname.
+              MODIFY it_pos.
+            ELSE.
+              EXIT.
+            ENDIF.
+          ENDLOOP.
+        ENDIF.
+      ENDSELECT.
+    ENDIF.
+  ENDIF.
+
+  PERFORM it_pos_sort_back TABLES it_pos.
+
+ENDFORM.                               " COMPLETE_BKPF
+
+
+*&---------------------------------------------------------------------*
+*&      Form  COMPLETE_BSEG
+*&---------------------------------------------------------------------*
+FORM complete_bseg.
+  DATA: posindex   LIKE sy-tabix.
+  DATA: ld_waers   TYPE waers.
+
+* needed for join with VBKPF and VBSEGS
+  DATA: BEGIN OF wa_vbsegs_ext.
+          INCLUDE STRUCTURE wa_vbsegs.
+  DATA:           budat LIKE vbkpf-budat,
+                  waers LIKE vbkpf-waers,
+       END OF wa_vbsegs_ext.
+
+* due to selection for parked documents
+  RANGES lt_seloption FOR vbkpf-ausbk.
+
+  CLEAR: wa_bseg, wa_vbsegd, wa_vbsegk, wa_vbsegs.
+
+* sort due to binary search
+  SORT it_pos STABLE BY bukrs belnr gjahr buzei.
+
+  if gd_usear is initial and gd_usedb is initial.
+    gd_usedb = 'X'.
+  endif.
+
+  IF gd_usear = 'X'.
+    LOOP AT gt_pos_archived ASSIGNING <gfs_pos_reduced>.
+      READ TABLE xbseg INTO wa_bseg
+                       WITH TABLE KEY bukrs = <gfs_pos_reduced>-bukrs
+                                      belnr = <gfs_pos_reduced>-belnr
+                                      gjahr = <gfs_pos_reduced>-gjahr
+                                      buzei = <gfs_pos_reduced>-buzei.
+      IF wa_bseg-shkzg = 'H'.
+        wa_bseg-menge = wa_bseg-menge * ( -1 ).
+        wa_bseg-erfmg = wa_bseg-erfmg * ( -1 ).                "1344731
+        wa_bseg-bpmng = wa_bseg-bpmng * ( -1 ).                "1344731
+        wa_bseg-nebtr = wa_bseg-nebtr * ( -1 ).
+        wa_bseg-klibt = wa_bseg-klibt * ( -1 ).                "1408344
+        wa_bseg-bdiff = wa_bseg-bdiff * ( -1 ).                "1537393
+        wa_bseg-bdif2 = wa_bseg-bdif2 * ( -1 ).                "1537393
+        wa_bseg-bdif3 = wa_bseg-bdif3 * ( -1 ).                "1537393
+        wa_bseg-rdiff = wa_bseg-rdiff * ( -1 ).                "1537393
+        wa_bseg-rdif2 = wa_bseg-rdif2 * ( -1 ).                "1537393
+        wa_bseg-rdif3 = wa_bseg-rdif3 * ( -1 ).                "1537393
+      ENDIF.
+*     invoice reference:
+      IF  wa_bseg-rebzg IS INITIAL
+      AND wa_bseg-rebzt IS INITIAL.
+        wa_bseg-rebzg = wa_bseg-belnr.
+      ENDIF.
+*     fill special fields:
+      READ TABLE it_pos WITH KEY bukrs = wa_bseg-bukrs
+                           belnr = wa_bseg-belnr
+                           gjahr = wa_bseg-gjahr
+                           buzei = wa_bseg-buzei
+                           BINARY SEARCH.
+      IF sy-subrc = 0.
+        posindex = sy-tabix.
+*       expiring currencies:
+        IF  NOT gd_expcur_flag IS INITIAL
+        AND NOT gd_expcur_bseg IS INITIAL.
+          READ TABLE xbkpf INTO wa_bkpf
+                           WITH TABLE KEY bukrs = wa_bseg-bukrs
+                                          belnr = wa_bseg-belnr
+                                          gjahr = wa_bseg-gjahr.
+          ld_waers = wa_bkpf-waers.
+          PERFORM item_curr_convert_bseg USING    gd_expcur_proc
+                                                  it_pos-hwaer
+                                                  ld_waers
+                                                  pa_stida
+                                         CHANGING wa_bseg.
+        ENDIF.
+        PERFORM move_special_fields USING it_spectab-tname.
+        MODIFY it_pos INDEX posindex.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+  IF gd_usedb = 'X'.
+*... first posted items table:
+    IF b0sg-xstan = 'X' AND NOT gt_pos_posted[] IS INITIAL.
+      SELECT * FROM bseg INTO wa_bseg FOR ALL ENTRIES IN gt_pos_posted
+                  WHERE bukrs = gt_pos_posted-bukrs
+                  AND   belnr = gt_pos_posted-belnr
+                  AND   gjahr = gt_pos_posted-gjahr
+                  AND   buzei = gt_pos_posted-buzei.
+        IF wa_bseg-shkzg = 'H'.
+          wa_bseg-menge = wa_bseg-menge * ( -1 ).
+        wa_bseg-erfmg = wa_bseg-erfmg * ( -1 ).                "1344731
+        wa_bseg-bpmng = wa_bseg-bpmng * ( -1 ).                "1344731
+          wa_bseg-nebtr = wa_bseg-nebtr * ( -1 ).
+        wa_bseg-klibt = wa_bseg-klibt * ( -1 ).                "1408344
+        wa_bseg-bdiff = wa_bseg-bdiff * ( -1 ).                "1537393
+        wa_bseg-bdif2 = wa_bseg-bdif2 * ( -1 ).                "1537393
+        wa_bseg-bdif3 = wa_bseg-bdif3 * ( -1 ).                "1537393
+        wa_bseg-rdiff = wa_bseg-rdiff * ( -1 ).                "1537393
+        wa_bseg-rdif2 = wa_bseg-rdif2 * ( -1 ).                "1537393
+        wa_bseg-rdif3 = wa_bseg-rdif3 * ( -1 ).                "1537393
+        ENDIF.
+*     invoice reference:
+        IF  wa_bseg-rebzg IS INITIAL
+        AND wa_bseg-rebzt IS INITIAL.
+          wa_bseg-rebzg = wa_bseg-belnr.
+        ENDIF.
+*     fill special fields:
+        READ TABLE it_pos WITH KEY bukrs = wa_bseg-bukrs
+                             belnr = wa_bseg-belnr
+                             gjahr = wa_bseg-gjahr
+                             buzei = wa_bseg-buzei
+                             BINARY SEARCH.
+        IF sy-subrc = 0.
+          posindex = sy-tabix.
+*       expiring currencies:
+          IF  NOT gd_expcur_flag IS INITIAL
+          AND NOT gd_expcur_bseg IS INITIAL.
+            SELECT SINGLE waers FROM bkpf INTO ld_waers
+                                WHERE bukrs = wa_bseg-bukrs
+                                AND   belnr = wa_bseg-belnr
+                                AND   gjahr = wa_bseg-gjahr.
+            PERFORM item_curr_convert_bseg USING    gd_expcur_proc
+                                                    it_pos-hwaer
+                                                    ld_waers
+                                                        pa_stida
+                                           CHANGING wa_bseg.
+          ENDIF.
+          PERFORM move_special_fields USING it_spectab-tname.
+          MODIFY it_pos INDEX posindex.
+        ENDIF.
+      ENDSELECT.
+    ENDIF.
+
+*... now parked items tables:
+    IF b0sg-xstav = 'X' AND NOT gt_pos_parked[] IS INITIAL.
+      CLEAR wa_bseg.
+      CASE it_pos-koart.
+        WHEN c_koart_ar.
+          SELECT * FROM vbsegd INTO wa_vbsegd
+                   FOR ALL ENTRIES IN gt_pos_parked
+                       WHERE ausbk = gt_pos_parked-bukrs
+                       AND   belnr = gt_pos_parked-belnr
+                       AND   gjahr = gt_pos_parked-gjahr
+                       AND   bukrs = gt_pos_parked-bukrs
+                       AND   buzei = gt_pos_parked-buzei.
+            MOVE-CORRESPONDING wa_vbsegd TO wa_bseg.
+            IF wa_bseg-shkzg = 'H'.
+              wa_bseg-menge = wa_bseg-menge * ( -1 ).
+            ENDIF.
+            READ TABLE it_pos WITH KEY bukrs = wa_bseg-bukrs
+                                 belnr = wa_bseg-belnr
+                                 gjahr = wa_bseg-gjahr
+                                 buzei = wa_bseg-buzei
+                                 BINARY SEARCH.
+            IF sy-subrc = 0.
+              posindex = sy-tabix.
+*           expiring currencies:
+              IF  NOT gd_expcur_flag IS INITIAL
+              AND NOT gd_expcur_bseg IS INITIAL.
+                SELECT SINGLE waers FROM vbkpf INTO ld_waers
+                                    WHERE ausbk = wa_bseg-bukrs
+                                    AND   bukrs = wa_bseg-bukrs
+                                    AND   belnr = wa_bseg-belnr
+                                    AND   gjahr = wa_bseg-gjahr.
+                PERFORM item_curr_convert_bseg USING    gd_expcur_proc
+                                                        it_pos-hwaer
+                                                        ld_waers
+                                                            pa_stida
+                                               CHANGING wa_bseg.
+              ENDIF.
+              PERFORM move_special_fields USING it_spectab-tname.
+              MODIFY it_pos INDEX posindex.
+            ENDIF.
+          ENDSELECT.
+        WHEN c_koart_ap.
+          SELECT * FROM vbsegk INTO wa_vbsegk
+                   FOR ALL ENTRIES IN gt_pos_parked
+                       WHERE ausbk = gt_pos_parked-bukrs
+                       AND   belnr = gt_pos_parked-belnr
+                       AND   gjahr = gt_pos_parked-gjahr
+                       AND   bukrs = gt_pos_parked-bukrs
+                       AND   buzei = gt_pos_parked-buzei.
+            MOVE-CORRESPONDING wa_vbsegk TO wa_bseg.
+            IF wa_bseg-shkzg = 'H'.
+              wa_bseg-menge = wa_bseg-menge * ( -1 ).
+            ENDIF.
+            READ TABLE it_pos WITH KEY bukrs = wa_bseg-bukrs
+                                 belnr = wa_bseg-belnr
+                                 gjahr = wa_bseg-gjahr
+                                 buzei = wa_bseg-buzei
+                                 BINARY SEARCH.
+            IF sy-subrc = 0.
+              posindex = sy-tabix.
+*           expiring currencies:
+              IF  NOT gd_expcur_flag IS INITIAL
+              AND NOT gd_expcur_bseg IS INITIAL.
+                SELECT SINGLE waers FROM vbkpf INTO ld_waers
+                                    WHERE ausbk = wa_bseg-bukrs
+                                    AND   bukrs = wa_bseg-bukrs
+                                    AND   belnr = wa_bseg-belnr
+                                    AND   gjahr = wa_bseg-gjahr.
+                PERFORM item_curr_convert_bseg USING    gd_expcur_proc
+                                                        it_pos-hwaer
+                                                        ld_waers
+                                                            pa_stida
+                                               CHANGING wa_bseg.
+              ENDIF.
+              PERFORM move_special_fields USING it_spectab-tname.
+              MODIFY it_pos INDEX posindex.
+            ENDIF.
+          ENDSELECT.
+        WHEN c_koart_gl.
+
+          LOOP AT it_pos WHERE bstat = 'V'.
+*         ausbk and bukrs is equal if buzei = 001
+            REFRESH lt_seloption.
+            CLEAR lt_seloption.
+            IF it_pos-buzei = '001'.
+              lt_seloption-sign  = 'I'.
+              lt_seloption-option = 'EQ'.
+              lt_seloption-low = it_pos-bukrs.
+              APPEND lt_seloption.
+            ENDIF.
+
+            CLEAR: wa_vbsegs_ext, wa_bseg.
+            SELECT SINGLE *
+                    INTO CORRESPONDING FIELDS OF wa_vbsegs_ext
+                    FROM vbsegs INNER JOIN vbkpf
+                    ON   vbsegs~ausbk = vbkpf~ausbk
+                    AND  vbsegs~bukrs = vbkpf~bukrs
+                    AND  vbsegs~belnr = vbkpf~belnr
+                    AND  vbsegs~gjahr = vbkpf~gjahr
+                    WHERE vbsegs~ausbk IN lt_seloption
+                    AND   vbsegs~belnr = it_pos-belnr
+                    AND   vbsegs~gjahr = it_pos-gjahr
+                    AND   vbsegs~bukrs = it_pos-bukrs
+                    AND   vbsegs~buzei = it_pos-buzei
+                    AND   vbkpf~budat  = it_pos-budat.
+
+            MOVE-CORRESPONDING wa_vbsegs_ext TO wa_bseg.
+          wa_bseg-pprct = wa_vbsegs_ext-pprctr.                "872204
+          wa_bseg-bewar = wa_vbsegs_ext-rmvct.                 "872204
+          wa_bseg-fkber_long = wa_vbsegs_ext-fkber.            "1305592
+            IF wa_bseg-shkzg = 'H'.
+              wa_bseg-menge = wa_bseg-menge * ( -1 ).
+            ENDIF.
+            READ TABLE it_pos WITH KEY bukrs = wa_bseg-bukrs
+                                 belnr = wa_bseg-belnr
+                                 gjahr = wa_bseg-gjahr
+                                 buzei = wa_bseg-buzei
+                                 budat = wa_vbsegs_ext-budat
+                                 BINARY SEARCH.
+            IF sy-subrc = 0.
+              posindex = sy-tabix.
+*           expiring currencies:
+              IF  NOT gd_expcur_flag IS INITIAL
+              AND NOT gd_expcur_bseg IS INITIAL.
+
+                PERFORM item_curr_convert_bseg USING   gd_expcur_proc
+                                                       it_pos-hwaer
+                                                    wa_vbsegs_ext-waers
+                                                            pa_stida
+                                              CHANGING wa_bseg.
+              ENDIF.
+              PERFORM move_special_fields USING it_spectab-tname.
+              MODIFY it_pos INDEX posindex.
+            ENDIF.
+          ENDLOOP.
+
+      ENDCASE.
+    ENDIF.
+  ENDIF.
+
+  PERFORM it_pos_sort_back TABLES it_pos.
+
+ENDFORM.                               " COMPLETE_BSEG
+
+
+*&---------------------------------------------------------------------*
+*&      Form  COMPLETE_BSEGC
+*&---------------------------------------------------------------------*
+FORM complete_bsegc.
+
+  CLEAR: wa_bsegc.
+  SELECT       (gt_spec_fields)
+        FROM bsegc
+        INTO CORRESPONDING FIELDS OF wa_bsegc
+         FOR ALL ENTRIES IN it_pos
+       WHERE bukrs = it_pos-bukrs
+         AND belnr = it_pos-belnr
+         AND gjahr = it_pos-gjahr
+         AND rfzei = it_pos-rfzei.
+*   fill special fields for all lines of document:
+    LOOP AT it_pos WHERE bukrs = wa_bsegc-bukrs
+                   AND   belnr = wa_bsegc-belnr
+                   AND   gjahr = wa_bsegc-gjahr
+                   AND   rfzei = wa_bsegc-rfzei.
+      PERFORM move_special_fields USING it_spectab-tname.
+      MODIFY it_pos.
+    ENDLOOP.
+  ENDSELECT.
+
+ENDFORM.                               " COMPLETE_BSEGC
+
+*&---------------------------------------------------------------------*
+*&      Form  COMPLETE_BSEC
+*&---------------------------------------------------------------------*
+FORM complete_bsec.
+  DATA: posindex   LIKE sy-tabix.
+  DATA: f_bsec_sel(40) TYPE c,
+        lt_bsec_sel    LIKE TABLE OF f_bsec_sel,
+        lt_bsec        LIKE wa_bsec OCCURS 0 WITH HEADER LINE,
+        lv_len         TYPE i.
+
+  CLEAR: wa_bsec, wa_vbsec.
+
+*... posted items:
+*... NOTE 798255
+  IF NOT it_pos[] IS INITIAL.
+    FREE lt_bsec_sel.
+    APPEND 'BUKRS' TO lt_bsec_sel.
+    APPEND 'BELNR' TO lt_bsec_sel.
+    APPEND 'GJAHR' TO lt_bsec_sel.
+    APPEND 'BUZEI' TO lt_bsec_sel.
+    SELECT fname FROM t021s APPENDING TABLE lt_bsec_sel
+                                         WHERE lstcl = 2
+                                           AND tname = 'BSEC'.
+
+    SELECT (lt_bsec_sel) FROM bsec
+      INTO CORRESPONDING FIELDS OF TABLE lt_bsec
+      FOR ALL ENTRIES IN it_pos
+                WHERE bukrs = it_pos-bukrs
+                AND   belnr = it_pos-belnr
+                AND   gjahr = it_pos-gjahr
+                AND   buzei = it_pos-buzei.
+
+    SORT lt_bsec BY bukrs belnr gjahr buzei.
+
+    LOOP AT it_pos.
+      posindex = sy-tabix.
+      READ TABLE lt_bsec INTO wa_bsec
+        WITH KEY bukrs = it_pos-bukrs
+                 belnr = it_pos-belnr
+                 gjahr = it_pos-gjahr
+                 buzei = it_pos-buzei
+        BINARY SEARCH.
+      IF sy-subrc = 0.
+        PERFORM move_special_fields USING it_spectab-tname.
+        MODIFY it_pos INDEX posindex.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+*... NOTE 798255
+
+*... parked items:
+  IF b0sg-xstav = 'X'.
+    CLEAR wa_bsec.
+    SELECT * FROM vbsec INTO wa_vbsec FOR ALL ENTRIES IN it_pos
+                  WHERE ausbk = it_pos-bukrs
+                  AND   belnr = it_pos-belnr
+                  AND   gjahr = it_pos-gjahr
+                  AND   buzei = it_pos-buzei.
+      MOVE-CORRESPONDING wa_vbsec TO wa_bsec.
+      wa_bsec-bukrs = wa_vbsec-ausbk.
+      READ TABLE it_pos WITH KEY bukrs = wa_bsec-bukrs
+                               belnr = wa_bsec-belnr
+                               gjahr = wa_bsec-gjahr
+                               buzei = wa_bsec-buzei.
+      IF sy-subrc = 0.
+        posindex = sy-tabix.
+        PERFORM move_special_fields USING it_spectab-tname.
+        MODIFY it_pos INDEX posindex.
+      ENDIF.
+    ENDSELECT.
+  ENDIF.
+
+ENDFORM.                               " COMPLETE_BSEC
+
+*&---------------------------------------------------------------------*
+*&      Form  COMPLETE_BSED
+*&---------------------------------------------------------------------*
+FORM complete_bsed.
+  DATA: posindex   LIKE sy-tabix.
+
+  CLEAR: wa_bsed.
+  SELECT * FROM bsed INTO wa_bsed FOR ALL ENTRIES IN it_pos
+                WHERE bukrs = it_pos-bukrs
+                AND   belnr = it_pos-belnr
+                AND   gjahr = it_pos-gjahr
+                AND   buzei = it_pos-buzei.
+    READ TABLE it_pos WITH KEY bukrs = wa_bsed-bukrs
+                             belnr = wa_bsed-belnr
+                             gjahr = wa_bsed-gjahr
+                             buzei = wa_bsed-buzei.
+    IF sy-subrc = 0.
+      posindex = sy-tabix.
+      PERFORM move_special_fields USING it_spectab-tname.
+*     Handle additional special fields for bill of exchange.
+      PERFORM move_special_fields_boe.
+      MODIFY it_pos INDEX posindex.
+    ENDIF.
+  ENDSELECT.
+
+ENDFORM.                               " COMPLETE_BSED
+
+*&---------------------------------------------------------------------*
+*&      Form  COMPLETE_PAYR
+*&---------------------------------------------------------------------*
+FORM complete_payr.
+  DATA: number LIKE bseg-augbl.
+
+  LOOP AT it_pos.
+    CLEAR: wa_payr.
+    SHIFT wa_payr-voidr BY 2 PLACES.
+*   prospects of finding something in PAYR:
+    IF it_pos-koart CO 'DK'.
+      IF it_pos-augbl IS INITIAL OR
+         it_pos-shkzg EQ 'S' AND it_pos-xzahl EQ 'X'.
+        number = it_pos-belnr.
+      ELSE.
+        number = it_pos-augbl.
+      ENDIF.
+    ELSE.
+      number = it_pos-belnr.
+    ENDIF.
+    CALL FUNCTION 'GET_CHECK_INFORMATION'
+      EXPORTING
+        i_augbl = number
+        i_augdt = it_pos-augdt
+        i_belnr = it_pos-belnr
+        i_bukrs = it_pos-bukrs
+        i_gjahr = it_pos-gjahr
+        i_shkzg = it_pos-shkzg
+        i_xzahl = it_pos-xzahl
+        i_call  = space
+        i_koart = it_pos-koart
+      IMPORTING
+        e_payr  = wa_payr
+      EXCEPTIONS
+        OTHERS  = 4.
+    IF wa_payr-voidr IS INITIAL.
+      SHIFT wa_payr-voidr BY 2 PLACES.
+    ENDIF.
+    PERFORM move_special_fields USING it_spectab-tname.
+    MODIFY it_pos.
+  ENDLOOP.
+
+ENDFORM.                               " COMPLETE_PAYR
+
+*&---------------------------------------------------------------------*
+*&      Form  COMPLETE_BSBV
+*&---------------------------------------------------------------------*
+FORM complete_bsbv.
+
+  LOOP AT it_pos.
+    CLEAR: wa_bsbv.
+    CALL FUNCTION 'VALUATION_FETCH_BSBV'
+      EXPORTING
+        i_bukrs = it_pos-bukrs
+        i_gjahr = it_pos-gjahr
+        i_belnr = it_pos-belnr
+        i_buzei = it_pos-buzei
+        i_kunnr = it_pos-konto
+      IMPORTING
+        e_bsbv  = wa_bsbv.
+    if it_pos-shkzg = 'H'.                                     "1002712
+      wa_bsbv-bwshb1 = wa_bsbv-bwshb1 * ( -1 ).                "1002712
+      wa_bsbv-bwshb2 = wa_bsbv-bwshb2 * ( -1 ).                "1002712
+      wa_bsbv-bwshb3 = wa_bsbv-bwshb3 * ( -1 ).                "1002712
+      wa_bsbv-bwshb4 = wa_bsbv-bwshb4 * ( -1 ).                "1002712
+      wa_bsbv-bwshb5 = wa_bsbv-bwshb5 * ( -1 ).                "1002712
+      wa_bsbv-bwshb6 = wa_bsbv-bwshb6 * ( -1 ).                "1002712
+    endif.                                                     "1002712
+    PERFORM move_special_fields USING it_spectab-tname.
+    MODIFY it_pos.
+  ENDLOOP.
+
+ENDFORM.                               " COMPLETE_BSBV
+
+*&---------------------------------------------------------------------*
+*&      Form  MOVE_SPECIAL_FIELDS
+*&---------------------------------------------------------------------*
+FORM move_special_fields  USING  p_tname LIKE dd03p-tabname.
+  FIELD-SYMBOLS: <fs_sp_tab>, <fs_it_pos>.
+
+  LOOP AT it_moveref WHERE tname = p_tname.
+    ASSIGN it_moveref-fldref->*   TO <fs_sp_tab>.
+    ASSIGN it_moveref-fldref_2->* TO <fs_it_pos>.
+    MOVE <fs_sp_tab> TO <fs_it_pos>.
+  ENDLOOP.
+
+ENDFORM.                               " MOVE_SPECIAL_FIELDS
+
+*&---------------------------------------------------------------------*
+*&      Form  UPD_SPECIAL_STATUS
+*&---------------------------------------------------------------------*
+FORM upd_special_status.
+
+*... special table status: pending -> processed
+  LOOP AT it_spectab WHERE tstat = 'P'.
+    it_spectab-tstat = 'X'.
+    MODIFY it_spectab.
+*... corresponding special field status: ? -> processed
+    LOOP AT it_specfld WHERE tname = it_spectab-tname.
+      it_specfld-fstat = 'X'.
+      MODIFY it_specfld.
+    ENDLOOP.
+  ENDLOOP.
+
+ENDFORM.                               " UPD_SPECIAL_STATUS
+
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_ITEM_OK
+*&---------------------------------------------------------------------*
+FORM check_item_ok USING    p_norm
+                            p_shbv
+                            p_merk
+                            p_park
+                            p_item    LIKE rfposxext
+                   CHANGING p_okay.
+
+  CLEAR p_okay.
+* normal document:
+  IF p_norm = 'X'.
+    IF ( p_item-bstat = space ) AND ( p_item-umskz = space ).
+      p_okay = 'X'.
+    ENDIF.
+  ENDIF.
+* SHB item:
+  IF p_shbv = 'X'.
+    IF ( p_item-umskz NE space ) AND ( p_item-bstat NE 'S' ) AND
+       ( p_item-bstat NE 'V' )   AND ( p_item-bstat NE 'W' ) AND
+       ( p_item-bstat NE 'Z' ).
+      p_okay = 'X'.
+    ENDIF.
+  ENDIF.
+* Merkposten:
+  IF p_merk = 'X'.
+    IF p_item-bstat = 'S'.
+      p_okay = 'X'.
+    ENDIF.
+  ENDIF.
+* parked document:
+  IF p_park = 'X'.
+    IF ( p_item-bstat = 'V' ) OR ( p_item-bstat = 'W' ).
+      p_okay = 'X'.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                               " CHECK_ITEM_OK
+
+*&---------------------------------------------------------------------*
+*&      Form  INIT_KKCURR_TABLE
+*&---------------------------------------------------------------------*
+FORM init_kkcurr_table.
+  SELECT kkber waers FROM t014 INTO it_kkcurr.
+    INSERT table it_kkcurr.
+  ENDSELECT.
+ENDFORM.                               " INIT_KKCURR_TABLE
+
+*&---------------------------------------------------------------------*
+*&      Form  ITEM_CURRENCY_FIELDS
+*&---------------------------------------------------------------------*
+FORM item_currency_fields.
+  wa_pos-hwae2 = wa_x001-hwae2.
+  wa_pos-hwae3 = wa_x001-hwae3.
+  READ TABLE it_kkcurr WITH KEY kkber = wa_pos-kkber
+                       BINARY SEARCH.
+  IF sy-subrc = 0.
+    wa_pos-kkbwr = it_kkcurr-curry.
+  ENDIF.
+ENDFORM.                               " ITEM_CURRENCY_FIELDS
+
+*&---------------------------------------------------------------------*
+*&      Form  ACCTAB_FILL
+*&---------------------------------------------------------------------*
+FORM fill_acct_table  USING  p_koart LIKE rfepk-koart
+                             p_konto LIKE rfepk-konto
+                             p_bukrs LIKE rfepk-bukrs
+                             p_refkt LIKE rfepk-refkt
+                             p_name1 LIKE rfepk-name1
+                             p_sakan LIKE rfepk-sakan.
+
+  CLEAR: it_accts.
+  it_accts-konto = p_konto.
+  it_accts-bukrs = p_bukrs.
+  it_accts-koart = p_koart.
+  it_accts-refkt = p_refkt.
+  it_accts-name1 = p_name1.
+  it_accts-sakan = p_sakan.
+  APPEND it_accts.
+
+ENDFORM.                    "fill_acct_table
+
+*&---------------------------------------------------------------------*
+*&      Form  COMTAB_FILL
+*&---------------------------------------------------------------------*
+FORM fill_comp_table  USING  p_bukrs LIKE rfepb-bukrs
+                             p_waers LIKE rfepb-waers
+                             p_kkber LIKE rfepb-kkber.
+
+  CLEAR: it_comps.
+  CALL FUNCTION 'FI_PERIOD_DETERMINE'
+       EXPORTING
+            i_budat        = sy-datlo
+            i_bukrs        = p_bukrs
+*           I_PERIV        = ' '
+*           I_GJAHR        = 0000
+*           I_MONAT        = 00
+*           X_XMO16        = ' '
+       IMPORTING
+            e_gjahr        = it_comps-gjahr
+            .
+  IF sy-subrc NE 0.
+  ENDIF.
+  it_comps-bukrs = p_bukrs.
+  it_comps-waers = p_waers.
+  it_comps-kkber = p_kkber.
+  APPEND it_comps.
+ENDFORM.                    "fill_comp_table
+
+*&---------------------------------------------------------------------*
+*&      Form  ITEM_CHECK_APPEND
+*&---------------------------------------------------------------------*
+FORM item_check_append.
+  DATA: gtext(60)    TYPE c,
+        igui         TYPE i.
+  DATA: ld_shkzg     LIKE bseg-shkzg.
+  CONSTANTS:
+        ldc_debit    LIKE bseg-shkzg VALUE 'S',
+        ldc_credit   LIKE bseg-shkzg VALUE 'H'.
+
+  CHECK: wa_pos-bwwrt IN so_bwwrt,
+         wa_pos-bwwr2 IN so_bwwr2,
+         wa_pos-bwwr3 IN so_bwwr3,
+         wa_pos-dmshb IN so_dmshb,
+         wa_pos-hwaer IN so_hwaer,
+         wa_pos-dmbe2 IN so_dmbe2,
+         wa_pos-hwae2 IN so_hwae2,
+         wa_pos-dmbe3 IN so_dmbe3,
+         wa_pos-hwae3 IN so_hwae3,
+         wa_pos-faedt IN so_faedt,
+         wa_pos-jamon IN so_jamon,
+         wa_pos-koart IN so_koart.
+
+  CHECK: wa_pos-qbshb IN so_qbshb,
+         wa_pos-qsfbt IN so_qsfbt,
+         wa_pos-qsshb IN so_qsshb,
+         wa_pos-skfbt IN so_skfbt,
+         wa_pos-wskto IN so_wskto,
+         wa_pos-sknto IN so_sknto,
+         wa_pos-verz1 IN so_verz1,
+         wa_pos-verzn IN so_verzn,
+         wa_pos-wrshb IN so_wrshb,
+         wa_pos-pswsl IN so_waers,
+         wa_pos-zaldt IN so_zaldt,
+         wa_pos-zinsz IN so_zinsz.
+
+  CHECK: wa_pos-askto IN so_askto,
+         wa_pos-kurse IN so_kurse,
+         wa_pos-kkbwr IN so_kkbwr.
+
+  CHECK: wa_pos-gsber IN so_gsber.
+
+* check debit/credit flag according to negative posting:
+  IF wa_pos-xnegp IS INITIAL.
+    ld_shkzg = wa_pos-shkzg.
+  ELSE.
+    IF wa_pos-shkzg = ldc_debit.
+      ld_shkzg = ldc_credit.
+    ELSE.
+      ld_shkzg = ldc_debit.
+    ENDIF.
+  ENDIF.
+  CHECK: ld_shkzg IN so_shkzg.
+
+  MOVE-CORRESPONDING wa_pos TO wa_pos2.
+  APPEND  wa_pos2 TO it_pos.
+
+* number of selected items on gui:
+  igui = sy-tabix MOD c_guicnt.
+  IF igui = 0.
+    WRITE sy-tabix TO gtext+0.
+    CONDENSE gtext.
+    WRITE text-008 TO gtext+20.
+    CONDENSE gtext.
+    CALL FUNCTION 'SAPGUI_PROGRESS_INDICATOR'
+      EXPORTING
+        text = gtext.
+  ENDIF.
+
+ENDFORM.                               " ITEM_CHECK_APPEND
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_GENERAL_PARAM
+*&---------------------------------------------------------------------*
+FORM get_general_param.
+  DATA: charh(16)   TYPE c,
+        ld_num(16)  TYPE n.
+  DATA: ls_rfopt  TYPE rfopt.
+  DATA: ld_parid TYPE usr05-parid.
+
+*... get checkbox stuff depending on acc.type:
+  CASE sy-repid.
+    WHEN c_repid_ar.
+      GET PARAMETER ID 'FIT_X_AR' FIELD charh.
+      GET PARAMETER ID 'FIT_ALV_AR' FIELD pa_vari.
+      ld_parid = 'FIT_ALV_AR'.
+    WHEN c_repid_ap.
+      GET PARAMETER ID 'FIT_X_AP' FIELD charh.
+      GET PARAMETER ID 'FIT_ALV_AP' FIELD pa_vari.
+      ld_parid = 'FIT_ALV_AP'.
+    WHEN c_repid_gl.
+      GET PARAMETER ID 'FIT_X_GL' FIELD charh.
+      GET PARAMETER ID 'FIT_ALV_GL' FIELD pa_vari.
+      ld_parid = 'FIT_ALV_GL'.
+    WHEN OTHERS.
+*     horror case!
+      EXIT.
+  ENDCASE.
+  IF NOT charh IS INITIAL.
+    x_norm = charh(1).
+    x_shbv = charh+1(1).
+    x_merk = charh+2(1).
+    x_park = charh+3(1).
+    x_apar = charh+4(1).
+  ENDIF.
+
+*...changing of pa_vari (default value FIT_ALV_**)
+  GET PARAMETER ID 'FOP' FIELD ls_rfopt.
+  IF NOT ls_rfopt-xarbv IS INITIAL.
+    SELECT SINGLE parva FROM usr05 INTO (pa_vari)
+                        WHERE bname = sy-uname
+                        AND parid = ld_parid.
+    IF sy-subrc <> 0.
+      CLEAR pa_vari.
+    ENDIF.
+  ENDIF.
+
+*... get item number limit:
+  GET PARAMETER ID 'FIT_X_NMAX' FIELD ld_num.
+  IF ld_num CO ' 0123456789'.
+    pa_nmax = ld_num.
+  ENDIF.
+
+ENDFORM.                               " GET_GENERAL_PARAM
+
+*&---------------------------------------------------------------------*
+*&      Form  SET_GENERAL_PARAM
+*&---------------------------------------------------------------------*
+FORM set_general_param.
+
+  DATA: ls_rfopt  TYPE rfopt.
+  DATA: charh(16) TYPE c,
+        ld_num(16)  TYPE n,
+        ls_usr05  LIKE usr05.
+  DATA: ld_refresh_count   TYPE i,
+        ld_memory_id(40)   TYPE c.
+
+  CHECK sy-calld IS INITIAL.
+  CHECK sy-tcode CP 'ZFBL+N' OR
+      ( sy-tcode CP 'S+38' AND sy-repid CP 'ZFTM_RFITEM++' ) OR
+      ( sy-tcode EQ 'SE80' AND sy-repid CP 'ZFTM_RFITEM++' ).
+
+  charh(1)   = x_norm.
+  charh+1(1) = x_shbv.
+  charh+2(1) = x_merk.
+  charh+3(1) = x_park.
+  charh+4(1) = x_apar.
+* if in refresh call, then do not update layout parameter:
+  ld_memory_id = sy-repid.
+  WRITE '/REFR' TO ld_memory_id+35(5).
+  CONDENSE ld_memory_id NO-GAPS.
+  IMPORT counter TO ld_refresh_count
+         FROM MEMORY ID ld_memory_id.
+  CASE sy-repid.
+    WHEN c_repid_ar.
+      SET PARAMETER ID 'FIT_X_AR'   FIELD charh.
+      IF ld_refresh_count = 0.
+        GET PARAMETER ID 'FOP' FIELD ls_rfopt.
+        IF ls_rfopt-xarbv IS INITIAL.
+          SET PARAMETER ID 'FIT_ALV_AR' FIELD pa_vari.
+          WRITE 'FIT_ALV_AR' TO ls_usr05-parid.
+        ELSE.
+          SET PARAMETER ID 'FIT_ALV_AR' FIELD space.
+        ENDIF.
+      ENDIF.
+    WHEN c_repid_ap.
+      SET PARAMETER ID 'FIT_X_AP'   FIELD charh.
+      IF ld_refresh_count = 0.
+        GET PARAMETER ID 'FOP' FIELD ls_rfopt.
+        IF ls_rfopt-xarbv IS INITIAL.
+          SET PARAMETER ID 'FIT_ALV_AP' FIELD pa_vari.
+          WRITE 'FIT_ALV_AP' TO ls_usr05-parid.
+        ELSE.
+          SET PARAMETER ID 'FIT_ALV_AP' FIELD space.
+        ENDIF.
+      ENDIF.
+    WHEN c_repid_gl.
+      SET PARAMETER ID 'FIT_X_GL'   FIELD charh.
+      IF ld_refresh_count = 0.
+        GET PARAMETER ID 'FOP' FIELD ls_rfopt.
+        IF ls_rfopt-xarbv IS INITIAL.
+          SET PARAMETER ID 'FIT_ALV_GL' FIELD pa_vari.
+          WRITE 'FIT_ALV_GL' TO ls_usr05-parid.
+        ELSE.
+          SET PARAMETER ID 'FIT_ALV_GL' FIELD space.
+        ENDIF.
+      ENDIF.
+    WHEN OTHERS.
+*     horror case!
+      EXIT.
+  ENDCASE.
+  IF ld_refresh_count = 0.
+    GET PARAMETER ID 'FOP' FIELD ls_rfopt.
+    IF ls_rfopt-xarbv IS INITIAL.
+      ls_usr05-bname = sy-uname.
+      WRITE pa_vari TO ls_usr05-parva.
+      IF ls_usr05-parva IS INITIAL.
+        DELETE FROM usr05 WHERE bname = ls_usr05-bname
+                          AND   parid = ls_usr05-parid.
+      ELSE.
+        MODIFY usr05 FROM ls_usr05.
+      ENDIF.
+      COMMIT WORK.
+    ENDIF.
+  ENDIF.
+  ld_num = pa_nmax.
+  SET PARAMETER ID 'FIT_X_NMAX' FIELD ld_num.
+
+ENDFORM.                               " SET_GENERAL_PARAM
+
+*&---------------------------------------------------------------------*
+*&      Form  SAVE_ALL_SELECTIONS
+*&---------------------------------------------------------------------*
+FORM save_all_selections.
+
+*... set pa_cent finally:
+  PERFORM set_pa_cent.
+
+*... get report selection-screen selections:
+  CALL FUNCTION 'RS_REFRESH_FROM_SELECTOPTIONS'
+    EXPORTING
+      curr_report     = g_repid
+    IMPORTING
+      sp              = gt_searchpattern
+    TABLES
+      selection_table = gt_selscreen
+    EXCEPTIONS
+      not_found       = 1
+      no_report       = 2
+      OTHERS          = 3.
+  IF sy-subrc > 1.
+    EXIT.
+  ENDIF.
+*... get report dynamic selections:
+  CALL FUNCTION 'RS_REFRESH_FROM_DYNAMICAL_SEL'
+    EXPORTING
+      curr_report        = g_repid
+      mode_write_or_move = 'M'
+    IMPORTING
+      p_trange           = gt_dyn_trange
+    EXCEPTIONS
+      not_found          = 1
+      wrong_type         = 2
+      OTHERS             = 3.
+  IF sy-subrc > 1.
+    EXIT.
+  ENDIF.
+  CALL FUNCTION 'FREE_SELECTIONS_RANGE_2_EX'
+    EXPORTING
+      field_ranges = gt_dyn_trange
+    IMPORTING
+      expressions  = gt_dyn_texpr.
+
+ENDFORM.                               " SAVE_ALL_SELECTIONS
+
+*&---------------------------------------------------------------------*
+*&      Form  SET_PA_CENT
+*&---------------------------------------------------------------------*
+FORM set_pa_cent.
+  DATA: lb_cent_filled TYPE c,
+        lb_cent_empty  TYPE c.
+
+* already non initial => exit:
+  CHECK pa_cent IS INITIAL.
+* no branch/central entries => exit:
+  READ TABLE it_central INDEX 1.
+  CHECK sy-subrc = 0.
+* check for either filled or empty central entries:
+  LOOP AT it_central WHERE NOT central IS INITIAL.
+    lb_cent_filled = c_true.
+    EXIT.
+  ENDLOOP.
+  LOOP AT it_central WHERE central IS INITIAL.
+    lb_cent_empty = c_true.
+    EXIT.
+  ENDLOOP.
+  IF lb_cent_filled NE lb_cent_empty.
+*   pure case:
+    IF lb_cent_filled = c_true.
+*     all filled, none empty
+      pa_cent = 'Y'.
+    ELSE.
+*     none filled, all empty
+      pa_cent = 'N'.
+    ENDIF.
+  ELSE.
+*   mixed case: prompt user
+    CLEAR pa_cent.
+  ENDIF.
+
+ENDFORM.                               " SET_PA_CENT
+
+
+*&---------------------------------------------------------------------*
+*&      Form  display_grid_or_classic
+*&---------------------------------------------------------------------*
+FORM display_grid_or_classic.
+  DATA: ld_param    TYPE c.
+
+*... set list display type depending on parameters:
+  CASE pa_grid.
+    WHEN 'Y'.
+      x_grid = c_x.
+    WHEN 'N'.
+      CLEAR x_grid.
+    WHEN OTHERS.
+      GET PARAMETER ID 'FIT_ALVC' FIELD ld_param.
+      IF NOT ld_param IS INITIAL.
+        x_grid = c_x.
+      ELSE.
+        CLEAR x_grid.
+      ENDIF.
+  ENDCASE.
+
+*... if programm is running in batch, choose ALV list.
+  IF sy-batch = 'X'.
+    CLEAR x_grid.
+  ENDIF.
+
+ENDFORM.                               " display_grid_or_classic
+
+*&---------------------------------------------------------------------*
+*&      Form  start_again
+*&---------------------------------------------------------------------*
+FORM start_again.
+
+  MESSAGE s033.
+  SUBMIT (g_repid) WITH SELECTION-TABLE gt_selscreen
+                   WITH FREE SELECTIONS gt_dyn_texpr
+                   WITH kd_index EQ gt_searchpattern
+                   WITH dd_index EQ gt_searchpattern
+                   WITH sd_index EQ gt_searchpattern
+                   VIA SELECTION-SCREEN.
+
+ENDFORM.                               " start_again
+
+*&---------------------------------------------------------------------*
+*&      Form  MAKE_FIELDCATALOG
+*&---------------------------------------------------------------------*
+FORM make_fieldcatalog.
+  DATA: lt_dfies_rfposx   LIKE dfies OCCURS  50 WITH HEADER LINE,
+        lt_dfies_bsix     LIKE dfies OCCURS 100 WITH HEADER LINE,
+        lt_duplicates     TYPE tpit_t_fname WITH HEADER LINE,
+        ld_fname          LIKE dfies-fieldname,
+        ld_name_bsix      LIKE dcobjdef-name,
+        lt_fmrfc          LIKE fmrfc OCCURS 1.
+  data: ld_act_imp_ch_data type c.                             "1496480
+  data: ld_ref_to_ch_data  type ref to if_ex_fi_items_ch_data. "1496480
+
+*...define icon fields:
+
+  CLEAR gt_fieldcat.
+  gt_fieldcat-fieldname = 'SYM_AUGP'.
+  gt_fieldcat-symbol    = 'X'.
+  APPEND gt_fieldcat.
+  CLEAR gt_fieldcat.
+  gt_fieldcat-fieldname = 'ICO_AUGP'.
+  gt_fieldcat-icon      = 'X'.
+  APPEND gt_fieldcat.
+  CLEAR gt_fieldcat.
+  gt_fieldcat-fieldname = 'ICO_DUE'.
+  gt_fieldcat-icon      = 'X'.
+  APPEND gt_fieldcat.
+  CLEAR gt_fieldcat.
+  gt_fieldcat-fieldname = 'ICO_DUE1'.
+  gt_fieldcat-icon      = 'X'.
+  APPEND gt_fieldcat.
+
+*...define technical and obsolete fields (static):
+
+  CLEAR gt_fieldcat.
+  gt_fieldcat-fieldname = 'ACTIV'.
+  gt_fieldcat-tech      = 'X'.
+  APPEND gt_fieldcat.
+  CLEAR gt_fieldcat.
+  gt_fieldcat-fieldname = 'STAKZ'.
+  gt_fieldcat-tech      = 'X'.
+  APPEND gt_fieldcat.
+  CLEAR gt_fieldcat.
+  gt_fieldcat-fieldname = 'XAUGP'.
+  gt_fieldcat-tech      = 'X'.
+  APPEND gt_fieldcat.
+  CLEAR gt_fieldcat.
+  gt_fieldcat-fieldname = 'COLOR'.
+  gt_fieldcat-tech      = 'X'.
+  APPEND gt_fieldcat.
+  CLEAR gt_fieldcat.
+  gt_fieldcat-fieldname = 'XZAHL'.
+  gt_fieldcat-tech      = 'X'.
+  APPEND gt_fieldcat.
+* DLA long procurement number longnum  ERP05
+  DATA:  cl_change TYPE REF TO /sappspro/cl_numbers,
+         lf_active TYPE boolean.
+  CREATE OBJECT cl_change.
+  CALL METHOD cl_change->is_active
+    RECEIVING
+      rv_active = lf_active.
+* hide LONGNUM if DLA is not active
+  IF lf_active = space.
+    CLEAR gt_fieldcat.
+    gt_fieldcat-fieldname = 'LONGNUM'.
+    gt_fieldcat-tech      = 'X'.
+    APPEND gt_fieldcat.
+  ENDIF.
+* hide GKONT and GKART, if OPEN FI exit 1650 not used:
+  CALL FUNCTION 'BF_FUNCTIONS_FIND'
+    EXPORTING
+      i_event       = '00001650'
+    TABLES
+      t_fmrfc       = lt_fmrfc
+    EXCEPTIONS
+      nothing_found = 1
+      OTHERS        = 2.
+  IF sy-subrc NE 0.
+*   if OpenFI not defined, check for BADI FI_ITEMS_CH_DATA     "1496480
+    call method cl_exithandler=>get_instance                   "1496480
+      EXPORTING                                                "1496480
+        exit_name              = 'FI_ITEMS_CH_DATA'            "1496480
+        null_instance_accepted = 'X'                           "1496480
+      IMPORTING                                                "1496480
+        act_imp_existing       = ld_act_imp_ch_data            "1496480
+      CHANGING                                                 "1496480
+        instance               = ld_ref_to_ch_data.            "1496480
+    if ld_act_imp_ch_data is initial.                          "1496480
+      clear gt_fieldcat.                                       "1496480
+      gt_fieldcat-fieldname = 'GKONT'.                         "1496480
+      gt_fieldcat-tech      = 'X'.                             "1496480
+      append gt_fieldcat.                                      "1496480
+      clear gt_fieldcat.                                       "1496480
+      gt_fieldcat-fieldname = 'GKART'.                         "1496480
+      gt_fieldcat-tech      = 'X'.                             "1496480
+      append gt_fieldcat.                                      "1496480
+    endif.                                                     "1496480
+  ENDIF.
+
+*...define obsolete fields (dynamic):
+
+  TRY.                                                         "1833229
+      CALL FUNCTION 'PSM_FM_F15_CORE_RFITEM_FCAT'              "1833229
+        CHANGING                                               "1833229
+          ct_fieldcat = gt_fieldcat[].                         "1833229
+    CATCH cx_sy_dyn_call_illegal_func.                         "1833229
+*     FUNCTION not existing yet/inactive -> OK                 "1833229
+  ENDTRY.                                                      "1833229
+
+* check for existence of special fields:
+  READ TABLE it_t021s INDEX 1.
+  CHECK sy-subrc = 0.
+
+* get RFPOSX field list:
+  CALL FUNCTION 'DDIF_NAMETAB_GET'
+       EXPORTING
+            tabname     = 'RFPOSX'
+       TABLES
+*           X031L_TAB   =
+            dfies_tab   = lt_dfies_rfposx
+       EXCEPTIONS
+            not_found   = 1
+            OTHERS      = 2
+            .
+  CHECK sy-subrc = 0.
+
+* collect duplicates = special fields which are contained in RFPOSX:
+  LOOP AT it_t021s.
+    CHECK NOT it_t021s-tname IS INITIAL.
+    READ TABLE lt_dfies_rfposx WITH KEY
+                               fieldname = it_t021s-fname.
+    CHECK sy-subrc = 0.
+    lt_duplicates-fname = it_t021s-fname.
+    APPEND lt_duplicates.
+  ENDLOOP.
+
+* found duplicates?
+  READ TABLE lt_duplicates INDEX 1.
+  CHECK sy-subrc = 0.
+
+* get BSIx field list:
+  CASE g_repid.
+    WHEN c_repid_ar.
+      ld_name_bsix = 'BSID'.
+    WHEN c_repid_ap.
+      ld_name_bsix = 'BSIK'.
+    WHEN c_repid_gl.
+      ld_name_bsix = 'BSIS'.
+  ENDCASE.
+  CALL FUNCTION 'DDIF_NAMETAB_GET'
+       EXPORTING
+            tabname     = ld_name_bsix
+       TABLES
+*           X031L_TAB   =
+            dfies_tab   = lt_dfies_bsix
+       EXCEPTIONS
+            not_found   = 1
+            OTHERS      = 2
+            .
+  CHECK sy-subrc = 0.
+
+* check whether duplicates are contained in BSIx:
+  LOOP AT lt_duplicates.
+    CLEAR ld_fname.
+    READ TABLE lt_dfies_bsix WITH KEY
+                             fieldname = lt_duplicates-fname.
+    IF sy-subrc = 0.
+*     standard field ok. set special field to 'tech':
+      ld_fname = 'U_'.
+      WRITE lt_duplicates-fname TO ld_fname+2.
+    ELSE.
+*     special field ok. set standard field to 'tech':
+      ld_fname = lt_duplicates-fname.
+    ENDIF.
+    CLEAR gt_fieldcat.
+    gt_fieldcat-fieldname = ld_fname.
+    gt_fieldcat-tech      = 'X'.
+    APPEND gt_fieldcat.
+  ENDLOOP.
+
+ENDFORM.                               " MAKE_FIELDCATALOG
+
+
+*&---------------------------------------------------------------------*
+*&      Form  make_fieldcatalog2
+*&      set TP-fields as TECH if TP-authority doesn't exists
+*&---------------------------------------------------------------------*
+FORM make_fieldcatalog2.
+  data: ld_tpauth type c.
+
+* remove tp table entries
+  LOOP AT it_tp_fields.
+    DELETE gt_fieldcat WHERE fieldname = it_tp_fields-fname.
+  ENDLOOP.
+
+* check transfer price authority
+  PERFORM check_tp_auth.
+
+* Rewritten with note 1634647
+  clear gd_tpauth.
+  ld_tpauth = 'X'.
+  loop at it_tp_auth.
+    if sy-tabix = 1.
+      ld_tpauth = it_tp_auth-auth.
+    endif.
+    if it_tp_auth-auth is initial.
+      clear ld_tpauth.
+    endif.
+    if not ld_tpauth is initial.
+      if ld_tpauth = 'X'
+      and ( it_tp_auth-auth = '1'
+      or it_tp_auth-auth = '2' ).
+        ld_tpauth = it_tp_auth-auth.
+      endif.
+      if ( ld_tpauth = '1'
+      and it_tp_auth-auth = '2' )
+      or ( ld_tpauth = '2'
+      and it_tp_auth-auth = '1' ).
+        clear ld_tpauth.
+      endif.
+    endif.
+  endloop.
+  gd_tpauth = ld_tpauth.
+
+  case gd_tpauth.
+    when space.
+* hide 2. and 3. HW
+      loop at it_tp_fields.
+        clear gt_fieldcat.
+        gt_fieldcat-fieldname = it_tp_fields-fname.
+        gt_fieldcat-tech = 'X'.
+        append gt_fieldcat.
+      endloop.
+*      loop at it_tp_field2.
+*        clear gt_fieldcat.
+*        gt_fieldcat-fieldname = it_tp_field2-fname.
+*        gt_fieldcat-tech = 'X'.
+*        append gt_fieldcat.
+*      endloop.
+    when '1'.
+* hide 3. HW
+      loop at it_tp_fields where fname CA '3'.
+        clear gt_fieldcat.
+        gt_fieldcat-fieldname = it_tp_fields-fname.
+        gt_fieldcat-tech = 'X'.
+        append gt_fieldcat.
+      endloop.
+    when '2'.
+* hide 2. HW
+      loop at it_tp_fields where fname CA '3'.
+      CLEAR gt_fieldcat.
+      gt_fieldcat-fieldname = it_tp_fields-fname.
+      gt_fieldcat-tech = 'X'.
+      APPEND gt_fieldcat.
+    ENDLOOP.
+  endcase.
+* Rewritten with note 1634647
+
+ENDFORM.                    " make_fieldcatalog2
+
+
+*&---------------------------------------------------------------------*
+*&      Form  dynp_get_status
+*&---------------------------------------------------------------------*
+FORM dynp_get_status USING    id_fun
+                     CHANGING cd_val.
+  DATA: ld_val_save TYPE i.
+
+  ld_val_save = cd_val.
+  CALL 'DYNP_GET_STATUS'
+         ID 'FUNCTION' FIELD id_fun
+         ID 'VALUE'    FIELD cd_val.
+  IF sy-subrc NE 0.
+    cd_val = ld_val_save.
+  ENDIF.
+
+ENDFORM.                               " dynp_get_status
+
+*&---------------------------------------------------------------------*
+*&      Form  export_filitexts_data
+*&---------------------------------------------------------------------*
+FORM export_filitexts_data.
+
+  EXPORT stida FROM pa_stida_default
+         TO MEMORY ID 'FILITXT01'.
+
+ENDFORM.                               " export_filitexts_data
+*----------------------------------------------------------------------*
+*   form wl_memory_set_get
+*   set/get parameter for worklist setting
+*----------------------------------------------------------------------*
+FORM wl_memory_set_get  USING    id_set    TYPE c
+                        CHANGING cd_wl_on  TYPE c.
+
+  IF id_set IS INITIAL.
+    GET PARAMETER ID 'FIT_WL' FIELD cd_wl_on.
+  ELSE.
+    SET PARAMETER ID 'FIT_WL' FIELD cd_wl_on.
+  ENDIF.
+
+ENDFORM.                    "wl_memory_set_get
+
+*----------------------------------------------------------------------*
+*   form wl_flag_and_button
+*   set global flag and button text according to static memory
+*----------------------------------------------------------------------*
+FORM wl_flag_and_button.
+
+  PERFORM wl_memory_set_get USING space
+                                  gd_wl_on.
+  IF gd_wl_on IS INITIAL.
+    sscrfields-functxt_01 = text-w01.
+  ELSE.
+    sscrfields-functxt_01 = text-w04.
+  ENDIF.
+
+ENDFORM.                    "wl_flag_and_button
+
+*----------------------------------------------------------------------*
+*   form worklist_on_off
+*   set worklist flag on <-> off, set button text accordingly
+*----------------------------------------------------------------------*
+FORM worklist_on_off.
+
+  DATA: ld_value   TYPE c.
+
+  IF gd_wl_on = c_x.
+    PERFORM wl_memory_set_get USING c_x
+                                    ld_value.
+  ELSE.
+    ld_value = c_x.
+    PERFORM wl_memory_set_get USING c_x
+                                    ld_value.
+  ENDIF.
+  PERFORM wl_flag_and_button.
+
+ENDFORM.                    "worklist_on_off
+
+*----------------------------------------------------------------------*
+*   form wl_modify_screen
+*   hide screen fields according to worklist flag setting
+*----------------------------------------------------------------------*
+FORM wl_modify_screen.
+
+  IF gd_wl_on IS INITIAL.
+*   worklist off -> hide worklist layout:
+    IF screen-group1 = 'WKL'.
+      screen-active    = 0.
+      screen-invisible = 1.
+    ENDIF.
+  ELSE.
+*   worklist on -> hide LDB layout:
+    IF screen-group2 = 'DBS'.
+      screen-active    = 0.
+      screen-invisible = 1.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    "wl_modify_screen
+
+*----------------------------------------------------------------------*
+*   form resolve_worklist
+*   read worklist table entries for a given worklist identifier
+*----------------------------------------------------------------------*
+FORM resolve_worklist  TABLES et_cosel TYPE tcosel
+                       USING  id_worklist LIKE tfav-ident
+                              id_objct    LIKE tfav-objct.
+
+  DATA: lt_tfavw TYPE STANDARD TABLE OF tfavw WITH HEADER LINE.
+
+  REFRESH et_cosel.
+  CALL FUNCTION 'RF_WORKLISTS_VALUES_GET'
+    EXPORTING
+      id_objct     = id_objct
+      id_ident     = id_worklist
+    TABLES
+      et_tfavw     = lt_tfavw
+    EXCEPTIONS
+      not_existing = 1.
+  IF sy-subrc NE 0.
+    MESSAGE e040(msitem) WITH id_worklist.
+  ENDIF.
+  et_cosel-field  = id_objct.
+  et_cosel-sign   = 'I'.
+  et_cosel-option = 'EQ'.
+  CLEAR et_cosel-high.
+  LOOP AT lt_tfavw.
+    et_cosel-low = lt_tfavw-value.
+    APPEND et_cosel.
+  ENDLOOP.
+
+ENDFORM.                    "resolve_worklist
+
+*&---------------------------------------------------------------------*
+*&      Form  CHANGE_STATUS
+*&---------------------------------------------------------------------*
+FORM change_status.
+
+  DATA: BEGIN OF lt_exclude OCCURS 5,
+          fcode LIKE sy-ucomm,
+        END OF lt_exclude.
+  DATA: ld_flag(1) TYPE c.
+  DATA: ls_rssubinfo LIKE rssubinfo.
+
+
+  CALL FUNCTION 'RS_SUBMIT_INFO'
+    IMPORTING
+      p_submit_info = ls_rssubinfo
+    EXCEPTIONS
+      OTHERS        = 1.
+
+  IF NOT ls_rssubinfo-mode_norml IS INITIAL.
+* check: worklist functionality active?
+    GET PARAMETER ID 'FI_WORKLISTS_FLAG' FIELD ld_flag.
+    IF ld_flag IS INITIAL.
+      lt_exclude-fcode = 'FC01'.
+      APPEND lt_exclude.
+*   clear user preference parameter:
+      SET PARAMETER ID 'FIT_WL' FIELD space.
+    ENDIF.
+    lt_exclude-fcode = 'FC02'.
+    APPEND lt_exclude.
+    lt_exclude-fcode = 'FC03'.
+    APPEND lt_exclude.
+    lt_exclude-fcode = 'FC04'.
+    APPEND lt_exclude.
+*  lt_exclude-fcode = 'FC05'.
+*  append lt_exclude.
+
+    CALL FUNCTION 'RS_SET_SELSCREEN_STATUS'
+      EXPORTING
+        p_status  = sy-pfkey
+      TABLES
+        p_exclude = lt_exclude.
+
+  ENDIF.
+
+ENDFORM.                               " CHANGE_STATUS
+*----------------------------------------------------------------------*
+*   form dd_get_flag
+*   get due date selection flag PID value
+*----------------------------------------------------------------------*
+FORM dd_get_flag.
+
+  GET PARAMETER ID 'FIT_DUE_DATE_SEL' FIELD gd_ddsel_on.
+
+ENDFORM.                    "dd_get_flag
+
+*----------------------------------------------------------------------*
+*   form dd_modify_screen
+*   hide screen fields according to due date selection PID setting
+*----------------------------------------------------------------------*
+FORM dd_modify_screen.
+
+  IF gd_ddsel_on IS INITIAL.
+*   parameter off -> hide due date selection field:
+    IF screen-group1 = 'DUE'.
+      screen-active    = 0.
+      screen-invisible = 1.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    "dd_modify_screen
+
+*&---------------------------------------------------------------------*
+*&      Form  COMPLETE_DOCUMENT_TEXT
+*&---------------------------------------------------------------------*
+FORM complete_document_text.
+
+  DATA: lt_ttxid      LIKE ttxid OCCURS 1 WITH HEADER LINE.
+
+  LOOP AT it_pos.
+    CALL FUNCTION 'FI_TEXTS_DOCUMENT'
+      EXPORTING
+        i_aktyp         = 'A'
+        i_belnr         = it_pos-belnr
+        i_bukrs         = it_pos-bukrs
+        i_check         = 'X'
+        i_gjahr         = it_pos-gjahr
+        i_object        = 'BELEG'
+        i_give_back_ids = 'X'
+      TABLES
+        t_tdid          = lt_ttxid
+      EXCEPTIONS
+        no_texts_found  = 1
+        OTHERS          = 2.
+    IF sy-subrc = 0.
+      it_pos-xtext = 'X'.
+      READ TABLE lt_ttxid INDEX 1.
+      IF sy-subrc = 0.
+        it_pos-tdid = lt_ttxid-tdid.
+      ENDIF.
+    ENDIF.
+    MODIFY it_pos.
+  ENDLOOP.
+
+ENDFORM.                    "complete_document_text
+*----------------------------------------------------------------------*
+*   INCLUDE RFITEM_INC                                                 *
+*----------------------------------------------------------------------*
+
+*&---------------------------------------------------------------------*
+*&      Expiring currencies: INCLUDE RFDBCONVCUR
+*&---------------------------------------------------------------------*
+INCLUDE rfdbexpc.
+
+*&---------------------------------------------------------------------*
+*&      Form  init_expcur
+*&---------------------------------------------------------------------*
+FORM init_expcur.
+
+* expiring currencies relevant for this process?
+  gd_expcur_proc = 'SAPDB'.
+  WRITE sy-dbnam TO gd_expcur_proc+5.
+  CALL FUNCTION 'CURRENCY_CHECK_FOR_PROCESS'
+    EXPORTING
+      process                = gd_expcur_proc
+    EXCEPTIONS
+      process_not_maintained = 1
+      OTHERS                 = 2.
+  IF sy-subrc = 0.
+    gd_expcur_flag = 'X'.
+  ENDIF.
+
+ENDFORM.                    " init_expcur
+
+*&---------------------------------------------------------------------*
+*&      Form  insert_tp_fields
+*&      insert fields which are used for transfer prices
+*&---------------------------------------------------------------------*
+FORM insert_tp_fields.
+
+  CLEAR it_tp_fields. it_tp_fields-fname = 'DMBE2'. APPEND it_tp_fields.
+  CLEAR it_tp_fields. it_tp_fields-fname = 'DMBE3'. APPEND it_tp_fields.
+
+  CLEAR it_tp_fields. it_tp_fields-fname = 'BWWR2'. APPEND it_tp_fields.
+  CLEAR it_tp_fields. it_tp_fields-fname = 'BWWR3'. APPEND it_tp_fields.
+
+  CLEAR it_tp_fields. it_tp_fields-fname = 'HWAE2'. APPEND it_tp_fields.
+  CLEAR it_tp_fields. it_tp_fields-fname = 'HWAE3'. APPEND it_tp_fields.
+
+  PERFORM check_tp_t021s USING 'DMBT2'.
+  PERFORM check_tp_t021s USING 'DMBT3'.
+
+  PERFORM check_tp_t021s USING 'DMB21'.
+  PERFORM check_tp_t021s USING 'DMB22'.
+  PERFORM check_tp_t021s USING 'DMB23'.
+
+  PERFORM check_tp_t021s USING 'DMB31'.
+  PERFORM check_tp_t021s USING 'DMB32'.
+  PERFORM check_tp_t021s USING 'DMB33'.
+
+  PERFORM check_tp_t021s USING 'MWST2'.
+  PERFORM check_tp_t021s USING 'MWST3'.
+
+  PERFORM check_tp_t021s USING 'NAVH2'.
+  PERFORM check_tp_t021s USING 'NAVH3'.
+
+  PERFORM check_tp_t021s USING 'SKNT2'.
+  PERFORM check_tp_t021s USING 'SKNT3'.
+
+  PERFORM check_tp_t021s USING 'BDIF2'.
+  PERFORM check_tp_t021s USING 'BDIF3'.
+
+  PERFORM check_tp_t021s USING 'RDIF2'.
+  PERFORM check_tp_t021s USING 'RDIF3'.
+
+  PERFORM check_tp_t021s USING 'TXBH2'.
+  PERFORM check_tp_t021s USING 'TXBH3'.
+
+  PERFORM check_tp_t021s USING 'PPDIF2'.
+  PERFORM check_tp_t021s USING 'PPDIF3'.
+
+ENDFORM.                    " insert_tp_fields
+
+
+*&---------------------------------------------------------------------*
+*&      Form  check_tp_t021s
+*&      insert tp fields if they exists in t021s
+*&---------------------------------------------------------------------*
+FORM check_tp_t021s USING tp_fname.
+
+  READ TABLE it_t021s WITH KEY fname = tp_fname.
+  IF sy-subrc = 0.
+    CLEAR it_tp_fields.
+    CONCATENATE 'U_' tp_fname INTO it_tp_fields-fname.
+    APPEND it_tp_fields.
+  ENDIF.
+
+ENDFORM.                    " check_tp_t021s
+
+
+*&---------------------------------------------------------------------*
+*&      Form check_tp_auth.
+*&      determine auth and set auth-flag in it_tp_auth
+*&---------------------------------------------------------------------*
+FORM check_tp_auth.
+
+  DATA: ld_lines TYPE i,
+        ld_tpauth(1) type c,
+        ld_tpauth1(1) type c,                                  "1634647
+        ld_tpauth2(1) type c.                                  "1634647
+
+* company code with transfer prices
+  DESCRIBE TABLE it_tp_auth LINES ld_lines.
+
+* check transfer prices.
+  IF ld_lines GT 0.
+
+* check company codes.
+    LOOP AT it_tp_auth.
+*     Rewritten with note 1634647
+      clear ld_tpauth1.
+      clear ld_tpauth2.
+      if not it_tp_auth-curtp is initial.
+        if it_tp_auth-curtp+1(1) = '1'
+        or it_tp_auth-curtp+1(1) = '2'.
+          call function 'TP_VALUATION_AUTHORITY'
+            EXPORTING
+              i_bukrs                        = it_tp_auth-bukrs
+              i_cvtyp                        = it_tp_auth-curtp
+              i_actvt                        = '03'
+            IMPORTING
+                  e_xauth                        = ld_tpauth1
+            EXCEPTIONS
+              kokrs_finding_error            = 1
+              valutyp_finding_error          = 2
+              insufficient_input_for_kokrs   = 3
+              insufficient_input_for_valutyp = 4
+              OTHERS                         = 5.
+          IF sy-subrc <> 0.
+            MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+                    WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+          ENDIF.
+        else.
+          if it_tp_auth-curtp+1(1) = '0'.
+            ld_tpauth1 = 'X'.
+          endif.
+        endif.
+      endif.
+      if not it_tp_auth-curtp2 is initial.
+        if it_tp_auth-curtp2+1(1) = '1'
+        or it_tp_auth-curtp2+1(1) = '2'.
+          call function 'TP_VALUATION_AUTHORITY'
+            EXPORTING
+              i_bukrs                        = it_tp_auth-bukrs
+              i_cvtyp                        = it_tp_auth-curtp2
+              i_actvt                        = '03'
+            IMPORTING
+              e_xauth                        = ld_tpauth2
+            EXCEPTIONS
+              kokrs_finding_error            = 1
+              valutyp_finding_error          = 2
+              insufficient_input_for_kokrs   = 3
+              insufficient_input_for_valutyp = 4
+              others                         = 5.
+          if sy-subrc <> 0.
+            message id sy-msgid type sy-msgty number sy-msgno
+                    with sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+          endif.
+        else.
+          if it_tp_auth-curtp2+1(1) = '0'.
+            ld_tpauth2 = 'X'.
+          endif.
+        endif.
+      endif.
+      if  not ld_tpauth1 is initial
+      and not ld_tpauth2 is initial.
+        ld_tpauth = 'X'.
+      else.
+        if not ld_tpauth1 is initial.
+          ld_tpauth = '1'.
+        endif.
+        if not ld_tpauth2 is initial.
+          ld_tpauth = '2'.
+        endif.
+      endif.
+      it_tp_auth-auth = ld_tpauth.
+      MODIFY it_tp_auth.
+*     Rewritten with note 1634647
+    ENDLOOP.
+
+  ENDIF.
+
+ENDFORM.                    " check_tp_auth
+
+
+*&---------------------------------------------------------------------*
+*&      Form  get_existing_variant
+*&
+*&---------------------------------------------------------------------*
+FORM get_existing_variant USING rs_variant LIKE disvariant.
+
+  DATA ld_use_default(1) TYPE c.
+
+  CLEAR ld_use_default.
+
+  IF rs_variant-variant = space.
+*   try ALV default variant
+    CALL FUNCTION 'REUSE_ALV_VARIANT_DEFAULT_GET'
+      EXPORTING
+        i_save     = 'A'
+      CHANGING
+        cs_variant = rs_variant
+      EXCEPTIONS
+        OTHERS     = 4.
+    IF sy-subrc NE 0.
+      ld_use_default = 'X'.
+    ENDIF.
+  ENDIF.
+
+  IF ld_use_default = space.
+    CALL FUNCTION 'REUSE_ALV_VARIANT_EXISTENCE'
+      EXPORTING
+        i_save        = 'A'
+      CHANGING
+        cs_variant    = rs_variant
+      EXCEPTIONS
+        wrong_input   = 1
+        not_found     = 2
+        program_error = 3
+        OTHERS        = 4.
+    IF sy-subrc <> 0.
+      ld_use_default = 'X'.
+    ENDIF.
+  ENDIF.
+
+  IF ld_use_default = 'X'.
+    rs_variant-report = g_repid.
+    rs_variant-variant = '1SAP'.
+    rs_variant-username = sy-uname.
+    CALL FUNCTION 'REUSE_ALV_VARIANT_EXISTENCE'
+      EXPORTING
+        i_save        = 'A'
+      CHANGING
+        cs_variant    = rs_variant
+      EXCEPTIONS
+        wrong_input   = 1
+        not_found     = 2
+        program_error = 3
+        OTHERS        = 4.
+    IF sy-subrc <> 0.
+      CLEAR rs_variant.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    " get_existing_variant
+*&---------------------------------------------------------------------*
+*&      Form  check_date
+*&---------------------------------------------------------------------*
+*       check
+*----------------------------------------------------------------------*
+*      -->P_KD_BUKRS  text
+*----------------------------------------------------------------------*
+FORM check_date TABLES   p_xd_bukrs
+                USING    p_xd_tpc.
+
+  DATA: ld_program LIKE sy-repid.
+  STATICS: s_return TYPE char1.
+
+  p_xd_tpc = space.
+
+  CHECK s_return = 1 OR s_return IS INITIAL.
+  CHECK x_opsel = 'X' AND ( NOT pa_stida_default IS INITIAL ) .
+
+  CASE g_repid.
+    WHEN 'ZFTM_RFITEMAP'.
+      ld_program = 'SAPDBKDF'.
+    WHEN 'ZFTM_RFITEMAR'.
+      ld_program = 'SAPDBDDF'.
+    WHEN 'ZFTM_RFITEMGL'.
+      ld_program = 'SAPDBSDF'.
+  ENDCASE.
+
+  SELECT * FROM t001 WHERE bukrs IN p_xd_bukrs.
+
+    p_xd_tpc = 'X'.
+    CALL FUNCTION 'FI_CHECK_DATE'
+      EXPORTING
+        i_bukrs           = t001-bukrs
+        i_user            = sy-uname
+        i_program         = ld_program
+        i_from_date       = pa_stida_default
+      IMPORTING
+        e_return          = s_return
+      EXCEPTIONS
+        no_authority_prog = 1
+        no_authority_date = 2
+        wrong_parameter   = 3
+        OTHERS            = 4.
+    IF sy-subrc <> 0.
+      p_xd_tpc = space.
+      MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+              WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+    ENDIF.
+
+  ENDSELECT.
+
+ENDFORM.                    " check_date
+
+*&---------------------------------------------------------------------*
+*&      Form  AUTHORITY_TCODE
+*&---------------------------------------------------------------------*
+*       Check authority to use transaction code
+*----------------------------------------------------------------------*
+*      -->P_Tcode
+*      -->P_SUBRC
+*----------------------------------------------------------------------*
+FORM authority_tcode USING    value(p_tcode)
+                              p_subrc.
+
+  STATICS: BEGIN OF s_tab OCCURS 0,
+             tcode LIKE sy-tcode,
+             subrc LIKE sy-subrc,
+           END OF s_tab.
+
+  READ TABLE s_tab WITH KEY tcode = p_tcode.
+  IF sy-subrc = 0.
+    p_subrc = s_tab-subrc.
+    EXIT.
+  ENDIF.
+  CLEAR s_tab.
+  s_tab-tcode = p_tcode.
+  CALL FUNCTION 'AUTHORITY_CHECK_TCODE'
+    EXPORTING
+      tcode  = s_tab-tcode
+    EXCEPTIONS
+      ok     = 0
+      OTHERS = 4.
+  MOVE sy-subrc TO: p_subrc, s_tab-subrc.
+  APPEND s_tab.
+
+ENDFORM.                    " AUTHORITY_TCODE
+
+
+*&--------------------------------------------------------------------*
+*&      Form  IT_POS_SORT_BACK
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+*      -->RT_POS     text
+*---------------------------------------------------------------------*
+FORM it_pos_sort_back TABLES rt_pos.
+* basically the same form as used for sorting in the ALV.
+* (see FUNC K_KKB_OUTTAB_SORT, FORM FB_OUTTAB_SORT).
+  DATA: lt_sort TYPE slis_t_sortinfo_alv,
+        ld_sort TYPE slis_sortinfo_alv.
+  DATA: a01(30) TYPE c,
+        a02(30) TYPE c,
+        a03(30) TYPE c,
+        a04(30) TYPE c,
+        a05(30) TYPE c,
+        a06(30) TYPE c,
+        a07(30) TYPE c,
+        a08(30) TYPE c,
+        a09(30) TYPE c,
+        a10(30) TYPE c,
+        a11(30) TYPE c,
+        a12(30) TYPE c,
+        a13(30) TYPE c,
+        a14(30) TYPE c,
+        a15(30) TYPE c.
+  DATA: d01(30) TYPE c,
+        d02(30) TYPE c,
+        d03(30) TYPE c,
+        d04(30) TYPE c,
+        d05(30) TYPE c,
+        d06(30) TYPE c,
+        d07(30) TYPE c,
+        d08(30) TYPE c,
+        d09(30) TYPE c,
+        d10(30) TYPE c,
+        d11(30) TYPE c,
+        d12(30) TYPE c,
+        d13(30) TYPE c,
+        d14(30) TYPE c,
+        d15(30) TYPE c.
+  DATA: l_pos(2) TYPE n.
+  DATA: l_field(3) TYPE c.
+  FIELD-SYMBOLS: <sf>.
+
+  IF x_grid IS INITIAL.
+    CALL FUNCTION 'REUSE_ALV_LIST_LAYOUT_INFO_GET'
+      IMPORTING
+        et_sort       = lt_sort
+      EXCEPTIONS
+        no_infos      = 1
+        program_error = 2
+        OTHERS        = 3.
+  ELSE.
+    CALL FUNCTION 'REUSE_ALV_GRID_LAYOUT_INFO_GET'
+      IMPORTING
+        et_sort       = lt_sort
+      EXCEPTIONS
+        no_infos      = 1
+        program_error = 2
+        OTHERS        = 3.
+  ENDIF.
+
+  SORT lt_sort BY spos.
+  CLEAR l_pos.
+  LOOP AT lt_sort INTO ld_sort.
+    l_pos = l_pos + 1.
+    IF ld_sort-up = 'X'.
+      CONCATENATE 'A' l_pos
+                      INTO l_field.
+    ELSE.
+      CONCATENATE 'D' l_pos
+                      INTO l_field.
+    ENDIF.
+    ASSIGN (l_field) TO <sf>.
+    <sf> = ld_sort-fieldname.
+  ENDLOOP.
+  IF sy-subrc = 0.
+    SORT rt_pos STABLE
+                 AS TEXT BY (a01) ASCENDING
+                  (d01) DESCENDING
+                  (a02) ASCENDING
+                  (d02) DESCENDING
+                  (a03) ASCENDING
+                  (d03) DESCENDING
+                  (a04) ASCENDING
+                  (d04) DESCENDING
+                  (a05) ASCENDING
+                  (d05) DESCENDING
+                  (a06) ASCENDING
+                  (d06) DESCENDING
+                  (a07) ASCENDING
+                  (d07) DESCENDING
+                  (a08) ASCENDING
+                  (d08) DESCENDING
+                  (a09) ASCENDING
+                  (d09) DESCENDING
+                  (a10) ASCENDING
+                  (d10) DESCENDING
+                  (a11) ASCENDING
+                  (d11) DESCENDING
+                  (a12) ASCENDING
+                  (d12) DESCENDING
+                  (a13) ASCENDING
+                  (d13) DESCENDING
+                  (a14) ASCENDING
+                  (d14) DESCENDING
+                  (a15) ASCENDING
+                  (d15) DESCENDING .
+
+  ELSE.
+    IF sy-ucomm eq space.
+*     same order as before due to handling in open fi 1650
+      SORT it_pos STABLE BY bukrs konto.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    "IT_POS_SORT_BACK
+
+*&--------------------------------------------------------------------*
+*&      Form  special_fields_used
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+*      -->ID_TABLENAME
+*---------------------------------------------------------------------*
+FORM special_fields_used
+     USING id_tablename LIKE dd03p-tabname.
+
+  DATA: ld_fname TYPE type_spec_fields.
+
+
+  CLEAR gt_spec_fields.
+  REFRESH gt_spec_fields.
+
+* Always include the following infos ...
+  ld_fname-fname = 'BUKRS'.
+  APPEND ld_fname TO gt_spec_fields.
+  ld_fname-fname = 'BELNR'.
+  APPEND ld_fname TO gt_spec_fields.
+  ld_fname-fname = 'GJAHR'.
+  APPEND ld_fname TO gt_spec_fields.
+
+* ...plus some table specific additional infos...
+  CASE id_tablename.
+    WHEN 'BKPF'.
+      ld_fname-fname = 'AWSYS'.
+      APPEND ld_fname TO gt_spec_fields.
+      ld_fname-fname = 'BUDAT'.
+      APPEND ld_fname TO gt_spec_fields.
+    WHEN 'BSEGC'.
+      ld_fname-fname = 'RFZEI'.
+      APPEND ld_fname TO gt_spec_fields.
+  ENDCASE.
+
+* ... plus special fields from internal table IT_T021S.
+  LOOP AT it_t021s WHERE tname = id_tablename.
+    APPEND it_t021s-fname TO gt_spec_fields.
+  ENDLOOP.
+
+ENDFORM.                    "special_fields_used
+
+*---------------------------------------------------------------------*
+*       FORM special_fields_modify                                    *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  ID_TABLENAME                                                  *
+*---------------------------------------------------------------------*
+FORM special_fields_modify USING id_tablename LIKE dd03p-tabname.
+
+  DATA: ld_fname TYPE type_spec_fields.
+
+
+* Delete non-existent fields.
+  LOOP AT gt_spec_fields INTO ld_fname.
+
+    CALL FUNCTION 'DDIF_NAMETAB_GET'
+      EXPORTING
+        tabname    = id_tablename
+        lfieldname = ld_fname-fname
+      EXCEPTIONS
+        not_found  = 1.
+
+    IF sy-subrc = 1 .
+     DELETE TABLE gt_spec_fields WITH TABLE KEY fname = ld_fname-fname .
+    ENDIF.
+
+  ENDLOOP.
+
+* Add new fields.
+  CASE id_tablename.
+    WHEN 'VBKPF'.
+  ENDCASE.
+
+ENDFORM.                    "special_fields_modify
+
+*---------------------------------------------------------------------*
+*       FORM init_admin_tables_boe                                    *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+FORM init_admin_tables_boe.
+
+  DATA: ls_t021s TYPE t021s.
+
+  LOOP AT it_t021s.
+    IF it_t021s-tname = 'BSEC'.
+      IF    it_t021s-fname = 'BANKS'
+         OR it_t021s-fname = 'BANKL'
+         OR it_t021s-fname = 'BANKN'
+         OR it_t021s-fname = 'BKONT'.
+        ls_t021s-lstcl = '2'.
+        ls_t021s-tname = 'BSED'.
+        ls_t021s-fname = 'WLZBP'.
+        APPEND ls_t021s TO it_t021s.
+        EXIT.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    "init_admin_tables_boe
+
+*---------------------------------------------------------------------*
+*       FORM analyze_act_fieldcat_boe                                 *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+FORM analyze_act_fieldcat_boe.
+
+  IF it_specfld-tname = 'BSEC' AND it_specfld-fstat = 'P'.
+    IF    it_specfld-fname_2 = 'U_BANKS'
+       OR it_specfld-fname_2 = 'U_BANKL'
+       OR it_specfld-fname_2 = 'U_BANKN'
+       OR it_specfld-fname_2 = 'U_BKONT' .
+
+      READ TABLE it_specfld WITH KEY fname_2 = 'U_WLZBP'.
+      IF sy-subrc NE 0.
+*         horror case:
+        MESSAGE w012.
+        EXIT.
+      ENDIF.
+*       special field status = initial?
+      IF it_specfld-fstat = space.
+*         set status 'pending':
+        it_specfld-fstat = 'P'.
+        MODIFY it_specfld INDEX sy-tabix.
+*         check corresponding table status:
+        READ TABLE it_spectab WITH KEY tname = it_specfld-tname.
+        IF sy-subrc NE 0.
+*         horror case:
+          MESSAGE w012.
+          EXIT.
+        ENDIF.
+        IF it_spectab-tstat = space.
+          it_spectab-tstat = 'P'.
+          MODIFY it_spectab INDEX sy-tabix.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    "analyze_act_fieldcat_boe
+
+*---------------------------------------------------------------------*
+*       FORM move_special_fields_boe                                  *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+FORM move_special_fields_boe.
+
+  FIELD-SYMBOLS: <fs_sp_tab>, <fs_it_pos>.
+
+  IF NOT it_pos-umskz IS INITIAL AND NOT wa_bsed-wlzbp IS INITIAL.
+    CLEAR wa_bsec.
+    wa_bsec-banks = wa_bsed-wlzbp+1(3).
+    wa_bsec-bankl = wa_bsed-wlzbp+5(15).
+    wa_bsec-bankn = wa_bsed-wlzbp+21(18).
+    wa_bsec-bkont = wa_bsed-wlzbp+40(2).
+
+    LOOP AT it_moveref WHERE tname = 'BSEC'.
+      ASSIGN it_moveref-fldref->*   TO <fs_sp_tab>.
+      ASSIGN it_moveref-fldref_2->* TO <fs_it_pos>.
+      IF <fs_it_pos> IS INITIAL.
+        MOVE <fs_sp_tab> TO <fs_it_pos>.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+
+ENDFORM.                    "move_special_fields_boe
+
+
+
+
+
+*---------------------------------------------------------------------*
+*       FORM create_performance_tables                                *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  id_tablename                                                  *
+*---------------------------------------------------------------------*
+FORM create_performance_tables USING id_tablename TYPE dd03p-tabname .
+
+  FIELD-SYMBOLS : <lfs_pos>              TYPE zftm_rfposxext.
+  STATICS :       lst_performance_tables TYPE c.
+
+  IF lst_performance_tables IS INITIAL.
+    IF id_tablename EQ 'BKPF' OR id_tablename EQ 'BSEG' .
+
+* Creating additional tables for speeding up the database selects
+      REFRESH: gt_pos_parked, gt_pos_posted, gt_pos_archived.
+
+      LOOP AT it_pos ASSIGNING <lfs_pos>.
+        gd_pos_reduced-bukrs = <lfs_pos>-bukrs.
+        gd_pos_reduced-belnr = <lfs_pos>-belnr.
+        gd_pos_reduced-gjahr = <lfs_pos>-gjahr.
+        gd_pos_reduced-buzei = <lfs_pos>-buzei.
+        gd_pos_reduced-budat = <lfs_pos>-budat.
+
+        IF <lfs_pos>-bstat CA 'VWZ'.
+          INSERT gd_pos_reduced INTO TABLE gt_pos_parked.
+        ELSEIF <lfs_pos>-xarch EQ 'X' AND gd_usear = 'X'.
+          INSERT gd_pos_reduced INTO TABLE gt_pos_archived.
+        ELSE.
+          INSERT gd_pos_reduced INTO TABLE gt_pos_posted.
+        ENDIF.
+      ENDLOOP.
+
+      lst_performance_tables = 'X'.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    "create_performance_tables
+
+*---------------------------------------------------------------------*
+*       FORM import_arch_from_memory                                  *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+FORM import_arch_from_memory.
+
+  FIELD-SYMBOLS: <ybkpf> TYPE bkpf,
+                 <ybseg> TYPE bseg.
+
+  IF gd_usear = 'X' AND gd_memor = 'X'.
+    IMPORT gd_read_memo_done FROM MEMORY ID 'GD_READ_MEMO_DONE'.
+    IF gd_read_memo_done EQ 'N'.
+      IMPORT ybkpf FROM MEMORY ID 'YBKPF'.
+      IF xbkpf[] IS INITIAL.
+        INSERT lines of ybkpf INTO TABLE xbkpf.
+      ELSE.
+        LOOP AT ybkpf ASSIGNING <ybkpf>.
+          READ TABLE xbkpf WITH TABLE KEY bukrs = <ybkpf>-bukrs
+                                          belnr = <ybkpf>-belnr
+                                          gjahr = <ybkpf>-gjahr
+                                    TRANSPORTING NO FIELDS.
+          IF NOT sy-subrc IS INITIAL.
+            INSERT <ybkpf> INTO TABLE xbkpf.
+          ENDIF.
+        ENDLOOP.
+      ENDIF.
+      IMPORT ybseg FROM MEMORY ID 'YBSEG'.
+      IF xbseg[] IS INITIAL.
+        INSERT lines of ybseg INTO TABLE xbseg.
+      ELSE.
+        LOOP AT ybseg ASSIGNING <ybseg>.
+          READ TABLE xbseg WITH TABLE KEY bukrs = <ybseg>-bukrs
+                                          belnr = <ybseg>-belnr
+                                          gjahr = <ybseg>-gjahr
+                                          buzei = <ybseg>-buzei
+                                    TRANSPORTING NO FIELDS.
+          IF NOT sy-subrc IS INITIAL.
+            INSERT <ybseg> INTO TABLE xbseg.
+          ENDIF.
+        ENDLOOP.
+      ENDIF.
+
+*    INSERT LINES OF ybseg INTO TABLE xbseg.
+*    refresh ybseg.
+*    FREE MEMORY ID 'YBSEG'.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                               " IMPORT_ARCH_FROM_MEMORY

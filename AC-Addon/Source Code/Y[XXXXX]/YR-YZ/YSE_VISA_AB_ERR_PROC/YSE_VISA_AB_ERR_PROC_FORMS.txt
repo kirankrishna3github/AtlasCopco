@@ -1,0 +1,369 @@
+*&---------------------------------------------------------------------*
+*&  Include           YSE_VISA_AB_ERR_PROC_FORMS
+*&---------------------------------------------------------------------*
+
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_DATA
+*&---------------------------------------------------------------------*
+form select_data .
+
+* Get all errors of table yse_visa_ab_err in an internal table
+
+  if p_ekorg is not initial.
+
+    select      *
+           from yse_visa_ab_err
+           into corresponding fields of
+           table it_err
+* Begin of insert MOD-001
+            where xblnr in so_xblnr
+            and ekorg eq p_ekorg
+            and credat in so_creda.
+* End of insert MOD-001
+
+  else.
+
+    select      *
+         from yse_visa_ab_err
+         into corresponding fields of
+         table it_err
+* Begin of insert MOD-001
+          where xblnr in so_xblnr
+          and credat in so_creda.
+* End of insert MOD-001
+
+  endif.
+* Begin of insert MOD-001
+
+
+* Progress indicator
+  h_text = 'Data is being selected'(i01).
+  call function 'SAPGUI_PROGRESS_INDICATOR'
+    exporting
+      text = h_text.
+
+  refresh: t_idoc.
+* REFRESH: t_out.
+
+* Select Idocs with status 51
+  select docnum into table t_idoc
+         from edidc
+         where status = c_51
+           and mestyp = c_yse_visa_ordrsp.
+
+  h_counter = 0.
+  describe table t_idoc lines h_total.
+
+* Process segments
+  loop at t_idoc.
+    add 1 to h_counter.
+    h_text = 'IDoc & (& of &) is being processed'(i02).
+    replace '&' with t_idoc-docnum into h_text.
+    replace '&' with h_counter     into h_text.
+    replace '&' with h_total       into h_text.
+    condense h_text.
+    call function 'SAPGUI_PROGRESS_INDICATOR'
+      exporting
+        text = h_text.
+    clear: its_edidd[],
+            h_error.
+*   Get IDoc data
+    call function 'IDOC_READ_COMPLETELY'
+      exporting
+        document_number         = t_idoc-docnum
+      importing
+        idoc_control            = lv_edidc
+      tables
+        int_edidd               = its_edidd
+      exceptions
+        document_not_exist      = 1
+        document_number_invalid = 2
+        others                  = 3.
+    if sy-subrc <> 0.
+*      MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*              WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+    else.
+      perform fill_output.
+    endif.
+
+  endloop.
+
+
+* End of insert MOD-001
+
+  perform select_status_800.
+
+endform.                    " SELECT_DATA
+
+*&---------------------------------------------------------------------*
+*&      Form  PROCESS_DATA
+*&---------------------------------------------------------------------*
+form process_data .
+
+* Sort so that most recent idoc for every PO item comes before the other
+* idocs
+  sort it_err by  ebeln ascending
+                  ebelp ascending
+                 docnum descending.
+
+* Loop over the full error table and copy the most recent ones per PO Item
+  loop at it_err.
+*   If PO item is different from previous one
+    if it_err-ebeln ne it_overview-ebeln or it_err-ebelp ne it_overview-ebelp.
+      it_overview = it_err.
+      append it_overview.
+    endif.
+  endloop.
+
+endform.                    " PROCESS_DATA
+
+
+* Begin of insert MOD-001
+*&---------------------------------------------------------------------*
+*&      Form  FILL_OUTPUT
+*&---------------------------------------------------------------------*
+*       Fill output table
+*----------------------------------------------------------------------*
+form fill_output .
+
+  data: lt_edids type standard table of edids,
+        lv_edids type edids.
+
+  data: lv_segnum type edids-segnum,
+        lv_teller type edids-segnum.
+
+
+
+  clear it_err.
+  it_err-docnum = t_idoc-docnum.
+
+  loop at its_edidd.
+
+
+*   Check data
+    case its_edidd-segnam.
+
+      when 'E1EDP02'.
+        move its_edidd-sdata to ls_e1edp02.
+        if ls_e1edp02-qualf = '001'.
+          concatenate '4500' ls_e1edp02-belnr into it_err-ebeln.
+          it_err-ebelp = ls_e1edp02-zeile.
+        endif.
+        if ls_e1edp02-qualf = '002'.
+          if ls_e1edp02-belnr in so_xblnr.
+            it_err-xblnr = ls_e1edp02-belnr.
+          else.
+            h_error = 'X'.
+            exit.
+          endif.
+        endif.
+
+      when 'E1EDK01'.
+        move its_edidd-sdata to ls_e1edk01.
+        if ls_e1edk01-bstzd eq p_ekorg or p_ekorg is initial.
+          it_err-lifnr = ls_e1edk01-recipnt_no.
+          it_err-ekorg = ls_e1edk01-bstzd.
+        else.
+          h_error = 'X'.
+          exit.
+        endif.
+
+      when 'E1EDP19'.
+        move its_edidd-sdata to ls_e1edp19.
+        if ls_e1edp19-qualf = '001'.
+          it_err-idtnr = ls_e1edp19-idtnr.
+        endif.
+
+      when 'E1EDP20'.
+        move its_edidd-sdata to ls_e1edp20.
+        it_err-bbein = ls_e1edp20-edatu.
+        it_err-wmeng = ls_e1edp20-wmeng.
+    endcase.
+
+***********
+
+
+    refresh: lt_edids.
+    select *
+    from   edids
+    into   table lt_edids
+    where  docnum = t_idoc-docnum
+    and    status = '51'.
+    if sy-subrc eq 0.
+      sort lt_edids by logdat descending.
+      read table lt_edids into lv_edids index 1.
+      if lv_edids-segnum is not initial.
+        lv_segnum = lv_edids-segnum.
+      endif.
+      if not lv_edids-stamid is initial.
+        message id lv_edids-stamid type 'E' number lv_edids-stamno
+                into it_err-text
+                with lv_edids-stapa1 lv_edids-stapa2 lv_edids-stapa3 lv_edids-stapa4.
+        if lv_edidc-credat in so_creda.
+          it_err-credat = lv_edidc-credat.
+          it_err-cretim = lv_edidc-cretim.
+        else.
+          h_error = 'X'.
+          exit.
+        endif.
+      endif.
+    endif.
+**********
+
+  endloop.
+
+  if h_error is initial.
+    append it_err.
+  endif.
+
+endform.                    " FILL_OUTPUT
+
+
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_AUTHORISATION
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+form check_authorisation.
+
+
+  authority-check object 'M_BEST_EKO'
+           id 'EKORG' field p_ekorg
+           id 'ACTVT'  dummy.
+
+  if sy-subrc = 4.
+*   No authorisation to display the data
+    message id 'YSE_GENERAL' type 'E' number '002' with p_ekorg.
+  elseif sy-subrc <> 0.
+*   Error checking authorization.
+    message id 'YSE_GENERAL' type 'E' number '001'.
+  endif.
+
+endform.                    "CHECK_AUTHORISATION
+*
+***********************************************************************
+* Form HANDLE_DOUBLE_CLICK                                             *
+************************************************************************
+*      -->P_E_ROW_ID     text                                          *
+*      -->P_E_COLUMN_ID  text                                          *
+************************************************************************
+* When a field in the ALV grid has been double clicked, load the       *
+* detail overview for that period and rental depot.                    *
+************************************************************************
+form handle_double_click  using    p_e_row_id
+                                   p_e_column_id.
+
+  data: gv_mode    type c             value 'E'.
+
+  clear it_overview.
+  read table it_overview into t_overview index p_e_row_id.
+
+* If Contract Number clicked
+*  SET PARAMETER ID 'DCN' FIELD t_out-docnum.
+  perform prepare_show_idoc.
+  call transaction 'WE02' using i_bdcdata
+           mode gv_mode update 'S'.
+
+
+endform.            " handle_double_click
+
+
+************************************************************************
+* Show IDOC                                                            *
+************************************************************************
+
+form prepare_show_idoc.
+
+  data: lv_date type d,
+        lv_sysdate type sy-datum.
+
+
+  refresh: i_bdcdata.
+
+
+* Screen 1
+
+  perform fill_bdcdata in program yam_common_routines
+           using    'RSEIDOC2'  '1000'  'X'  ''   ''
+           changing struct_bdcdata.
+  append struct_bdcdata  to i_bdcdata.
+  clear  struct_bdcdata.
+
+  clear lv_date.
+  lv_sysdate = t_overview-credat - 1.
+  write lv_sysdate to lv_date.
+  perform fill_bdcdata in program yam_common_routines
+       using    ''  ''  ''  'CREDAT-LOW' lv_date
+          changing struct_bdcdata.
+  append struct_bdcdata  to i_bdcdata.
+  clear  struct_bdcdata.
+
+  perform fill_bdcdata in program yam_common_routines
+       using    ''  ''  ''  'DOCNUM-LOW'  t_overview-docnum
+          changing struct_bdcdata.
+  append struct_bdcdata  to i_bdcdata.
+  clear  struct_bdcdata.
+
+
+
+  perform fill_bdcdata in program yam_common_routines
+           using    ''  ''  ''  'BDC_OKCODE'  '=ONLI'
+           changing struct_bdcdata.
+  append struct_bdcdata  to i_bdcdata.
+  clear  struct_bdcdata.
+
+* Screen 2
+
+  perform fill_bdcdata in program yam_common_routines
+         using    'IDOC_TREE_CONTROL'  '0100'  'X'  ''   ''
+         changing struct_bdcdata.
+  append struct_bdcdata  to i_bdcdata.
+  clear  struct_bdcdata.
+
+
+endform.                    "prepare_show_idoc
+
+* End of insert MOD-001
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_STATUS_800
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+form select_status_800 .
+  data: lt_matsps type table of yse_matsps,
+        ls_matsps type yse_matsps.
+
+  if p_ekorg is initial and '800' in so_xblnr.
+    select * from yse_matsps into table lt_matsps"#EC CI_NOFIRST
+       where bukrs = 'MRUA'
+         and datum in so_creda
+         and deleted = ''.
+  elseif p_ekorg(2) = 'RU' and '800' in so_xblnr.
+    select * from yse_matsps into table lt_matsps"#EC CI_NOFIRST
+            where ekorg eq p_ekorg
+              and datum in so_creda
+              and deleted = ''.
+  endif.
+
+  loop at lt_matsps into ls_matsps.
+    it_err-mandt  = ls_matsps-mandt.
+    it_err-docnum = ls_matsps-docnum.
+    it_err-ebeln = ls_matsps-ebeln.
+    it_err-ebelp = ls_matsps-ebelp.
+    it_err-credat = ls_matsps-datum.
+    it_err-cretim = ls_matsps-uzeit.
+    it_err-lifnr = ls_matsps-lifnr.
+    it_err-ekorg = ls_matsps-ekorg.
+    it_err-idtnr = ls_matsps-matnr.
+    it_err-xblnr = '800'.
+*    it_err-bbein
+*    it_err-wmeng
+*    it_err-bbmng
+    concatenate 'Material' ls_matsps-matnr 'is superceded by material'
+        ls_matsps-nfmat into it_err-text separated by space.
+    append it_err.
+  endloop.
+endform.                    " SELECT_STATUS_800

@@ -1,0 +1,708 @@
+*----------------------------------------------------------------------*
+* PROGRAM ID           : YCS_CREATE_INVOICE                            *
+* PROGRAM TITLE        : One button adm: create invoice                *
+* AUTHOR               : Luc Mertens                                   *
+* DATE                 : 11/04/2011                                    *
+* DEVELOPMENT ID       :                                               *
+* CHANGE REQUEST NUMBER: CD1K964287                                    *
+* PROGRAM DESCRIPTION  : Create Debit Memo/Service invoice             *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG
+*
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME                 |CORRECTION NR| CHANGE REF #
+*----------------------------------------------------------------------*
+* MOD-001 |20120104  | Geert Rutten                       |CD1K969706  *
+*----------------------------------------------------------------------*
+REPORT ycs_create_invoice NO STANDARD PAGE HEADING
+                                LINE-SIZE 100.
+
+* Begin of insert MOD-001
+TABLES: vbap.
+* End of insert MOD-001
+PARAMETERS: p_docnr    TYPE vbak-vbeln, " OBLIGATORY,
+            p_aufnr    TYPE aufk-aufnr OBLIGATORY,
+            p_zterm    TYPE vbkd-zterm,
+            p_proj     TYPE char04     OBLIGATORY,
+            p_flow     TYPE char04     OBLIGATORY,
+            p_credmr   TYPE boolean,
+            p_werks    TYPE werks_d.
+
+DATA: lt_komfk           TYPE TABLE OF komfk,       "gets filled
+      ls_komfk           TYPE komfk,
+      lt_komv            TYPE TABLE OF komv,        "Empty
+      lt_thead           TYPE TABLE OF theadvb,     "Empty
+      lt_vbfs            TYPE TABLE OF vbfs,        "Returns Error Messages
+      ls_vbfs            TYPE vbfs,
+      lt_vbpa            TYPE TABLE OF vbpavb,      "Empty
+      lt_vbrk            TYPE TABLE OF vbrkvb,      "Empty
+      lt_vbrp            TYPE TABLE OF vbrpvb,      "Empty
+      lt_vbss            TYPE TABLE OF vbss,        "Empty
+      ls_vbss            TYPE vbss,
+      gs_vbss            TYPE vbss,
+      ls_vbsk            TYPE vbsk.                 "Empty
+
+DATA: lv_action(80) TYPE C.
+
+DATA: es_log_details TYPE ycs_onebut_clsd.
+* Begin of insert MOD-001
+DATA: lv_kdauf       TYPE aufk-kdauf.
+* End of insert MOD-001
+DATA: ls_ycs_onebut_clsd TYPE ycs_onebut_clsd.
+
+DATA: gt_err       TYPE STANDARD TABLE OF bdcmsgcoll,
+      lt_err       TYPE STANDARD TABLE OF bdcmsgcoll,
+      ls_err       TYPE bdcmsgcoll.
+DATA: lt_errors    TYPE bal_t_msg,
+      ls_errors    TYPE LINE OF bal_t_msg.
+DATA: lt_return    TYPE STANDARD TABLE OF bapiret2,
+      ls_return    TYPE bapiret2.
+
+DATA: lv_fkart       TYPE fkart,
+      gv_handle      TYPE balloghndl,
+      is_msg         TYPE bal_s_msg,
+      lv_invoice     TYPE vbeln_vf,
+      lv_objnr       TYPE aufk-objnr,
+      lv_iphas       TYPE afih-iphas,
+      lv_dmr         TYPE vbak-vbeln,
+      lv_dmr_cre,                      " +LME-001
+      lv_kunnr       TYPE vbak-kunnr,
+      lv_kunnr_bp    TYPE vbpa-kunnr,
+      lv_kunnr_py    TYPE vbpa-kunnr,
+      lv_spras       TYPE kna1-spras,
+      lv_laiso       TYPE laiso,
+      lt_partners_to TYPE TABLE OF vbpa2kom,
+      ls_partners_to TYPE vbpa2kom,
+      ls_partners TYPE yscs_partnerseo,
+      lt_inv_not     TYPE STANDARD TABLE OF tline,
+      ls_inv_not     TYPE tline,
+      lt_text_header TYPE STANDARD TABLE OF bapisdtext,
+      ls_text_header TYPE bapisdtext.
+
+
+DATA: it_methods     LIKE bapi_alm_order_method OCCURS 0 WITH HEADER LINE,
+      it_header      LIKE bapi_alm_order_headers_i OCCURS 0 WITH HEADER LINE.
+
+DATA: ls_vbakkom  TYPE vbakkom,
+      ls_vbakkomx TYPE vbakkomx,
+      ls_vbak     TYPE vbak,
+      lv_vaplz TYPE gewrk,
+      lv_bemot TYPE bemot,
+      lv_objnr1 TYPE j_objnr,
+      lv_sttxt TYPE co_sttxt.
+DATA: lt_vbpakom  TYPE STANDARD TABLE OF vbpakom.
+
+DATA: BEGIN OF stat_tab OCCURS 0.    " Internal status setting table
+        INCLUDE STRUCTURE jstat.                            "
+DATA: END   OF stat_tab.
+
+DATA: lv_vkorg TYPE vkorg.
+*
+CONSTANTS: c_i0045(5)  TYPE c VALUE 'I0045',
+           c_i0002(5)  TYPE c VALUE 'I0002'.
+
+CONSTANTS: gc_blank(1) TYPE c VALUE ' '.
+
+
+
+*------------------------------------------------------------------------
+* Initialization
+PERFORM initialization.
+
+WAIT UP TO 3 SECONDS.
+
+
+
+*------------------------------------------------------------------------
+* Set Teco
+CLEAR lv_iphas.
+SELECT SINGLE iphas INTO lv_iphas
+  FROM afih WHERE aufnr = p_aufnr.
+
+
+
+IF lv_iphas < '3'.  " < TECO
+  it_methods-refnumber = '00001'.
+  it_methods-method = 'TECHNICALCOMPLETE'.
+  it_methods-objectkey = p_aufnr.
+  it_methods-objecttype = 'HEADER'.
+  APPEND it_methods.
+
+  it_methods-refnumber = '00001'.
+  it_methods-method = 'SAVE'.
+  it_methods-objectkey = p_aufnr.
+  it_methods-objecttype = ' '.
+  APPEND it_methods.
+
+  it_header-teco_ref_date = sy-datum.
+  it_header-orderid = p_aufnr.
+  APPEND it_header.
+
+  CALL FUNCTION 'BAPI_ALM_ORDER_MAINTAIN'
+    TABLES
+      it_methods = it_methods
+      it_header  = it_header
+      return     = lt_return.
+
+  LOOP AT lt_return INTO ls_return.
+    CLEAR is_msg.
+    is_msg-msgty = ls_return-type.
+    is_msg-msgid = ls_return-id.
+    is_msg-msgno = ls_return-number.
+    is_msg-msgv1 = ls_return-message_v1.
+    is_msg-msgv2 = ls_return-message_v2.
+    is_msg-msgv3 = ls_return-message_v3.
+    is_msg-msgv4 = ls_return-message_v4.
+    PERFORM add_message_to_log USING is_msg.
+  ENDLOOP.
+
+  READ TABLE lt_return INTO ls_return WITH KEY type = 'E'.
+  IF sy-subrc = 0.
+    ROLLBACK WORK.
+    PERFORM save_application_log USING gv_handle.
+    RETURN.
+  ELSE.
+    COMMIT WORK AND WAIT.
+
+    WAIT UP TO 3 SECONDS.
+
+* Set Notification Complete (NOCO)
+    CLEAR lv_vkorg.
+
+    SELECT SINGLE vkorg FROM qmel INTO lv_vkorg
+    WHERE aufnr = p_aufnr.
+
+    SUBMIT yam_close_notifs_for_order
+     WITH  s_aufnr = p_aufnr
+     WITH  p_vkorg = lv_vkorg
+     WITH p_test = ' '
+     AND RETURN.
+* Begin insert 09/01/2012
+  SELECT SINGLE * FROM ycs_onebut_clsd INTO es_log_details
+     WHERE aufnr = p_aufnr AND idat2 = sy-datum.
+  IF sy-subrc <> 0.
+    SELECT SINGLE * FROM viord INTO CORRESPONDING FIELDS OF es_log_details
+    WHERE aufnr  = p_aufnr.
+
+    es_log_details-idat2 = sy-datum.
+* Begin of change MOD-001
+    IF p_proj = 'SEED'.
+      SELECT SINGLE kdauf FROM aufk INTO lv_kdauf
+       WHERE aufnr  = p_aufnr.
+      SELECT SINGLE vkorg
+        FROM vbak INTO es_log_details-vkorg
+        WHERE vbeln = lv_kdauf.
+    ELSE.
+    SELECT SINGLE iwerk FROM viord INTO es_log_details-vkorg
+      WHERE aufnr  = p_aufnr.
+    ENDIF.
+
+
+* End of change MOD-001
+
+    SELECT SINGLE getri FROM afko INTO es_log_details-getri
+      WHERE aufnr = p_aufnr.
+
+    es_log_details-ernam = sy-uname.
+    es_log_details-action = 'TECO'.
+    INSERT into ycs_onebut_clsd values es_log_details.
+  ELSE.
+    CLEAR lv_action.
+    concatenate es_log_details-action 'TECO'  into  lv_action separated by space.
+    UPDATE ycs_onebut_clsd set action = lv_action
+     where aufnr = p_aufnr and idat2 = sy-datum.
+  ENDIF.
+* End insert 09/01/2012
+
+  ENDIF.
+ENDIF.
+
+
+*CALL FUNCTION 'CO_RU_ORDER_LOCK'
+*  EXPORTING
+*    aufnr_imp            = p_aufnr
+*  EXCEPTIONS
+*    order_already_locked = 01.
+
+CALL FUNCTION 'CO_RU_ORDER_DEQUEUE'
+  EXPORTING
+    aufnr_imp = p_aufnr.
+
+* First create the return parts
+IF p_proj = 'AM  '.
+  CALL FUNCTION 'YCS_IO17_TECO'
+    EXPORTING
+      ip_aufnr      = p_aufnr
+      ip_werks      = p_werks
+    EXCEPTIONS
+      error_occured = 1.
+
+  WAIT UP TO 2 SECONDS.
+
+ENDIF.
+
+
+
+
+
+
+
+*------------------------------------------------------------------------
+* Create DMR
+SET PARAMETER ID 'AUN' FIELD gc_blank.
+CLEAR lv_dmr_cre.      " +LME-001
+
+IF p_flow = 'CH' AND p_credmr = 'X'.
+  IF p_proj = 'AM  '.
+    PERFORM create_dmr IN PROGRAM ycs_create_dmr
+                TABLES gt_err
+                 USING p_aufnr p_proj.
+  ELSE.
+    PERFORM create_dmr IN PROGRAM ycs_create_dmr
+                TABLES gt_err
+                 USING p_docnr p_proj.
+    lv_dmr_cre = 'X'.      " +LME-001
+  ENDIF.
+
+  IMPORT gt_err TO lt_err FROM MEMORY ID 'YCS_CREATE_DMR'.
+
+  LOOP AT lt_err INTO ls_err.
+    CLEAR is_msg.
+    MOVE-CORRESPONDING ls_err TO is_msg.
+    is_msg-msgty = ls_err-msgtyp.
+    is_msg-msgno = ls_err-msgnr.
+    PERFORM add_message_to_log USING is_msg.
+  ENDLOOP.
+
+  CLEAR lv_iphas.
+  SELECT SINGLE iphas INTO lv_iphas
+  FROM afih WHERE aufnr = p_aufnr.
+
+  READ TABLE lt_err INTO ls_err WITH KEY msgtyp = 'E'.
+  IF sy-subrc = 0.
+    IF lv_iphas < '3'.  " < TECO
+      PERFORM cancel_teco.
+    ENDIF.
+    PERFORM save_application_log USING gv_handle.
+    RETURN.
+  ELSE.
+
+ SELECT SINGLE * FROM ycs_onebut_clsd INTO es_log_details
+     WHERE aufnr = p_aufnr AND idat2 = sy-datum.
+  IF sy-subrc <> 0.
+    SELECT SINGLE * FROM viord INTO CORRESPONDING FIELDS OF es_log_details
+    WHERE aufnr  = p_aufnr.
+
+    es_log_details-idat2 = sy-datum.
+
+    IF p_proj = 'SEED'.
+      SELECT SINGLE kdauf FROM aufk INTO lv_kdauf
+       WHERE aufnr  = p_aufnr.
+      SELECT SINGLE vkorg
+        FROM vbak INTO es_log_details-vkorg
+        WHERE vbeln = lv_kdauf.
+    ELSE.
+    SELECT SINGLE iwerk FROM viord INTO es_log_details-vkorg
+      WHERE aufnr  = p_aufnr.
+    ENDIF.
+    es_log_details-action = 'DMR Created'.
+
+    SELECT SINGLE getri FROM afko INTO es_log_details-getri
+      WHERE aufnr = p_aufnr.
+
+    es_log_details-ernam = sy-uname.
+
+    INSERT into ycs_onebut_clsd values es_log_details.
+  ELSE.
+    CLEAR lv_action.
+    concatenate es_log_details-action 'DMR Created'  into  lv_action separated by space.
+    UPDATE ycs_onebut_clsd set action = lv_action
+     where aufnr = p_aufnr and idat2 = sy-datum.
+  ENDIF.
+
+
+  ENDIF.
+ENDIF.
+
+*------------------------------------------------------------------------
+* Remove billing block on SO(SEED FP) or DMR(other)
+* + update DMR for CT-AM CH with paym.terms and inv.notes
+CLEAR: ls_vbakkom, ls_vbakkomx.
+REFRESH: lt_return, lt_text_header, lt_partners_to.
+
+IF p_proj = 'SEED' AND p_flow = 'FP'.
+  ls_vbakkom-vbeln  = p_docnr.
+  ls_vbakkomx-vbeln = p_docnr.
+ELSE.
+  IF NOT p_docnr IS INITIAL.
+    IF lv_dmr_cre = 'X'.                   " +LME-001
+      GET PARAMETER ID 'AUN' FIELD lv_dmr. " +LME-001
+      ls_vbakkom-vbeln  = lv_dmr.          " +LME-001
+      ls_vbakkomx-vbeln = lv_dmr.          " +LME-001
+    ELSE.                                  " +LME-001
+      ls_vbakkom-vbeln  = p_docnr.
+      ls_vbakkomx-vbeln = p_docnr.
+    ENDIF.                                 " +LME-001
+  ELSE.
+    GET PARAMETER ID 'AUN' FIELD lv_dmr.
+    ls_vbakkom-vbeln  = lv_dmr.
+    ls_vbakkomx-vbeln = lv_dmr.
+  ENDIF.
+ENDIF.
+
+ls_vbakkom-faksk  = ' '.
+ls_vbakkomx-faksk = 'X'.
+
+*
+IF p_proj = 'AM  ' AND p_flow = 'CH'.
+  ls_vbakkom-zterm  = p_zterm.
+  ls_vbakkomx-zterm = 'X'.
+
+  IMPORT inv_not TO lt_inv_not FROM MEMORY ID 'YCS_CREATE_INVOICE'.
+
+  IF sy-subrc = 0 AND NOT lt_inv_not[] IS INITIAL.
+    CLEAR: lv_kunnr,
+           lv_spras.
+    SELECT SINGLE kunnr INTO lv_kunnr
+      FROM vbak WHERE vbeln = lv_dmr.
+
+    SELECT SINGLE spras INTO lv_spras
+      FROM kna1 WHERE kunnr = lv_kunnr.
+
+    CALL FUNCTION 'CONVERSION_EXIT_ISOLA_OUTPUT'
+      EXPORTING
+        input  = lv_spras
+      IMPORTING
+        output = lv_laiso.
+
+    LOOP AT lt_inv_not INTO ls_inv_not.
+      ls_text_header-doc_number = lv_dmr.
+      ls_text_header-itm_number = 0.
+      ls_text_header-text_id    = '0001'.
+      ls_text_header-langu      = lv_spras.
+      ls_text_header-langu_iso  = lv_laiso.
+      ls_text_header-format_col = ls_inv_not-tdformat.
+      ls_text_header-text_line  = ls_inv_not-tdline.
+      APPEND ls_text_header TO lt_text_header.
+      CLEAR ls_text_header.
+    ENDLOOP.
+  ENDIF.
+ENDIF.
+
+IF p_proj = 'AM'.
+* get bill-to
+  SELECT SINGLE kunnr INTO lv_kunnr_bp
+    FROM vbpa WHERE parvw = 'RE'
+                AND vbeln = ls_vbakkom-vbeln
+                AND posnr = '000000'.
+
+* get current payer
+  SELECT SINGLE kunnr INTO lv_kunnr_py
+    FROM vbpa WHERE parvw = 'RG'
+                AND vbeln = ls_vbakkom-vbeln
+                AND posnr = '000000'.
+
+  IF sy-subrc = 0.
+    ls_partners_to-vbeln = ls_vbakkom-vbeln.
+    ls_partners_to-bparvw = 'RG'.
+    ls_partners_to-bparnr = lv_kunnr_bp.
+    ls_partners_to-bparvw_old = 'RG'.
+    ls_partners_to-bparnr_old = lv_kunnr_py.
+    ls_partners_to-posnr =  '000000'.
+
+    APPEND ls_partners_to TO lt_partners_to.
+  ENDIF.
+ENDIF.
+
+ls_vbakkomx-updkz = 'U'.
+
+CALL FUNCTION 'SD_SALES_DOCU_MAINTAIN'
+  EXPORTING
+    i_vbakkom      = ls_vbakkom
+    i_vbakkomx     = ls_vbakkomx
+    i_call_bapi    = 'X'
+    with_commit    = 'X'
+  TABLES
+    ix_text_header = lt_text_header
+    ix_vbpa2kom    = lt_partners_to
+    return         = lt_return.
+
+LOOP AT lt_return INTO ls_return.
+  CLEAR is_msg.
+  is_msg-msgty = ls_return-type.
+  is_msg-msgid = ls_return-id.
+  is_msg-msgno = ls_return-number.
+  is_msg-msgv1 = ls_return-message_v1.
+  is_msg-msgv2 = ls_return-message_v2.
+  is_msg-msgv3 = ls_return-message_v3.
+  is_msg-msgv4 = ls_return-message_v4.
+  PERFORM add_message_to_log USING is_msg.
+ENDLOOP.
+
+CLEAR lv_iphas.
+SELECT SINGLE iphas INTO lv_iphas
+  FROM afih WHERE aufnr = p_aufnr.
+
+
+READ TABLE lt_return INTO ls_return WITH KEY type = 'E'.
+IF sy-subrc = 0.
+  ROLLBACK WORK.
+  IF lv_iphas < '3'.  " < TECO
+    PERFORM cancel_teco.
+  ENDIF.
+  PERFORM save_application_log USING gv_handle.
+  RETURN.
+ELSE.
+  COMMIT WORK AND WAIT.
+ENDIF.
+
+WAIT UP TO 2 SECONDS.
+*------------------------------------------------------------------------
+* Create Service Invoice / Debit Memo
+SET PARAMETER ID 'VF ' FIELD gc_blank.
+
+CLEAR: lt_vbrk, lt_vbrp, lt_vbss, lt_vbpa, lt_vbfs, lt_thead, lt_komv.
+REFRESH: lt_vbss.
+
+CLEAR ls_komfk.
+ls_komfk-vbeln = ls_vbakkom-vbeln.
+APPEND ls_komfk TO lt_komfk.
+
+IF p_proj = 'SEED'.
+
+  SELECT SINGLE *
+    FROM vbap
+    WHERE vbeln = ls_vbakkom-vbeln AND pstyv = 'ZOD5'.
+  IF sy-subrc = 0.
+    lv_fkart = 'ZF2D'.
+  ELSE.
+    lv_fkart = 'ZF2'.
+  ENDIF.
+
+ELSE.
+  lv_fkart = 'L2'.
+ENDIF.
+
+
+*
+CALL FUNCTION 'RV_INVOICE_CREATE'
+  EXPORTING
+    invoice_type = lv_fkart
+    invoice_date = sy-datum
+    vbsk_i       = ls_vbsk
+    with_posting = 'B'
+  TABLES
+    xkomfk       = lt_komfk
+    xthead       = lt_thead
+    xvbfs        = lt_vbfs
+    xvbss        = lt_vbss
+    xvbrk        = lt_vbrk
+    xvbrp        = lt_vbrp
+    xvbpa        = lt_vbpa
+    xkomv        = lt_komv.
+
+LOOP AT lt_vbfs INTO ls_vbfs.
+  CLEAR is_msg.
+  MOVE-CORRESPONDING ls_vbfs TO is_msg.
+  PERFORM add_message_to_log USING is_msg.
+ENDLOOP.
+
+CLEAR lv_iphas.
+SELECT SINGLE iphas INTO lv_iphas
+  FROM afih WHERE aufnr = p_aufnr.
+
+
+READ TABLE lt_vbfs INTO ls_vbfs WITH KEY msgty = 'E'.
+IF sy-subrc = 0.
+  ROLLBACK WORK.
+  IF lv_iphas < '3'.  " < TECO
+    PERFORM cancel_teco.
+  ENDIF.
+ELSE.
+  COMMIT WORK AND WAIT.
+
+*   Send to log the order is closed
+*   An order is closed when the INVOICE button has completed all actions with success
+
+  SELECT SINGLE * FROM ycs_onebut_clsd INTO es_log_details
+     WHERE aufnr = p_aufnr AND idat2 = sy-datum.
+  IF sy-subrc <> 0.
+    SELECT SINGLE * FROM viord INTO CORRESPONDING FIELDS OF es_log_details
+    WHERE aufnr  = p_aufnr.
+
+    es_log_details-idat2 = sy-datum.
+
+* Begin of change MOD-001
+    IF p_proj = 'SEED'.
+      SELECT SINGLE kdauf FROM aufk INTO lv_kdauf
+       WHERE aufnr  = p_aufnr.
+      SELECT SINGLE vkorg
+        FROM vbak INTO es_log_details-vkorg
+        WHERE vbeln = lv_kdauf.
+    ELSE.
+    SELECT SINGLE iwerk FROM viord INTO es_log_details-vkorg
+      WHERE aufnr  = p_aufnr.
+    ENDIF.
+    es_log_details-action = 'INVOICED'.
+
+* End of change MOD-001
+
+    SELECT SINGLE getri FROM afko INTO es_log_details-getri
+      WHERE aufnr = p_aufnr.
+
+    es_log_details-ernam = sy-uname.
+
+    INSERT into ycs_onebut_clsd values es_log_details.
+  ELSE.
+    CLEAR lv_action.
+    concatenate es_log_details-action 'INVOICED'  into  lv_action separated by space.
+    UPDATE ycs_onebut_clsd set action = lv_action
+     where aufnr = p_aufnr and idat2 = sy-datum.
+  ENDIF.
+
+
+
+
+ENDIF.
+
+* Save application log
+PERFORM save_application_log USING gv_handle.
+
+*&---------------------------------------------------------------------*
+*&      Form  INITIALIZATION
+*&---------------------------------------------------------------------*
+FORM initialization .
+
+  DATA: ls_log    TYPE bal_s_log.
+
+  ls_log-object = 'YCS_ONE_BUTTON'.
+  ls_log-subobject = 'YCS_ONE_BUTTON'.
+  ls_log-extnumber = p_aufnr.
+
+*.. Create application log
+  CALL FUNCTION 'BAL_LOG_CREATE'
+    EXPORTING
+      i_s_log                 = ls_log
+    IMPORTING
+      e_log_handle            = gv_handle
+    EXCEPTIONS
+      log_header_inconsistent = 1
+      OTHERS                  = 2.
+
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+ENDFORM.                    " INITIALIZATION
+
+*&---------------------------------------------------------------------*
+*&      Form  SAVE_APPLICATION_LOG
+*&---------------------------------------------------------------------*
+FORM save_application_log USING ip_handle.
+
+  DATA: lt_handle TYPE bal_t_logh.
+
+  APPEND ip_handle TO lt_handle.
+
+  CALL FUNCTION 'BAL_DB_SAVE'
+    EXPORTING
+*     I_CLIENT               = SY-MANDT
+      i_in_update_task       = 'X'
+      i_t_log_handle         = lt_handle
+*   IMPORTING
+*     E_NEW_LOGNUMBERS       =
+    EXCEPTIONS
+      log_not_found          = 1
+      save_not_allowed       = 2
+      numbering_error        = 3
+      OTHERS                 = 4
+            .
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+  COMMIT WORK.
+
+ENDFORM.                    " SAVE_APPLICATION_LOG
+
+*&---------------------------------------------------------------------*
+*&      Form  ADD_MESSAGE_TO_LOG
+*&---------------------------------------------------------------------*
+*       Add a generated message to the application log
+*----------------------------------------------------------------------*
+FORM add_message_to_log USING is_msg.
+
+  CALL FUNCTION 'BAL_LOG_MSG_ADD'
+    EXPORTING
+*     I_LOG_HANDLE              =
+      i_s_msg                   = is_msg
+*   IMPORTING
+*     E_S_MSG_HANDLE            =
+*     E_MSG_WAS_LOGGED          =
+*     E_MSG_WAS_DISPLAYED       =
+    EXCEPTIONS
+      log_not_found             = 1
+      msg_inconsistent          = 2
+      log_is_full               = 3
+      OTHERS                    = 4
+            .
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+ENDFORM.                    " ADD_MESSAGE_TO_LOG
+*&---------------------------------------------------------------------*
+*&      Form  CANCEL_TECO
+*&---------------------------------------------------------------------*
+*       Reset former status
+*----------------------------------------------------------------------*
+FORM cancel_teco .
+
+  DATA lt_messages  TYPE bal_t_msg.
+
+* Un-teco service order
+  CALL FUNCTION 'IBAPI_ALM_ORDER_TECO_RESET'
+    EXPORTING
+      iv_orderid    = p_aufnr
+    TABLES
+      et_messages   = lt_messages
+      return        = lt_return
+    EXCEPTIONS
+      error_message = 1.
+
+  LOOP AT lt_return INTO ls_return.
+    CLEAR is_msg.
+    is_msg-msgty = ls_return-type.
+    is_msg-msgid = ls_return-id.
+    is_msg-msgno = ls_return-number.
+    is_msg-msgv1 = ls_return-message_v1.
+    is_msg-msgv2 = ls_return-message_v2.
+    is_msg-msgv3 = ls_return-message_v3.
+    is_msg-msgv4 = ls_return-message_v4.
+    PERFORM add_message_to_log(ycs_create_invoice) USING is_msg.
+  ENDLOOP.
+
+  READ TABLE lt_return INTO ls_return WITH KEY type = 'E'.
+  IF sy-subrc = 0.
+    ROLLBACK WORK.
+  ELSE.
+    READ TABLE lt_return INTO ls_return WITH KEY type = 'A'.
+    IF sy-subrc = 0.
+      ROLLBACK WORK.
+    ELSE.
+      COMMIT WORK AND WAIT.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    " CANCEL_TECO
+
+*Selection text£º
+*P_AUFNR:        Service Order
+*P_CREDMR:        Create DMR
+*P_DOCNR:D       .
+*P_FLOW:        Flow
+*P_PROJ:        Project (AM/SEED)
+*P_ZTERM:D       .

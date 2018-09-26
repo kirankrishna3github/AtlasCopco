@@ -1,0 +1,396 @@
+*----------------------------------------------------------------------*
+*  INCLUDE SDRRR51NC  ---   Subroutines
+*  ************************************
+*
+* perform collect_control_lines.
+* perform create_header_lines.
+* perform create_item_lines.
+* perform create_reference_line.
+* perform create_report_lines.
+* perform create_revenue_lines.
+*
+*----------------------------------------------------------------------*
+
+*----------------------------------------------------------------------*
+*       Form  COLLECT_CONTROL_LINES
+*----------------------------------------------------------------------*
+*       Collect control lines searching for revenue and reference lines
+*----------------------------------------------------------------------*
+*   --> PIT_VBREVK  Control lines
+*   <-> PIT_CONTROL Collect control lines
+*----------------------------------------------------------------------*
+form collect_control_lines using pit_vbrevk  type gvt_strucst_vbrevk
+                        changing pit_control type gvt_strucst_control.
+
+* Internal work areas
+  data: lvs_vbrevk  like vbrevk,
+        lvs_control type gvs_struc_control.
+
+* Fill control lines into internal table
+  loop at pit_vbrevk into lvs_vbrevk.
+    lvs_control-mandt = lvs_vbrevk-mandt.
+    lvs_control-vbeln = lvs_vbrevk-vbeln.
+    lvs_control-posnr = lvs_vbrevk-posnr.
+    collect lvs_control into pit_control.
+  endloop.
+
+endform.                               " COLLECT_CONTROL_LINES
+
+*----------------------------------------------------------------------*
+*       Form CREATE_HEADER_LINES
+*----------------------------------------------------------------------*
+*       Create header lines for ALV
+*----------------------------------------------------------------------*
+*   <-> PIT_VBREVK  Control lines
+*   <-> PIT_HEADER  Header fields (ALV)
+*----------------------------------------------------------------------*
+form create_header_lines changing pit_vbrevk type gvt_strucst_vbrevk
+                                  pit_header type gvt_strucst_vbrav51hd.
+
+* Internal work areas
+  data: lvs_vbrevk type vbrevk,
+        lvs_header type vbrav51hd.
+
+* Sort control lines (deferred revenues/unbilled receivables)
+  sort pit_vbrevk by mandt vbeln posnr dukz sakrr sakrrk.
+
+* Read control lines
+  loop at pit_vbrevk into lvs_vbrevk.
+
+    clear lvs_header.
+
+    if lvs_vbrevk-dukz eq gcf_dukz_deferred.  " If lvs_vbrevk-dukz ...
+*     Fill fields into header (deferred revenues)
+      move-corresponding lvs_vbrevk to lvs_header.
+*     Fill amount for deferred revenue
+      lvs_header-wrbtr_sakdr   = lvs_vbrevk-wrbtr.
+*     Fill amounts for realized revenues
+      lvs_header-rvamt_real_g  = lvs_vbrevk-rvamt.
+      lvs_header-rvamt_real_dr = lvs_vbrevk-rvamt.
+*     Fill not realized revenues in billing cases
+      if lvs_vbrevk-rrrel ca gcf_rrrel_billtipf.
+*       Fill amount for not realized revenues
+        lvs_header-rvamt_not_real =
+                    lvs_vbrevk-acc_value - lvs_header-rvamt_real_g.
+      endif.
+*     Append header
+      append lvs_header to pit_header.
+    else.
+
+*     Read header (unbilled receivables)
+      read table pit_header into lvs_header with key
+                                     mandt  = lvs_vbrevk-mandt
+                                     vbeln  = lvs_vbrevk-vbeln
+                                     posnr  = lvs_vbrevk-posnr
+                                     sakrr  = lvs_vbrevk-sakrrk
+                                     sakrrk = lvs_vbrevk-sakrr
+                                     binary search.
+
+      if sy-subrc eq 0.
+*       Fill amount for unbilled receivables
+        lvs_header-wrbtr_sakur    = lvs_vbrevk-wrbtr * -1.
+*       Fill amounts for realized revenues
+        lvs_header-rvamt_real_g   =
+                    lvs_header-rvamt_real_g + lvs_vbrevk-rvamt.
+        lvs_header-rvamt_real_ur  = lvs_vbrevk-rvamt.
+*       Fill amount for not realized revenues
+        lvs_header-rvamt_not_real =
+                    lvs_vbrevk-acc_value - lvs_header-rvamt_real_g.
+*       Modify header
+        modify pit_header from lvs_header index sy-tabix.
+      endif.
+
+    endif.                             " If lvs_vbrevk-dukz ...
+
+  endloop.
+
+endform.                               " create_header_lines
+
+*----------------------------------------------------------------------*
+*       Form  CREATE_ITEM_LINES
+*----------------------------------------------------------------------*
+*       Create item lines for ALV
+*----------------------------------------------------------------------*
+*   --> PIT_VBREVE         Revenue lines
+*   --> PIT_VBREVR         Reference lines
+*   --> PIF_SUBRC_VBREVE   Error mark for table revenue lines
+*   --> PIF_SUBRC_VBREVR   Error mark for table reference
+*   <-> PCT_HEADER         Header fields (ALV)
+*   <-> PCT_ITEM           Item fields (ALV)
+*----------------------------------------------------------------------*
+form create_item_lines using pit_vbreve type gvt_strucst_vbreve
+                             pit_vbrevr type gvt_strucst_vbrevr
+                             pif_subrc_vbreve
+                             pif_subrc_vbrevr
+                    changing pct_header type gvt_strucst_vbrav51hd
+                             pct_item   type gvt_strucst_vbrav51it.
+
+* Internal work areas
+  data: lvs_vbreve type vbreve,
+        lvs_vbrevr type vbrevr,
+        lvs_item   type vbrav51it.
+
+* Read revenue lines
+  if pif_subrc_vbreve eq 0.            " If pif_subrc_vbreve ...
+
+    loop at pit_vbreve into lvs_vbreve.
+
+*     Initialize work area
+      clear: lvs_item.
+
+*     Create VPRS item lines for ALV
+      if lvs_vbreve-kstat = gcf_true.
+        move-corresponding lvs_vbreve to lvs_item.
+        lvs_item-rvamt_real = lvs_vbreve-wrbtr.
+      else.
+*       Create revenue line for ALV
+        perform create_revenue_line using pct_header
+                                          lvs_vbreve
+                                 changing pct_item
+                                          lvs_item.
+      endif.
+
+      if lvs_item-revpoblck eq gcf_bill_rel_yes.
+*       Populate icon: Blocked revenue line
+        concatenate '@06\Q' text-001 '@' into lvs_item-icon_poblck.
+      else.
+*       Populate icon: Unblocked revenue line
+        clear: lvs_item-icon_poblck.
+      endif.
+
+      if not lvs_item is initial.
+*       Append item
+        append lvs_item to pct_item.
+      endif.
+
+    endloop.
+
+  endif.                               " If pif_subrc_vbreve ...
+
+* Read reference lines
+  if pif_subrc_vbrevr eq 0.            " If pif_subrc_vbrevr ...
+    loop at pit_vbrevr into lvs_vbrevr.
+*     Create reference line for ALV
+      perform create_reference_line using lvs_vbrevr
+                                 changing pct_header
+                                          pct_item.
+    endloop.
+  endif.                               " If pif_subrc_vbrevr ...
+
+* Sort item lines (deferred revenues/unbilled receivables)
+  sort pct_item by vbeln posnr sakdr sakur bdjpoper popupo.
+
+endform.                               " create_item_lines
+
+*----------------------------------------------------------------------*
+*       Form  CREATE_REFERENCE_LINE
+*----------------------------------------------------------------------*
+*       Create reference line for ALV
+*----------------------------------------------------------------------*
+*   --> PIS_VBREVR         Reference line
+*   <-> PCT_HEADER         Header fields (ALV)
+*   <-> PCT_ITEM           Item fields (ALV)
+*----------------------------------------------------------------------*
+form create_reference_line using pis_vbrevr type vbrevr
+                        changing pct_header type gvt_strucst_vbrav51hd
+                                 pct_item   type gvt_strucst_vbrav51it.
+
+* Internal work areas
+  data: lvs_header type vbrav51hd,
+        lvs_item   type vbrav51it.
+
+* Internal fields
+  data: lvf_sakrr        like pis_vbrevr-sakrr,
+        lvf_sakrrk       like pis_vbrevr-sakrrk,
+        lvf_header_tabix type sy-tabix,
+        lvf_account_change(1).
+
+* Set key fields
+  lvf_sakrr  = pis_vbrevr-sakrr.
+  lvf_sakrrk = pis_vbrevr-sakrrk.
+
+  do 2 times.                          " Do 2 times.
+
+*   Read header of the reference lines
+    read table pct_header into lvs_header with key
+                                   mandt  = pis_vbrevr-mandt
+                                   vbeln  = pis_vbrevr-vbeln
+                                   posnr  = pis_vbrevr-posnr
+                                   sakrr  = lvf_sakrr
+                                   sakrrk = lvf_sakrrk
+                                   binary search.
+
+*   Set SY-TABIX
+    lvf_header_tabix = sy-tabix.
+
+    if sy-subrc = 0.
+      exit.
+    else.
+*     Set key fields
+      lvf_sakrr  = pis_vbrevr-sakrrk.
+      lvf_sakrrk = pis_vbrevr-sakrr.
+*     Set mark: Accounts were changed
+      lvf_account_change = gcf_charx.
+    endif.
+
+  enddo.                               " Do 2 times.
+
+  if sy-subrc = 0.
+
+*   Fill fields into item (revenues)
+    move-corresponding pis_vbrevr to lvs_item.
+
+*   Fill amount of invoiced revenues
+    lvs_item-rvamt_inv = pis_vbrevr-wrbtr.
+
+    if lvf_account_change is initial.
+*     Fill amount for unbilled receivables
+      lvs_item-wrbtr_sakur = pis_vbrevr-rvamt.
+*     Fill amount for deferred revenues
+      lvs_item-wrbtr_sakdr = pis_vbrevr-wrbtr - pis_vbrevr-rvamt.
+*     Fill deferred revenue account
+      lvs_item-sakdr       = pis_vbrevr-sakrr.
+*     Fill unbilled receivable account
+      lvs_item-sakur       = pis_vbrevr-sakrrk.
+    else.
+*     Fill amount for unbilled receivables
+      lvs_item-wrbtr_sakur = pis_vbrevr-wrbtr - pis_vbrevr-rvamt.
+*     Fill amount for deferred revenues
+      lvs_item-wrbtr_sakdr = pis_vbrevr-rvamt.
+*     Fill deferred revenue account
+      lvs_item-sakdr = pis_vbrevr-sakrrk.
+*     Fill unbilled receivable account
+      lvs_item-sakur = pis_vbrevr-sakrr.
+    endif.
+
+*   Append item
+    append lvs_item to pct_item.
+
+*   Fill field into header (invoiced revenues)
+    lvs_header-rvamt_inv = lvs_header-rvamt_inv + lvs_item-rvamt_inv.
+
+*   Modify header
+    modify pct_header from lvs_header index lvf_header_tabix.
+
+  endif.
+
+endform.                               " create_reference_line
+
+*----------------------------------------------------------------------*
+*       Form  CREATE_REPORT_LINES
+*----------------------------------------------------------------------*
+*       Create report lines for ALV
+*----------------------------------------------------------------------*
+*   --> PIT_VBREVE         Revenue lines
+*   --> PIT_VBREVR         Reference lines
+*   --> PIF_SUBRC_VBREVE   Error mark for table revenue lines
+*   --> PIF_SUBRC_VBREVR   Error mark for table reference
+*   <-> PIT_VBREVK         Control lines
+*   <-> PIT_HEADER         Header fields (ALV)
+*   <-> PIT_ITEM           Item fields (ALV)
+*----------------------------------------------------------------------*
+form create_report_lines using pit_vbreve type gvt_strucst_vbreve
+                               pit_vbrevr type gvt_strucst_vbrevr
+                               pif_subrc_vbreve
+                               pif_subrc_vbrevr
+                      changing pit_vbrevk type gvt_strucst_vbrevk
+                               pit_header type gvt_strucst_vbrav51hd
+                               pit_item   type gvt_strucst_vbrav51it.
+
+* Create header lines for ALV
+  perform create_header_lines changing pit_vbrevk[]
+                                       pit_header[].
+
+* Create item lines for ALV
+  perform create_item_lines using pit_vbreve[]
+                                  pit_vbrevr[]
+                                  pif_subrc_vbreve
+                                  pif_subrc_vbrevr
+                         changing pit_header[]
+                                  pit_item[].
+
+endform.                               " create_report_lines
+
+*----------------------------------------------------------------------*
+*       Form  CREATE_REVENUE_LINE
+*----------------------------------------------------------------------*
+*       Create revenue line for ALV
+*----------------------------------------------------------------------*
+*   --> PIT_HEADER         Header fields (ALV)
+*   --> PIS_VBREVE         Revenue line
+*   <-> PCT_ITEM           Item fields (ALV)
+*   <-> PCS_ITEM           Item line )
+*----------------------------------------------------------------------*
+form create_revenue_line
+                   using pit_header type gvt_strucst_vbrav51hd
+                         pis_vbreve type vbreve
+                changing pct_item   type gvt_strucst_vbrav51it
+                         pcs_item   type vbrav51it.
+
+  data: lvf_sakdr          like pis_vbreve-sakdr,
+        lvf_sakur          like pis_vbreve-sakur,
+        lvf_account_change type char1.
+
+* Set key fields
+  lvf_sakdr = pis_vbreve-sakdr.
+  lvf_sakur = pis_vbreve-sakur.
+
+  do 2 times.                          " Do 2 times.
+
+*   Read header of the reference lines
+    read table pit_header with key mandt  = pis_vbreve-mandt
+                                   vbeln  = pis_vbreve-vbeln
+                                   posnr  = pis_vbreve-posnr
+                                   sakrr  = lvf_sakdr
+                                   sakrrk = lvf_sakur
+                                   transporting no fields
+                                   binary search.
+
+    if sy-subrc = 0.
+      exit.
+    else.
+*     Set key fields
+      lvf_sakdr = pis_vbreve-sakur.
+      lvf_sakur = pis_vbreve-sakdr.
+*     Set mark: Accounts were changed
+      lvf_account_change = gcf_charx.
+    endif.
+
+  enddo.                               " Do 2 times.
+
+  if sy-subrc = 0.                     " If sy-subrc ...
+
+*   Fill fields into item (revenues)
+    move-corresponding pis_vbreve to pcs_item.
+
+    if pis_vbreve-rrsta eq gcf_rrsta_aktiv or
+       pis_vbreve-rrsta eq gcf_rrsta_norel.
+*     Fill amount of not realized revenues
+      pcs_item-rvamt_not_real = pis_vbreve-wrbtr   * -1 .
+    else.
+*     Fill amount of realized revenues
+      pcs_item-rvamt_real     = pis_vbreve-wrbtr   * -1 .
+
+      if lvf_account_change is initial.
+*       Fill amount of deferred revenues
+        pcs_item-wrbtr_sakdr    = pis_vbreve-rvamt   * -1 .
+*       Fill amount of unbilled receivables
+        pcs_item-wrbtr_sakur    =
+             ( pis_vbreve-wrbtr - pis_vbreve-rvamt ) * -1 .
+      else.
+*       Fill amount of deferred revenues
+        pcs_item-wrbtr_sakdr    =
+             ( pis_vbreve-wrbtr - pis_vbreve-rvamt ) * -1 .
+*       Fill amount of unbilled receivables
+        pcs_item-wrbtr_sakur    = pis_vbreve-rvamt   * -1 .
+*       Fill deferred revenue account
+        pcs_item-sakdr          = pis_vbreve-sakur.
+*       Fill unbilled receivable account
+        pcs_item-sakur          = pis_vbreve-sakdr.
+      endif.
+
+    endif.
+
+  endif.                               " If sy-subrc ...
+
+endform.                               " create_revenue_line

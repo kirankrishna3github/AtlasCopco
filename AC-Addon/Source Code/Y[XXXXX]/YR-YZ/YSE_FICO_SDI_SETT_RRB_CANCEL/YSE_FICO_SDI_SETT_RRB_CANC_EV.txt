@@ -1,0 +1,122 @@
+*&---------------------------------------------------------------------*
+*&  Include           YSE_FICO_SDI_SETT_RRB_CANC_EV                    *
+*&---------------------------------------------------------------------*
+
+
+start-of-selection.
+
+
+*Select all billing relevant accounting doc's since here we can use the
+*document entry date to restrict selection
+select bukrs belnr gjahr cpudt awkey
+  from bkpf into table gt_canc_acc
+  where bukrs in so_bukrs
+    and belnr in so_belnr
+    and gjahr in so_gjahr
+    and cpudt in so_cpudt
+    and blart eq gc_blart.
+
+
+if sy-subrc ne 0.
+  message id 'YSE_RRB' type 'S' number '000'.
+  exit.
+endif.
+
+*Now filter out all the invoice cancelation doc's
+**First move the doc number to a field with the correct type
+loop at gt_canc_acc assigning <fs_canc_acc>.
+  move: <fs_canc_acc>-bukrs to gs_canc_bill-bukrs,
+        <fs_canc_acc>-belnr to gs_canc_bill-belnr,
+        <fs_canc_acc>-gjahr to gs_canc_bill-gjahr,
+        <fs_canc_acc>-cpudt to gs_canc_bill-cpudt,
+        <fs_canc_acc>-awkey(10) to gs_canc_bill-vbeln.
+
+  append gs_canc_bill to gt_canc_bill.
+
+endloop.
+
+**Next select all dmr's, which are stored in the assignment field of the cancelation doc's header
+select vbeln zuonr from vbrk into table gt_vbrk
+  for all entries in gt_canc_bill
+  where vbeln eq gt_canc_bill-vbeln
+    and fkart eq gc_s1.      "Only cancelations
+
+if sy-subrc ne 0.
+  message id 'YSE_RRB' type 'S' number '000'.
+  exit.
+endif.
+
+**Now move the DMR's to a field with the correct type
+loop at gt_vbrk assigning <fs_vbrk>.
+  move: <fs_vbrk>-vbeln to gs_dmr-canc,
+        <fs_vbrk>-zuonr(10) to gs_dmr-inv.
+
+  select single vbelv from vbfa into gs_dmr-dmr
+    where vbeln = <fs_vbrk>-zuonr(10)  "Subsequent doc is the invoice
+    and vbtyp_v = 'L'.    "Preceding doc cat is dmr
+
+  "Also make sure it is rrb billing form 02
+  select single vbeln from vbkd into gs_dmr-dmr
+    where vbeln = gs_dmr-dmr
+    and faktf = '02'.
+
+  check sy-subrc eq 0.  "Only append dmr if rrb
+
+  append gs_dmr to gt_dmr.  "RRB DMR so append for checks
+endloop.
+
+
+*Now check if a reposting already has been done
+*We can do this by checking our custom table YSE_COBRB_PROCES
+
+select * from YSE_COBRB_PROCES into table gt_cobrb
+  for all entries in gt_dmr
+  where kdauf eq gt_dmr-dmr
+  and billing_doc = gt_dmr-inv.
+*  and obj_key_rev = ' '.
+
+
+*In table gt_cobrb we now have all the ones that need to be reversed
+*Get own log sys for storing the cobrb entry
+  CALL FUNCTION 'OWN_LOGICAL_SYSTEM_GET'
+   IMPORTING
+     OWN_LOGICAL_SYSTEM                   = gv_own_logsys.
+
+
+loop at gt_dmr assigning <fs_dmr>.
+  "1) check if a repost has been done
+  loop at gt_cobrb assigning <fs_cobrb>
+    where kdauf = <fs_dmr>-dmr
+      and billing_doc = <fs_dmr>-inv.
+      if <fs_cobrb>-obj_key_rev = ' '.
+        perform reverse_repost.      "Reverse the repost of original dmr and update the table
+      endif.
+  endloop.
+  if sy-subrc ne 0.  "This means that the original dmr hasn't been reposted so no reversal is required but
+                     "we need to update the cobrb table to make sure that the preceding dmr of this cancelation isn't reposted
+
+    loop at gt_vbrk assigning <fs_vbrk> where zuonr(10) = <fs_dmr>-inv.
+    endloop.
+    if sy-subrc eq 0.
+      loop at gt_canc_acc assigning <fs_canc_acc> where awkey(10) = <fs_vbrk>-vbeln.
+      endloop.
+      if sy-subrc eq 0.
+        concatenate <fs_canc_acc>-belnr <fs_canc_acc>-bukrs <fs_canc_acc>-gjahr into gs_cobrb-obj_key.
+        move: <fs_canc_acc>-bukrs to gs_cobrb-bukrs,
+              'BKPFF'             to gs_cobrb-obj_typ,
+              gv_own_logsys       to gs_cobrb-obj_sys,
+              <fs_canc_acc>-gjahr to gs_cobrb-gjahr,
+              <fs_dmr>-dmr        to gs_cobrb-kdauf,
+              'manual cancel'     to gs_cobrb-obj_key_rev,
+              <fs_dmr>-inv        to gs_cobrb-billing_doc.
+        insert into YSE_COBRB_PROCES values gs_cobrb.
+        write: / , 'No repost was done, no cancellation is required for billing doc ', <fs_dmr>-inv.
+        commit work and wait.
+
+      endif.
+    endif.
+
+  else.         "Do nothing since cancelation levels things out again
+
+  endif.
+endloop.

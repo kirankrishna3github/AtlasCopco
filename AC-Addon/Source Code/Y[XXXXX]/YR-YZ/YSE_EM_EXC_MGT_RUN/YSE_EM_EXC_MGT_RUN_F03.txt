@@ -1,0 +1,891 @@
+*----------------------------------------------------------------------*
+***INCLUDE YSE_EM_EXC_MGT_RUN_F03 .
+*----------------------------------------------------------------------*
+
+*&---------------------------------------------------------------------*
+*&      Form  select_sohist
+*&---------------------------------------------------------------------*
+*       SELECT SALES ORDER HISTORY
+*----------------------------------------------------------------------*
+*  Find all sales districts where the plant is (direct) responsible for
+*  and get all sales history for these sales district + sel. param.
+*----------------------------------------------------------------------*
+FORM select_sohist.
+
+  PERFORM fill_districts.
+  PERFORM fill_materials.
+  PERFORM FILL_SRCLIST.
+
+* select sales history
+  SELECT *
+  FROM yse_em_sohist
+  INTO TABLE i_sohist
+  WHERE period LE end_period
+  AND period GE start_period
+* AND matnr IN r_matnr  ==> dumps if too many entries
+  AND vkorg EQ p_vkorg
+  AND vtweg IN s_vtweg
+  AND bzirk IN r_bzirk.
+
+  SELECT * FROM yse_em_sohistmig WHERE period LE end_period
+                                   AND period GE start_period
+*                                  AND matnr  IN r_matnr   ==> dumps if too many entries
+                                   AND vkorg  EQ p_vkorg
+                                   AND vtweg  IN s_vtweg
+                                   AND bzirk IN r_bzirk.
+    i_sohist = yse_em_sohistmig.
+    COLLECT i_sohist.
+  ENDSELECT.
+
+* Remove redundant entries
+*  LOOP AT I_SOHIST WHERE MATNR NOT IN R_MATNR.
+*    DELETE I_SOHIST.
+*  ENDLOOP.
+  LOOP AT I_SOHIST.
+    READ TABLE I_MARC WITH KEY MATNR = I_SOHIST-MATNR BINARY SEARCH.
+    IF SY-SUBRC NE 0.
+      DELETE I_SOHIST.
+    ENDIF.
+  ENDLOOP.
+
+  PERFORM create_temp_file.
+  PERFORM select_extra.      "Extra selects for filling fields in the EM table
+
+ENDFORM.                    " select_sohist
+
+*&---------------------------------------------------------------------*
+*&      Form  calculate_parameters
+*&---------------------------------------------------------------------*
+* D = calculate Forecasting demand for the next 12 periods             *
+* A function should be called that executes the functionality in       *
+* standard SAP transaction MP30.                                       *
+*&---------------------------------------------------------------------*
+FORM calculate_parameters .
+
+*  PERFORM GET_MAT_STCOST.    -> Moved to outside decision tree
+*  PERFORM MATERIAL_FORECAST. -> Moved to outside decision tree
+  PERFORM calculate_lotsize.
+  PERFORM calculate_ss.
+  PERFORM calculate_reorder.
+  PERFORM calculate_dmsv.
+
+ENDFORM.                    " calculate_parameters
+
+*&---------------------------------------------------------------------*
+*&      Form  calculate_pars_light
+*&---------------------------------------------------------------------*
+FORM calculate_pars_light .
+
+*  PERFORM GET_MAT_STCOST.    -> Moved to outside decision tree
+*  PERFORM MATERIAL_FORECAST. -> Moved to outside decision tree
+*  PERFORM calculate_lotsize. -> Not part of "light"
+*  PERFORM calculate_ss.      -> Not part of "light
+*  PERFORM calculate_reorder. -> Not part of "light
+  PERFORM calculate_dmsv.
+ENDFORM.                    " calculate_pars_light
+
+*&---------------------------------------------------------------------*
+*&      Form  CALCULATE_LOTSIZE
+*&---------------------------------------------------------------------*
+*       Determine lotsize for the selected material
+*----------------------------------------------------------------------*
+*
+*  LS = SQRT ( 2 * D * C )/ ( S * i )
+*
+*Whereby:
+*LS = Lot Size
+*D =  Forecasted demand for the next 12 periods (months)
+*C =  Order cost as defined in table 4 (for the warehouse type of the
+*selected plant)
+*S = 	Standard cost as defined in the accounting view of the material
+*master (MBEW-STPRS)
+*i = 	Inventory holding cost as defined in table 4 (for the warehouse
+*type of the selected plant)
+*----------------------------------------------------------------------*
+
+FORM calculate_lotsize.
+
+  DATA: lv_lotsize  LIKE marc-bstmi.   "+MOD-001
+
+  DATA:
+    V_TEMP1 LIKE V_CONFC,
+    V_TEMP2 LIKE V_CONFC.
+
+  CLEAR: eord, eina.
+  CLEAR: v_packqty, v_lotsize, v_lotsize_new, v_lotsize_dif.
+  CLEAR: V_LSCALC, V_VOLUM.
+
+* Convert material volume to M3 if required (this is needed for 1. Calculation method)
+  IF I_MARC-VOLEH EQ 'M3'.
+    V_VOLUM = I_MARC-VOLUM.
+  ELSE.
+    CALL FUNCTION 'UNIT_CONVERSION_SIMPLE'
+      EXPORTING
+        INPUT                      = I_MARC-VOLUM
+        UNIT_IN                    = I_MARC-VOLEH
+        UNIT_OUT                   = 'M3'
+      IMPORTING
+        OUTPUT                     = V_VOLUM.
+  ENDIF.
+
+* Get pack quantity
+  IF sy-subrc EQ 0.
+    V_PACKQTY      = YSE_EM_MATPLANT-pack_qty.
+    i_log-pack_qty = YSE_EM_MATPLANT-pack_qty.
+  ENDIF.
+
+* 1. Calculation method
+* *********************
+* If lotsize flag in table YSE_EM_MATPLANT not set to "M"anual
+  IF YSE_EM_MATPLANT-LOTSIZE_IND NE 'M'.
+*   Determine whether "Economic Order Quant" or "Time based lot size" formula should be used
+    CLEAR: I_EORD, I_LFA1.
+    READ TABLE I_EORD WITH KEY MATNR = I_MARC-MATNR
+                               WERKS = I_MARC-WERKS.
+    IF SY-SUBRC EQ 0.
+      READ TABLE I_LFA1 WITH KEY LIFNR = I_EORD-LIFNR.
+    ENDIF.
+*   In case fixed vendor is a central vendor
+    IF I_LFA1-KTOKK EQ 'ZICV'.
+
+*     If  Item volume < volume for EOQ (central)
+*     AND Order lines (12 mtn) < movements for EOQ (central)
+      IF      V_VOLUM LT YSE_EM_WHSTYPAR-VOLEOQ_CEN
+          AND V_SO12  LT YSE_EM_WHSTYPAR-MOVEOQ_CEN.
+*       EOQ calculation
+        V_LSCALC = SPACE.
+      ELSE.
+*       Time based calculation
+        V_LSCALC = 'S'.
+      ENDIF.
+*   In case fixed vendor is a local vendor
+*   ELSEIF I_LFA1-KTOKK EQ 'ZLMV'.
+*   In case fixed vendor is local, has another account group, or could not be determined
+    ELSE.
+*     If  Item volume < volume for EOQ (local)
+*     AND Order lines (12 mtn) < movements for EOQ (local)
+      IF      V_VOLUM LT YSE_EM_WHSTYPAR-VOLEOQ_LCL
+          AND V_SO12  LT YSE_EM_WHSTYPAR-MOVEOQ_LCL.
+*       EOQ calculation
+        V_LSCALC = SPACE.
+      ELSE.
+*       Time based calculation
+        V_LSCALC = 'S'.
+      ENDIF.
+    ENDIF.
+* Lotsize flag in table YSE_EM_MATPLANT set to "M"anual -> no calc req
+  ELSE.
+*   Set adjusted values for lotsize and lotsize flag same to current vals
+    I_LOG-ADLOSI = I_LOG-BSTFE.
+    I_LOG-ADLSFL = I_LOG-CULSFL.
+*   No further lotsize calculation required
+*   EXIT.  " Changed for issue 3408 ("Issue A")
+*   The procedure for EOQ has to be followed
+    V_LSCALC = SPACE.
+  ENDIF.
+
+* 2. Actual Lotsize calculation for EOQ
+* *************************************
+  IF V_LSCALC = SPACE.
+*   Calculate lot size
+*   Denominator
+    v_lotsize_calc = v_stcost * yse_em_whstypar-ihcperc.
+*   If denominator is 0, set it to 1
+    IF v_lotsize_calc IS INITIAL.
+      v_lotsize_calc = 1.
+    ENDIF.
+*   Completion of the formula
+*   v_lotsize = SQRT(  ( 2 * v_fcdem * yse_em_whstypar-ordcost ) /
+* Begin of deleton by MOD-001
+*    v_lotsize = SQRT(  ( 2 * v_confc * yse_em_whstypar-ordcost ) /
+*                       ( v_lotsize_calc ) ).
+* End of deleton by MOD-001
+
+* Begin of insertion by MOD-001
+* If value of any parameter is negative then convert the value in to positive to calculate the SQRT of it
+    lv_lotsize = ( 2 * v_confc * yse_em_whstypar-ordcost ) / ( v_lotsize_calc ).
+    IF lv_lotsize < 0.
+      lv_lotsize = -1 * lv_lotsize .
+      v_lotsize  = sqrt( lv_lotsize ).
+      v_lotsize  = -1 * v_lotsize.
+    ELSE.
+      v_lotsize = SQRT( lv_lotsize ).
+    ENDIF.
+* End of insertion by MOD-001
+
+* 3. Actual Lotsize calculation for "Time based ls calc"
+* ******************************************************
+  ELSEIF V_LSCALC = 'S'.
+
+*   V_LOTSIZE = V_FCDEM * YSE_EM_WHSTYPAR-LOTSIZ_DAYS / 250.
+    V_LOTSIZE = V_CONFC * YSE_EM_WHSTYPAR-LOTSIZ_DAYS / 250.
+
+  ENDIF.
+
+* 4. Completion of lotsize calc (rounding, ...)
+* *********************************************
+* If lotsize > D
+* IF v_lotsize GT v_fcdem.
+  IF v_lotsize GT v_confc.
+*   v_lotsize = TRUNC( v_fcdem ).
+    v_lotsize = TRUNC( v_confc ).
+  ELSEIF v_lotsize LT 1.
+    v_lotsize = 1.
+  ENDIF.
+
+* Round new lotsize (for branch WH)
+* ---------------------------------
+  IF YSE_EM_PLANT-WHTYPE EQ 'B'.
+*   If 1 <= lotsize < 7 , then round with multiple of 1
+    IF V_LOTSIZE GE 1 AND V_LOTSIZE LT 7.
+      V_LOTSIZE_NEW = TRUNC( V_LOTSIZE ).
+*   If 7 <= lotsize < 40 , then round with multiple of 5
+    ELSEIF V_LOTSIZE GE 7 AND V_LOTSIZE LT 40.
+*     9 will round to 10, 8 also, but 7 will round to 5, while it should also be 10
+*     Therefore it's faster to set new lotsize to 10 when V_LOTSIZE <= 10
+      IF V_LOTSIZE LE 10.
+        V_LOTSIZE_NEW = 10.
+      ELSE.
+        CALL FUNCTION 'YSE_ROUND'
+          EXPORTING
+            NUMBER_IN  = V_LOTSIZE
+            FACTOR     = 5
+          IMPORTING
+            NUMBER_OUT = V_LOTSIZE_NEW.
+      ENDIF.
+*   If 40 <= lotsize < 125 , then round with multiple of 10
+    ELSEIF V_LOTSIZE GE 40 AND V_LOTSIZE LT 125.
+      CALL FUNCTION 'YSE_ROUND'
+        EXPORTING
+          NUMBER_IN  = V_LOTSIZE
+          FACTOR     = 10
+        IMPORTING
+          NUMBER_OUT = V_LOTSIZE_NEW.
+*   If 125 <= lotsize < 500 , then round with multiple of 50
+    ELSEIF V_LOTSIZE GE 125 AND V_LOTSIZE LT 500.
+      CALL FUNCTION 'YSE_ROUND'
+        EXPORTING
+          NUMBER_IN  = V_LOTSIZE
+          FACTOR     = 50
+        IMPORTING
+          NUMBER_OUT = V_LOTSIZE_NEW.
+*   If 500 <= lotsize , then round with multiple of 100
+    ELSEIF V_LOTSIZE GE 500.
+      CALL FUNCTION 'YSE_ROUND'
+        EXPORTING
+          NUMBER_IN  = V_LOTSIZE
+          FACTOR     = 100
+        IMPORTING
+          NUMBER_OUT = V_LOTSIZE_NEW.
+    ENDIF.
+
+* Round new lotsize (for central WH and pack qty > 1)
+* ---------------------------------------------------
+  ELSEIF YSE_EM_PLANT-WHTYPE EQ 'C' AND V_PACKQTY GT 1.
+    V_LOTSIZE_NEW = TRUNC( ( ( 2 * ( V_LOTSIZE / V_PACKQTY ) ) + 1 ) / 2 ) * V_PACKQTY.
+    IF V_LOTSIZE_NEW LT 1.
+      V_LOTSIZE_NEW = 1.
+    ENDIF.
+
+*   If lotsize <= Packqty / 2
+    V_TEMP1 = V_PACKQTY / 2.
+    IF V_LOTSIZE LE V_TEMP1.
+*     If Packqty >= D / 2
+*     V_TEMP1 = V_FCDEM / 2.
+      V_TEMP1 = V_CONFC / 2.
+      IF V_PACKQTY GE V_TEMP1.
+*       If 1 <= lotsize < 7 , then round with multiple of 1
+        IF V_LOTSIZE GE 1 AND V_LOTSIZE LT 7.
+          V_LOTSIZE_NEW = TRUNC( V_LOTSIZE ).
+*       If 7 <= lotsize < 40 , then round with multiple of 5
+        ELSEIF V_LOTSIZE GE 7 AND V_LOTSIZE LT 40.
+*         9 will round to 10, 8 also, but 7 will round to 5, while it should also be 10
+*         Therefore it's faster to set new lotsize to 10 when V_LOTSIZE <= 10
+          IF V_LOTSIZE LE 10.
+            V_LOTSIZE_NEW = 10.
+          ELSE.
+            CALL FUNCTION 'YSE_ROUND'
+              EXPORTING
+                NUMBER_IN  = V_LOTSIZE
+                FACTOR     = 5
+              IMPORTING
+                NUMBER_OUT = V_LOTSIZE_NEW.
+          ENDIF.
+*       If 40 <= lotsize < 125 , then round with multiple of 10
+        ELSEIF V_LOTSIZE GE 40 AND V_LOTSIZE LT 125.
+          CALL FUNCTION 'YSE_ROUND'
+            EXPORTING
+              NUMBER_IN  = V_LOTSIZE
+              FACTOR     = 10
+            IMPORTING
+              NUMBER_OUT = V_LOTSIZE_NEW.
+*       If 125 <= lotsize < 500 , then round with multiple of 50
+        ELSEIF V_LOTSIZE GE 125 AND V_LOTSIZE LT 500.
+          CALL FUNCTION 'YSE_ROUND'
+            EXPORTING
+              NUMBER_IN  = V_LOTSIZE
+              FACTOR     = 50
+            IMPORTING
+              NUMBER_OUT = V_LOTSIZE_NEW.
+*       If 500 <= lotsize , then round with multiple of 100
+        ELSEIF V_LOTSIZE GE 500.
+          CALL FUNCTION 'YSE_ROUND'
+            EXPORTING
+              NUMBER_IN  = V_LOTSIZE
+              FACTOR     = 100
+            IMPORTING
+              NUMBER_OUT = V_LOTSIZE_NEW.
+        ENDIF.
+*     If Packqty < D / 2
+      ELSE.
+        V_LOTSIZE_NEW = V_PACKQTY.
+      ENDIF.
+
+*     If new lotsize >= ( D x Maxlotsize / ConvFactor )
+*     V_TEMP2 = V_FCDEM * YSE_EM_WHSTYPAR-MAXLOTSIZE.
+      V_TEMP2 = V_CONFC * YSE_EM_WHSTYPAR-MAXLOTSIZE.
+      V_TEMP1 = V_TEMP2 / V_CFACTOR.
+      IF V_LOTSIZE_NEW GE V_TEMP1.
+*       If D * Max lotsize > pack qty
+        IF V_TEMP2 GT V_PACKQTY.
+          V_LOTSIZE_NEW = TRUNC( V_TEMP1 / V_PACKQTY ) * V_PACKQTY.
+          IF V_LOTSIZE_NEW LT 1.
+            V_LOTSIZE_NEW = V_PACKQTY.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+
+    ENDIF.   " lotsize <= Packqty / 2
+
+* Round new lotsize (for central WH and pack qty 0 or 1)
+* ------------------------------------------------------
+  ELSEIF YSE_EM_PLANT-WHTYPE EQ 'C' AND V_PACKQTY LE 1.
+
+*   If lot size > ( D x Max lotsize / ConvFactor )
+*   V_TEMP1 = V_FCDEM * YSE_EM_WHSTYPAR-MAXLOTSIZE / V_CFACTOR.
+    V_TEMP1 = V_CONFC * YSE_EM_WHSTYPAR-MAXLOTSIZE / V_CFACTOR.
+    IF V_LOTSIZE GT V_TEMP1.
+      V_LOTSIZE_NEW = TRUNC( V_TEMP1 ).
+      IF V_LOTSIZE_NEW LT 1.
+        V_LOTSIZE_NEW = 1.
+      ENDIF.
+      V_LOTSIZE = V_LOTSIZE_NEW.              "Kevin
+    ENDIF.
+
+*   If 1 <= lotsize < 7 , then round with multiple of 1
+    IF V_LOTSIZE GE 1 AND V_LOTSIZE LT 7.
+      V_LOTSIZE_NEW = TRUNC( V_LOTSIZE ).
+*   If 7 <= lotsize < 40 , then round with multiple of 5
+    ELSEIF V_LOTSIZE GE 7 AND V_LOTSIZE LT 40.
+*     9 will round to 10, 8 also, but 7 will round to 5, while it should also be 10
+*     Therefore it's faster to set new lotsize to 10 when V_LOTSIZE <= 10
+      IF V_LOTSIZE LE 10.
+        V_LOTSIZE_NEW = 10.
+      ELSE.
+        CALL FUNCTION 'YSE_ROUND'
+          EXPORTING
+            NUMBER_IN  = V_LOTSIZE
+            FACTOR     = 5
+          IMPORTING
+            NUMBER_OUT = V_LOTSIZE_NEW.
+      ENDIF.
+*   If 40 <= lotsize < 125 , then round with multiple of 10
+    ELSEIF V_LOTSIZE GE 40 AND V_LOTSIZE LT 125.
+      CALL FUNCTION 'YSE_ROUND'
+        EXPORTING
+          NUMBER_IN  = V_LOTSIZE
+          FACTOR     = 10
+        IMPORTING
+          NUMBER_OUT = V_LOTSIZE_NEW.
+*   If 125 <= lotsize < 500 , then round with multiple of 50
+    ELSEIF V_LOTSIZE GE 125 AND V_LOTSIZE LT 500.
+      CALL FUNCTION 'YSE_ROUND'
+        EXPORTING
+          NUMBER_IN  = V_LOTSIZE
+          FACTOR     = 50
+        IMPORTING
+          NUMBER_OUT = V_LOTSIZE_NEW.
+*   If 500 <= lotsize , then round with multiple of 100
+    ELSEIF V_LOTSIZE GE 500.
+      CALL FUNCTION 'YSE_ROUND'
+        EXPORTING
+          NUMBER_IN  = V_LOTSIZE
+          FACTOR     = 100
+        IMPORTING
+          NUMBER_OUT = V_LOTSIZE_NEW.
+    ENDIF.
+
+  ENDIF.
+*********************************************************
+*******Kevin*********************************************
+*********************************************************
+* update exc log line
+  I_LOG-ADLOSI = V_LOTSIZE_NEW.
+  I_LOG-ADLSFL = V_LSCALC.
+
+* update exc log line if already exists => otherwise determine code
+  IF i_log-excode IS INITIAL.
+*   Determine exception code if new lotsize is significantly different from current lotsize
+*   Determine difference between current and new lotsize
+    v_lotsize_dif = ABS( v_lotsize_new - i_log-bstfe ).
+
+    IF    (     v_lotsize_new GE 1
+            AND v_lotsize_new LT 7
+            AND v_lotsize_new NE i_log-bstfe )
+       OR (     v_lotsize_new GE 7
+            AND v_lotsize_new LT 40
+            AND v_lotsize_dif GT 5 )
+       OR (     v_lotsize_new GE 40
+            AND v_lotsize_new LT 125
+            AND v_lotsize_dif GT 10 )
+       OR (     v_lotsize_new GE 125
+            AND v_lotsize_new LT 500
+            AND v_lotsize_dif GT 50 )
+       OR (     v_lotsize_new GE 500
+            AND v_lotsize_dif GT 100 ).
+
+*     Raise lot size exception, depending on lotsize flag
+      IF        YSE_EM_MATPLANT-LOTSIZE_IND EQ SPACE  " currently : EOQ
+            AND V_LSCALC                    EQ 'S'.   " adjusted  : Time based
+        PERFORM SET_EM_MSG USING 'B01'.
+      ELSEIF    YSE_EM_MATPLANT-LOTSIZE_IND EQ 'S'    " Currently : Time based
+            AND V_LSCALC                    EQ SPACE. " Adjusted  : EOQ
+        PERFORM SET_EM_MSG USING 'B02'.
+      ELSEIF  YSE_EM_MATPLANT-LOTSIZE_IND EQ V_LSCALC. " Current = Adjusted
+        PERFORM SET_EM_MSG USING 'B03'.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    " CALCULATE_LOTSIZE
+
+*&---------------------------------------------------------------------*
+*&      Form  CALCULATE_SS
+*&---------------------------------------------------------------------*
+*       Calculate Safety Stock & Exception code
+*----------------------------------------------------------------------*
+FORM calculate_ss .
+
+  DATA:
+    LV_MINSS  TYPE EISBE,
+    LV_MAXSS  TYPE EISBE,
+    LV_VOLVAL TYPE STPRS,
+    LV_INTG   TYPE I.
+
+* Determine demand during lead time (as ROP = SS + DDL <=> DD = ROP - SS)
+  V_DDL = OUT_MAPRO-MINBE - OUT_MAPRO-EISBE.
+
+* Calculate minimum safety stock
+* LV_MINSS = V_FCDEM / 50.
+  LV_MINSS = V_CONFC / 50.
+* Round minimum safety stock LV_MINSS
+  LV_INTG  = LV_MINSS.
+  LV_MINSS = LV_INTG.
+
+* Calculate maximum safety stock
+* If standard cost =< Max price
+  IF V_STCOST LE YSE_EM_WHSTYPAR-MAXSTCOST.
+*   LV_MAXSS = V_FCDEM / 6.
+    LV_MAXSS = V_CONFC / 6.
+* If D >= 40
+* ELSEIF V_FCDEM GE 40.
+  ELSEIF V_CONFC GE 40.
+*   LV_MAXSS = V_FCDEM / 6.
+    LV_MAXSS = V_CONFC / 6.
+* If D >= 20
+* ELSEIF V_FCDEM GE 20.
+  ELSEIF V_CONFC GE 20.
+*   Calculate Vol. Val.
+*   LV_VOLVAL = V_FCDEM * V_STCOST.
+    LV_VOLVAL = V_CONFC * V_STCOST.
+*   If Vol. Val. >= Min Vol Val
+    IF LV_VOLVAL GE YSE_EM_WHSTYPAR-MINVOLVAL.
+*     LV_MAXSS = V_FCDEM / 12.
+      LV_MAXSS = V_CONFC / 12.
+    ELSE.
+*     LV_MAXSS = V_FCDEM / 6.
+      LV_MAXSS = V_CONFC / 6.
+    ENDIF.
+* Other cases
+  ELSE.
+*   LV_MAXSS = V_FCDEM / 6.
+    LV_MAXSS = V_CONFC / 6.
+  ENDIF.
+* Round maximum safety stock LV_MAXSS
+  LV_INTG  = LV_MAXSS.
+  LV_MAXSS = LV_INTG.
+
+* If calculated minimum safety stock > calc max safety stock
+  IF LV_MINSS GT LV_MAXSS.
+    LV_MINSS = LV_MAXSS.
+  ENDIF.
+
+* If calculated safety stock < calculated minimum safety stock
+  IF OUT_MAPRO-EISBE LT LV_MINSS.
+    OUT_MAPRO-EISBE = LV_MINSS.
+  ELSEIF OUT_MAPRO-EISBE GT LV_MAXSS.
+    OUT_MAPRO-EISBE = LV_MAXSS.
+  ENDIF.
+
+* update exception code if already exists => otherwise determine code
+  IF NOT i_log-excode IS INITIAL. "Exception code already exists
+    i_log-adeisbe = out_mapro-eisbe.
+  ELSE.                          "No exception code determined yet
+*   Determine exception code E01 (K Raskin: changed E01 to C01) if new SS is different from current SS
+    IF i_log-eisbe NE out_mapro-eisbe.
+      PERFORM set_em_msg USING 'C01'.
+      i_log-adeisbe = out_mapro-eisbe.
+*     Set "adjusted lotsize" and "adjusted lotsize flag" flag to "old" values (CR0065)
+      I_LOG-ADLOSI = I_LOG-BSTFE.
+      I_LOG-ADLSFL = I_LOG-CULSFL.
+    ELSE.
+      i_log-adeisbe = i_log-eisbe.
+    ENDIF.
+  ENDIF.
+
+* Use demand during leadtime to adjust Reorderpoint according to AC adjusted safety stock
+  OUT_MAPRO-MINBE = V_DDL + I_LOG-ADEISBE.
+
+ENDFORM.                    " CALCULATE_SS
+
+*&---------------------------------------------------------------------*
+*&      Form  calculate_reorder
+*&---------------------------------------------------------------------*
+*       Calculate Reorder Point & Exception code
+*----------------------------------------------------------------------*
+
+FORM calculate_reorder.
+  CLEAR: v_minbe_dif, v_fcdem_week.
+
+  IF out_mapro-minbe GE 1.
+    i_log-adrepo = out_mapro-minbe.
+  ELSE.
+    out_mapro-minbe = 1.
+    i_log-adrepo = 1.
+  ENDIF.
+
+  IF i_log-excode IS INITIAL.   " If no exception code exists yet
+* Determine exception code C01 (K Raskin: Changed C01 to E01) if new difference between old and new
+* reorder point is bigger then D/50
+* calculate difference
+    v_minbe_dif = ABS( i_log-minbe - out_mapro-minbe ).
+*   v_fcdem_week = v_fcdem / 50.
+    v_fcdem_week = v_CONfc / 50.
+    IF v_minbe_dif GT v_fcdem_week.
+      PERFORM set_em_msg USING 'E01'.
+*     Set "adjusted lotsize" and "adjusted lotsize flag" flag to "old" values (CR0065)
+      I_LOG-ADLOSI = I_LOG-BSTFE.
+      I_LOG-ADLSFL = I_LOG-CULSFL.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    " calculate_reorder
+
+*&---------------------------------------------------------------------*
+*&      Form  calculate_dmsv
+*&---------------------------------------------------------------------*
+*       Calculate Delta max stock value
+*----------------------------------------------------------------------*
+
+FORM calculate_dmsv .
+  CLEAR: v_lead, v_ld360, v_y, v_z.
+* S = Standard cost = v_stcost
+* SS = Safety Stock = out_mapro-eisbe
+* D = forecast dem 12 months = v_fcdem
+* Y = to be calculated
+* L = Lead time in days = T399D-BZTEK + MARC-PLIFZ + MARC-WEBAZ
+  v_lead = t399d-bztek + i_marc-plifz + i_marc-webaz.
+* v_ld360 = v_lead * v_fcdem / 360.
+  v_ld360 = v_lead * v_confc / 360.
+
+  IF     i_log-excode EQ 'D01'
+      OR i_log-excode EQ 'A01'
+      OR i_log-excode EQ 'A03'.
+*   Calculate Y
+    IF v_lotsize_new GT v_ld360.
+      v_y = v_lotsize_new.
+    ELSE.
+      v_y = v_ld360.
+    ENDIF.
+*   DMSV = S x (SS + Y) )
+    i_log-dmaxsval = v_stcost * ( i_log-adeisbe + v_y ).
+
+  ELSEIF i_log-excode EQ 'D02'
+      OR i_log-excode EQ 'A02'
+      OR i_log-excode EQ 'A04'.
+*   Calculate Y
+    IF i_marc-bstfe GT v_ld360.
+      v_y = i_marc-bstfe.
+    ELSE.
+      v_y = v_ld360.
+    ENDIF.
+*   DMSV = - 1 ( S x (SS + Y) )
+    i_log-dmaxsval = - 1 * ( v_stcost * ( i_log-adeisbe + v_y ) ).
+
+  ELSEIF i_log-excode EQ 'B01'
+      OR i_log-excode EQ 'B02'
+      OR i_log-excode EQ 'B03'.
+*   Calculate Y
+    IF v_lotsize_new GT v_ld360.
+      v_y = v_lotsize_new.
+    ELSE.
+      v_y = v_ld360.
+    ENDIF.
+*   Calculate Z
+    IF i_marc-bstfe GT v_ld360.
+      v_z = i_marc-bstfe.
+    ELSE.
+      v_z = v_ld360.
+    ENDIF.
+*   DMSV = S x Y - S x Z
+*   i_log-dmaxsval = ( v_stcost * v_y ) - ( v_stcost * v_z ).
+    i_log-dmaxsval = V_STCOST * ( V_Y - V_Z + I_LOG-ADEISBE - I_LOG-EISBE ).
+
+*  Commented for CR0065
+*  ELSEIF i_log-excode EQ 'C01'.
+**   DMSV = S x (New SS - Old SS)
+*    i_log-dmaxsval = v_stcost * ( i_log-ADeisbe - i_marc-eisbe ).
+
+  ELSEIF i_log-excode EQ 'E01' OR I_LOG-EXCODE = 'C01'.  " Added C01 for CR0065
+*   DMSV = S x (New ROP - Old ROP)
+    i_log-dmaxsval = v_stcost * ( i_log-ADREPO - i_marc-minbe ).
+  ENDIF.
+
+ENDFORM.                    " calculate_dmsv
+
+*&---------------------------------------------------------------------*
+*&      Form  MATERIAL_FORECAST
+*&---------------------------------------------------------------------*
+FORM MATERIAL_FORECAST.
+
+  DATA:
+    LV_INT       TYPE I,
+    LV_DATUM     TYPE DATUM,
+    LV_ABPER(6)  TYPE C,
+    LV_3MPERF(6) TYPE C,
+    LV_3MPERP(6) TYPE C.
+
+* Fill table i_consu with consumption values for the specific material.
+* For Central Warehouse
+* IF distribution mode = DTC & to be distribution mode = DTC
+*      temp-zmeng * BD%
+* ELSE
+*      temp-zmeng
+
+* Build table with consumption according to AC logic
+  REFRESH: i_consu, I_FCVAL, I_FCVAL[], I_FCMSG[], I_FCMSG.
+  CLEAR: v_fcdem, WA_FCHDR, V_CONFC.
+  IF yse_em_plant-whtype EQ 'C'.
+    LOOP AT i_temp WHERE matnr EQ i_marc-matnr.
+      CLEAR i_consu.
+      i_consu-perna = i_temp-period.
+      IF i_marc-cudimo EQ c_dtc AND i_log-excode NE 'D01'.
+        i_consu-kwert = i_temp-zmeng * yse_em_whstypar-brkperc.
+      ELSE.
+        i_consu-kwert = i_temp-zmeng.
+      ENDIF.
+      APPEND i_consu.
+    ENDLOOP.
+  ELSEIF yse_em_plant-whtype EQ 'B'.
+    LOOP AT i_temp WHERE matnr EQ i_marc-matnr.
+      CLEAR i_consu.
+      i_consu-perna = i_temp-period.
+      IF yse_em_matso-spec IS INITIAL.
+        i_consu-kwert = i_temp-zmeng * yse_em_whstypar-brkperc.
+      ELSE.
+        i_consu-kwert = i_temp-zmeng * yse_em_whstypar-altperc.
+      ENDIF.
+      APPEND i_consu.
+    ENDLOOP.
+  ENDIF.
+
+* Have forecast done
+  CALL FUNCTION 'YSE_MATERIAL_FORECAST'
+* CALL FUNCTION 'MATERIAL_FORECAST_DIALOG'
+    EXPORTING
+      in_matnr                 = i_marc-matnr
+      in_werks                 = p_werks
+      in_pcont                 = i_pcont
+*     IN_ONLINE                = 'X'
+    IMPORTING
+      OUT_PROP                 = out_prop
+      out_mapro                = out_mapro
+*     OUT_FCODE                =
+    TABLES
+      consu                    = i_consu
+      forec                    = i_forec
+      mssgs                    = i_mssgs
+    EXCEPTIONS
+      no_consumption_data      = 1
+      t440l_not_found          = 2
+      no_forecast_params       = 3
+      no_valid_plant           = 4
+      no_material              = 5
+      no_forec_for_mat         = 6
+      no_material_at_plant     = 7
+      forecast_error           = 8
+      OTHERS                   = 9.
+
+* Round Safety stock
+  CALL FUNCTION 'ROUND'
+    EXPORTING
+      DECIMALS            = 0
+      INPUT               = OUT_MAPRO-EISBE
+      SIGN                = 'X'
+    IMPORTING
+      OUTPUT              = OUT_MAPRO-EISBE.
+* Round ROP
+  CALL FUNCTION 'ROUND'
+    EXPORTING
+      DECIMALS            = 0
+      INPUT               = OUT_MAPRO-MINBE
+      SIGN                = 'X'
+    IMPORTING
+      OUTPUT              = OUT_MAPRO-MINBE.
+* Round lot size
+  CALL FUNCTION 'ROUND'
+    EXPORTING
+      DECIMALS            = 0
+      INPUT               = OUT_MAPRO-BSTFE
+      SIGN                = 'X'
+    IMPORTING
+      OUTPUT              = OUT_MAPRO-BSTFE.
+
+* Prepare forecast header
+  WA_FCHDR-MATNR = I_MARC-MATNR.
+  WA_FCHDR-WERKS = P_WERKS.
+  WA_FCHDR-ERDAT = SY-DATUM.
+
+* Save forecast messages in custom table
+  MOVE-CORRESPONDING WA_FCHDR TO I_FCMSG.
+  LOOP AT I_MSSGS.
+    MOVE-CORRESPONDING I_MSSGS TO I_FCMSG.
+    I_FCMSG-POSN2 = I_FCMSG-POSN2 + 1.
+    APPEND I_FCMSG.
+  ENDLOOP.
+  DELETE FROM YSE_EM_FCMSG WHERE MATNR EQ I_MARC-MATNR
+                             AND WERKS EQ I_MARC-WERKS.
+  INSERT YSE_EM_FCMSG FROM TABLE I_FCMSG.
+
+* Determine D (into variable V_FCDEM) as the forecasted demand for the next 12 periods
+* Also determine D2 (into variable V_CONFC) as combination of recent consumption and
+* short term forecast
+* First determine the period from which we're interested in forecast values (sometimes
+* the forecast module returns lines from the past)
+  LV_DATUM = END_DATE + 1.
+  LV_ABPER = LV_DATUM(6).
+* Determine 3 months in the future (END_DATE should be end of last month)
+  CALL FUNCTION 'MONTH_PLUS_DETERMINE'
+    EXPORTING
+      MONTHS  = 4
+      OLDDATE = END_DATE
+    IMPORTING
+      NEWDATE = LV_DATUM.
+  LV_3MPERF = LV_DATUM(6).
+* Determine 3 months in the past (END_DATE should be end of last month)
+  CALL FUNCTION 'MONTH_PLUS_DETERMINE'
+    EXPORTING
+      MONTHS  = -3
+      OLDDATE = END_DATE
+    IMPORTING
+      NEWDATE = LV_DATUM.
+  LV_3MPERP = LV_DATUM(6).
+* And prepare internal table to save the forecast values in custom table
+  MOVE-CORRESPONDING WA_FCHDR TO I_FCVAL.
+  LOOP AT i_forec.
+*   If period is in the past
+    IF I_FOREC-PERNA LT LV_ABPER.
+      DELETE I_FOREC.
+    ELSE.
+*     Round the result value
+      CALL FUNCTION 'ROUND'
+        EXPORTING
+          DECIMALS            = 0
+          INPUT               = i_forec-kwert
+          SIGN                = 'X'
+        IMPORTING
+          OUTPUT              = i_forec-kwert.
+*     Save it in the internal table
+      MODIFY I_FOREC.
+*     Keep total forecast
+      v_fcdem = v_fcdem + i_forec-kwert.
+*     If it's in the near future (first 3 months coming)
+      IF I_FOREC-PERNA LT LV_3MPERF.
+        V_CONFC = V_CONFC + I_FOREC-KWERT.
+      ENDIF.
+*     Copy period and forecast value
+      I_FCVAL-PERNA = I_FOREC-PERNA.
+      I_FCVAL-OWERT = I_FOREC-KWERT.
+      APPEND I_FCVAL.
+    ENDIF.
+  ENDLOOP.
+  i_log-fcdem = v_fcdem.
+
+* Add last 3 months of consumption/history to V_CONFC
+  LOOP AT I_CONSU WHERE PERNA GT LV_3MPERP.
+    V_CONFC = V_CONFC + I_CONSU-KWERT.
+  ENDLOOP.
+* Multiply the sum of 3 months history + 3 months forecast
+  V_CONFC = V_CONFC * 2.
+* Round WAF
+  LV_INT = V_CONFC.
+  V_CONFC = LV_INT.
+  I_LOG-CONFC = V_CONFC.
+
+* Save forecast header data in custom table
+  WA_FCHDR-CONFC = V_CONFC.
+  MOVE-CORRESPONDING OUT_PROP TO WA_FCHDR.
+  MODIFY YSE_EM_FCHDR FROM WA_FCHDR.
+
+* Save forecast values in custom table
+  DELETE FROM YSE_EM_FCVAL WHERE MATNR EQ I_MARC-MATNR
+                             AND WERKS EQ I_MARC-WERKS.
+  INSERT YSE_EM_FCVAL FROM TABLE I_FCVAL.
+
+ENDFORM.                    " MATERIAL_FORECAST
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_MAT_STCOST
+*&---------------------------------------------------------------------*
+FORM GET_MAT_STCOST.
+
+* begin of insert air21099 03.12.09 CR1151
+  data: lv_bukrs  type bukrs,
+        lv_bukrs2 type bukrs.
+
+* Get movering average price for companies activated for actual costing
+  clear: lv_bukrs,
+         lv_bukrs2.
+
+  select single bukrs into lv_bukrs
+    from t001k where bwkey = p_werks.
+
+  if sy-subrc = 0.
+    select single bukrs into lv_bukrs2
+      from yse_cc_act_cost where bukrs = lv_bukrs.
+
+    if sy-subrc = 0.
+      CLEAR V_STCOST.
+      SELECT SINGLE * FROM mbew
+                  WHERE matnr EQ i_marc-matnr
+                    AND bwkey EQ p_werks
+                    and bwtar eq space.
+
+      IF sy-subrc EQ 0.
+        v_stcost = mbew-verpr.
+      ENDIF.
+    endif.
+  endif.
+  check lv_bukrs2 is initial.
+* end of insert air21099 03.12.09 CR1151
+
+* get standard cost into variable V_STCOST
+  CLEAR V_STCOST.
+  SELECT SINGLE * FROM mbew
+                  WHERE matnr EQ i_marc-matnr
+                    AND bwkey EQ p_werks.
+  IF sy-subrc EQ 0.
+    v_stcost = mbew-stprs.
+  ENDIF.
+
+ENDFORM.                    " GET_MAT_STCOST

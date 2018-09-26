@@ -1,0 +1,1906 @@
+************************************************************************
+*           Copyright(c) 2003 Deutsche Bank AG
+* All rights reserved. This Software is proprietary to Deutsche Bank AG
+* and is protected by copyright law and international treaties. Under no
+* circumstances are you permitted to make any attempt to alter, decrypt
+* or reverse engineer this software, and any unauthorised reproduction
+* of this software or any portion thereof may result in severe civil and
+* criminal penalties, and will be prosecuted to the maximum extent
+* possible under the law.
+************************************************************************
+REPORT YHFDBI89 LINE-COUNT 65 LINE-SIZE 160
+                NO STANDARD PAGE HEADING
+                MESSAGE-ID 00.
+************************************************************************
+*  Author       :  Deutsche Bank AG
+*  Date         :  Apr/2003
+*  Description  : This program performs the following functions :
+*  a) compute the checksum for each payment file created
+*  b) write the checksum to checksum files
+*  c) print checksum list
+*  d) append an entry to audit file for each payment file created
+* Changes done by Ajay: Oct'04 - external commands exceptions,AS/400
+************************************************************************
+** DDIC-Customized Objects ********************************************
+TABLES: REGUH, YHFAUDTR, YHFPARMI, WITH_ITEM, RLGRAP.
+************************* User Selection *******************************
+** Selection screen parameters ****************************************
+PARAMETERS: P_EMID LIKE REGUH-SRTF2.
+SELECT-OPTIONS: W_LAUFI FOR REGUH-LAUFI NO INTERVALS.
+SELECTION-SCREEN BEGIN OF BLOCK CRITERIA WITH FRAME TITLE TEXT-001.
+PARAMETERS:
+   CO_CODE         LIKE REGUH-ZBUKR OBLIGATORY.
+SELECT-OPTIONS:
+   HBK_KEY         FOR REGUH-HBKID OBLIGATORY,
+   ACCT_ID         FOR REGUH-HKTID NO-EXTENSION,
+   PAY_METH        FOR REGUH-RZAWE NO-EXTENSION OBLIGATORY. "paym
+PARAMETERS:
+   DBD_PAY LIKE YHFHELP-YHDBDPY.
+SELECTION-SCREEN BEGIN OF LINE.
+PARAMETERS:
+   YHTEST LIKE YHFHELP-YHTEST RADIOBUTTON GROUP 1.
+SELECTION-SCREEN:
+  COMMENT 03(50) TEXT-005 FOR FIELD YHTEST,
+  END OF LINE.
+PARAMETERS: FALLBACK   LIKE RFPDO1-F170XCRE.
+PARAMETERS: KATAKANA   LIKE RFPDO1-F170XCRE.
+SELECTION-SCREEN SKIP 1.
+SELECTION-SCREEN BEGIN OF LINE.
+PARAMETERS:
+  YHLIVE LIKE YHFHELP-YHLIVE RADIOBUTTON GROUP 1.
+SELECTION-SCREEN:
+  COMMENT 03(50) TEXT-006 FOR FIELD YHLIVE,
+  END OF LINE.
+SELECTION-SCREEN END OF BLOCK CRITERIA.
+SELECTION-SCREEN BEGIN OF BLOCK CHEQUE WITH FRAME TITLE TEXT-003.
+PARAMETERS:
+   PAYPROG(50) TYPE C.
+SELECTION-SCREEN BEGIN OF LINE.
+PARAMETERS: REF1 RADIOBUTTON GROUP RAD.
+SELECTION-SCREEN COMMENT 4(50) TEXT-010 .
+SELECTION-SCREEN END OF LINE.
+
+SELECTION-SCREEN BEGIN OF LINE.
+PARAMETERS: REF2 RADIOBUTTON GROUP RAD.
+SELECTION-SCREEN COMMENT 4(50) TEXT-011 .
+SELECTION-SCREEN END OF LINE.
+
+SELECTION-SCREEN BEGIN OF LINE.
+PARAMETERS: REF3 RADIOBUTTON GROUP RAD.
+SELECTION-SCREEN COMMENT 4(50) TEXT-009 .
+SELECTION-SCREEN END OF LINE.
+
+SELECTION-SCREEN END OF BLOCK CHEQUE.
+
+SELECTION-SCREEN BEGIN OF BLOCK WTXRUN WITH FRAME TITLE TEXT-004.
+PARAMETERS: WTXPROG(50) TYPE C.
+SELECT-OPTIONS: S_WITHT FOR WITH_ITEM-WITHT NO INTERVALS.
+SELECTION-SCREEN END OF BLOCK WTXRUN.
+
+** Global fields *******************************************************
+** Global constants ****************************************************
+************************* Data Declaration *****************************
+DATA: RWBTR_TOT(13) TYPE P DECIMALS 2. "accum. payment total
+DATA: WS_CHKSUM(1), WS_VALUT(10), RC LIKE SY-SUBRC,WS_COMP_CHKSUM(1),
+      V_PAYFILE(270), V_CHECK_FILE(270), V_WTXREP(1000), DIS_PLY(270),
+      WS_CHKSUM1(1).
+*DATA: V_DBCHK LIKE SXPGCOLIST-NAME.
+DATA: V_PAYFILE1(270), WS_SER_DELFILE(1),V_ERRFILE(270).
+
+*ZK 27/11/2007 To correct the error msg
+DATA: errortxt TYPE STRING.
+DATA: V_DBCHK LIKE SXPGCOLIST-NAME.
+*-----------------------------------------------------------------
+
+DATA: LOGTXT(70) TYPE C,
+            STATUS LIKE BTCXP3-EXITSTAT,
+            EXITPARAM LIKE EXTCMDEXEX-EXITCODE.
+DATA: L_FILENAME LIKE RLGRAP-FILENAME,
+             IN LIKE RLGRAP-FILENAME,
+             WS_EXT LIKE RLGRAP-FILENAME,
+*             WS_RWBTR LIKE REGUH-RWBTR,
+            WS_RWBTR(13) TYPE P DECIMALS 2,
+            CHKSUM(80) TYPE C, V_WTXREPFILE(120),
+           CNT TYPE I, WS_PC_DOWNLOAD(1), L_FILELENGTH TYPE I,
+            NRLINES TYPE I,
+            RNUM TYPE I , BYTES TYPE I,
+            SUBRC LIKE SY-SUBRC,
+            DBD_PAY1  LIKE YHFHELP-YHDBDPY.
+
+** Global arrays and internal tables ***********************************
+DATA: BEGIN OF EXEC_PROTOCOL OCCURS 100.  "protocol table for call func.
+        INCLUDE STRUCTURE BTCXPM.
+DATA: END OF EXEC_PROTOCOL.
+DATA: BEGIN OF SELTAB OCCURS 5.
+        INCLUDE STRUCTURE RSPARAMS.
+DATA: END OF SELTAB.
+DATA: BEGIN OF MASTER_ITAB OCCURS 5000,
+        VALUE_DATE          LIKE REGUH-VALUT,
+        REC_AC_NAME         LIKE REGUH-ZNME1,
+        REC_BANK_CD         LIKE REGUH-ZBNKY,
+        REC_BR              LIKE REGUH-ZBNKY,
+        REC_AC_NO(34)                       ,
+        TR_CD               LIKE T042N-BKTCP,
+        PAYMENT_AMT         LIKE REGUH-RWBTR,
+*        PAYMENT_AMT(13)     TYPE P DECIMALS 2,
+*       PAY_AMT_LOCAL       LIKE REGUH-RWBTR,
+        PAY_AMT_LOCAL(13)   TYPE P DECIMALS 2, "changed on 30-Nov-2006
+        PAYMENT_DOC_NO      LIKE REGUH-VBLNR,
+        COUNTRY_KEY         LIKE REGUH-LAND1,
+        PAY_METHOD          LIKE REGUH-RZAWE, "payment method
+        BANK_KEY            LIKE REGUH-HBKID, "house bank key
+        ACCOUNT_ID          LIKE REGUH-HKTID, "account id
+        BANK_AC_NO          LIKE REGUH-UBKNT, "our account number
+        PAY_CURR            LIKE REGUH-WAERS, "currency key
+        BANK_NUMBER         LIKE REGUH-UBNKL,
+        BENE_NUMBER         LIKE REGUH-LIFNR, "vendor number
+        PAYMENT_MODE(3)     TYPE C,
+        WTX_INCLUD          LIKE YHFFMTXR-YPAYDTL,
+        LAUFI               LIKE REGUH-LAUFI,
+      END OF MASTER_ITAB.
+DATA: BEGIN OF ITAB_WTXREP OCCURS 0,
+        BUKRS LIKE BSIK-BUKRS,
+        NAME1 LIKE LFA1-NAME1,
+        ADDR1 LIKE LFA1-STRAS,
+        ADDR2 LIKE LFA1-STRAS,
+        ADDR3 LIKE LFA1-STRAS,
+        BELNR LIKE BSIK-BELNR,
+        AUGDT LIKE BSIK-AUGDT,
+        WT_WITHCD(5) TYPE C,
+        WT_QSSHB(20),
+        WT_QBSHB(20),
+        QSATZ(10),
+      END OF ITAB_WTXREP.
+
+DATA: BEGIN OF I_TABLE OCCURS 10,
+        LINE(800),
+      END OF I_TABLE.
+DATA: BEGIN OF ITAB OCCURS 10,
+        PAY_MODE(3) TYPE C,
+        YHFFMTXR LIKE YHFFMTXR,
+        REGUH LIKE REGUH,
+      END OF ITAB.
+
+* Added for WS+encryption fix
+DATA: WS_EXE(20) TYPE C.
+
+* Report heading.
+TOP-OF-PAGE.
+  WRITE: /1 'REF: YHFDBI87', 50 'DEUTSCHE BANK AG'
+         , 110 SY-DATUM, SY-TIMLO.
+  WRITE: /1 SY-UNAME,   48 'AUTO PAYMENT CHECKSUM'
+         , 110 'PAGE: ', SY-PAGNO.
+  ULINE.
+************************* Main Program *********************************
+START-OF-SELECTION.
+
+  IMPORT V_PAYFILE FROM MEMORY ID 'PAYFILE'.
+  IMPORT V_CHECK_FILE FROM MEMORY ID 'CHECKFILE'.
+  IMPORT V_PAYFILE1 FROM MEMORY ID 'V_PAYFILE1'.
+  CONCATENATE DBD_PAY V_PAYFILE1 INTO DIS_PLY.
+  IMPORT V_ERRFILE FROM MEMORY ID 'V_ERRFILE'.
+  IMPORT WS_PC_DOWNLOAD FROM MEMORY ID 'WS_PC_DOWNLOAD'.
+
+*PC download option....................
+*  IF WS_PC_DOWNLOAD EQ 'Y'.
+**    EXPORT V_ERRFILE TO MEMORY ID 'V_ERRFILE'.
+*    PERFORM DOWN_LOAD_PC.
+*  ENDIF.
+
+  RWBTR_TOT = 0.
+  RC = 0.
+  PERFORM CHECK_FILE USING V_PAYFILE RC.
+  IF RC = 0.
+** Check sum Genration logic ***********************************
+    PERFORM MD5_COMPUTE_CHKSUM USING V_PAYFILE
+                                     V_CHECK_FILE.
+    PERFORM PRINT_HEADING USING V_PAYFILE
+                                 V_CHECK_FILE.
+    PERFORM PRINT_CHECK_DBI.
+    PERFORM WRITE_AUDIT.
+  ENDIF.
+** Encryption Logic **************** ***********************************
+  PERFORM DATA_TRANSFER USING V_PAYFILE V_CHECK_FILE.
+************************* Sub-Routines *********************************
+
+**Download encrypted file to workstation, By Srini - 04-Dec-2006
+  IF WS_PC_DOWNLOAD EQ 'Y'.
+    PERFORM DOWN_LOAD_PC.
+  ENDIF.
+
+  IF WS_SER_DELFILE EQ 'Y'.
+    DELETE DATASET V_PAYFILE.
+    DELETE DATASET V_CHECK_FILE.
+    DELETE DATASET V_ERRFILE.
+  ENDIF.
+
+** to pop up confirmation if STR SPL param is set.
+  PERFORM POP_UP_INFOR_PAYFILE.
+*---------------------------------------------------------------------*
+*       FORM CHECK_FILE                                               *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  FILE1                                                         *
+*  -->  RC                                                            *
+*---------------------------------------------------------------------*
+FORM CHECK_FILE USING FILE1 RC.
+
+*FOR 4.6
+*  OPEN DATASET FILE1 FOR INPUT IN TEXT MODE.
+*END 4.6
+
+*FOR 4.7
+  OPEN DATASET FILE1 FOR INPUT IN TEXT MODE  ENCODING DEFAULT.
+*END 4.7
+
+  IF SY-SUBRC NE 0.
+    WRITE:/ 'Error opening file: ', FILE1.
+    RC = SY-SUBRC.
+  ELSE.
+    CLOSE DATASET FILE1.
+  ENDIF.
+ENDFORM.
+*---------------------------------------------------------------------*
+*       FORM PRINT_CHECK_DBI                                          *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+FORM PRINT_CHECK_DBI.
+  CNT = 0.
+  SKIP 2.
+  WRITE: /1 'Payment List Summary'.
+  ULINE.
+  WRITE: /1 'SNo',
+          5 'Bank A/C No',
+         17 'PayCurr',
+         25 'Value Date',
+         36 'Rec A/C Name',
+         62 'RecBankCd',
+         72 'RecBr',
+         80 'Rec A/C No',
+
+        110  'Tr Cd',
+        119 'Payment Amt',
+*        134 'Payment Doc No'.
+        147 'Pay. Doc No'.
+
+*        93 'Tr Cd',
+*       102 'Payment Amt',
+**        117 'Payment Doc No'.
+*       124 'Pay. Doc No'.
+  WRITE: /5 'WHT Code',
+         25 'Base Amt',
+         62 'Tax Rate',
+         80 'Tax Amt'.
+  ULINE.
+
+  IMPORT MASTER_ITAB FROM MEMORY ID 'MASTER_ITAB'.
+  IF WTXPROG NE SPACE.
+    IF DBD_PAY1 NE SPACE.
+      CONCATENATE DBD_PAY1 'WTX' SY-DATUM 'REP' INTO V_WTXREPFILE.
+    ELSE.
+      CONCATENATE DBD_PAY 'WTX' SY-DATUM 'REP' INTO V_WTXREPFILE.
+    ENDIF.
+
+*FOR 4.6
+*    OPEN DATASET V_WTXREPFILE FOR INPUT IN TEXT MODE.
+*END 4.6
+
+*FOR 4.7
+     OPEN DATASET V_WTXREPFILE FOR INPUT IN TEXT MODE ENCODING DEFAULT.
+*END 4.7
+
+    IF SY-SUBRC <> 0.
+      WRITE:/ 'cannot open withholding tax details report file'.
+      EXIT.
+    ENDIF.
+    DO.
+      READ DATASET V_WTXREPFILE INTO V_WTXREP.
+      IF SY-SUBRC <> 0.
+        EXIT.
+      ENDIF.
+      SPLIT V_WTXREP AT ';' INTO ITAB_WTXREP-BUKRS ITAB_WTXREP-NAME1
+      ITAB_WTXREP-ADDR1 ITAB_WTXREP-ADDR2 ITAB_WTXREP-ADDR3
+      ITAB_WTXREP-BELNR ITAB_WTXREP-AUGDT ITAB_WTXREP-WT_WITHCD
+      ITAB_WTXREP-WT_QSSHB ITAB_WTXREP-WT_QBSHB ITAB_WTXREP-QSATZ.
+      APPEND ITAB_WTXREP.
+    ENDDO.
+  ENDIF.
+  LOOP AT MASTER_ITAB.
+*    IF SY-SUBRC NE 0.
+*      EXIT.
+*    ENDIF.
+    CNT = CNT + 1.
+    CONCATENATE MASTER_ITAB-VALUE_DATE+0(2)
+                '.' MASTER_ITAB-VALUE_DATE+2(2)
+                '.' MASTER_ITAB-VALUE_DATE+4(4) INTO WS_VALUT.
+    WS_RWBTR = MASTER_ITAB-PAYMENT_AMT.
+    WRITE: /1(4) CNT,
+           5 MASTER_ITAB-BANK_AC_NO,
+           17 MASTER_ITAB-PAY_CURR,
+           25 WS_VALUT,
+           36(25) MASTER_ITAB-REC_AC_NAME,
+           62 MASTER_ITAB-REC_BANK_CD,
+           72 MASTER_ITAB-REC_BR,
+           80 MASTER_ITAB-REC_AC_NO,
+
+           110 MASTER_ITAB-TR_CD,
+           119 WS_RWBTR.
+    IF ZW_LAUFI+5(1) = 'P'.
+      WRITE: 147 MASTER_ITAB-BENE_NUMBER.
+    ELSE.
+      WRITE: 147 MASTER_ITAB-PAYMENT_DOC_NO.
+    ENDIF.
+
+*           93 MASTER_ITAB-TR_CD,
+*           96 WS_RWBTR.
+*    IF ZW_LAUFI+5(1) = 'P'.
+*      WRITE: 124 MASTER_ITAB-BENE_NUMBER.
+*    ELSE.
+*      WRITE: 124 MASTER_ITAB-PAYMENT_DOC_NO.
+*    ENDIF.
+    IF MASTER_ITAB-WTX_INCLUD NE SPACE.
+      PERFORM PRINT_WTX_DETAILS USING MASTER_ITAB-PAYMENT_DOC_NO.
+    ENDIF.
+
+*    Commented on 16-Oct-2006
+*    RWBTR_TOT = RWBTR_TOT + MASTER_ITAB-PAYMENT_AMT. "payment total
+  ENDLOOP.
+
+  ULINE.
+  SKIP 2.
+  WRITE: /1 'Checksum Summary '.
+  ULINE.
+  IF WS_PC_DOWNLOAD NE 'Y'.
+    WRITE: /1 'Checksum File  :',  18(120) V_CHECK_FILE.
+  ELSE.
+    WRITE: /1 'Checksum File  :',  18(120) RLGRAP-FILENAME.
+  ENDIF.
+  SKIP 1.
+  IF SYST-OPSYS = 'AS/400' OR SYST-OPSYS = 'OS/400'.
+   IF WS_CHKSUM1 = 'Y'.
+    WRITE: /1 'Check Total    : ', 18(40) EXEC_PROTOCOL+3.
+   ELSE.
+    WRITE: /1 'Check Total    : ', 18(32) EXEC_PROTOCOL+3.
+   ENDIF.
+  ELSE.
+    WRITE: /1 'Check Total    : ', 18(128) EXEC_PROTOCOL+3.
+  ENDIF.
+  WRITE: /1 'Check Date     : ', 18 SY-DATUM.
+  WRITE: /1 'Check Time     : ', 18 SY-UZEIT.
+  ULINE.
+  DELETE DATASET V_WTXREPFILE.
+ENDFORM.
+*---------------------------------------------------------------------*
+*       FORM PRINT_WTX_DETAILS                                        *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  VALUE(P_PAY_DOC)                                              *
+*---------------------------------------------------------------------*
+FORM PRINT_WTX_DETAILS USING VALUE(P_PAY_DOC) TYPE C.
+*  DATA: CNT TYPE I.
+  LOOP AT ITAB_WTXREP
+  WHERE BELNR = P_PAY_DOC.
+*    CNT = CNT + 1.
+*    WRITE: /1(4) CNT,
+    WRITE: /1(4) ' ',
+           5 ITAB_WTXREP-WT_WITHCD,
+           15 ITAB_WTXREP-WT_QSSHB,
+           62 ITAB_WTXREP-QSATZ,
+           68 ITAB_WTXREP-WT_QBSHB.
+  ENDLOOP.
+ENDFORM.
+***********************************************************PP01
+* Changed by : Purna Chandra
+* Date       : 20\08\2007
+* To create the SHA checksum value generation.
+***********************************************************PP01
+*---------------------------------------------------------------------*
+*       FORM MD5_COMPUTE_CHKSUM                                       *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  PAYFILE                                                       *
+*  -->  CHKFILE1                                                      *
+*---------------------------------------------------------------------*
+FORM MD5_COMPUTE_CHKSUM USING PAYFILE CHKFILE1.
+  DATA: V_FILE_FLAG LIKE YHFPARMI-PARM_VAL.
+***********************************************************PP01
+* Changed by : Purna Chandra
+* Date       : 20\08\2007
+* To create the SHA checksum value generation.
+***********************************************************PP01
+*  DATA: ADDPARAM LIKE SXPGCOLIST-PARAMETERS.
+*  ADDPARAM = PAYFILE.
+*  REFRESH EXEC_PROTOCOL.
+*
+*  IF SYST-OPSYS = 'AS/400' OR SYST-OPSYS = 'OS/400'.
+*    CONCATENATE 'PARM(' '''' ADDPARAM '''' ')' INTO ADDPARAM.
+*  ENDIF.
+***********************************************************PP01
+* Changed by : Purna Chandra
+* Date       : 20\08\2007
+* To create the SHA checksum value generation.
+***********************************************************PP01
+
+***** PC download validation requirements************************
+
+  SELECT SINGLE * FROM YHFPARMI WHERE BUKRS = SPACE
+                    AND PARM1 = 'WDN'
+                    AND PARM2 = 'EAP'.
+  IF SY-SUBRC EQ 0.
+    MOVE YHFPARMI-PARM_VAL TO WS_PC_DOWNLOAD.
+  ELSE.
+    SELECT SINGLE * FROM YHFPARMI WHERE BUKRS = CO_CODE
+                      AND PARM1 = 'WDN'
+                      AND PARM2 = 'EAP'.
+    IF SY-SUBRC EQ 0.
+      MOVE YHFPARMI-PARM_VAL TO WS_PC_DOWNLOAD.
+    ENDIF.
+  ENDIF.
+
+  IF WS_PC_DOWNLOAD EQ 'Y'.
+    SELECT SINGLE * FROM YHFPARMI WHERE BUKRS = SPACE
+                      AND PARM1 = 'WDN'
+                      AND PARM2 = 'EXP'.
+    IF SY-SUBRC EQ 0.
+      MOVE YHFPARMI-PARM_VAL TO DBD_PAY1.
+    ELSE.
+      SELECT SINGLE * FROM YHFPARMI WHERE BUKRS = CO_CODE
+                        AND PARM1 = 'WDN'
+                        AND PARM2 = 'EXP'.
+      IF SY-SUBRC EQ 0.
+        MOVE YHFPARMI-PARM_VAL TO DBD_PAY1.
+      ENDIF.
+    ENDIF.
+
+    SELECT SINGLE * FROM YHFPARMI WHERE BUKRS = SPACE
+                        AND PARM1 = 'WDN'
+                        AND PARM2 = 'DEL'.
+    IF SY-SUBRC EQ 0.
+      MOVE YHFPARMI-PARM_VAL TO WS_SER_DELFILE.
+    ELSE.
+      SELECT SINGLE * FROM YHFPARMI WHERE BUKRS = CO_CODE
+                        AND PARM1 = 'WDN'
+                        AND PARM2 = 'DEL'.
+      IF SY-SUBRC EQ 0.
+        MOVE YHFPARMI-PARM_VAL TO WS_SER_DELFILE.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+***** Chk-sum  validation requirements************************
+  SELECT PARM_VAL INTO WS_COMP_CHKSUM FROM YHFPARMI
+                  WHERE BUKRS = SPACE
+                  AND PARM1 = 'CHK'
+                  AND PARM2 = SPACE.
+  ENDSELECT.
+  IF WS_COMP_CHKSUM NE 'N'.
+    SELECT PARM_VAL INTO WS_CHKSUM FROM YHFPARMI
+                    WHERE BUKRS = SPACE
+                    AND PARM1   = 'COM'
+                    AND PARM2   = 'FUN'.
+    ENDSELECT.
+***********************************************************PP01
+* Changed by : Purna Chandra
+* Date       : 20\08\2007
+* To create the SHA checksum value generation.
+***********************************************************PP01
+
+    SELECT PARM_VAL INTO WS_CHKSUM1 FROM YHFPARMI
+                    WHERE ( BUKRS = SPACE OR BUKRS = CO_CODE ) AND
+                          PARM1 = 'CHK'   AND
+                          PARM2 = 'SHA'.
+    ENDSELECT.
+****************************************************************
+* If WS_CHKSUM1 EQ 'Y' it will generate the SHA checksum program
+* which generate the 40 bytes hash value, ELSE it will generate
+* the 32 bytes hash value.
+****************************************************************
+  PERFORM OS_COMMAND USING V_PAYFILE.
+
+* Changed by : Purna Chandra
+* Date       : 20\08\2007
+* To create the SHA checksum value generation.
+***********************************************************PP01
+*    IF WS_CHKSUM = 'Y'.
+*      CALL FUNCTION 'SXPG_COMMAND_EXECUTE'
+*           EXPORTING
+*                COMMANDNAME                = 'YDBCHKSUM'
+*                ADDITIONAL_PARAMETERS      = ADDPARAM
+*           IMPORTING
+*                STATUS                     = STATUS
+*                EXITCODE                   = EXITPARAM
+*           TABLES
+*                EXEC_PROTOCOL              = EXEC_PROTOCOL
+*           EXCEPTIONS
+*                NO_PERMISSION              = 1
+*                COMMAND_NOT_FOUND          = 2
+*                PARAMETERS_TOO_LONG        = 3
+*                SECURITY_RISK              = 4
+*                WRONG_CHECK_CALL_INTERFACE = 5
+*                PROGRAM_START_ERROR        = 6
+*                PROGRAM_TERMINATION_ERROR  = 7
+*                X_ERROR                    = 8
+*                PARAMETER_EXPECTED         = 9
+*                TOO_MANY_PARAMETERS        = 10
+*                ILLEGAL_COMMAND            = 11
+*                OTHERS                     = 12.
+*    ELSE.
+*      CALL FUNCTION 'SXPG_CALL_SYSTEM'
+*           EXPORTING
+*                COMMANDNAME                = 'YDBCHKSUM'
+*                ADDITIONAL_PARAMETERS      = ADDPARAM
+*           IMPORTING
+*                STATUS                     = STATUS
+*                EXITCODE                   = EXITPARAM
+*           TABLES
+*                EXEC_PROTOCOL              = EXEC_PROTOCOL
+*           EXCEPTIONS
+*                NO_PERMISSION              = 1
+*                COMMAND_NOT_FOUND          = 2
+*                PARAMETERS_TOO_LONG        = 3
+*                SECURITY_RISK              = 4
+*                WRONG_CHECK_CALL_INTERFACE = 5
+*                PROGRAM_START_ERROR        = 6
+*                PROGRAM_TERMINATION_ERROR  = 7
+*                X_ERROR                    = 8
+*                PARAMETER_EXPECTED         = 9
+*                TOO_MANY_PARAMETERS        = 10
+*                ILLEGAL_COMMAND            = 11
+*                OTHERS                     = 12.
+*    ENDIF.
+***********************************************************PP01
+
+    CASE SY-SUBRC.
+      WHEN 0.
+
+*FOR 4.6
+*        OPEN DATASET CHKFILE1 FOR OUTPUT.
+*END 4.6
+
+*FOR 4.7
+ CLOSE DATASET CHKFILE1.
+ OPEN DATASET CHKFILE1 FOR OUTPUT IN TEXT MODE ENCODING DEFAULT.
+*END 4.7
+        CHKSUM = EXEC_PROTOCOL+3.
+        IF SYST-OPSYS = 'AS/400' OR SYST-OPSYS = 'OS/400'.
+         IF WS_CHKSUM1 = 'Y'.
+           LOOP AT EXEC_PROTOCOL.
+            TRANSFER: EXEC_PROTOCOL+3(40) TO CHKFILE1.
+           ENDLOOP.
+         ELSE.
+            LOOP AT EXEC_PROTOCOL.
+            TRANSFER: EXEC_PROTOCOL+3(32) TO CHKFILE1.
+           ENDLOOP.
+         ENDIF.
+       ELSE.
+        LOOP AT EXEC_PROTOCOL.
+          TRANSFER: EXEC_PROTOCOL+3(128) TO CHKFILE1.
+        ENDLOOP.
+       ENDIF.
+*Logic for PC download (checksum file)
+        IF WS_PC_DOWNLOAD EQ 'Y'.
+          REFRESH : I_TABLE.
+          CLEAR :  NRLINES, L_FILELENGTH.
+
+*FOR 4.7
+          CLOSE DATASET CHKFILE1.
+*END 4.7
+
+          OPEN DATASET CHKFILE1 FOR INPUT IN BINARY MODE.
+          IF SY-SUBRC <> 0.
+            WRITE:/ 'cannot open Extraction  file'.
+            EXIT.
+          ENDIF.
+          READ DATASET CHKFILE1 INTO I_TABLE LENGTH L_FILELENGTH.
+          CLOSE DATASET CHKFILE1.
+          IF SY-SUBRC <> 0.
+            EXIT.
+          ENDIF.
+          APPEND I_TABLE.
+          DESCRIBE TABLE I_TABLE LINES NRLINES.
+          IMPORT DBD_PAY FROM MEMORY ID 'DBD_PAY'.
+          IMPORT DBD_PAY1 FROM MEMORY ID 'DBD_PAY1'.
+
+          SELECT SINGLE PARM_VAL INTO V_FILE_FLAG FROM YHFPARMI
+                 WHERE ( BUKRS = CO_CODE OR BUKRS = SPACE )
+                   AND PARM1  = 'FIX'
+                   AND PARM2   = 'NME'.
+
+          IF V_FILE_FLAG EQ 'Y'.
+            CONCATENATE DBD_PAY 'DBI.CHK' INTO RLGRAP-FILENAME.
+          ELSE.
+            CONCATENATE DBD_PAY 'DBI' ZW_LAUFI ZW_LAUFD '.CHK'
+            INTO RLGRAP-FILENAME.
+          ENDIF.
+
+
+
+          CALL FUNCTION 'WS_DOWNLOAD'
+               EXPORTING
+                    BIN_FILESIZE            = L_FILELENGTH
+                    FILENAME                = RLGRAP-FILENAME
+                    FILETYPE                = 'BIN'
+               TABLES
+                    DATA_TAB                = I_TABLE
+               EXCEPTIONS
+                    FILE_OPEN_ERROR         = 1
+                    FILE_WRITE_ERROR        = 2
+                    INVALID_FILESIZE        = 3
+                    INVALID_TYPE            = 4
+                    NO_BATCH                = 5
+                    UNKNOWN_ERROR           = 6
+                    INVALID_TABLE_WIDTH     = 7
+                    GUI_REFUSE_FILETRANSFER = 8
+                    CUSTOMER_ERROR          = 9
+                    OTHERS                  = 10.
+          IF SY-SUBRC <> 0.
+            MESSAGE E030 WITH RLGRAP-FILENAME.   "could not open file
+          ENDIF.
+        ENDIF.
+        CLOSE DATASET CHKFILE1.
+      WHEN 1.
+        MESSAGE I368 WITH
+        'ERROR IN FM SXPG_CALL_SYSTEM OR SXPG_COMMAND_EXECUTE'
+                      '- NO PERMISSION'.
+        DELETE DATASET PAYFILE.
+        DELETE DATASET CHKFILE1.
+        PERFORM VALID_EXCEPT.
+      WHEN 2.
+        MESSAGE I368 WITH
+         'ERROR IN FM SXPG_CALL_SYSTEM OR SXPG_COMMAND_EXECUTE'
+                       '- COMMAND NOT FOUND'.
+        DELETE DATASET PAYFILE.
+        DELETE DATASET CHKFILE1.
+        PERFORM VALID_EXCEPT.
+      WHEN 3.
+        MESSAGE I368 WITH
+         'ERROR IN FM SXPG_CALL_SYSTEM OR SXPG_COMMAND_EXECUTE'
+                       '- PARAMETERS TOO LONG'.
+        DELETE DATASET PAYFILE.
+        DELETE DATASET CHKFILE1.
+        PERFORM VALID_EXCEPT.
+      WHEN 4.
+        MESSAGE I368 WITH
+         'ERROR IN FM SXPG_CALL_SYSTEM OR SXPG_COMMAND_EXECUTE'
+                       '- SECURITY RISK'.
+        DELETE DATASET PAYFILE.
+        DELETE DATASET CHKFILE1.
+        PERFORM VALID_EXCEPT.
+      WHEN 5.
+        MESSAGE I368 WITH
+         'ERROR IN FM SXPG_CALL_SYSTEM OR SXPG_COMMAND_EXECUTE'
+                       '- WRONG_CHECK_CALL_IF'.
+        DELETE DATASET PAYFILE.
+        DELETE DATASET CHKFILE1.
+        PERFORM VALID_EXCEPT.
+      WHEN 6.
+        MESSAGE I368 WITH
+         'ERROR IN FM SXPG_CALL_SYSTEM OR SXPG_COMMAND_EXECUTE'
+                       '- PROGRAM_START_ERROR'.
+        DELETE DATASET PAYFILE.
+        DELETE DATASET CHKFILE1.
+        PERFORM VALID_EXCEPT.
+      WHEN 7.
+        MESSAGE I368 WITH
+         'ERROR IN FM SXPG_CALL_SYSTEM OR SXPG_COMMAND_EXECUTE'
+                       '- PROGRAM_TERMINATION_ERROR'.
+        DELETE DATASET PAYFILE.
+        DELETE DATASET CHKFILE1.
+        PERFORM VALID_EXCEPT.
+      WHEN 8.
+        MESSAGE I368 WITH
+         'ERROR IN FM SXPG_CALL_SYSTEM OR SXPG_COMMAND_EXECUTE'
+                       '- X_ERROR'.
+        DELETE DATASET PAYFILE.
+        DELETE DATASET CHKFILE1.
+        PERFORM VALID_EXCEPT.
+      WHEN 9.
+        MESSAGE I368 WITH
+         'ERROR IN FM SXPG_CALL_SYSTEM OR SXPG_COMMAND_EXECUTE'
+                       '- PARAMETER_EXPECTED'.
+        DELETE DATASET PAYFILE.
+        DELETE DATASET CHKFILE1.
+        PERFORM VALID_EXCEPT.
+      WHEN 10.
+        MESSAGE I368 WITH
+         'ERROR IN FM SXPG_CALL_SYSTEM OR SXPG_COMMAND_EXECUTE'
+                       '- TOO_MANY_PARAMETERS'.
+        DELETE DATASET PAYFILE.
+        DELETE DATASET CHKFILE1.
+        PERFORM VALID_EXCEPT.
+      WHEN 11.
+        MESSAGE I368 WITH
+         'ERROR IN FM SXPG_CALL_SYSTEM OR SXPG_COMMAND_EXECUTE'
+                       '- ILLEGAL_COMMAND'.
+        DELETE DATASET PAYFILE.
+        DELETE DATASET CHKFILE1.
+        PERFORM VALID_EXCEPT.
+      WHEN 12.
+        MESSAGE I368 WITH
+         'ERROR IN FM SXPG_CALL_SYSTEM OR SXPG_COMMAND_EXECUTE'
+                       '- OTHERS'.
+        DELETE DATASET PAYFILE.
+        DELETE DATASET CHKFILE1.
+        PERFORM VALID_EXCEPT.
+      WHEN OTHERS.
+        MESSAGE I368 WITH
+                       ' OHTER ERRORS'.
+        DELETE DATASET PAYFILE.
+        DELETE DATASET CHKFILE1.
+        PERFORM VALID_EXCEPT.
+    ENDCASE.
+    CASE EXITPARAM.
+      WHEN 0.
+      WHEN OTHERS.
+      clear errortxt.
+      CONCATENATE 'Exec of ext.Cmd' V_DBCHK 'Failed-Ret with ExitCode:'
+        INTO errortxt separated by space.
+*        MESSAGE I368 WITH
+*      'Exec of ext.Cmd YDBCHKSUM Failed-Ret with ExitCode:' EXITPARAM.
+        MESSAGE I368 WITH
+          errortxt EXITPARAM.
+
+        DELETE DATASET PAYFILE.
+        DELETE DATASET CHKFILE1.
+        PERFORM VALID_EXCEPT.
+    ENDCASE.
+*  ENDIF.
+*IF WS_SER_DELFILE EQ 'Y'.
+*   DELETE DATASET PAYFILE.
+*   DELETE DATASET CHKFILE1.
+*   DELETE DATASET V_ERRFILE.
+ ENDIF.
+ENDFORM.                               " MD5_COMPUTE_CHKSUM
+
+*---------------------------------------------------------------------*
+*       FORM PRINT_HEADING                                            *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  PAYFILE                                                       *
+*  -->  PAYCHK                                                        *
+*---------------------------------------------------------------------*
+FORM PRINT_HEADING USING PAYFILE PAYCHK.
+  DATA: W_COL TYPE I, C TYPE I, PROG_NAME LIKE SY-REPID.
+
+  MOVE SY-REPID TO PROG_NAME.
+  CALL FUNCTION 'RS_REFRESH_FROM_SELECTOPTIONS'
+       EXPORTING
+            CURR_REPORT     = PROG_NAME
+       TABLES
+            SELECTION_TABLE = SELTAB
+       EXCEPTIONS
+            NOT_FOUND       = 1
+            NO_REPORT       = 2
+            OTHERS          = 3.
+
+  NEW-PAGE NO-HEADING.
+  SKIP 1.
+  IF WS_PC_DOWNLOAD EQ 'Y'.
+    WRITE: /1 'Payment File     :',  23(120) DIS_PLY.
+    WRITE: /1 'Checksum File    :',  23(120) RLGRAP-FILENAME.
+  ELSE.
+    WRITE: /1 'Payment File     :',  23(120) PAYFILE.
+    WRITE: /1 'Checksum File    :',  23(120) PAYCHK.
+  ENDIF.
+  SKIP 1.
+  WRITE: /1 'Run Date         :',  23 ZW_LAUFD.
+  WRITE: /1 'Identification   :',  23 ZW_LAUFI.
+  PERFORM PRINT_SELECTION(YHFDBIFN) TABLES SELTAB
+                          USING 'W_LAUFI' 'Additional Ids   :'.
+  WRITE: /1 'Company Code     :',  23 CO_CODE.
+  PERFORM PRINT_SELECTION(YHFDBIFN) TABLES SELTAB
+                          USING 'HBK_KEY' 'House Bank       :'.
+  PERFORM PRINT_SELECTION(YHFDBIFN) TABLES SELTAB
+                          USING 'ACCT_ID' 'Account ID       :'.
+  PERFORM PRINT_SELECTION(YHFDBIFN) TABLES SELTAB
+                          USING 'PAY_METH' 'Payment Method   :'.
+  IF YHTEST EQ 'X'.
+    WRITE: /1 'Run Type         :',  23 'Test'.
+  ELSE.
+    WRITE: /1 'Run Type         :',  23 'Live'.
+  ENDIF.
+  WRITE: /1 'Stop FTP         :',  23 FALLBACK.
+  WRITE: /1 'KATAKANA 2-1 byte:',  23 KATAKANA.
+  WRITE: /1 'PayDtl Program   :',  23 PAYPROG.
+  IF REF1 EQ 'X'.
+    WRITE: /1 'Invoice Number   :',  23 'From Reference Text'.
+  ELSE.
+    WRITE: /1 'Invoice Number   :',  23 'From Doc. Header Text'.
+  ENDIF.
+  WRITE: /1 'WTX Program      :',  23 WTXPROG.
+  PERFORM PRINT_SELECTION(YHFDBIFN) TABLES SELTAB
+                          USING 'S_WITHT' 'WTX Tax Type     :'.
+  SKIP 1.
+  ULINE.
+ENDFORM.
+*---------------------------------------------------------------------*
+*       FORM ENCRYPT_FILE                                             *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  V_PATH                                                        *
+*  -->  PAYFILE                                                       *
+*---------------------------------------------------------------------*
+FORM ENCRYPT_FILE USING V_PATH PAYFILE.
+  DATA: LOCAL_COMMAND(250) TYPE C.
+  DATA: ADDPARAM LIKE SXPGCOLIST-PARAMETERS.
+  DATA: EXITPARAM LIKE EXTCMDEXEX-EXITCODE.
+  DATA: TEMP_FILE(270).
+  TYPE-POOLS: SABC.
+  CONCATENATE V_PATH 'TEMP.TXT' INTO TEMP_FILE.
+
+  CALL FUNCTION 'AUTHORITY_CHECK_C_FUNCTION'
+       EXPORTING
+*         PROGRAM          =
+            ACTIVITY         = SABC_ACT_CALL
+            FUNCTION         = 'SYSTEM'
+    EXCEPTIONS
+         NO_AUTHORITY     = 1
+         ACTIVITY_UNKNOWN = 2
+         OTHERS           = 3
+        .
+
+  IF SY-SUBRC EQ 0.
+*-----------------------------------------------
+* Translate move command based on OS environment.
+* 19-Sep-2006 - By Srini
+*-----------------------------------------------
+    IF SYST-OPSYS CS 'WIN'.
+      CONCATENATE 'move' PAYFILE TEMP_FILE INTO LOCAL_COMMAND
+                SEPARATED BY SPACE.
+    ELSE.
+      CONCATENATE 'mv' PAYFILE TEMP_FILE INTO LOCAL_COMMAND
+                SEPARATED BY SPACE.
+    ENDIF.
+
+*    CONCATENATE 'mv' PAYFILE TEMP_FILE INTO LOCAL_COMMAND
+*                SEPARATED BY SPACE.
+
+    CALL 'SYSTEM' ID 'COMMAND' FIELD LOCAL_COMMAND.
+    IF SY-SUBRC > 0.
+      MESSAGE E368 WITH 'Error creating temporary file'.
+    ENDIF.
+  ELSE.
+    MESSAGE E897(SD) WITH 'User not having authority to '
+     'Run UNIX Command.' ' Contact your Adminstrator'.
+*  ELSE.
+*    IF SY-SUBRC EQ 2.
+*      MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*              WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+*    ENDIF.
+  ENDIF.
+
+* move payment file to temporary location
+*  CONCATENATE 'mv' PAYFILE TEMP_FILE INTO LOCAL_COMMAND
+*              SEPARATED BY SPACE.
+*  CALL 'SYSTEM' ID 'COMMAND' FIELD LOCAL_COMMAND.
+*  IF SY-SUBRC > 0.
+*    MESSAGE E368 WITH 'Error creating temporary file'.
+*  ENDIF.
+
+  CONCATENATE: 'e' TEMP_FILE PAYFILE CHKSUM
+               INTO ADDPARAM SEPARATED BY SPACE.
+
+*  call function
+  REFRESH EXEC_PROTOCOL.
+  IF WS_CHKSUM = 'Y'.
+    CALL FUNCTION 'SXPG_COMMAND_EXECUTE'
+         EXPORTING
+              COMMANDNAME                = 'YDBCRYPT'
+              ADDITIONAL_PARAMETERS      = ADDPARAM
+         IMPORTING
+              EXITCODE                   = EXITPARAM
+         TABLES
+              EXEC_PROTOCOL              = EXEC_PROTOCOL
+         EXCEPTIONS
+              NO_PERMISSION              = 1
+              COMMAND_NOT_FOUND          = 2
+              PARAMETERS_TOO_LONG        = 3
+              SECURITY_RISK              = 4
+              WRONG_CHECK_CALL_INTERFACE = 5
+              PROGRAM_START_ERROR        = 6
+              PROGRAM_TERMINATION_ERROR  = 7
+              X_ERROR                    = 8
+              PARAMETER_EXPECTED         = 9
+              TOO_MANY_PARAMETERS        = 10
+              ILLEGAL_COMMAND            = 11
+              OTHERS                     = 12.
+  ELSE.
+    CALL FUNCTION 'SXPG_CALL_SYSTEM'
+         EXPORTING
+              COMMANDNAME                = 'YDBCRYPT'
+              ADDITIONAL_PARAMETERS      = ADDPARAM
+         IMPORTING
+              EXITCODE                   = EXITPARAM
+         TABLES
+              EXEC_PROTOCOL              = EXEC_PROTOCOL
+         EXCEPTIONS
+              NO_PERMISSION              = 1
+              COMMAND_NOT_FOUND          = 2
+              PARAMETERS_TOO_LONG        = 3
+              SECURITY_RISK              = 4
+              WRONG_CHECK_CALL_INTERFACE = 5
+              PROGRAM_START_ERROR        = 6
+              PROGRAM_TERMINATION_ERROR  = 7
+              X_ERROR                    = 8
+              PARAMETER_EXPECTED         = 9
+              TOO_MANY_PARAMETERS        = 10
+              ILLEGAL_COMMAND            = 11
+              OTHERS                     = 12.
+  ENDIF.
+  CASE SY-SUBRC.
+    WHEN 0.
+      SKIP 2.
+      WRITE:/ 'STATUS OF ENCRYPTION'.
+      ULINE.
+      LOOP AT EXEC_PROTOCOL.
+        WRITE:/ EXEC_PROTOCOL.
+      ENDLOOP.
+      DELETE DATASET TEMP_FILE.
+    WHEN 1.
+      MESSAGE I368 WITH
+       'ERROR IN FM SXPG_CALL_SYSTEM OR SXPG_COMMAND_EXECUTE'
+                     '- NO PERMISSION'.
+      DELETE DATASET PAYFILE.
+      DELETE DATASET V_CHECK_FILE.
+      PERFORM VALID_EXCEPT.
+    WHEN 2.
+      MESSAGE I368 WITH
+       'ERROR IN FM SXPG_CALL_SYSTEM OR SXPG_COMMAND_EXECUTE'
+                     '- COMMAND NOT FOUND'.
+      DELETE DATASET PAYFILE.
+      DELETE DATASET V_CHECK_FILE.
+      PERFORM VALID_EXCEPT.
+    WHEN 3.
+      MESSAGE I368 WITH
+       'ERROR IN FM SXPG_CALL_SYSTEM OR SXPG_COMMAND_EXECUTE'
+                     '- PARAMETERS TOO LONG'.
+      DELETE DATASET PAYFILE.
+      DELETE DATASET V_CHECK_FILE.
+      PERFORM VALID_EXCEPT.
+    WHEN 4.
+      MESSAGE I368 WITH
+       'ERROR IN FM SXPG_CALL_SYSTEM OR SXPG_COMMAND_EXECUTE'
+                     '- SECURITY RISK'.
+      DELETE DATASET PAYFILE.
+      DELETE DATASET V_CHECK_FILE.
+      PERFORM VALID_EXCEPT.
+    WHEN 5.
+      MESSAGE I368 WITH
+       'ERROR IN FM SXPG_CALL_SYSTEM OR SXPG_COMMAND_EXECUTE'
+                     '- WRONG_CHECK_CALL_IF'.
+      DELETE DATASET PAYFILE.
+      DELETE DATASET V_CHECK_FILE.
+      PERFORM VALID_EXCEPT.
+    WHEN 6.
+      MESSAGE I368 WITH
+       'ERROR IN FM SXPG_CALL_SYSTEM OR SXPG_COMMAND_EXECUTE'
+                     '- PROGRAM_START_ERROR'.
+      DELETE DATASET PAYFILE.
+      DELETE DATASET V_CHECK_FILE.
+      PERFORM VALID_EXCEPT.
+    WHEN 7.
+      MESSAGE I368 WITH
+       'ERROR IN FM SXPG_CALL_SYSTEM OR SXPG_COMMAND_EXECUTE'
+                     '- PROGRAM_TERMINATION_ERROR'.
+      DELETE DATASET PAYFILE.
+      DELETE DATASET V_CHECK_FILE.
+      PERFORM VALID_EXCEPT.
+    WHEN 8.
+      MESSAGE I368 WITH
+       'ERROR IN FM SXPG_CALL_SYSTEM OR SXPG_COMMAND_EXECUTE'
+                     '- X_ERROR'.
+      DELETE DATASET PAYFILE.
+      DELETE DATASET V_CHECK_FILE.
+      PERFORM VALID_EXCEPT.
+    WHEN 9.
+      MESSAGE I368 WITH
+       'ERROR IN FM SXPG_CALL_SYSTEM OR SXPG_COMMAND_EXECUTE'
+                     '- PARAMETER_EXPECTED'.
+      DELETE DATASET PAYFILE.
+      DELETE DATASET V_CHECK_FILE.
+      PERFORM VALID_EXCEPT.
+    WHEN 10.
+      MESSAGE I368 WITH
+       'ERROR IN FM SXPG_CALL_SYSTEM OR SXPG_COMMAND_EXECUTE'
+                     '- TOO_MANY_PARAMETERS'.
+      DELETE DATASET PAYFILE.
+      DELETE DATASET V_CHECK_FILE.
+      PERFORM VALID_EXCEPT.
+    WHEN 11.
+      MESSAGE I368 WITH
+       'ERROR IN FM SXPG_CALL_SYSTEM OR SXPG_COMMAND_EXECUTE'
+                     '- ILLEGAL_COMMAND'.
+      DELETE DATASET PAYFILE.
+      DELETE DATASET V_CHECK_FILE.
+      PERFORM VALID_EXCEPT.
+    WHEN 12.
+      MESSAGE I368 WITH
+       'ERROR IN FM SXPG_CALL_SYSTEM OR SXPG_COMMAND_EXECUTE'
+                     '- OTHERS'.
+      DELETE DATASET PAYFILE.
+      DELETE DATASET V_CHECK_FILE.
+      PERFORM VALID_EXCEPT.
+    WHEN OTHERS.
+      MESSAGE I368 WITH
+                     ' OHTER ERRORS'.
+      DELETE DATASET PAYFILE.
+      DELETE DATASET V_CHECK_FILE.
+      PERFORM VALID_EXCEPT.
+  ENDCASE.
+  CASE EXITPARAM.
+    WHEN 0.
+    WHEN OTHERS.
+      MESSAGE I368 WITH
+      'Exec of ext. Cmd YDBCRYPT Failed-Ret with ExitCode: ' EXITPARAM.
+      DELETE DATASET PAYFILE.
+      DELETE DATASET V_CHECK_FILE.
+      PERFORM VALID_EXCEPT.
+  ENDCASE.
+
+ENDFORM.
+
+*---------------------------------------------------------------------*
+*       FORM DATA_TRANSFER                                            *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  PAYFILE                                                       *
+*  -->  CHKFILE                                                       *
+*---------------------------------------------------------------------*
+FORM DATA_TRANSFER USING PAYFILE CHKFILE.
+  DATA: OUTPARAM(255),
+        STATUS LIKE BTCXP3-EXITSTAT,
+        SER_FLAG LIKE SXPGCOLIST-NAME,
+        WS_ENCRYPT(1) TYPE C,
+        WS_IPADDR LIKE YHFPARMI-PARM_VAL,
+        WS_USER   LIKE YHFPARMI-PARM_VAL,
+        WS_PASS   LIKE YHFPARMI-PARM_VAL,
+        WS_DIR    LIKE YHFPARMI-PARM_VAL,
+        WS_CMD    LIKE SXPGCOLIST-NAME,
+        V_PFILE(100), V_CFILE(100),
+        V_DIRLEN TYPE I, V_FILELEN TYPE I,
+        FIELD_POS TYPE I, STRR TYPE I,
+        LEN   TYPE I, OFFSET  TYPE I.
+
+  V_DIRLEN = STRLEN( DBD_PAY ).
+  V_FILELEN = STRLEN( PAYFILE ) - V_DIRLEN.
+  V_PFILE = PAYFILE+V_DIRLEN(V_FILELEN).
+  V_CFILE = CHKFILE+V_DIRLEN(V_FILELEN).
+  DATA: BEGIN OF INFILE OCCURS 100,
+                    LINES(1000) TYPE C,
+              END OF INFILE.
+
+  SELECT SINGLE PARM_VAL INTO WS_ENCRYPT FROM YHFPARMI
+        WHERE BUKRS = CO_CODE
+          AND PARM1 = 'ENC'
+          AND PARM2 = SPACE.
+  IF WS_PC_DOWNLOAD  = 'Y'.
+    IF WS_ENCRYPT = 'Y' .
+      PERFORM ENCRYPT_FILE USING DBD_PAY1 PAYFILE.
+    ENDIF.
+  ELSE.
+    IF WS_ENCRYPT = 'Y' .
+      PERFORM ENCRYPT_FILE USING DBD_PAY PAYFILE.
+    ENDIF.
+  ENDIF.
+  SELECT SINGLE PARM_VAL INTO SER_FLAG FROM YHFPARMI
+             WHERE BUKRS = CO_CODE
+             AND   PARM1 = 'SER'
+             AND   PARM2 = 'FTP'.
+  IF SER_FLAG EQ 'YDBFTP01'.
+    PERFORM FTP_TYP1_WITH_TARGET_DIRECTORY USING V_PAYFILE V_CHECK_FILE.
+  ELSE.
+    PERFORM FTP_ORIGINAL USING V_PAYFILE V_CHECK_FILE.
+  ENDIF.
+
+  IF WS_PC_DOWNLOAD EQ 'Y'.
+    SELECT SINGLE * FROM YHFPARMI WHERE BUKRS = SPACE
+                     AND PARM1 = 'WDN'
+                     AND PARM2 = 'WSE'.
+    IF SY-SUBRC EQ 0.
+      MOVE YHFPARMI-PARM_VAL TO WS_EXE.
+    ELSE.
+      SELECT SINGLE * FROM YHFPARMI WHERE BUKRS = CO_CODE
+                        AND PARM1 = 'WDN'
+                        AND PARM2 = 'WSE'.
+      IF SY-SUBRC EQ 0.
+        MOVE YHFPARMI-PARM_VAL TO WS_EXE.
+      ELSE.
+        EXIT.   "Exit if not parameter is found for WS exe
+      ENDIF.
+    ENDIF.
+
+    STRR = STRLEN( DBD_PAY ).
+    DO STRR  TIMES.
+      OFFSET = SY-INDEX - 1.
+      IF DBD_PAY+OFFSET(1) =  '\'.
+        FIELD_POS = OFFSET.
+      ENDIF.
+    ENDDO.
+    FIELD_POS = FIELD_POS + 1.
+    LEN = STRR - FIELD_POS.
+    IF LEN NE 0.
+      CLEAR:  DBD_PAY+FIELD_POS(LEN).
+    ENDIF.
+    CONCATENATE DBD_PAY WS_EXE INTO WS_EXT.
+    CALL FUNCTION 'WS_EXECUTE'
+        EXPORTING
+             DOCUMENT           = 'X '
+             CD                            = DBD_PAY
+            PROGRAM              = WS_EXE
+*         EXEC_RC            = ' '
+*    IMPORTING
+*         RBUFF              =
+        EXCEPTIONS
+             FRONTEND_ERROR         = 1
+             NO_BATCH                          = 2
+             PROG_NOT_FOUND         = 3
+             ILLEGAL_OPTION              = 4
+             GUI_REFUSE_EXECUTE = 5
+             OTHERS                               = 6.
+    CASE SY-SUBRC.
+      WHEN 0.
+        CLEAR: INFILE.
+        WRITE: /1 'Executing external command', 28 WS_EXT,
+       54  'Successful. Please review log details below:'.
+        CONCATENATE DBD_PAY 'ws_exe_log.txt' INTO IN.
+        TRANSLATE IN TO UPPER CASE.
+        CALL FUNCTION 'WS_UPLOAD'
+            EXPORTING
+                 FILENAME                = IN
+                 FILETYPE                 = 'ASC'
+*            IMPORTING
+*                 FILELENGTH              =
+             TABLES
+                  DATA_TAB                = INFILE
+            EXCEPTIONS
+                 CONVERSION_ERROR        = 1
+                 FILE_OPEN_ERROR             = 2
+                 FILE_READ_ERROR             = 3
+                 INVALID_TYPE                       = 4
+                 NO_BATCH                             = 5
+                 UNKNOWN_ERROR             = 6
+                 INVALID_TABLE_WIDTH      = 7
+                 GUI_REFUSE_FILETRANSFER = 8
+                 CUSTOMER_ERROR            = 9
+                 OTHERS                  =   10
+                  .
+        IF SY-SUBRC EQ 0.
+          LOOP AT INFILE.
+            WRITE:/ INFILE.
+          ENDLOOP.
+        ELSE.
+          WRITE: 'File cannot be open. reason: ', SY-SUBRC.
+          EXIT.
+        ENDIF.
+      WHEN 1.
+        MESSAGE I368 WITH
+         'ERROR WHILE EXECUTING WS_EXECUTE'
+                       '- Error occurred in SAPGUI'.
+        PERFORM DELETE_FILE.
+      WHEN 2.
+        MESSAGE I368 WITH
+         'ERROR WHILE EXECUTING WS_EXECUTE'
+              '- Front end function cannot be executed in batch'.
+        PERFORM DELETE_FILE.
+      WHEN 3.
+        MESSAGE I368 WITH
+        'ERROR WHILE EXECUTING WS_EXECUTE'
+               '- Encryption Unsuccessful due to dll is not there'.
+        PERFORM DELETE_FILE.
+      WHEN 4.
+        MESSAGE I368 WITH
+         'ERROR WHILE EXECUTING WS_EXECUTE'
+                       '- OSMAC* or WIN16_EXT at incorrect frontend'.
+        PERFORM DELETE_FILE.
+      WHEN 5.
+        MESSAGE I368 WITH
+         'ERROR WITH GUI REFUSE'
+                    '-VERIFY GUI EXECUTION or not executable way'.
+        PERFORM DELETE_FILE.
+      WHEN OTHERS.
+        MESSAGE I368 WITH
+                       ' OHTER ERRORS'.
+        PERFORM DELETE_FILE.
+    ENDCASE.
+    STOP.
+  ENDIF.
+ENDFORM.                               " DATA_TRANSFER
+*---------------------------------------------------------------------*
+*       FORM WRITE_AUDIT                                              *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+FORM WRITE_AUDIT.
+  SORT MASTER_ITAB BY LAUFI.
+  DELETE ADJACENT DUPLICATES FROM MASTER_ITAB COMPARING LAUFI.
+  YHFAUDTR-YHPAYKEY = 'DBI'.
+  YHFAUDTR-YSYSDATE  = SY-DATUM.
+  YHFAUDTR-YSYSTIME  = SY-UZEIT.
+  YHFAUDTR-LAUFD     = ZW_LAUFD.
+  YHFAUDTR-YHPAYFILE  = V_PAYFILE.
+  LOOP AT MASTER_ITAB.
+    YHFAUDTR-LAUFI     = MASTER_ITAB-LAUFI.
+    INSERT INTO YHFAUDTR VALUES YHFAUDTR.
+  ENDLOOP.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*&      Form  FTP_ORIGINAL
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM FTP_ORIGINAL USING PAYFILE CHKFILE.
+  DATA: OUTPARAM(255),
+      STATUS        LIKE BTCXP3-EXITSTAT,
+      SER_FLAG      LIKE SXPGCOLIST-NAME,
+      WS_ENCRYPT(1) TYPE C,
+      WS_IPADDR     LIKE YHFPARMI-PARM_VAL,
+      WS_USER       LIKE YHFPARMI-PARM_VAL,
+      WS_PASS       LIKE YHFPARMI-PARM_VAL,
+      WS_DIR        LIKE YHFPARMI-PARM_VAL,
+      WS_CMD        LIKE SXPGCOLIST-NAME,
+      V_PFILE(100), V_CFILE(100),
+      V_DIRLEN TYPE I, V_FILELEN TYPE I.
+  V_DIRLEN = STRLEN( DBD_PAY ).
+  V_FILELEN = STRLEN( PAYFILE ) - V_DIRLEN.
+  V_PFILE = PAYFILE+V_DIRLEN(V_FILELEN).
+  V_CFILE = CHKFILE+V_DIRLEN(V_FILELEN).
+
+  SELECT SINGLE PARM_VAL INTO WS_IPADDR FROM YHFPARMI
+         WHERE BUKRS = CO_CODE
+           AND PARM1 = 'GIF'
+           AND PARM2 = 'IPA'.
+  SELECT SINGLE PARM_VAL INTO WS_USER FROM YHFPARMI
+         WHERE BUKRS = CO_CODE
+           AND PARM1 = 'GIF'
+           AND PARM2 = 'USR'.
+  SELECT SINGLE PARM_VAL INTO WS_PASS FROM YHFPARMI
+         WHERE BUKRS = CO_CODE
+           AND PARM1 = 'GIF'
+           AND PARM2 = 'PWD'.
+
+  IF FALLBACK EQ SPACE AND WS_IPADDR NE SPACE.
+
+    SKIP 2.
+    IF WS_IPADDR = 'H2H'.
+      WS_CMD = 'YDBPOSTPROC'.
+      IF DBD_PAY1 NE SPACE.
+        CONCATENATE: DBD_PAY1 V_PFILE V_CFILE
+                     INTO OUTPARAM SEPARATED BY SPACE.
+      ELSE.
+        CONCATENATE: DBD_PAY  V_PFILE V_CFILE
+                     INTO OUTPARAM SEPARATED BY SPACE.
+      ENDIF.
+      WRITE:/ 'STATUS OF H2H TRANSFER'.
+    ELSE.
+      WS_CMD = 'YDBFTP'.
+      CONCATENATE: WS_IPADDR WS_USER WS_PASS
+                   PAYFILE V_PFILE CHKFILE V_CFILE
+                   INTO OUTPARAM SEPARATED BY SPACE.
+*      WRITE:/ 'STATUS OF GIFTED SERVER TRANSFER'.
+      WRITE:/ 'STATUS OF FILE TRANSFER TO REPOSITORY SERVER'.
+    ENDIF.
+    ULINE.
+
+    REFRESH: EXEC_PROTOCOL.
+    IF WS_CHKSUM = 'Y'.
+      CALL FUNCTION 'SXPG_COMMAND_EXECUTE'
+           EXPORTING
+                COMMANDNAME                = WS_CMD
+                ADDITIONAL_PARAMETERS      = OUTPARAM
+           IMPORTING
+                STATUS                     = STATUS
+                EXITCODE                   = EXITPARAM
+           TABLES
+                EXEC_PROTOCOL              = EXEC_PROTOCOL
+           EXCEPTIONS
+                NO_PERMISSION              = 1
+                COMMAND_NOT_FOUND          = 2
+                PARAMETERS_TOO_LONG        = 3
+                SECURITY_RISK              = 4
+                WRONG_CHECK_CALL_INTERFACE = 5
+                PROGRAM_START_ERROR        = 6
+                PROGRAM_TERMINATION_ERROR  = 7
+                X_ERROR                    = 8
+                PARAMETER_EXPECTED         = 9
+                TOO_MANY_PARAMETERS        = 10
+                ILLEGAL_COMMAND            = 11
+                OTHERS                     = 12.
+    ELSE.
+      CALL FUNCTION 'SXPG_CALL_SYSTEM'
+           EXPORTING
+                COMMANDNAME                = WS_CMD
+                ADDITIONAL_PARAMETERS      = OUTPARAM
+           IMPORTING
+                STATUS                     = STATUS
+           TABLES
+                EXEC_PROTOCOL              = EXEC_PROTOCOL
+           EXCEPTIONS
+                NO_PERMISSION              = 1
+                COMMAND_NOT_FOUND          = 2
+                PARAMETERS_TOO_LONG        = 3
+                SECURITY_RISK              = 4
+                WRONG_CHECK_CALL_INTERFACE = 5
+                PROGRAM_START_ERROR        = 6
+                PROGRAM_TERMINATION_ERROR  = 7
+                X_ERROR                    = 8
+                PARAMETER_EXPECTED         = 9
+                TOO_MANY_PARAMETERS        = 10
+                ILLEGAL_COMMAND            = 11
+                OTHERS                     = 12.
+    ENDIF.
+    CASE SY-SUBRC.
+      WHEN 0.
+        IF WS_IPADDR EQ 'H2H'.
+          IF SY-SUBRC EQ 0.
+            WRITE:/ 'File transfer completed successfully'.
+          ENDIF.
+        ELSE.
+          LOOP AT EXEC_PROTOCOL WHERE MESSAGE(3) EQ '226'.
+            DELETE DATASET     PAYFILE.
+            DELETE DATASET     CHKFILE.
+            EXIT.
+          ENDLOOP.
+        ENDIF.
+
+        LOOP AT EXEC_PROTOCOL.
+          WRITE:/ EXEC_PROTOCOL.
+        ENDLOOP.
+
+      WHEN 1.
+        MESSAGE I368 WITH
+         'ERROR IN FM SXPG_CALL_SYSTEM OR SXPG_COMMAND_EXECUTE'
+                       '- NO PERMISSION'.
+        DELETE DATASET PAYFILE.
+        DELETE DATASET CHKFILE.
+        PERFORM VALID_EXCEPT.
+      WHEN 2.
+        MESSAGE I368 WITH
+         'ERROR IN FM SXPG_CALL_SYSTEM OR SXPG_COMMAND_EXECUTE'
+                       '- COMMAND NOT FOUND'.
+        DELETE DATASET PAYFILE.
+        DELETE DATASET CHKFILE.
+        PERFORM VALID_EXCEPT.
+      WHEN 3.
+        MESSAGE I368 WITH
+         'ERROR IN FM SXPG_CALL_SYSTEM OR SXPG_COMMAND_EXECUTE'
+                       '- PARAMETERS TOO LONG'.
+        DELETE DATASET PAYFILE.
+        DELETE DATASET CHKFILE.
+        PERFORM VALID_EXCEPT.
+      WHEN 4.
+        MESSAGE I368 WITH
+         'ERROR IN FM SXPG_CALL_SYSTEM OR SXPG_COMMAND_EXECUTE'
+                       '- SECURITY RISK'.
+        DELETE DATASET PAYFILE.
+        DELETE DATASET CHKFILE.
+        PERFORM VALID_EXCEPT.
+      WHEN 5.
+        MESSAGE I368 WITH
+         'ERROR IN FM SXPG_CALL_SYSTEM OR SXPG_COMMAND_EXECUTE'
+                       '- WRONG_CHECK_CALL_IF'.
+        DELETE DATASET PAYFILE.
+        DELETE DATASET CHKFILE.
+        PERFORM VALID_EXCEPT.
+      WHEN 6.
+        MESSAGE I368 WITH
+         'ERROR IN FM SXPG_CALL_SYSTEM OR SXPG_COMMAND_EXECUTE'
+                       '- PROGRAM_START_ERROR'.
+        DELETE DATASET PAYFILE.
+        DELETE DATASET CHKFILE.
+        PERFORM VALID_EXCEPT.
+      WHEN 7.
+        MESSAGE I368 WITH
+         'ERROR IN FM SXPG_CALL_SYSTEM OR SXPG_COMMAND_EXECUTE'
+                       '- PROGRAM_TERMINATION_ERROR'.
+        DELETE DATASET PAYFILE.
+        DELETE DATASET CHKFILE.
+        PERFORM VALID_EXCEPT.
+      WHEN 8.
+        MESSAGE I368 WITH
+         'ERROR IN FM SXPG_CALL_SYSTEM OR SXPG_COMMAND_EXECUTE'
+                       '- X_ERROR'.
+        DELETE DATASET PAYFILE.
+        DELETE DATASET CHKFILE.
+        PERFORM VALID_EXCEPT.
+      WHEN 9.
+        MESSAGE I368 WITH
+         'ERROR IN FM SXPG_CALL_SYSTEM OR SXPG_COMMAND_EXECUTE'
+                       '- PARAMETER_EXPECTED'.
+        DELETE DATASET PAYFILE.
+        DELETE DATASET CHKFILE.
+        PERFORM VALID_EXCEPT.
+      WHEN 10.
+        MESSAGE I368 WITH
+         'ERROR IN FM SXPG_CALL_SYSTEM OR SXPG_COMMAND_EXECUTE'
+                       '- TOO_MANY_PARAMETERS'.
+        DELETE DATASET PAYFILE.
+        DELETE DATASET CHKFILE.
+        PERFORM VALID_EXCEPT.
+      WHEN 11.
+        MESSAGE I368 WITH
+         'ERROR IN FM SXPG_CALL_SYSTEM OR SXPG_COMMAND_EXECUTE'
+                       '- ILLEGAL_COMMAND'.
+        DELETE DATASET PAYFILE.
+        DELETE DATASET CHKFILE.
+        PERFORM VALID_EXCEPT.
+      WHEN 12.
+        MESSAGE I368 WITH
+         'ERROR IN FM SXPG_CALL_SYSTEM OR SXPG_COMMAND_EXECUTE'
+                       '- OTHERS'.
+        DELETE DATASET PAYFILE.
+        DELETE DATASET CHKFILE.
+        PERFORM VALID_EXCEPT.
+      WHEN OTHERS.
+        MESSAGE I368 WITH
+                       ' OHTER ERRORS'.
+        DELETE DATASET PAYFILE.
+        DELETE DATASET CHKFILE.
+        PERFORM VALID_EXCEPT.
+    ENDCASE.
+
+    CASE EXITPARAM.
+      WHEN 0.
+      WHEN OTHERS.
+        MESSAGE I368 WITH
+        'Exec of ext. Cmd YDBFTP Failed-Ret with ExitCode: ' EXITPARAM.
+        DELETE DATASET PAYFILE.
+        DELETE DATASET CHKFILE.
+        PERFORM VALID_EXCEPT.
+    ENDCASE.
+  ENDIF.
+  ULINE.
+  SKIP 2.
+  WRITE: /50 'End of Report'.
+ENDFORM.                    " FTP_ORIGINAL
+
+*&---------------------------------------------------------------------*
+*&      Form  FTP_TYP1_WITH_TARGET_DIRECTORY
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM FTP_TYP1_WITH_TARGET_DIRECTORY USING PAYFILE CHKFILE.
+  DATA: OUTPARAM(255),
+        STATUS LIKE BTCXP3-EXITSTAT,
+        SER_FLAG LIKE SXPGCOLIST-NAME,
+        WS_ENCRYPT(1) TYPE C,
+        WS_IPADDR LIKE YHFPARMI-PARM_VAL,
+        WS_USER   LIKE YHFPARMI-PARM_VAL,
+        WS_PASS   LIKE YHFPARMI-PARM_VAL,
+        WS_DIR    LIKE YHFPARMI-PARM_VAL,
+        WS_CMD    LIKE SXPGCOLIST-NAME,
+        V_PFILE(100), V_CFILE(100),
+        V_DIRLEN TYPE I, V_FILELEN TYPE I.
+  V_DIRLEN = STRLEN( DBD_PAY ).
+  V_FILELEN = STRLEN( PAYFILE ) - V_DIRLEN.
+  V_PFILE = PAYFILE+V_DIRLEN(V_FILELEN).
+  V_CFILE = CHKFILE+V_DIRLEN(V_FILELEN).
+
+  SELECT SINGLE PARM_VAL INTO WS_IPADDR FROM YHFPARMI
+         WHERE BUKRS = CO_CODE
+           AND PARM1 = 'SER'
+           AND PARM2 = 'IPA'.
+  SELECT SINGLE PARM_VAL INTO WS_USER FROM YHFPARMI
+         WHERE BUKRS = CO_CODE
+           AND PARM1 = 'SER'
+           AND PARM2 = 'USR'.
+  SELECT SINGLE PARM_VAL INTO WS_PASS FROM YHFPARMI
+         WHERE BUKRS = CO_CODE
+           AND PARM1 = 'SER'
+           AND PARM2 = 'PWD'.
+
+  SELECT SINGLE PARM_VAL INTO WS_DIR FROM YHFPARMI
+         WHERE BUKRS = CO_CODE
+           AND PARM1 = 'SER'
+           AND PARM2 = 'DIR'.
+
+  IF FALLBACK EQ SPACE AND WS_IPADDR NE SPACE.
+
+    SKIP 2.
+    WS_CMD = 'YDBFTP01'.
+    IF DBD_PAY1 NE SPACE.
+      CONCATENATE: WS_IPADDR WS_USER WS_PASS DBD_PAY1 V_PFILE V_CFILE
+                   WS_DIR INTO OUTPARAM SEPARATED BY SPACE.
+    ELSE.
+      CONCATENATE: WS_IPADDR WS_USER WS_PASS DBD_PAY V_PFILE V_CFILE
+                   WS_DIR INTO OUTPARAM SEPARATED BY SPACE.
+    ENDIF.
+    ULINE.
+
+    REFRESH: EXEC_PROTOCOL.
+
+    IF WS_CHKSUM = 'Y'.
+      CALL FUNCTION 'SXPG_COMMAND_EXECUTE'
+           EXPORTING
+                COMMANDNAME                = WS_CMD
+                ADDITIONAL_PARAMETERS      = OUTPARAM
+           IMPORTING
+                STATUS                     = STATUS
+                EXITCODE                   = EXITPARAM
+           TABLES
+                EXEC_PROTOCOL              = EXEC_PROTOCOL
+           EXCEPTIONS
+                NO_PERMISSION              = 1
+                COMMAND_NOT_FOUND          = 2
+                PARAMETERS_TOO_LONG        = 3
+                SECURITY_RISK              = 4
+                WRONG_CHECK_CALL_INTERFACE = 5
+                PROGRAM_START_ERROR        = 6
+                PROGRAM_TERMINATION_ERROR  = 7
+                X_ERROR                    = 8
+                PARAMETER_EXPECTED         = 9
+                TOO_MANY_PARAMETERS        = 10
+                ILLEGAL_COMMAND            = 11
+                OTHERS                     = 12.
+    ELSE.
+      CALL FUNCTION 'SXPG_CALL_SYSTEM'
+           EXPORTING
+                COMMANDNAME                = WS_CMD
+                ADDITIONAL_PARAMETERS      = OUTPARAM
+           IMPORTING
+                STATUS                     = STATUS
+           TABLES
+                EXEC_PROTOCOL              = EXEC_PROTOCOL
+           EXCEPTIONS
+                NO_PERMISSION              = 1
+                COMMAND_NOT_FOUND          = 2
+                PARAMETERS_TOO_LONG        = 3
+                SECURITY_RISK              = 4
+                WRONG_CHECK_CALL_INTERFACE = 5
+                PROGRAM_START_ERROR        = 6
+                PROGRAM_TERMINATION_ERROR  = 7
+                X_ERROR                    = 8
+                PARAMETER_EXPECTED         = 9
+                TOO_MANY_PARAMETERS        = 10
+                ILLEGAL_COMMAND            = 11
+                OTHERS                     = 12.
+    ENDIF.
+    CASE SY-SUBRC.
+      WHEN 0.
+*    IF WS_IPADDR EQ 'H2H'.
+*      IF SY-SUBRC EQ 0.
+*        WRITE:/ 'File transfer completed successfully'.
+*      ENDIF.
+*    ELSE.
+        LOOP AT EXEC_PROTOCOL WHERE MESSAGE(3) EQ '226'.
+          DELETE DATASET     PAYFILE.
+          DELETE DATASET     CHKFILE.
+          EXIT.
+        ENDLOOP.
+*    ENDIF.
+        LOOP AT EXEC_PROTOCOL.
+          WRITE:/ EXEC_PROTOCOL.
+        ENDLOOP.
+      WHEN 1.
+        MESSAGE I368 WITH
+         'ERROR IN FM SXPG_CALL_SYSTEM OR SXPG_COMMAND_EXECUTE'
+                       '- NO PERMISSION'.
+        DELETE DATASET PAYFILE.
+        DELETE DATASET CHKFILE.
+        PERFORM VALID_EXCEPT.
+      WHEN 2.
+        MESSAGE I368 WITH
+         'ERROR IN FM SXPG_CALL_SYSTEM OR SXPG_COMMAND_EXECUTE'
+                       '- COMMAND NOT FOUND'.
+        DELETE DATASET PAYFILE.
+        DELETE DATASET CHKFILE.
+        PERFORM VALID_EXCEPT.
+      WHEN 3.
+        MESSAGE I368 WITH
+         'ERROR IN FM SXPG_CALL_SYSTEM OR SXPG_COMMAND_EXECUTE'
+                       '- PARAMETERS TOO LONG'.
+        DELETE DATASET PAYFILE.
+        DELETE DATASET CHKFILE.
+        PERFORM VALID_EXCEPT.
+      WHEN 4.
+        MESSAGE I368 WITH
+         'ERROR IN FM SXPG_CALL_SYSTEM OR SXPG_COMMAND_EXECUTE'
+                       '- SECURITY RISK'.
+        DELETE DATASET PAYFILE.
+        DELETE DATASET CHKFILE.
+        PERFORM VALID_EXCEPT.
+      WHEN 5.
+        MESSAGE I368 WITH
+         'ERROR IN FM SXPG_CALL_SYSTEM OR SXPG_COMMAND_EXECUTE'
+                       '- WRONG_CHECK_CALL_IF'.
+        DELETE DATASET PAYFILE.
+        DELETE DATASET CHKFILE.
+        PERFORM VALID_EXCEPT.
+      WHEN 6.
+        MESSAGE I368 WITH
+         'ERROR IN FM SXPG_CALL_SYSTEM OR SXPG_COMMAND_EXECUTE'
+                       '- PROGRAM_START_ERROR'.
+        DELETE DATASET PAYFILE.
+        DELETE DATASET CHKFILE.
+        PERFORM VALID_EXCEPT.
+      WHEN 7.
+        MESSAGE I368 WITH
+         'ERROR IN FM SXPG_CALL_SYSTEM OR SXPG_COMMAND_EXECUTE'
+                       '- PROGRAM_TERMINATION_ERROR'.
+        DELETE DATASET PAYFILE.
+        DELETE DATASET CHKFILE.
+        PERFORM VALID_EXCEPT.
+      WHEN 8.
+        MESSAGE I368 WITH
+         'ERROR IN FM SXPG_CALL_SYSTEM OR SXPG_COMMAND_EXECUTE'
+                       '- X_ERROR'.
+        DELETE DATASET PAYFILE.
+        DELETE DATASET CHKFILE.
+        PERFORM VALID_EXCEPT.
+      WHEN 9.
+        MESSAGE I368 WITH
+         'ERROR IN FM SXPG_CALL_SYSTEM OR SXPG_COMMAND_EXECUTE'
+                       '- PARAMETER_EXPECTED'.
+        DELETE DATASET PAYFILE.
+        DELETE DATASET CHKFILE.
+        PERFORM VALID_EXCEPT.
+      WHEN 10.
+        MESSAGE I368 WITH
+         'ERROR IN FM SXPG_CALL_SYSTEM OR SXPG_COMMAND_EXECUTE'
+                       '- TOO_MANY_PARAMETERS'.
+        DELETE DATASET PAYFILE.
+        DELETE DATASET CHKFILE.
+        PERFORM VALID_EXCEPT.
+      WHEN 11.
+        MESSAGE I368 WITH
+         'ERROR IN FM SXPG_CALL_SYSTEM OR SXPG_COMMAND_EXECUTE'
+                       '- ILLEGAL_COMMAND'.
+        DELETE DATASET PAYFILE.
+        DELETE DATASET CHKFILE.
+        PERFORM VALID_EXCEPT.
+      WHEN 12.
+        MESSAGE I368 WITH
+         'ERROR IN FM SXPG_CALL_SYSTEM OR SXPG_COMMAND_EXECUTE'
+                       '- OTHERS'.
+        DELETE DATASET PAYFILE.
+        DELETE DATASET CHKFILE.
+        PERFORM VALID_EXCEPT.
+      WHEN OTHERS.
+        MESSAGE I368 WITH
+                       ' OHTER ERRORS'.
+        DELETE DATASET PAYFILE.
+        DELETE DATASET CHKFILE.
+        PERFORM VALID_EXCEPT.
+    ENDCASE.
+
+    CASE EXITPARAM.
+      WHEN 0.
+      WHEN OTHERS.
+        MESSAGE I368 WITH
+'Exec of ext. Cmd YDBFTP01 Failed-Ret with ExitCode: ' EXITPARAM.
+        DELETE DATASET PAYFILE.
+        DELETE DATASET CHKFILE.
+        PERFORM VALID_EXCEPT.
+    ENDCASE.
+  ENDIF.
+  ULINE.
+  SKIP 2.
+  WRITE: /50 'End of Report'.
+ENDFORM.                    " FTP_TYP1_WITH_TARGET_DIRECTORY
+
+*&---------------------------------------------------------------------*
+*&      Form  VALID_EXCEPT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM VALID_EXCEPT.
+  PERFORM PRINT_HEADING USING V_PAYFILE V_CHECK_FILE.
+  PERFORM PRINT_CHECK_DBI.
+  IF WS_PC_DOWNLOAD NE 'Y'.
+    STOP.
+  ENDIF.
+ENDFORM.                    " VALID_EXCEPT
+
+*&---------------------------------------------------------------------*
+*&      Form  DELETE_FILE
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM DELETE_FILE.
+  CLEAR : L_FILENAME.
+  MOVE  DIS_PLY TO L_FILENAME.
+  CALL FUNCTION 'WS_FILE_DELETE'
+       EXPORTING
+            FILE = L_FILENAME.
+ENDFORM.                    " DELETE_FILE
+
+*&---------------------------------------------------------------------*
+*&      Form  DOWN_LOAD_PC
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM DOWN_LOAD_PC.
+  DATA: V_FILE_FLAG LIKE YHFPARMI-PARM_VAL.
+  REFRESH : I_TABLE.
+  CLEAR :  L_FILELENGTH.
+  OPEN DATASET V_PAYFILE FOR INPUT IN BINARY MODE.
+  IF SY-SUBRC <> 0.
+*          WRITE:/ 'cannot open Extraction  file'.
+    EXIT.
+  ENDIF.
+  BYTES = 0.
+  DO.
+    READ DATASET V_PAYFILE INTO I_TABLE LENGTH L_FILELENGTH.
+    SUBRC = SY-SUBRC.
+    APPEND I_TABLE.
+    ADD L_FILELENGTH  TO BYTES.
+    IF SUBRC NE 0.
+      EXIT.
+    ENDIF.
+  ENDDO.
+  CLOSE DATASET V_PAYFILE.
+
+  IMPORT DBD_PAY FROM MEMORY ID 'DBD_PAY'.
+  IMPORT V_PAYFILE1 FROM MEMORY ID 'V_PAYFILE1'.
+
+  SELECT SINGLE PARM_VAL INTO V_FILE_FLAG FROM YHFPARMI
+        WHERE ( BUKRS = CO_CODE OR BUKRS = SPACE )
+          AND PARM1  = 'FIX'
+          AND PARM2   = 'NME'.
+  IF V_FILE_FLAG EQ 'Y'.
+    CONCATENATE DBD_PAY 'DBI.TXT' INTO RLGRAP-FILENAME.
+  ELSE.
+    CONCATENATE DBD_PAY V_PAYFILE1 INTO RLGRAP-FILENAME.
+  ENDIF.
+  CALL FUNCTION 'WS_DOWNLOAD'
+       EXPORTING
+            BIN_FILESIZE            = BYTES  "L_FILELENGTH
+            FILENAME                = RLGRAP-FILENAME
+            FILETYPE                = 'BIN'
+       TABLES
+            DATA_TAB                = I_TABLE
+       EXCEPTIONS
+            FILE_OPEN_ERROR         = 1
+            FILE_WRITE_ERROR        = 2
+            INVALID_FILESIZE        = 3
+            INVALID_TYPE            = 4
+            NO_BATCH                = 5
+            UNKNOWN_ERROR           = 6
+            INVALID_TABLE_WIDTH     = 7
+            GUI_REFUSE_FILETRANSFER = 8
+            CUSTOMER_ERROR          = 9
+            OTHERS                  = 10.
+  IF SY-SUBRC <> 0.
+    MESSAGE E030  WITH RLGRAP-FILENAME.   "could not open file
+  ELSE.
+  ENDIF.
+ENDFORM.                    " DOWN_LOAD_PC
+*&---------------------------------------------------------------------*
+*&      Form  POP_UP_INFOR_PAYFILE
+*&---------------------------------------------------------------------*
+*       POP-UP FOR INFORMATION THAT THE PAYMENT FILE HAS BEEN GENERATED
+*----------------------------------------------------------------------*
+FORM POP_UP_INFOR_PAYFILE .
+  data: TO_PROCEED_FLAG, v_skip_parm1.
+  SELECT SINGLE PARM_VAL FROM YHFPARMI INTO V_SKIP_PARM1
+                             WHERE ( BUKRS = CO_CODE OR BUKRS = SPACE )
+                                AND  PARM1 = 'STR'
+                                AND  PARM2 = 'SPL'.
+  if v_skip_parm1 eq 'Y'.
+    CALL FUNCTION 'POPUP_TO_DISPLAY_TEXT'
+         EXPORTING
+              TITEL     = 'Payment file generated'
+              TEXTLINE1 = 'Use tcode /nSP01 to retrieve the reports'.
+  endif.
+ENDFORM.                    " POP_UP_INFOR_PAYFILE
+***********************************************************PP01
+* Changed by : Purna Chandra
+* Date       : 20\08\2007
+* To create the SHA checksum value generation.
+***********************************************************PP01
+*&---------------------------------------------------------------------*
+*&      Form  OS_COMMAND
+*&---------------------------------------------------------------------*
+*
+*----------------------------------------------------------------------*
+*      PAYFILE
+*----------------------------------------------------------------------*
+FORM OS_COMMAND USING  PAYFILE.
+  DATA: ADDPARAM LIKE SXPGCOLIST-PARAMETERS.
+*  DATA: V_DBCHK LIKE SXPGCOLIST-NAME.
+  clear V_DBCHK.
+
+  ADDPARAM = PAYFILE.
+  REFRESH EXEC_PROTOCOL.
+
+  IF SYST-OPSYS = 'AS/400' OR SYST-OPSYS = 'OS/400'.
+    CONCATENATE 'PARM(' '''' ADDPARAM '''' ')' INTO ADDPARAM.
+  ENDIF.
+  IF WS_CHKSUM1 = 'Y'.
+    V_DBCHK = 'YDBCHKSHA'.
+  ELSE.
+    V_DBCHK = 'YDBCHKSUM'.
+  ENDIF.
+
+  IF WS_CHKSUM = 'Y'.
+    CALL FUNCTION 'SXPG_COMMAND_EXECUTE'
+         EXPORTING
+              COMMANDNAME                = V_DBCHK
+              ADDITIONAL_PARAMETERS      = ADDPARAM
+         IMPORTING
+              STATUS                     = STATUS
+              EXITCODE                   = EXITPARAM
+         TABLES
+              EXEC_PROTOCOL              = EXEC_PROTOCOL
+         EXCEPTIONS
+              NO_PERMISSION              = 1
+              COMMAND_NOT_FOUND          = 2
+              PARAMETERS_TOO_LONG        = 3
+              SECURITY_RISK              = 4
+              WRONG_CHECK_CALL_INTERFACE = 5
+              PROGRAM_START_ERROR        = 6
+              PROGRAM_TERMINATION_ERROR  = 7
+              X_ERROR                    = 8
+              PARAMETER_EXPECTED         = 9
+              TOO_MANY_PARAMETERS        = 10
+              ILLEGAL_COMMAND            = 11
+              OTHERS                     = 12.
+  ELSE.
+    CALL FUNCTION 'SXPG_CALL_SYSTEM'
+         EXPORTING
+              COMMANDNAME                = V_DBCHK
+              ADDITIONAL_PARAMETERS      = ADDPARAM
+         IMPORTING
+              STATUS                     = STATUS
+              EXITCODE                   = EXITPARAM
+         TABLES
+              EXEC_PROTOCOL              = EXEC_PROTOCOL
+         EXCEPTIONS
+              NO_PERMISSION              = 1
+              COMMAND_NOT_FOUND          = 2
+              PARAMETERS_TOO_LONG        = 3
+              SECURITY_RISK              = 4
+              WRONG_CHECK_CALL_INTERFACE = 5
+              PROGRAM_START_ERROR        = 6
+              PROGRAM_TERMINATION_ERROR  = 7
+              X_ERROR                    = 8
+              PARAMETER_EXPECTED         = 9
+              TOO_MANY_PARAMETERS        = 10
+              ILLEGAL_COMMAND            = 11
+              OTHERS                     = 12.
+  ENDIF.
+ENDFORM.                    " OS_COMMAND
+***********************************************************PP01
+* Changed by : Purna Chandra
+* Date       : 20\08\2007
+* To create the SHA checksum value generation.
+
+***********************************************************PP01
+*Selection text£º
+*ACCT_ID:        Account ID
+*CO_CODE:        Company  Code
+*DBD_PAY:        Export Path for DBI File
+*FALLBACK:        Stop FTP
+*HBK_KEY:        House Bank
+*KATAKANA:        KATAKANA 2-1 byte Conversion
+*PAYPROG:        Payment Detail Program
+*PAY_METH:        Payment Method
+*S_WITHT:        Withholding Tax Type
+*WTXPROG:        Withholding Tax Program
+*W_LAUFI:        Additional Identification
+*YHLIVE:        DBI: Live Run Indicator
+
+*YHTEST:        db-direct : Test Run Indicator
+*List Title: Titlebar£º
+*:DEUTSCHE BANK AG - CHECKSUM LISTING

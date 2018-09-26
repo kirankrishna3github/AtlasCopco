@@ -1,0 +1,378 @@
+*&---------------------------------------------------------------------*
+*&  Include           YSE_FICO_SDI_SETT_RRBI_EV                        *
+*&---------------------------------------------------------------------*
+
+*----------------------------------------------------------------------*
+AT SELECTION-SCREEN ON p_bukrs.
+
+  SELECT SINGLE y_version_new INTO gv_version_new
+         FROM yse_rrb_comp_new
+         WHERE bukrs = p_bukrs.
+
+  IF gv_version_new IS INITIAL.
+    MESSAGE ID 'YSE_GENERAL' TYPE 'E' NUMBER '000'
+            WITH 'Company not processed via the new version'(e01).
+  ENDIF.
+
+
+*-------------------------------------------------------------------------------*
+*  START-OF-SELECTION                                                           *
+*-------------------------------------------------------------------------------*
+START-OF-SELECTION.
+
+  TYPES: BEGIN OF lty_matnr,
+           matnr TYPE matnr,
+           mtart TYPE mtart,
+         END OF lty_matnr,
+
+         BEGIN OF lty_parts,
+           matnr TYPE matnr,
+         END OF lty_parts.
+
+  DATA: lt_matnr TYPE STANDARD TABLE OF lty_matnr,
+        ls_matnr TYPE lty_matnr,
+        lt_parts TYPE STANDARD TABLE OF lty_parts,
+        ls_parts TYPE lty_parts.
+* Begin if insertion by MOD-003
+  DATA: gv_FUNC_AREA1 TYPE FKBER,
+        gv_FUNC_AREA2 TYPE FKBER.
+* End if insertion by MOD-003
+  CLEAR: gt_dmr[], gt_rrb_reposti[], gt_rrb_reposti_canc[].
+
+* Get last day of period used
+  PERFORM get_last_date_of_period.
+
+* Get non taxable tax code of company code
+  SELECT SINGLE mwska INTO gv_tax_code
+         FROM t001
+         WHERE bukrs EQ p_bukrs.
+
+* Get the company code currency
+  CLEAR gv_waers.
+  SELECT SINGLE waers INTO gv_waers
+         FROM t001
+         WHERE bukrs EQ p_bukrs.
+
+* Invert posting date date
+  CONVERT DATE gv_doc_date INTO INVERTED-DATE gv_gdatu.
+
+* Exchange rate type
+  CASE p_bukrs.
+    WHEN 'MRUA'.
+      gv_kurst = 'DRU'.
+    WHEN 'POLA'.
+      gv_kurst = 'D'.
+    WHEN OTHERS.
+      gv_kurst = 'EURX'.
+  ENDCASE.
+
+* Intermediate currency
+  CASE p_bukrs.
+    WHEN 'MRUA'.
+      gv_waers_int = gv_waers.
+    WHEN 'POLA'.
+      gv_waers_int = gv_waers.
+    WHEN OTHERS.
+      gv_waers_int = 'EUR'.
+  ENDCASE.
+
+* Exchange rates
+  SELECT kurst fcurr tcurr gdatu ukurs INTO TABLE gt_curri
+         FROM tcurr
+         WHERE kurst =  gv_kurst
+           AND tcurr =  gv_waers_int
+           AND gdatu GE gv_gdatu.
+  SORT gt_curri BY kurst fcurr tcurr gdatu.
+  DELETE ADJACENT DUPLICATES FROM gt_curri COMPARING kurst fcurr tcurr.
+  gt_curr[] = gt_curri[].
+  FREE gt_curri.
+
+*** MOD-001 * begin ***
+* Get reposting accounts
+  SELECT vkorg ktgrd ktgrm sakn1
+         INTO TABLE gt_c001i
+         FROM c001
+         WHERE kappl  = 'V '
+           AND kschl IN ('KOFI', 'KOFK')
+           AND ktopl  = 'SCOA'
+           AND kvsl1  = 'ERL'.
+  SORT gt_c001i BY vkorg ktgrd ktgrm.
+  DELETE ADJACENT DUPLICATES FROM gt_c001i
+         COMPARING vkorg ktgrd ktgrm.
+  gt_c001[] = gt_c001i[].
+  FREE gt_c001i.
+
+* Get functional areas for the reposting accounts
+  SELECT saknr func_area
+         INTO TABLE gt_ska1i
+         FROM ska1
+         FOR ALL ENTRIES IN gt_c001
+         WHERE ktopl  = 'SCOA'
+           AND saknr  = gt_c001-sakn1.
+  SORT gt_ska1i BY saknr.
+  DELETE ADJACENT DUPLICATES FROM gt_ska1i
+         COMPARING saknr.
+  gt_ska1[] = gt_ska1i[].
+  FREE gt_ska1i.
+*** MOD-001 * end ***
+
+
+* Get all entries to process:
+** Either invoices that haven't been cancelled yet and need to be reposted
+
+  SELECT * INTO TABLE gt_rrb_reposti
+         FROM yse_rrb_reposti
+         WHERE bukrs = p_bukrs
+           AND sales_order IN so_vbeln
+           AND no_repost_req = ' '  "This indicator is set when there is an invoice without parts, so no reposting required
+           AND  reposted = ' '     "Not yet reposted
+           AND cancel_doc = ' '.   "and not cancelled so repost required
+
+** Or
+** Invoices that have been reposted already and now need to be reversed.
+
+  SELECT * INTO TABLE gt_rrb_reposti_canc
+         FROM yse_rrb_reposti
+         WHERE bukrs = p_bukrs
+           AND sales_order IN so_vbeln
+           AND no_repost_req = ' '  "This indicator is set when there is an invoice without parts, so no reposting required
+           AND reposted = 'X'     "Not yet reposted
+           AND cancel_doc <> ' '
+           AND repost_canceled = ' '.
+
+
+  IF gt_rrb_reposti[] IS INITIAL. "No invoices to be processed found
+    WRITE: 'No invoices to be processed found'.
+  ELSE.
+
+*   Get the materials of the invoices to see if any spare parts are used
+    SELECT * INTO TABLE gt_vbrp
+           FROM vbrp
+           FOR ALL ENTRIES IN gt_rrb_reposti
+           WHERE vbeln = gt_rrb_reposti-invoice
+             AND posnr = gt_rrb_reposti-item.
+
+    SORT gt_vbrp BY vbeln posnr.
+
+*   Copy over all materials to local matnr table and select material types
+    LOOP AT gt_vbrp INTO gs_vbrp.
+      MOVE gs_vbrp-matnr TO ls_matnr-matnr.
+      COLLECT ls_matnr INTO lt_matnr.
+    ENDLOOP.
+
+*   Get raw materials
+    SELECT matnr INTO TABLE lt_parts
+           FROM mara
+           FOR ALL ENTRIES IN lt_matnr
+           WHERE matnr = lt_matnr-matnr
+             AND mtart = 'ZMAT'.
+
+
+    SORT lt_parts.
+    LOOP AT gt_rrb_reposti ASSIGNING <fs_rrb_reposti>
+                           WHERE reposted = ' '         "Only the to be reposted ones
+                             AND cancel_doc = ' '.
+*     First check if any parts to repost
+      LOOP AT gt_vbrp INTO gs_vbrp WHERE vbeln = <fs_rrb_reposti>-invoice
+                                     AND posnr = <fs_rrb_reposti>-item.
+        READ TABLE lt_parts INTO ls_parts
+                   WITH KEY matnr = gs_vbrp-matnr.
+        IF sy-subrc NE 0.      "No spare part so no reposting for this item
+          DELETE gt_vbrp WHERE vbeln = gs_vbrp-vbeln
+                           AND posnr = gs_vbrp-posnr.
+        ENDIF.
+      ENDLOOP.
+    ENDLOOP.
+
+
+    LOOP AT gt_vbrp INTO gs_vbrp.    "Loop over all the to be reposted invoice items (are the same as dmr items)
+      CLEAR gs_dmr.
+      MOVE: p_bukrs         TO gs_dmr-bukrs,
+            gs_vbrp-vgbel   TO gs_dmr-vbeln,
+            gs_vbrp-vgpos   TO gs_dmr-posnr,
+            gs_vbrp-vbelv   TO gs_dmr-vgbel,
+            gs_vbrp-posnv   TO gs_dmr-vgpos,
+            gs_vbrp-werks   TO gs_dmr-werks,
+            gs_vbrp-matnr   TO gs_dmr-matnr.
+
+      SELECT SINGLE netwr wavwr stcur waerk
+             INTO CORRESPONDING FIELDS OF gs_dmr
+             FROM vbap
+             WHERE vbeln = gs_vbrp-vgbel
+               AND posnr = gs_vbrp-vgpos.
+
+      SELECT SINGLE objnr
+             INTO gs_dmr-objnr
+             FROM vbap
+             WHERE vbeln = gs_dmr-vgbel
+               AND posnr = gs_dmr-vgpos.
+
+*     Check settlement (Get the cobrb entry required)
+      SELECT SINGLE paobjnr
+             INTO gs_dmr-paobjnr
+             FROM cobrb
+             WHERE objnr = gs_dmr-objnr
+               AND letja = p_letja
+               AND letpe = p_letpe.
+      IF sy-subrc NE 0.
+        DELETE gt_vbrp WHERE vbeln = gs_vbrp-vbeln
+                         AND posnr = gs_vbrp-posnr.     "If no settlement entry found, delete the entry
+        CONTINUE.
+      ENDIF.
+
+*     Sales area and sold-to customer
+      SELECT SINGLE vkorg vtweg spart
+                    kunnr                                   "MOD-001
+             INTO CORRESPONDING FIELDS OF gs_dmr
+             FROM vbak
+             WHERE vbeln = gs_dmr-vgbel.
+
+*** MOD-001 * begin ***
+*     Customer account assignment group
+      SELECT SINGLE ktgrd INTO gs_dmr-ktgrd
+             FROM knvv
+             WHERE kunnr = gs_dmr-kunnr
+               AND vkorg = gs_dmr-vkorg
+               AND vtweg = gs_dmr-vtweg
+               AND spart = gs_dmr-spart.
+*** MOD-001 * end ***
+
+*     Get the serial number and the equipment from Maintenance order header via order master data
+      SELECT SINGLE afih~serialnr afih~equnr
+             INTO CORRESPONDING FIELDS OF gs_dmr
+             FROM afih
+             INNER JOIN aufk
+                     ON afih~aufnr EQ aufk~aufnr
+             WHERE aufk~kdauf = gs_dmr-vgbel
+               AND aufk~kdpos = gs_dmr-vgpos.
+
+*     Check if the sales doc currency is the same as the company code currency
+      IF gs_dmr-waerk <> gv_waers.    "Sales doc currency <> company code currency
+*       Convert to local currency (company currency)
+        PERFORM convert_amount_int USING gs_dmr-netwr
+                                         gs_dmr-waerk
+                                         gs_dmr-netwr
+                                         gv_waers.
+      ENDIF.
+
+*     Get the profit center
+      SELECT SINGLE prctr INTO gs_dmr-prctr
+             FROM marc
+             WHERE matnr = gs_dmr-matnr
+               AND werks = gs_dmr-werks.
+
+*     Get actual costs
+      SELECT SUM( in_wtgbtr ) INTO gs_dmr-wavwr
+             FROM ad01dlief
+             WHERE vbeln = gs_dmr-vbeln
+               AND vbpos = gs_dmr-posnr.
+
+      MOVE gs_vbrp-vbeln TO gs_dmr-billing_doc.
+      MOVE gs_vbrp-posnr TO gs_dmr-billing_item.
+
+      APPEND gs_dmr TO gt_dmr.
+
+    ENDLOOP.
+
+
+*   Now we have all the relevant DMR, loop over all DMR's, find the new PC, PLC, GAC and PGC
+*   and post the adjustments against these new characteristics.
+
+    DATA: lv_invoice_sv   TYPE vbeln_vf,
+          lv_paobjnr      TYPE rkeobjnr,
+          lv_sales_order  TYPE vbeln_va."MOD-002++
+
+* Begin of insertion by MOD-003
+    SELECT single FUNC_AREA INTO gv_FUNC_AREA1
+                            FROM SKA1 WHERE SAKNR = p_re_cos.
+    SELECT single FUNC_AREA INTO gv_FUNC_AREA2
+                            FROM SKA1 WHERE SAKNR = p_costs.
+* End of insertion by MOD-003
+    LOOP AT gt_dmr INTO gs_dmr.
+      MOVE gs_dmr TO gs_last_dmr.
+      READ TABLE gt_rrb_reposti ASSIGNING <fs_rrb_reposti>
+                               WITH KEY invoice = gs_dmr-billing_doc
+                                        item    = gs_dmr-billing_item.
+
+      CLEAR: gs_ce41000, gt_criteria[], gt_valuefield[], gt_accountgl[], gt_currencyamount[], gs_documentheader,gt_return[], gt_ce11000[], gt_items[].
+
+*     Profitability Segment (per invoice)
+      IF <fs_rrb_reposti>-invoice NE lv_invoice_sv OR
+         <fs_rrb_reposti>-sales_order NE lv_sales_order."MOD-002++
+        CLEAR lv_paobjnr.
+        SELECT SINGLE paobjnr INTO lv_paobjnr
+               FROM vbrp
+               WHERE vbeln   =  <fs_rrb_reposti>-invoice
+                 AND aubel   =  <fs_rrb_reposti>-sales_order
+                 AND paobjnr NE 0.
+        CHECK sy-subrc = 0.
+        lv_invoice_sv = <fs_rrb_reposti>-invoice.
+        lv_sales_order = <fs_rrb_reposti>-sales_order."MOD-002++
+      ENDIF.
+
+*     Get copa ce4 key field
+      SELECT SINGLE ce4key INTO gs_dmr-ce4key               "#EC *
+             FROM ce41000_acct
+             WHERE aktbo   = 'X'
+               AND paobjnr = lv_paobjnr
+               AND pasubnr = 1.
+      CHECK sy-subrc = 0.
+*     Get the old characteristics from CE41000
+      SELECT SINGLE * FROM ce41000                          "#EC *
+             INTO gs_ce41000
+             WHERE aktbo   = 'X'
+               AND paobjnr = gs_dmr-ce4key
+               AND pasubnr = 1.
+      CHECK sy-subrc = 0.
+
+*** MOD-001 * begin ***
+*     Get the revenue account
+      CLEAR gv_saknr.
+      READ TABLE gt_c001 WITH TABLE KEY vkorg = gs_dmr-vkorg
+                                        ktgrd = gs_dmr-ktgrd
+                                        ktgrm = gs_dmr-vtweg.
+      IF sy-subrc = 0.
+        gv_saknr = gt_c001-sakn1.
+      ENDIF.
+
+*     Get the functional area
+      CLEAR gv_fkber.
+      READ TABLE gt_ska1 WITH TABLE KEY saknr = gv_saknr.
+      IF sy-subrc = 0.
+        gv_fkber = gt_ska1-func_area.
+      ENDIF.
+*** MOD-001 * end ***
+
+*     Copy all the characteristics to the bapi internal table.
+      PERFORM create_line_10.
+      PERFORM create_line_20.
+      PERFORM create_line_30.
+      PERFORM create_line_40.
+
+      PERFORM create_header.
+
+      PERFORM execute_repost.
+
+    ENDLOOP.
+
+  ENDIF.
+
+
+  IF gt_rrb_reposti_canc[] IS INITIAL.
+    WRITE: / 'No cancellations to be processed found'.
+  ELSE.
+*   Also cancel the required doc's
+    LOOP AT gt_rrb_reposti_canc ASSIGNING <fs_rrb_reposti>.
+      PERFORM reverse_posting.
+    ENDLOOP.
+  ENDIF.
+
+  IF NOT gt_rrb_reposti[] IS INITIAL.
+    MODIFY yse_rrb_reposti FROM TABLE gt_rrb_reposti.
+    COMMIT WORK.
+  ENDIF.
+
+  IF NOT gt_rrb_reposti_canc[] IS INITIAL.
+    MODIFY yse_rrb_reposti FROM TABLE gt_rrb_reposti_canc.
+    COMMIT WORK.
+  ENDIF.

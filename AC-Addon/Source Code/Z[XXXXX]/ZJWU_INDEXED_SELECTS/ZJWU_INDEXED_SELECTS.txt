@@ -1,0 +1,342 @@
+*&---------------------------------------------------------------------*
+*& Report  ZJWU_INDEXED_SELECTS
+*&
+*&---------------------------------------------------------------------*
+*&
+*&
+*&---------------------------------------------------------------------*
+
+report  zjwu_indexed_selects.
+
+parameters: p_bukrs   like bkpf-bukrs memory id buk      obligatory,
+            p_belnr   like bkpf-belnr memory id bln      obligatory,
+            p_gjahr   like bkpf-gjahr memory id gjr      obligatory.
+
+types: begin of bkpf_fields,
+         bukrs    like bkpf-bukrs,
+         belnr    like bkpf-belnr,
+         gjahr    like bkpf-gjahr,
+         blart    like bkpf-blart,
+         budat    like bkpf-budat,
+       end   of bkpf_fields.
+
+data: bkpf  type bkpf,
+      dd07l type dd07l.
+
+data: bkpf_int type table of bkpf_fields,
+      bkpf_wa  type          bkpf_fields.
+
+data: start   type i,
+      end     type i,
+      dif     type i.
+
+start-of-selection.
+  perform get_one_document.
+  perform unindexed_select_bkpf.
+  perform indexed_select_bkpf.
+  perform unindexed_select_bkpf_2.
+  perform indexed_select_bkpf_2.
+
+*&---------------------------------------------------------------------*
+*&      Form  get_one_document
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+form get_one_document.
+
+* First we get a single document using a select statement that is
+* fully qualified on the primary key. Because buffering may be an issue,
+* the first select will be disregarded in this test. However, in real
+* life, this would be the important time.
+
+
+* Initial select
+  select  bukrs belnr gjahr blart budat
+    from  bkpf
+    into  table bkpf_int
+    where bukrs = p_bukrs
+    and   belnr = p_belnr
+    and   gjahr = p_gjahr.
+
+  if sy-subrc <> 0.
+    message id '00' type 'E' number '001' with
+               'Document does not exist'.
+  endif.
+
+* Next we get the same document using the same fully qualified select
+* statement. We will use the time for this in comparisons.
+
+  refresh bkpf_int.
+  get run time field start.
+
+  select  bukrs belnr gjahr blart budat
+    from  bkpf
+    into  table bkpf_int
+    where bukrs = p_bukrs
+    and   belnr = p_belnr
+    and   gjahr = p_gjahr.
+
+  get run time field end.
+  dif = end - start.
+  write: /001 'Time for first (fully qualified) select',
+          067  ':', dif, 'microseconds'.
+  skip 1.
+
+* So we can use these fields later on
+  read table bkpf_int into bkpf_wa index 1.
+
+endform.                    " get_one_document
+
+*&---------------------------------------------------------------------*
+*&      Form  unindexed_select_bkpf
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+form unindexed_select_bkpf.
+
+* Now we select a group of documents using a select statement that is
+* missing the company code from the primary key. This may return a
+* different set of documents from the first select, but we are just
+* interested in how long it takes.
+
+* Initial select
+
+  refresh bkpf_int.
+  select  bukrs belnr gjahr blart budat
+    from  bkpf
+    into  table bkpf_int
+    where belnr = p_belnr
+    and   gjahr = p_gjahr.
+
+  refresh bkpf_int.
+  get run time field start.
+
+* Use this select in comparisons
+  select  bukrs belnr gjahr blart budat
+    from  bkpf
+    into  table bkpf_int
+    where belnr = p_belnr
+    and   gjahr = p_gjahr.
+
+  get run time field end.
+  dif = end - start.
+  write: /001 'Time for second (unindexed) select',
+          067  ':', dif, 'microseconds'.
+
+endform.                    " unindexed_select_bkpf
+
+*&---------------------------------------------------------------------*
+*&      Form  indexed_select_bkpf
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+form indexed_select_bkpf.
+
+* Now we're going to use the first trick. Go to table T001 (company
+* codes) and retrieve all the company codes and put them into a range
+* table. We'll put the range table into the select. So long as the
+* number of company codes is not too great, this will speed up the
+* select on BKPF.
+
+  ranges: r_bukrs for bkpf-bukrs.
+
+* Preliminary selects
+  r_bukrs-option = 'EQ'.
+  r_bukrs-sign   = 'I'.
+  select bukrs
+    from t001
+    into r_bukrs-low.
+    append r_bukrs.
+  endselect.
+
+  refresh bkpf_int.
+  select  bukrs belnr gjahr blart budat
+    from  bkpf
+    into  table bkpf_int
+    where bukrs in r_bukrs
+    and   belnr = p_belnr
+    and   gjahr = p_gjahr.
+
+  refresh: bkpf_int,
+           r_bukrs.
+  get run time field start.
+
+* Use these selects in comparison
+  r_bukrs-option = 'EQ'.
+  r_bukrs-sign   = 'I'.
+  select bukrs
+    from t001
+    into r_bukrs-low.
+    append r_bukrs.
+  endselect.
+
+  select bukrs belnr gjahr blart budat
+    from  bkpf
+    into  table bkpf_int
+    where bukrs in r_bukrs
+    and   belnr = p_belnr
+    and   gjahr = p_gjahr.
+
+  get run time field end.
+  dif = end - start.
+  write: /001 'Time for third select',
+              '(indexed by selecting from the check table)',
+          067  ':', dif, 'microseconds'.
+  skip 1.
+
+endform.                    " indexed_select_bkpf
+
+*&---------------------------------------------------------------------*
+*&      Form  unindexed_select_bkpf_2
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+form unindexed_select_bkpf_2.
+
+* Now we'll get another group of records from BKPF. There is a
+* secondary index on BKPF with fields BUKRS, BSTAT and BUDAT.
+* We're going to leave BSTAT out of the select and use
+* BUKRS and BUDAT from the first document we selected.
+
+* Preliminary select - to be ignored.
+  refresh bkpf_int.
+  select  bukrs belnr gjahr blart budat
+    from  bkpf
+    into  table bkpf_int
+    where bukrs = p_bukrs
+    and   budat = bkpf_wa-budat.
+
+  refresh bkpf_int.
+  get run time field start.
+
+  select bukrs belnr gjahr blart budat
+    from  bkpf
+    into  table bkpf_int
+    where bukrs = p_bukrs
+    and   budat = bkpf_wa-budat.
+
+  get run time field end.
+  dif = end - start.
+  write: /001 'Time for fourth (partially indexed) select',
+          067  ':', dif, 'microseconds'.
+
+endform.                    " unindexed_select_bkpf_2
+
+*&---------------------------------------------------------------------*
+*&      Form  indexed_select_bkpf_2
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+form indexed_select_bkpf_2.
+
+* Finally, we will use the domain values of BSTAT in the select. If you
+* are sure that you know all of the values, you can hardcode them. I am
+* using all of the possible values of BSTAT so that all three selects
+* return the same data. In practice, we would probably narrow it down.
+* But since normal FI postings have BSTAT = SPACE, this won't help
+* unless we are looking for 'not' normal documents.
+
+  ranges: r_bstat for bkpf-bstat.
+  data  : d1 like dd07l-domvalue_l,
+          d2 like dd07l-domvalue_h.
+
+* Hardcoded values
+* Preliminary select.
+  refresh bkpf_int.
+  select  bukrs belnr gjahr blart budat
+    from  bkpf
+    into  table bkpf_int
+    where bukrs eq p_bukrs
+    and   bstat in (' ', 'A', 'B', 'D', 'M', 'S', 'V', 'W', 'Z')
+    and   budat = bkpf_wa-budat.
+
+  refresh bkpf_int.
+  get run time field start.
+* Use this select in comparisons
+  select  bukrs belnr gjahr blart budat
+    from  bkpf
+    into  table bkpf_int
+    where bukrs eq p_bukrs
+    and   bstat in (' ', 'A', 'B', 'D', 'M', 'S', 'V', 'W', 'Z')
+    and   budat = bkpf_wa-budat.
+
+  get run time field end.
+  dif = end - start.
+  write: /001 'Time for fifth select',
+              '(indexed by hardcoding the domain values)',
+          067  ':', dif, 'microseconds'.
+
+* After an upgrade, the values in a domain may change. It's safer to
+* retrieve all of the values from the data dictionary. There is a very
+* slight increase in the time.
+
+  r_bstat-sign   = 'I'.
+  select  domvalue_l domvalue_h
+    from  dd07l
+    into  (d1, d2)
+    where domname  = 'BSTAT'
+    and   as4local = 'A'.
+    if d2 is initial.
+      r_bstat-option = 'EQ'.
+      r_bstat-low    = d1.
+      clear r_bstat-high.
+    else.
+      r_bstat-option = 'BT'.
+      r_bstat-low    = d1.
+      r_bstat-high   = d2.
+    endif.
+    append r_bstat.
+  endselect.
+
+  refresh bkpf_int.
+  select  bukrs belnr gjahr blart budat
+    from  bkpf
+    into  table bkpf_int
+    where bukrs eq p_bukrs
+    and   bstat in r_bstat
+    and   budat = bkpf_wa-budat.
+
+  refresh: bkpf_int,
+           r_bstat.
+
+* Use this select in comparisons.
+  get run time field start.
+
+  r_bstat-sign   = 'I'.
+  select  domvalue_l domvalue_h
+    from  dd07l
+    into  (d1, d2)
+    where domname  = 'BSTAT'
+    and   as4local = 'A'.
+    if d2 is initial.
+      r_bstat-option = 'EQ'.
+      r_bstat-low    = d1.
+      clear r_bstat-high.
+    else.
+      r_bstat-option = 'BT'.
+      r_bstat-low    = d1.
+      r_bstat-high   = d2.
+    endif.
+    append r_bstat.
+  endselect.
+
+  refresh bkpf_int.
+  select  bukrs belnr gjahr blart budat
+    from  bkpf
+    into  table bkpf_int
+    where bukrs eq p_bukrs
+    and   bstat in r_bstat
+    and   budat = bkpf_wa-budat.
+
+  get run time field end.
+  dif = end - start.
+  write: /001 'Time for sixth select',
+              '(indexed by selecting the domain values)',
+          067  ':', dif, 'microseconds'.
+
+endform.                    " indexed_select_bkpf_2
+
+*Selection text£º
+*P_BELNR:D       .
+*P_BUKRS:D       .
+*P_GJAHR:D       .

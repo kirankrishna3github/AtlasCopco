@@ -1,0 +1,301 @@
+*&---------------------------------------------------------------------*
+*& Report  YAM_CLOSE_NOTIFS_FOR_ORDER                                  *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+*& This report will close the notifications if the service order       *
+*& has the status TECO or CLSD.                                        *
+*&---------------------------------------------------------------------*
+*& Modifications                                                       *
+*&---------------------------------------------------------------------*
+* MOD-xxx| Date     | Author          | Request  | Development ID      *
+*----------------------------------------------------------------------*
+*                                                                      *
+*&---------------------------------------------------------------------*
+REPORT  YAM_CLOSE_NOTIFS_FOR_ORDER MESSAGE-ID yam_re.
+
+*.................. Tables definitions................................ *
+TABLES: QMEL.
+
+*.................. Variable definitions.............................. *
+TYPES: BEGIN OF i_qmel,
+        aufnr like qmel-aufnr,
+        qmnum like qmel-qmnum,
+        objnr like qmel-objnr,
+        vkorg like qmel-vkorg,
+       END   OF i_qmel.
+
+*.. Global variables
+DATA: gt_qmel     TYPE STANDARD TABLE OF i_qmel WITH HEADER LINE.
+
+data: i_bapiret2             TYPE STANDARD TABLE OF bapiret2.
+
+data: begin of i_ret2 occurs 0.
+        include structure bapiret2.
+data: end of i_ret2.
+
+DATA: wa_ret2                      TYPE bapiret2,
+      wa_notsti                    type bapi2080_notsti,
+      wa_systatus                  type BAPI2080_NOTADT-SYSTATUS,
+      wa_USRSTATUS                 type BAPI2080_NOTADT-USRSTATUS.
+
+DATA: GV_OBJNR LIKE JEST-OBJNR.
+
+*.. Global constants
+CONSTANTS: gc_11        type vtweg     value '11',
+           gc_01        type spart     value '01',
+           gc_02(02)    type C         value '02',
+* Begin of insert
+           c_progr(26)  type C         value 'YAM_CLOSE_NOTIFS_FOR_ORDER'.
+* End of insert
+
+*.................. Layout selection screen........................... *
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE text-b01.
+SELECT-OPTIONS:
+  s_qmnum      for       qmel-qmnum matchcode object QMEG,
+  s_aufnr      for       qmel-aufnr matchcode object ORDP.
+PARAMETERS:
+  p_vkorg      TYPE      vkorg memory id VKO.
+SELECTION-SCREEN END   OF BLOCK b1.
+
+SELECTION-SCREEN BEGIN OF BLOCK b2 WITH FRAME TITLE text-b02.
+PARAMETERS:
+  P_TEST(1)    type      c     default 'X'.
+SELECTION-SCREEN END   OF BLOCK b2.
+
+*.................. Selection screen validations...................... *
+AT SELECTION-SCREEN ON p_vkorg.
+
+  AUTHORITY-CHECK OBJECT 'V_VBAK_VKO'
+           ID 'VKORG' FIELD p_vkorg
+           ID 'VTWEG' FIELD gc_11
+           ID 'SPART' FIELD gc_01
+           ID 'ACTVT' FIELD gc_02.
+
+  IF sy-subrc NE 0.
+*.. No authorization for sales organisation: &1
+    MESSAGE S001(00) WITH text-e03 p_vkorg.
+    exit.
+  ENDIF.
+
+
+*.................. Main program...................................... *
+START-OF-SELECTION.
+
+* Input checks
+  if p_vkorg is initial and
+     s_qmnum is initial and
+     s_aufnr is initial.
+*.. Please fill in notification, order and/or company code
+    message S001(00) with text-e01.
+    exit.
+  endif.
+
+* Select the relevant notifications
+  PERFORM select_notifs.
+
+  if gt_qmel[] is initial.
+    message S001(00) with text-i01.
+    exit.
+  endif.
+
+
+*.................. End of selection.................................. *
+END-OF-SELECTION.
+
+* Prepare the input parameters to be called with BAPI
+  CLEAR wa_notsti.
+  MOVE 'E'      TO wa_notsti-langu.
+  MOVE 'EN'     TO wa_notsti-languiso.
+  MOVE sy-datum tO wa_notsti-refdate.
+  move sy-uzeit to wa_notsti-reftime.
+
+* Close notifications for service orders which are TECO/CLSD
+  sort gt_qmel by aufnr.
+  loop at gt_qmel.
+
+    check not gt_qmel-aufnr is initial.
+    CONCATENATE 'OR' gt_qmel-AUFNR INTO GV_OBJNR.
+
+*.. Check S.O. TECO/CLSD status active
+    CALL FUNCTION 'STATUS_CHECK'
+      EXPORTING
+*       BYPASS_BUFFER           = ' '
+*       CLIENT                  = SY-MANDT
+        OBJNR                   = GV_OBJNR
+        STATUS                  = 'I0045'
+      EXCEPTIONS
+        OBJECT_NOT_FOUND        = 1
+        STATUS_NOT_ACTIVE       = 2
+        OTHERS                  = 3.
+
+    IF SY-SUBRC NE 0.
+      CALL FUNCTION 'STATUS_CHECK'
+        EXPORTING
+*         BYPASS_BUFFER           = ' '
+*         CLIENT                  = SY-MANDT
+          OBJNR                   = GV_OBJNR
+          STATUS                  = 'I0046'
+        EXCEPTIONS
+          OBJECT_NOT_FOUND        = 1
+          STATUS_NOT_ACTIVE       = 2
+          OTHERS                  = 3.
+
+      IF SY-SUBRC NE 0.
+        continue.
+      ENDIF.
+    ENDIF.
+
+*.. Check if related notification is already completed (NOCO)
+*.. then skip
+    CALL FUNCTION 'STATUS_CHECK'
+      EXPORTING
+*       BYPASS_BUFFER           = ' '
+*       CLIENT                  = SY-MANDT
+        OBJNR                   = gt_qmel-objnr
+        STATUS                  = 'I0072'
+      EXCEPTIONS
+        OBJECT_NOT_FOUND        = 1
+        STATUS_NOT_ACTIVE       = 2
+        OTHERS                  = 3.
+
+    if sy-subrc eq 0.
+      continue.
+    endif.
+
+*.. Check if related notification has a deletion flag (DLFL)
+*.. then skip
+    CALL FUNCTION 'STATUS_CHECK'
+      EXPORTING
+*       BYPASS_BUFFER           = ' '
+*       CLIENT                  = SY-MANDT
+        OBJNR                   = gt_qmel-objnr
+        STATUS                  = 'I0076'
+      EXCEPTIONS
+        OBJECT_NOT_FOUND        = 1
+        STATUS_NOT_ACTIVE       = 2
+        OTHERS                  = 3.
+
+    if sy-subrc eq 0.
+      continue.
+    endif.
+
+*.. Check if related notification has still outstanding tasks (OSTS)
+*.. then skip
+    CALL FUNCTION 'STATUS_CHECK'
+      EXPORTING
+*       BYPASS_BUFFER           = ' '
+*       CLIENT                  = SY-MANDT
+        OBJNR                   = gt_qmel-objnr
+        STATUS                  = 'I0158'
+      EXCEPTIONS
+        OBJECT_NOT_FOUND        = 1
+        STATUS_NOT_ACTIVE       = 2
+        OTHERS                  = 3.
+
+    if sy-subrc eq 0.
+      continue.
+    endif.
+
+    CALL FUNCTION 'BAPI_ALM_NOTIF_CLOSE'
+      EXPORTING
+        NUMBER       = gt_qmel-qmnum
+        SYSTSTAT     = wa_notsti
+        TESTRUN      = p_test
+      IMPORTING
+        SYSTEMSTATUS = wa_SYSTATUS
+        USERSTATUS   = wa_USRSTATUS
+      TABLES
+        RETURN       = i_bapiret2.
+
+    IF NOT i_bapiret2[] IS INITIAL.
+      LOOP AT i_bapiret2 into wa_ret2.
+        move wa_ret2 to i_ret2.
+        append i_ret2.
+        clear i_ret2.
+      endloop.
+    else.
+      commit work.
+    endif.
+
+  endloop.
+
+* Begin of insert MOD-001
+if sy-cprog <> c_progr.
+* End of insert MOD-001
+  if p_test = 'X'.
+    write: / text-i10,
+           / text-u11.
+  else.
+    write: / text-i11,
+           / text-u11.
+  endif.
+
+
+* Write errormessages
+  IF i_ret2[] IS INITIAL.
+    write: / text-e12.
+  ELSE.
+    LOOP AT i_ret2.
+      CALL FUNCTION 'NAST_PROTOCOL_UPDATE'
+        EXPORTING
+          msg_arbgb              = i_ret2-id
+          msg_nr                 = i_ret2-number
+          msg_ty                 = i_ret2-type
+          msg_v1                 = i_ret2-message_v1
+          msg_v2                 = i_ret2-message_v2
+          msg_v3                 = i_ret2-message_v3
+          msg_v4                 = i_ret2-message_v4
+        EXCEPTIONS
+          message_type_not_valid = 1
+          no_sy_message          = 2
+          OTHERS                 = 3.
+      IF sy-subrc <> 0.
+        write: / text-e11, sy-subrc.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+* Begin of insert MOD-001
+endif.
+* End of insert MOD-001
+
+*.................. Subroutines....................................... *
+*
+*---------------------------------------------------------------------
+FORM select_notifs.
+
+  if p_vkorg is initial.
+    select qmnum aufnr objnr vkorg
+      into corresponding fields of table gt_qmel
+      from qmel
+      where qmnum in s_qmnum
+        and aufnr in s_aufnr.
+  else.
+    select qmnum aufnr objnr vkorg
+      into corresponding fields of table gt_qmel
+      from qmel
+      where qmnum in s_qmnum
+        and aufnr in s_aufnr
+        and vkorg eq p_vkorg.
+  endif.
+
+ENDFORM.                    "select_equipments
+
+
+*----------------------------------------------------------------------
+*Text symbol text£º
+*B01:Selection
+*B02:Update mode
+*E01:Please fill in notification, order and/or company code
+*E03:No authorization for sales organisation :
+*E11:Error when printing
+*E12:Job finished
+*I01:No notifications selected !
+*I10:Test mode
+*I11:Update mode
+
+*U11:*****************
+*Selection text£º
+*P_TEST:        Testrun ?
+*P_VKORG:D       Sales Organization
+*S_AUFNR:D       Order
+*S_QMNUM:D       Notification

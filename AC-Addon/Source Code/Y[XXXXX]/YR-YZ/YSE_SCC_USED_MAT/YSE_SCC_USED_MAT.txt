@@ -1,0 +1,365 @@
+
+*&---------------------------------------------------------------------*
+*&  Include               YSE_SCC_USED_MAT                             *
+*&---------------------------------------------------------------------*
+*                                                                      *
+*----------------------------------------------------------------------*
+*                                                                      *
+* PROGRAM ID           : YSE_SCC_USED_MAT                              *
+* PROGRAM TITLE        : Fill table used materials for SCC             *
+* AUTHOR               : Geert Rutten                                  *
+* DATE                 : 03/09/2010                                    *
+* DEVELOPMENT ID       : XXXX                                          *
+*                                                                      *
+* CHANGE REQUEST NUMBER:                                               *
+*                                                                      *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE     | NAME     |CORRECTION NUMBER| CHANGE REFERENCE #*
+*                                                                      *
+*----------------------------------------------------------------------*
+*                                                                      *
+************************************************************************
+*                                                                      *
+************************************************************************
+
+program yse_scc_used_mat.
+
+***********************************************************************
+* Data
+***********************************************************************
+
+tables: marc, mard, eine, yse_scc_used_mat.
+
+*types: begin of gt_werks,
+*           werks type werks_d,
+*       end of gt_werks.
+
+types: begin of ty_mat,
+         matnr  type matnr,
+         werks  type werks_ext,
+         lgort  type lgort_d,
+      end of ty_mat.
+
+data: "it_werks type table of gt_werks with header line,
+      it_mat              type table of ty_mat with header line,
+      gt_scc_consign      type table of yse_scc_consign with header line,
+      wa_yse_scc_used_mat type yse_scc_used_mat,
+      gv_flag             type yse_scc_used_mat-flag,
+      gv_lead             type zsccplifz,
+      gv_lead_comp        type zsccplifz.
+
+************************************************************************
+*       S E L E C T - O P T I O N S / P A R A M E T E R S              *
+************************************************************************
+
+selection-screen : begin of block b1 with frame title text-001.
+
+parameters: p_ekorg type eine-ekorg obligatory.
+select-options:
+        s_werks  for marc-werks.
+
+selection-screen: end of block b1.
+
+
+************************************************************************
+*       S T A R T - O F - S E L E C T I O N    E V E N T               *
+************************************************************************
+start-of-selection.
+
+  clear: it_mat[],gt_scc_consign[].
+*  select  werks from t024w into table it_werks
+*        where werks in s_werks and ekorg eq p_ekorg.
+
+  select yse_scc_consign~werks yse_scc_consign~lgort
+    into corresponding fields of table gt_scc_consign
+    from yse_scc_consign
+    inner join t024w on t024w~werks = yse_scc_consign~werks "#EC CI_BUFFJOIN
+    where t024w~werks in s_werks
+      and t024w~ekorg = p_ekorg.
+
+  "For SLoc = 1000, should also consider SLoc = ' '
+  loop at gt_scc_consign where lgort = '1000' or lgort = '0001'. "0001 is for dummy plant
+    gt_scc_consign-lgort = ''.
+    append gt_scc_consign.
+  endloop.
+
+* Fill internal table it_mat with the Material/plants which are used for SCC Sales Documents
+  select vbap~matnr vbap~werks vbap~lgort
+   into corresponding fields of table it_mat
+   from vbak
+   inner join vbap on vbap~vbeln eq vbak~vbeln
+    for all entries in gt_scc_consign
+     where vbak~auart in ('ZOR', 'ZO03', 'ZKE', 'ZKB', 'ZKT')
+      and vbak~vkorg = p_ekorg
+      and vbap~werks = gt_scc_consign-werks
+      and vbap~lgort = gt_scc_consign-lgort
+      and vbap~pstyv <> 'ZTXT'.
+*      and vbap~werks in s_werks.
+
+* Fill internal table it_mat with the Material/plants which are used for SCC Purchase Documents
+  select ekpo~matnr ekpo~werks ekpo~lgort
+         from ekpo
+         inner join  ekko  on ekpo~ebeln =  ekko~ebeln
+          inner join  eket  on ekpo~ebeln =  eket~ebeln
+                         and  ekpo~ebelp =  eket~ebelp
+            appending corresponding fields of table it_mat
+          for all entries in gt_scc_consign
+         where ekko~ekorg = p_ekorg
+           and ekko~bsart in ('ZNB1', 'ZUB1')
+           and ekpo~werks = gt_scc_consign-werks
+           and ekpo~lgort = gt_scc_consign-lgort
+           and eket~etenr = '0001'.
+
+* Fill internal table it_mat with the Material/plants which are used for SCC Stock
+  select matnr werks lgort
+    appending corresponding fields of table it_mat
+    from mard
+     for all entries in gt_scc_consign
+      where werks = gt_scc_consign-werks
+        and lgort = gt_scc_consign-lgort
+        and labst <> 0.
+
+  loop at it_mat where lgort = ' '.
+    "Special handling for MR Nanjing
+    if it_mat-werks = 'CN91' or it_mat-werks = 'CN93'.
+      it_mat-lgort = '0001'.
+    else.
+      it_mat-lgort = '1000'.
+    endif.
+    modify it_mat transporting lgort.
+  endloop.
+
+  sort it_mat by matnr werks lgort.
+  delete adjacent duplicates from it_mat.
+
+* Fill table with supersessions
+  perform fill_supersession.
+
+* Fill table with the CW's if it is a branch
+  perform  fill_cwh.
+
+* Loop over internal table and add material/plants which are missing.
+  loop at it_mat where matnr <> ' '.
+
+* Find Lead Time
+    perform get_leadtime.
+
+    if it_mat-werks = 'CN91' or it_mat-werks = 'CN93'.
+      gv_flag = 'P'.
+    else.
+      gv_flag = 'X'.
+    endif.
+
+    clear wa_yse_scc_used_mat.
+    select single lead from yse_scc_used_mat into gv_lead_comp
+      where matnr = it_mat-matnr
+       and  werks = it_mat-werks
+       and  lgort = it_mat-lgort.
+    if sy-subrc <> 0.
+      clear wa_yse_scc_used_mat.
+      wa_yse_scc_used_mat-matnr = it_mat-matnr.
+      wa_yse_scc_used_mat-werks = it_mat-werks.
+      wa_yse_scc_used_mat-lgort = it_mat-lgort.
+      wa_yse_scc_used_mat-credat = sy-datum.
+      wa_yse_scc_used_mat-lead = gv_lead.
+      wa_yse_scc_used_mat-flag = gv_flag."'X'.
+      insert yse_scc_used_mat from wa_yse_scc_used_mat.
+    else.
+      if gv_lead_comp <> gv_lead.
+        update  yse_scc_used_mat
+            set lead = gv_lead  flag = gv_flag"'X'
+          where matnr =  it_mat-matnr
+           and  werks =  it_mat-werks
+           and  lgort =  it_mat-lgort.
+
+*        update  yse_scc_used_mat set flag = 'X'
+*        where matnr =  it_mat-matnr and
+*              werks =  it_mat-werks.
+      endif.
+    endif.
+  endloop.
+
+*&---------------------------------------------------------------------*
+*&      Form  get_transpmode
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+form get_transpmode using p_lifnr type lifnr
+                          p_matkl type matkl
+                          p_evers type evers
+                    changing p_transpmode type ztranspmode.
+  constants:  lc_po_replenishment(4) type c value 'ZNB1'.
+
+  select single zztranspmode from yse_po_transport into p_transpmode
+    where bsart = lc_po_replenishment
+     and  ekorg = p_ekorg
+     and  matkl = p_matkl
+     and  evers = p_evers
+     and  lifnr = p_lifnr
+     and  zzurgcode = 'Z1'.
+  if sy-subrc ne 0.
+    select single zztranspmode from yse_po_transport into p_transpmode
+     where bsart = lc_po_replenishment
+      and  ekorg = p_ekorg
+      and  matkl = p_matkl
+      and  evers = '*'
+      and  lifnr = p_lifnr
+      and  zzurgcode = 'Z1'.
+
+    if sy-subrc ne 0.
+      select single zztranspmode from yse_po_transport into p_transpmode
+       where bsart = lc_po_replenishment
+        and  ekorg = p_ekorg
+        and  matkl = '*'
+        and  evers = p_evers
+        and  lifnr = p_lifnr
+        and  zzurgcode = 'Z1'.
+      if sy-subrc ne 0.
+        select single zztranspmode from yse_po_transport into p_transpmode
+         where bsart = lc_po_replenishment
+           and ekorg = p_ekorg
+           and matkl = '*'
+           and evers = '*'
+           and lifnr = p_lifnr
+           and zzurgcode = 'Z1'.
+      endif.
+    endif.
+  endif.
+endform.                    "get_transpmode
+*&---------------------------------------------------------------------*
+*&      Form  fill_supersession
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+form fill_supersession.
+  data: lt_mat type table of ty_mat,
+        ls_mat type ty_mat.
+  data: lv_mmsta type mmsta,
+        lv_nfmat type nfmat.
+
+  lt_mat[] = it_mat[].
+  loop at lt_mat into ls_mat.
+    clear: lv_mmsta, lv_nfmat.
+    select single mmsta nfmat from marc into (lv_mmsta, lv_nfmat)
+      where matnr = ls_mat-matnr
+        and werks = ls_mat-werks.
+    if lv_mmsta = 'A1'.
+      select single * from mard
+        where matnr = lv_nfmat
+          and werks = ls_mat-werks
+          and lgort = ls_mat-lgort.
+      if sy-subrc = 0.
+        it_mat-matnr = lv_nfmat.
+        it_mat-werks = ls_mat-werks.
+        it_mat-lgort = ls_mat-lgort.
+        append it_mat.
+      endif.
+    endif.
+  endloop.
+
+  sort it_mat by matnr werks lgort.
+  delete adjacent duplicates from it_mat.
+endform.                    "fill_supersession
+*&---------------------------------------------------------------------*
+*&      Form  fill_CWH
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+form fill_cwh. " Fill central warehouse
+  data: lt_mat type table of ty_mat,
+        ls_mat type ty_mat.
+  data: lv_werks type marc-werks.
+
+  lt_mat[] = it_mat[].
+  loop at lt_mat into ls_mat.
+
+    select werks from yse_scc_planttyp into lv_werks
+      where ekorg = p_ekorg
+        and whtype = 'CW'.
+
+      if ls_mat-werks <> lv_werks.
+        select * from mard
+         where matnr = ls_mat-matnr
+           and werks = lv_werks.
+
+          read table gt_scc_consign transporting no fields
+            with key werks = lv_werks
+                     lgort = mard-lgort.
+          if sy-subrc = 0.
+            it_mat-matnr = ls_mat-matnr.
+            it_mat-werks = lv_werks.
+            it_mat-lgort = mard-lgort.
+            append it_mat.
+          endif.
+        endselect.
+      endif.
+    endselect.
+  endloop.
+
+* Remove double entries
+  sort it_mat by matnr werks lgort.
+  delete adjacent duplicates from it_mat.
+endform.                    "fill_CWH
+*&---------------------------------------------------------------------*
+*&      Form  get_leadtime
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+form get_leadtime.
+  data: lv_lifnr type lifnr,
+        lv_transpmode type ztranspmode,
+        lv_aplfz type plifz,
+        lv_evers type evers,
+        lv_matkl type matkl,
+        lv_infnr type infnr,
+        lv_plifz type plifz.
+
+  clear: gv_lead.
+
+  select single matkl from mara into (lv_matkl)
+             where matnr =  it_mat-matnr.
+
+  select single lifnr from eord into lv_lifnr
+    where matnr = it_mat-matnr
+      and werks = it_mat-werks
+      and bdatu > sy-datum
+      and flifn = 'X'.
+  if sy-subrc = 0.
+    select single infnr from eina into lv_infnr
+       where lifnr = lv_lifnr
+         and matnr = it_mat-matnr.
+
+    select single aplfz evers from eine into (lv_aplfz, lv_evers )
+       where infnr = lv_infnr
+         and ekorg = p_ekorg
+         and werks = it_mat-werks
+         and prdat > sy-datum.
+
+    perform get_transpmode using lv_lifnr lv_matkl lv_evers
+                           changing lv_transpmode.
+
+    select single plifz from yse_po_pldeltime into lv_plifz
+      where ekorg = p_ekorg
+        and lifnr = lv_lifnr
+        and werks = it_mat-werks
+        and zztranspmode = lv_transpmode.
+  endif.  "lv_lifnr
+  if lv_plifz is initial.
+    lv_plifz = lv_aplfz.
+    if lv_plifz is initial.
+      select single plifz from marc into lv_plifz
+        where matnr = it_mat-matnr
+          and werks = it_mat-werks.
+    endif.
+  endif.
+  write lv_plifz to gv_lead.
+endform.                    "get_leadtime
+
+*Text symbol text£º
+
+*001:Selection
+*Selection text£º
+*P_EKORG:        Purchase Organisation
+*S_WERKS:        Plant

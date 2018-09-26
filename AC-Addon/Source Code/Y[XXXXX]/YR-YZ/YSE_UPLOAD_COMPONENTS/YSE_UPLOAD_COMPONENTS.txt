@@ -1,0 +1,633 @@
+*&---------------------------------------------------------------------*
+*& Report  YSE_UPLOAD_COMPONENTS                                       *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+*&                                                                     *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+**********************************************************************
+* DEV request       : CD1K909312                                      *
+* Descr       : 070112-SE-REP-D208 Upload spare parts catalogue*
+* Author            : Christophe Geerts                               *
+* Date              :                                                 *
+* Functional spec   : D208                                            *
+* Description       :
+*Upload spare parts to the service order.  These will be entered by the
+*Technician on the client site via a scanner and then downloaded from
+*the scanner to a text file.  This program will use the downloaded file
+*to upload it in the corresponding service order (in the component
+*section)
+*=====================================================================*
+* Change History Log                                                  *
+*---------------------------------------------------------------------*
+* Mod. no.|  Date    | Name           | Correction Number | Change Ref*
+*---------------------------------------------------------------------*
+* MOD-001 |dd/mm/yyyy| xxxxxxxxxxxxxx | XXXXxxxxxx        | XXXXxxxxxx*
+*                                                                     *
+* Description:                                                        *
+*---------------------------------------------------------------------*
+* MOD-002 |dd/mm/yyyy| xxxxxxxxxxxxxx | XXXXxxxxxx                    *
+*                                                                     *
+* Description:                                                        *
+***********************************************************************
+
+REPORT  YSE_UPLOAD_COMPONENTS                   .
+
+TABLES: MARC.                                               "#EC NEEDED
+
+DATA: LV_PATH TYPE STRING.
+DATA: LV_FILENM TYPE STRING,
+      LV_SUBRC  TYPE I.
+
+DATA: LS_FILE      TYPE FILE_TABLE,
+      LS_FILECT    TYPE SDOKCNTASC. " sdokcntbin
+
+
+
+DATA: IT_METHODS   LIKE BAPI_ALM_ORDER_METHOD OCCURS 0 WITH HEADER LINE,
+      IT_COMPONENT LIKE BAPI_ALM_ORDER_COMPONENT OCCURS 0 WITH HEADER LINE,
+      IT_RETURN    TYPE TABLE OF BAPIRET2 WITH HEADER LINE,
+      WA_RETURN    TYPE BAPIRET2,
+      IT_FILES     TYPE FILETABLE,
+      IT_FILECT    TYPE STANDARD TABLE OF SDOKCNTASC. " sdokcntbin
+
+DATA: WA_COMPONENT TYPE BAPI_ALM_ORDER_COMPONENT.
+
+DATA: LV_COUNT TYPE SY-TABIX.
+DATA: LV_UNAME TYPE SY-UNAME.
+DATA: LV_NO_FILE TYPE C.
+*    constants: lv_Sep type x value '09'.
+TYPES: BEGIN OF TP_VAR,
+        AUFNR(12) TYPE C,
+        TRANSDATE(8) TYPE C,
+        TRANSTIME(8) TYPE C,
+        MATNR(18) TYPE C,
+        QTY(12) TYPE C,
+      END OF TP_VAR.
+
+TYPES: BEGIN OF TP_ERRORS.
+TYPES: AUFNR TYPE AUFNR.
+        INCLUDE STRUCTURE BAPIRET2.
+TYPES: END OF TP_ERRORS.
+
+DATA: WA_RETURN_ERRORS TYPE TP_ERRORS.
+DATA: IT_RETURN_ERRORS TYPE TABLE OF TP_ERRORS.
+DATA: LV_FILE TYPE STRING.
+DATA: WA_VAR TYPE TP_VAR.
+DATA: WA_VAR_1 TYPE TP_VAR.
+DATA: IT_VAR TYPE TABLE OF TP_VAR.
+DATA: LV_FILE_ERROR TYPE FILE_TABLE.
+DATA: WA_CAUFV TYPE CAUFV.
+DATA: LV_INFO(25) TYPE C.
+
+DATA: LV_ROW(4) TYPE C.
+DATA: LV_QTY TYPE CO_MENGE.
+DATA: LV_MATNR TYPE MATNR.
+DATA: LV_AUFNR TYPE AUFNR.
+DATA: LV_GO TYPE C.
+DATA: LV_ORDER TYPE AUFNR.
+DATA: LV_DIFF_ORDER TYPE C.
+
+
+
+CLASS CL_ABAP_CHAR_UTILITIES DEFINITION LOAD.
+CONSTANTS:
+    LV_SEP  TYPE C VALUE CL_ABAP_CHAR_UTILITIES=>HORIZONTAL_TAB,
+    LV_PATH_KEY TYPE STRING VALUE 'Software\SAP\SAPGUI Front\SAP Frontend Server\Filetransfer',"#EC NOTEXT
+    LV_WINDOW_TITLE TYPE STRING VALUE 'Tittelke'.           "#EC NOTEXT
+
+
+* SELECTION SCREEN *
+* **************** *
+PARAMETERS: P_FOR RADIOBUTTON GROUP RAD DEFAULT 'X',
+            P_BACK RADIOBUTTON GROUP RAD.
+
+PARAMETER      P_FILENM LIKE FILE_TABLE.
+PARAMETER      P_FILENS LIKE FILE_TABLE.
+
+INITIALIZATION.
+
+*Set the default frontend path for the file location
+  CALL METHOD CL_GUI_FRONTEND_SERVICES=>REGISTRY_GET_VALUE
+    EXPORTING
+      ROOT                 = CL_GUI_FRONTEND_SERVICES=>HKEY_CURRENT_USER
+      KEY                  = LV_PATH_KEY
+      VALUE                = 'PathDownload'
+    IMPORTING
+      REG_VALUE            = LV_PATH
+    EXCEPTIONS
+      GET_REGVALUE_FAILED  = 1
+      CNTL_ERROR           = 2
+      ERROR_NO_GUI         = 3
+      NOT_SUPPORTED_BY_GUI = 4.
+
+  IF NOT SY-SUBRC EQ 0 OR LV_PATH IS INITIAL.
+    CALL METHOD CL_GUI_FRONTEND_SERVICES=>DIRECTORY_GET_CURRENT
+      CHANGING
+        CURRENT_DIRECTORY            = LV_PATH
+      EXCEPTIONS
+        DIRECTORY_GET_CURRENT_FAILED = 1
+        CNTL_ERROR                   = 2
+        ERROR_NO_GUI                 = 3
+        NOT_SUPPORTED_BY_GUI         = 4
+        OTHERS                       = 5.
+    CALL METHOD CL_GUI_CFW=>FLUSH.
+  ENDIF.
+
+  IF NOT LV_PATH IS INITIAL.
+    CONCATENATE LV_PATH '\SA01.txt'(T01) INTO P_FILENM.
+*    P_FILENM = LV_PATH.
+  ENDIF.
+
+
+AT SELECTION-SCREEN OUTPUT.
+
+
+
+
+  IF P_FILENM IS INITIAL.
+*Foreground
+    LV_UNAME = SY-UNAME.
+*    TRANSLATE LV_UNAME TO LOWER CASE.
+    CONCATENATE 'C:\Documents and Settings\'(T02) LV_UNAME
+                '\Application Data\Servaid2.0\export\SA01.txt'(T03) INTO P_FILENM.
+  ENDIF.
+
+  IF P_FILENS IS INITIAL.
+*Background
+    P_FILENS = '/var/load/CD1/SA01.txt'(T04).
+  ENDIF.
+
+
+* SEARCH HELP FOR FILENAME *
+* ************************ *
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR P_FILENM.
+
+  FREE IT_FILES.
+  CALL METHOD CL_GUI_FRONTEND_SERVICES=>FILE_OPEN_DIALOG
+    EXPORTING
+      WINDOW_TITLE            = LV_WINDOW_TITLE
+    CHANGING
+      FILE_TABLE              = IT_FILES
+      RC                      = LV_SUBRC
+    EXCEPTIONS
+      FILE_OPEN_DIALOG_FAILED = 1
+      CNTL_ERROR              = 2
+      ERROR_NO_GUI            = 3
+      OTHERS                  = 4.
+
+  IF SY-SUBRC = 0.
+    READ TABLE IT_FILES INDEX 1 INTO LS_FILE.
+    P_FILENM = LS_FILE-FILENAME.
+  ENDIF.
+
+* START-OF-SELECTION *
+* ****************** *
+START-OF-SELECTION.
+
+  IF NOT P_FOR IS INITIAL.
+    PERFORM FRONTEND.
+  ELSE.
+    PERFORM BACKEND.
+  ENDIF.
+
+
+  LOOP AT IT_FILECT INTO LS_FILECT.
+    SPLIT LS_FILECT AT LV_SEP INTO WA_VAR-AUFNR
+                                   WA_VAR-TRANSDATE
+                                   WA_VAR-TRANSTIME
+                                   WA_VAR-MATNR
+                                   WA_VAR-QTY.
+
+
+*Determine if the file contains different service orders (should normally not happen)
+    IF LV_GO IS INITIAL.
+      LV_ORDER = WA_VAR-AUFNR.
+      LV_GO = 'X'.
+    ENDIF.
+
+    IF LV_ORDER NE WA_VAR-AUFNR.
+      LV_DIFF_ORDER = 'Y'.
+    ENDIF.
+
+    APPEND WA_VAR TO IT_VAR.
+    CLEAR: WA_VAR, LS_FILECT.
+  ENDLOOP.
+
+
+  IF NOT LV_DIFF_ORDER IS INITIAL.
+*If this has a value, then we sort, means that there are more than 1 service order in the file
+    SORT IT_VAR BY AUFNR.
+  ENDIF.
+
+
+*---------------------------------
+  CLEAR WA_VAR.
+  LOOP AT IT_VAR INTO WA_VAR_1.
+    MOVE-CORRESPONDING WA_VAR_1 TO WA_VAR.
+    AT NEW AUFNR.
+      CLEAR LV_COUNT.
+      FREE: IT_METHODS,
+            IT_COMPONENT,
+            IT_RETURN.
+    ENDAT.
+
+    LV_COUNT = LV_COUNT + 1.
+*   Create a component entry
+    CLEAR: LV_MATNR, LV_QTY, LV_AUFNR.
+    MOVE WA_VAR-QTY TO LV_QTY.
+
+*Convert material
+    CALL FUNCTION 'CONVERSION_EXIT_MATN1_INPUT'
+      EXPORTING
+        INPUT        = WA_VAR-MATNR
+      IMPORTING
+        OUTPUT       = LV_MATNR
+      EXCEPTIONS
+        LENGTH_ERROR = 1
+        OTHERS       = 2.
+    IF SY-SUBRC <> 0.
+* MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*         WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+    ENDIF.
+
+
+
+    WRITE WA_VAR-AUFNR TO LV_AUFNR RIGHT-JUSTIFIED.
+    OVERLAY LV_AUFNR WITH '000000000000'.
+
+    IT_COMPONENT-REQUIREMENT_QUANTITY = LV_QTY.
+    IT_COMPONENT-MATERIAL = LV_MATNR.
+    IT_COMPONENT-ACTIVITY = '0010'.
+* begin of delete LME 2007/12/10
+*    IT_COMPONENT-SPECIAL_STOCK = '1'.
+* end of delete LME 2007/12/10
+    APPEND IT_COMPONENT.
+
+*   Complete a method step for the current component
+* Prepare "Method Steps", we will need a step for each line in the file
+    IT_METHODS-REFNUMBER = LV_COUNT.
+    IT_METHODS-OBJECTTYPE = 'COMPONENT'(T06).
+    IT_METHODS-METHOD = 'CREATE'(T07).
+    IT_METHODS-OBJECTKEY = LV_AUFNR.         "SO_AUFNR-LOW.  " '004000000067'.
+    APPEND IT_METHODS.
+
+
+    AT END OF AUFNR.
+      CLEAR WA_CAUFV.
+      SELECT SINGLE * FROM CAUFV INTO WA_CAUFV
+                     WHERE AUFNR EQ LV_AUFNR.
+
+* Add the save method only once at the end of aufnr
+      CLEAR IT_METHODS-OBJECTTYPE.
+      IT_METHODS-METHOD = 'SAVE'.
+      APPEND IT_METHODS.
+
+* Call the bapi
+      CALL FUNCTION 'BAPI_ALM_ORDER_MAINTAIN'
+        TABLES
+          IT_METHODS   = IT_METHODS[]
+          IT_COMPONENT = IT_COMPONENT[]
+          RETURN       = IT_RETURN[].
+
+* Read message that indicates success
+      READ TABLE IT_RETURN WITH KEY TYPE = 'E'.
+
+* If not found, write the errors and exit
+      IF SY-SUBRC EQ 0.
+
+*See if there are at least 1 error regarding the non existence of materials
+        READ TABLE IT_RETURN WITH KEY TYPE   = 'E'
+                                      ID     = 'CO'
+                                      NUMBER = '010'.
+        IF SY-SUBRC EQ 0.
+
+*OK, then, delete all these errors from the table
+*        delete table it_return with table key type   = 'E'
+*                                              id     = 'CO'
+*                                              number = '010'.
+          DELETE IT_RETURN WHERE TYPE EQ 'E' AND
+                                 ID     EQ 'CO' AND
+                                 NUMBER EQ '010'.
+        ENDIF.
+
+        LOOP AT IT_COMPONENT INTO WA_COMPONENT.
+          SELECT SINGLE MATNR FROM MARC INTO MARC-MATNR
+                  WHERE MATNR EQ WA_COMPONENT-MATERIAL AND
+                        WERKS EQ WA_CAUFV-WERKS.            "#EC NEEDED
+          IF NOT SY-SUBRC EQ 0.
+            MOVE WA_VAR-AUFNR TO WA_RETURN_ERRORS-AUFNR.
+            CONCATENATE TEXT-003 WA_COMPONENT-MATERIAL TEXT-004 '' WA_CAUFV-WERKS INTO WA_RETURN_ERRORS-MESSAGE.
+            WA_RETURN_ERRORS-TYPE = 'E'.
+            WA_RETURN_ERRORS-ID = 'CO'.
+            WA_RETURN_ERRORS-NUMBER = '010'.
+
+            APPEND WA_RETURN_ERRORS TO IT_RETURN_ERRORS.
+            CLEAR: WA_RETURN, WA_RETURN_ERRORS.
+          ENDIF.
+        ENDLOOP.
+
+        LOOP AT IT_RETURN INTO WA_RETURN.
+          MOVE-CORRESPONDING WA_RETURN TO WA_RETURN_ERRORS.
+          MOVE WA_VAR-AUFNR TO WA_RETURN_ERRORS-AUFNR.
+          APPEND WA_RETURN_ERRORS TO IT_RETURN_ERRORS.
+          CLEAR: WA_RETURN, WA_RETURN_ERRORS.
+        ENDLOOP.
+
+      ELSE.
+* Commit the change
+        CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+          EXPORTING
+            WAIT = 'X'.
+      ENDIF.
+
+    ENDAT.
+
+    CLEAR: WA_VAR_1, WA_VAR.
+  ENDLOOP.
+*---------------------------------
+
+  IF LV_NO_FILE EQ 'X'.
+  ELSE.
+    IF NOT IT_RETURN_ERRORS[] IS INITIAL.
+
+*Errors occured
+*Write the error log
+      IF NOT P_FOR IS INITIAL.
+        LV_FILE_ERROR = P_FILENM.
+        CONCATENATE '.ERROR.' SY-DATUM SY-UZEIT '.txt' INTO LV_INFO.
+        REPLACE ALL OCCURRENCES OF '.txt' IN LV_FILE_ERROR WITH LV_INFO IGNORING CASE.
+* Read the file from the frontend
+        CLEAR LV_FILENM.
+        MOVE LV_FILE_ERROR TO LV_FILENM.
+        APPEND 'ERROR DETAILS PER SERVICE ORDER (structure BAPIRET2)'(T08) TO IT_FILECT.
+        CLEAR LS_FILECT.
+        CONCATENATE 'Original location of the file was'(T09) P_FILENM INTO LS_FILECT.
+        APPEND LS_FILECT TO IT_FILECT.
+        APPEND 'The origal content of the file are the entries above.'(T10) TO IT_FILECT.
+        APPEND '' TO IT_FILECT.
+
+
+
+
+
+        LOOP AT IT_RETURN_ERRORS INTO WA_RETURN_ERRORS.
+          CLEAR LV_ROW.
+          MOVE WA_RETURN_ERRORS-ROW TO LV_ROW.
+          CONCATENATE WA_RETURN_ERRORS-AUFNR
+                      LV_SEP
+                      WA_RETURN_ERRORS-TYPE
+                      LV_SEP
+                      WA_RETURN_ERRORS-ID
+                      LV_SEP
+                      WA_RETURN_ERRORS-NUMBER
+                      LV_SEP
+                      WA_RETURN_ERRORS-MESSAGE
+                      LV_SEP
+                      WA_RETURN_ERRORS-LOG_NO
+                      LV_SEP
+                      WA_RETURN_ERRORS-LOG_MSG_NO
+                      LV_SEP
+                      WA_RETURN_ERRORS-MESSAGE_V1
+                      LV_SEP
+                      WA_RETURN_ERRORS-MESSAGE_V2
+                      LV_SEP
+                      WA_RETURN_ERRORS-MESSAGE_V3
+                      LV_SEP
+                      WA_RETURN_ERRORS-MESSAGE_V4
+                      LV_SEP
+                      WA_RETURN_ERRORS-PARAMETER
+                      LV_SEP
+                      LV_ROW
+                      LV_SEP
+                      WA_RETURN_ERRORS-FIELD
+                      LV_SEP
+                      WA_RETURN_ERRORS-SYSTEM
+                      INTO LS_FILECT.
+          APPEND LS_FILECT TO IT_FILECT.
+        ENDLOOP.
+
+
+
+
+        CALL METHOD CL_GUI_FRONTEND_SERVICES=>GUI_DOWNLOAD
+          EXPORTING
+            FILENAME = LV_FILENM
+            FILETYPE = 'ASC'
+          CHANGING
+            DATA_TAB = IT_FILECT.
+        IF SY-SUBRC <> 0.
+*   MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*              WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+        ENDIF.
+
+        WRITE: TEXT-001.
+        WRITE: TEXT-002, LV_FILE_ERROR.
+
+
+
+      ELSE.
+*Rename the original file and write to the same location
+
+
+        LV_FILE_ERROR = P_FILENS.
+        CONCATENATE '.ERROR.' SY-DATUM SY-UZEIT '.txt' INTO LV_INFO.
+        REPLACE ALL OCCURRENCES OF '.txt' IN LV_FILE_ERROR WITH LV_INFO IGNORING CASE.
+
+        OPEN DATASET LV_FILE_ERROR FOR OUTPUT IN TEXT MODE ENCODING DEFAULT.
+        IF SY-SUBRC EQ 0.
+          CLEAR LS_FILECT.
+          LOOP AT IT_FILECT INTO LS_FILECT.
+            TRANSFER LS_FILECT TO LV_FILE_ERROR.
+            CLEAR LS_FILECT.
+          ENDLOOP.
+          CLEAR LS_FILECT.
+          TRANSFER LS_FILECT TO LV_FILE_ERROR.
+          TRANSFER 'ERROR DETAILS PER SERVICE ORDER (structure BAPIRET2)'(T05) TO LV_FILE_ERROR.
+          CLEAR LS_FILECT.
+          CONCATENATE 'Original location of the file was:'(T11) P_FILENS INTO LS_FILECT.
+          TRANSFER LS_FILECT TO LV_FILE_ERROR.
+
+          TRANSFER 'The origal content of the file are the entries above.'(T12) TO LV_FILE_ERROR.
+          CLEAR LS_FILECT.
+          TRANSFER LS_FILECT TO LV_FILE_ERROR.
+
+          LOOP AT IT_RETURN_ERRORS INTO WA_RETURN_ERRORS.
+            CLEAR LV_ROW.
+            MOVE WA_RETURN_ERRORS-ROW TO LV_ROW.
+            CONCATENATE WA_RETURN_ERRORS-AUFNR
+                        LV_SEP
+                        WA_RETURN_ERRORS-TYPE
+                        LV_SEP
+                        WA_RETURN_ERRORS-ID
+                        LV_SEP
+                        WA_RETURN_ERRORS-NUMBER
+                        LV_SEP
+                        WA_RETURN_ERRORS-MESSAGE
+                        LV_SEP
+                        WA_RETURN_ERRORS-LOG_NO
+                        LV_SEP
+                        WA_RETURN_ERRORS-LOG_MSG_NO
+                        LV_SEP
+                        WA_RETURN_ERRORS-MESSAGE_V1
+                        LV_SEP
+                        WA_RETURN_ERRORS-MESSAGE_V2
+                        LV_SEP
+                        WA_RETURN_ERRORS-MESSAGE_V3
+                        LV_SEP
+                        WA_RETURN_ERRORS-MESSAGE_V4
+                        LV_SEP
+                        WA_RETURN_ERRORS-PARAMETER
+                        LV_SEP
+                        LV_ROW
+                        LV_SEP
+                        WA_RETURN_ERRORS-FIELD
+                        LV_SEP
+                        WA_RETURN_ERRORS-SYSTEM
+                        INTO LS_FILECT.
+
+            TRANSFER LS_FILECT TO LV_FILE_ERROR.
+            CLEAR LS_FILECT.
+          ENDLOOP.
+          CLOSE DATASET LV_FILE_ERROR.
+        ENDIF.
+
+        WRITE: TEXT-001.
+        WRITE: TEXT-002, LV_FILE_ERROR.
+
+
+
+      ENDIF.
+    ELSE.
+*Everything went fine, delete the file from the same read location
+
+      WRITE: 'Upload was successfull! No errors.'(T13).
+
+      IF NOT P_FOR IS INITIAL.
+*Foreground
+        MOVE P_FILENM TO LV_FILE.
+        CLEAR LV_SUBRC.
+        CALL METHOD CL_GUI_FRONTEND_SERVICES=>FILE_DELETE
+          EXPORTING
+            FILENAME = LV_FILE
+          CHANGING
+            RC       = LV_SUBRC.
+        IF LV_SUBRC NE 0.
+          WRITE: 'Deletion of original frontend file failed.'(T14).
+        ENDIF.
+      ELSE.
+*Background
+        DELETE DATASET P_FILENS.
+        IF SY-SUBRC NE 0.
+          WRITE: 'Deletion of original server file failed.'(T15).
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+  ENDIF.
+
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  frontend
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM FRONTEND .
+  CLEAR LV_FILENM.
+  MOVE P_FILENM TO LV_FILENM.
+
+* Read the file from the frontend
+  CALL METHOD CL_GUI_FRONTEND_SERVICES=>GUI_UPLOAD
+    EXPORTING
+      FILENAME                = LV_FILENM
+      FILETYPE                = 'ASC'
+    CHANGING
+      DATA_TAB                = IT_FILECT
+    EXCEPTIONS
+      FILE_OPEN_ERROR         = 1
+      FILE_READ_ERROR         = 2
+      NO_BATCH                = 3
+      GUI_REFUSE_FILETRANSFER = 4
+      INVALID_TYPE            = 5
+      NO_AUTHORITY            = 6
+      UNKNOWN_ERROR           = 7
+      BAD_DATA_FORMAT         = 8
+      HEADER_NOT_ALLOWED      = 9
+      SEPARATOR_NOT_ALLOWED   = 10
+      HEADER_TOO_LONG         = 11
+      UNKNOWN_DP_ERROR        = 12
+      ACCESS_DENIED           = 13
+      DP_OUT_OF_MEMORY        = 14
+      DISK_FULL               = 15
+      DP_TIMEOUT              = 16
+      NOT_SUPPORTED_BY_GUI    = 17
+      ERROR_NO_GUI            = 18
+      OTHERS                  = 19.
+  IF SY-SUBRC <> 0.
+*   MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*              WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+    WRITE: 'Frontend file was not found.'(T17).
+    LV_NO_FILE = 'X'.
+  ENDIF.
+
+ENDFORM.                    " frontend
+*&---------------------------------------------------------------------*
+*&      Form  backend
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM BACKEND .
+*Background
+  OPEN DATASET P_FILENS FOR INPUT IN TEXT MODE ENCODING DEFAULT.
+  IF SY-SUBRC EQ 0.
+    DO.
+      READ DATASET P_FILENS INTO LS_FILECT.
+      IF SY-SUBRC <> 0.
+        EXIT.
+      ENDIF.
+      APPEND LS_FILECT TO IT_FILECT.
+      CLEAR LS_FILECT.
+    ENDDO.
+    CLOSE DATASET P_FILENS.
+  ELSE.
+    WRITE: 'Server file was not found.'(T16).
+    LV_NO_FILE = 'X'.
+  ENDIF.
+ENDFORM.                    " backend
+
+*Text symbol text£º
+*001:Upload was NOT successfull! There was at least 1 error.
+*002:Please check the errorfile at location:
+*003:Material__
+*004:__does not exist in plant
+*T01:\SA01.txt
+*T02:C:\Documents and Settings\
+*T03:\Application Data\Servaid2.0\export\SA01.txt
+*T04:/var/load/CD1/SA01.txt
+*T05:ERROR DETAILS PER SERVICE ORDER (structure BAPIRET2)
+*T06:COMPONENT
+*T07:CREATE
+*T08:ERROR DETAILS PER SERVICE ORDER (structure BAPIRET2)
+*T09:Original location of the file was
+*T10:The origal content of the file are the entries above.
+*T11:Original location of the file was:
+*T12:The origal content of the file are the entries above.
+*T13:Upload was successfull! No errors.
+*T14:Deletion of original frontend file failed.
+*T15:Deletion of original server file failed.
+*T16:Server file was not found.
+
+*T17:Frontend file was not found.
+*Selection text£º
+*P_BACK:        File is on Server
+*P_FILENM:        Full Path of Frontendfile
+*P_FILENS:        Full Path of Serverfile
+*P_FOR:        File is on Frontend

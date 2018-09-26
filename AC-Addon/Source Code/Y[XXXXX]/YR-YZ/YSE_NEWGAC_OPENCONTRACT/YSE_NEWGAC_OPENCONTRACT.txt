@@ -1,0 +1,857 @@
+*&---------------------------------------------------------------------*
+*& Report  YSE_NEWGAC_OPENCONTRACT
+*&---------------------------------------------------------------------*
+*& Change Contract : Re-derive profitability segment
+*&---------------------------------------------------------------------*
+*  Author                : Anda Wu
+*  Date                  : 06.01.2017
+*  Change Request Number : CR4052
+*  Transport request Nr. : CD1K990637
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD.NR. |   DATE     | NAME               | CORRECT. NR| CHANGE REF. *
+*----------------------------------------------------------------------*
+* MOD-NNN | DD.MM.YYYY | XXX  XXXX XXXXXX   | CD1KXXXXXX |  XXXXX      *
+*----------------------------------------------------------------------*
+REPORT  yse_newgac_opencontract.
+
+TABLES: vbak.
+
+* ALV grid
+TYPE-POOLS: slis,truxs.
+
+TYPES:  BEGIN OF ty_file_in,
+          vbeln(10)   TYPE c,
+          posnr(6)    TYPE c,
+        END OF ty_file_in,
+
+        BEGIN OF ty_vbap,
+          vbeln       TYPE vbak-vbeln,
+          erdat       TYPE vbak-erdat,
+          erzet       TYPE vbak-erzet,
+          ernam       TYPE vbak-ernam,
+          vkorg       TYPE vbak-vkorg,
+          vtweg       TYPE vbak-vtweg,
+          posnr       TYPE vbap-posnr,
+          matnr       TYPE vbap-matnr,
+          prodh       TYPE vbap-prodh,
+          prctr       TYPE vbap-prctr,
+        END OF ty_vbap,
+
+        BEGIN OF ty_mara,
+          matnr       TYPE mara-matnr,
+          prdha       TYPE mara-prdha,
+        END OF ty_mara,
+
+        BEGIN OF ty_mvke,
+          matnr    TYPE matnr,
+          vkorg    TYPE vkorg,
+          vtweg    TYPE vtweg,
+          prodh    TYPE prodh_d,
+        END OF ty_mvke,
+
+        BEGIN OF ty_err,
+          vbeln      TYPE vbeln_va,
+          posnr      TYPE posnr_va,
+          mtext      TYPE string,
+        END OF ty_err,
+
+        BEGIN OF ty_so_item,
+           vbeln   TYPE vbap-vbeln,
+           posnr   TYPE vbap-posnr,
+          END OF ty_so_item,
+
+        BEGIN OF ty_errlog,
+          matnr   TYPE marc-matnr,
+          werks   TYPE marc-werks,
+          vkorg   TYPE mvke-vkorg,
+          vtweg   TYPE mvke-vtweg,
+          errmsg  TYPE char128,
+         END OF ty_errlog.
+
+DATA: gt_inso  TYPE STANDARD TABLE OF yse_updcont_log,
+      gt_err TYPE STANDARD TABLE OF ty_err.
+
+DATA: gs_err          TYPE ty_err,
+      gt_messages     TYPE TABLE OF bdcmsgcoll,
+      gs_updcont_log  TYPE yse_updcont_log.
+
+DATA: bdcdata         TYPE  bdcdata  OCCURS 0
+                              WITH HEADER LINE.
+
+DATA: gt_fcat            TYPE slis_t_fieldcat_alv,
+      gs_fcat            TYPE slis_fieldcat_alv,
+      gt_alv_sort        TYPE slis_t_sortinfo_alv,
+      gv_user_command    TYPE slis_formname  VALUE 'USER_COMMAND',
+      gs_layout          TYPE slis_layout_alv.
+
+DATA: gv_mode      TYPE ctu_mode  VALUE 'N',
+      gv_mtext     TYPE string,
+      gv_col(3)    TYPE n,
+      gv_repid     TYPE sy-repid,
+      bdc_options  TYPE ctu_params,
+      ls_messages  TYPE bdcmsgcoll.
+
+*&---------------------------------------------------------------------*
+*&  Selection screen                                                   *
+*&---------------------------------------------------------------------*
+SELECTION-SCREEN BEGIN OF BLOCK b0 WITH FRAME TITLE text-b01.
+PARAMETER: rb_upl RADIOBUTTON GROUP gp1 DEFAULT 'X'
+                  USER-COMMAND fun MODIF ID m0,
+           rb_upd RADIOBUTTON GROUP gp1,
+           rb_refr RADIOBUTTON GROUP gp1.
+SELECTION-SCREEN END OF BLOCK b0.
+
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE text-b02.
+SELECT-OPTIONS: s_erdat  FOR vbak-erdat   MODIF ID m2,
+                s_vkorg  FOR vbak-vkorg   MODIF ID m2,
+                s_vbeln  FOR vbak-vbeln MODIF ID m2.
+PARAMETER:      p_file   TYPE char128 MODIF ID m5.
+*SELECTION-SCREEN SKIP.
+PARAMETERS:     p_upd TYPE char1 AS CHECKBOX DEFAULT 'X' MODIF ID m9,
+                p_phsou  TYPE tabname16 DEFAULT 'MARA' MODIF ID m9.
+SELECTION-SCREEN END OF BLOCK b1.
+
+AT SELECTION-SCREEN OUTPUT.
+  PERFORM frm_screen_set.
+
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR  p_file.
+  PERFORM file_f4_help.
+
+*&---------------------------------------------------------------------*
+*&  Main program                                                       *
+*&---------------------------------------------------------------------*
+START-OF-SELECTION.
+
+  CASE 'X'.
+    WHEN rb_upl.
+*     Upload the file to SAP customerizing table
+      PERFORM do_upload.
+    WHEN rb_upd.
+*     Update the contract
+      PERFORM do_update.
+    WHEN rb_refr.
+*     Refresh the old product hierachy
+      PERFORM do_refresh.
+    WHEN OTHERS.
+  ENDCASE.
+
+*&---------------------------------------------------------------------*
+*&  Forms                                                              *
+*&---------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_DATA
+*&---------------------------------------------------------------------*
+*       Select data
+*----------------------------------------------------------------------*
+FORM select_data .
+
+  SELECT *
+    INTO TABLE gt_inso
+    FROM yse_updcont_log
+    WHERE vbeln   IN s_vbeln
+      AND erdat   IN s_erdat
+      AND vkorg   IN s_vkorg.
+  DELETE gt_inso WHERE
+      FLAG_PH = 'U'.
+
+  SORT gt_inso BY vbeln posnr.
+
+ENDFORM.                    "select_data
+
+*&---------------------------------------------------------------------*
+*&      Form  PROCESS_DATA
+*&---------------------------------------------------------------------*
+*       Process input data
+*----------------------------------------------------------------------*
+FORM process_data.
+
+  DATA: lv_tabix  TYPE sy-tabix.
+* Process input
+  LOOP AT gt_inso INTO gs_updcont_log.
+    lv_tabix = sy-tabix.
+    IF    gs_updcont_log-nprodh = gs_updcont_log-oprodh
+      AND gs_updcont_log <> 'E'.
+      IF p_upd IS INITIAL.     "no update when no difference
+        CONTINUE.
+      ENDIF.
+    ENDIF.
+*   Update contract via transaction VA42 (order)
+    PERFORM call_va42.
+    MODIFY gt_inso FROM gs_updcont_log INDEX lv_tabix.
+  ENDLOOP.
+
+  MODIFY yse_updcont_log FROM TABLE gt_inso.
+
+ENDFORM.                    " PROCESS_DATA
+
+*&---------------------------------------------------------------------*
+*&      Form  CALL_VA42
+*&---------------------------------------------------------------------*
+*       Update 2x SO via transaction VA42
+*----------------------------------------------------------------------*
+FORM call_va42 .
+
+* I. Update SO item with product hierarchy of material
+* Clear structures and tables for the BAPI
+  CLEAR: bdcdata, gt_messages.
+  REFRESH: bdcdata, gt_messages.
+
+* Select Sales Order
+  PERFORM bdc_dynpro USING 'SAPMV45A'   '0102'.
+  PERFORM bdc_field  USING 'BDC_OKCODE' '=UER2'.
+  PERFORM bdc_field  USING 'VBAK-VBELN' gs_updcont_log-vbeln.
+
+* Item overview
+  PERFORM bdc_dynpro USING 'SAPMV45A'   '4001'.
+  PERFORM bdc_field  USING 'BDC_OKCODE' '=POPO'.
+
+* Position item
+  PERFORM bdc_dynpro USING 'SAPMV45A'   '0251'.
+  PERFORM bdc_field  USING 'RV45A-POSNR' gs_updcont_log-posnr.
+  PERFORM bdc_field  USING 'BDC_OKCODE' '=POSI'.
+
+* Go to Sales B
+  PERFORM bdc_dynpro USING 'SAPMV45A'   '4001'.
+  PERFORM bdc_field  USING 'BDC_OKCODE' '=PSTE'.
+
+* Save
+  PERFORM bdc_dynpro USING 'SAPMV45A'   '4003'.
+  PERFORM bdc_field  USING 'VBAP-PRODH' gs_updcont_log-nprodh.
+  PERFORM bdc_field  USING 'BDC_OKCODE' '=SICH'.
+
+  bdc_options-dismode = gv_mode.
+  bdc_options-updmode = 'S'.
+
+* Sales Order
+  CALL TRANSACTION 'VA42' USING bdcdata
+                          OPTIONS FROM bdc_options
+                          MESSAGES INTO gt_messages.
+
+* Get errors
+  LOOP AT gt_messages INTO ls_messages
+                      WHERE msgtyp = 'A'  OR
+                            msgtyp = 'E'.
+    MESSAGE ID ls_messages-msgid
+            TYPE ls_messages-msgtyp
+            NUMBER ls_messages-msgnr
+            INTO gv_mtext
+            WITH ls_messages-msgv1 ls_messages-msgv2
+                 ls_messages-msgv3 ls_messages-msgv4.
+    PERFORM add_error USING gv_mtext.
+    gs_updcont_log-flag_ph = 'E'.
+    gs_updcont_log-txt_ph = gv_mtext.
+    gs_updcont_log-aenam = sy-uname.
+    gs_updcont_log-aedat = sy-datum.
+    gs_updcont_log-aezet = sy-uzeit.
+    EXIT.
+  ENDLOOP.
+  IF sy-subrc <> 0.
+    gs_updcont_log-flag_ph = 'U'.
+    gs_updcont_log-aenam = sy-uname.
+    gs_updcont_log-aedat = sy-datum.
+    gs_updcont_log-aezet = sy-uzeit.
+    CLEAR gs_updcont_log-txt_ph.
+  ENDIF.
+
+  CHECK gs_updcont_log-flag_ph = 'U'.
+
+* II. Re-derive CO-PA characteristics
+* Clear structures and tables for the BAPI
+  CLEAR: bdcdata, gt_messages.
+  REFRESH: bdcdata, gt_messages.
+
+* Select Sales Order
+  PERFORM bdc_dynpro USING 'SAPMV45A'   '0102'.
+  PERFORM bdc_field  USING 'BDC_OKCODE' '=UER2'.
+  PERFORM bdc_field  USING 'VBAK-VBELN' gs_updcont_log-vbeln.
+
+* Item overview
+  PERFORM bdc_dynpro USING 'SAPMV45A'   '4001'.
+  PERFORM bdc_field  USING 'BDC_OKCODE' '=POPO'.
+
+* Position item
+  PERFORM bdc_dynpro USING 'SAPMV45A'   '0251'.
+  PERFORM bdc_field  USING 'RV45A-POSNR' gs_updcont_log-posnr.
+  PERFORM bdc_field  USING 'BDC_OKCODE' '=POSI'.
+
+* Go to account assignment
+  PERFORM bdc_dynpro USING 'SAPMV45A'   '4001'.
+  PERFORM bdc_field  USING 'BDC_OKCODE' '=PKNT'.
+
+* Go to Profitability segment
+  PERFORM bdc_dynpro USING 'SAPMV45A'   '4003'.
+  PERFORM bdc_field  USING 'DKACB-FMORE' 'X'.
+  PERFORM bdc_field  USING 'BDC_OKCODE' '/00'.
+
+* Profitability segment
+  PERFORM bdc_dynpro USING 'SAPLKACB'   '0002'.
+  PERFORM bdc_field  USING 'BDC_OKCODE' '=COBL_XERGO'.
+
+* Delete assignment
+  PERFORM bdc_dynpro USING 'SAPLKEAK'   '0300'.
+  PERFORM bdc_field  USING 'BDC_OKCODE' '=DEBS'.
+
+* Continue
+  PERFORM bdc_dynpro USING 'SAPLKEAK'   '0300'.
+  PERFORM bdc_field  USING 'BDC_OKCODE' '=WEIT'.
+
+*
+  PERFORM bdc_dynpro USING 'SAPLKACB'   '0002'.
+  PERFORM bdc_field  USING 'BDC_OKCODE' '=COBL_XERGO'.
+
+* Profitability segment
+  PERFORM bdc_dynpro USING 'SAPLKEAK'   '0300'.
+  PERFORM bdc_field  USING 'BDC_OKCODE' '=WEIT'.
+
+* Continue
+  PERFORM bdc_dynpro USING 'SAPLKACB'   '0002'.
+  PERFORM bdc_field  USING 'BDC_OKCODE' '=ENTE'.
+
+* Save
+  PERFORM bdc_dynpro USING 'SAPMV45A'   '4001'.
+  PERFORM bdc_field  USING 'BDC_OKCODE' '=SICH'.
+
+  bdc_options-dismode = gv_mode.
+  bdc_options-updmode = 'S'.
+
+* Sales Order
+  CALL TRANSACTION 'VA42' USING bdcdata
+                          OPTIONS FROM bdc_options
+                          MESSAGES INTO gt_messages.
+
+* Get errors
+  LOOP AT gt_messages INTO ls_messages
+                      WHERE msgtyp = 'A'  OR
+                            msgtyp = 'E'.
+    MESSAGE ID ls_messages-msgid
+            TYPE ls_messages-msgtyp
+            NUMBER ls_messages-msgnr
+            INTO gv_mtext
+            WITH ls_messages-msgv1 ls_messages-msgv2
+                 ls_messages-msgv3 ls_messages-msgv4.
+    PERFORM add_error USING gv_mtext.
+    gs_updcont_log-flag_ph = 'E'.
+    gs_updcont_log-txt_ph = gv_mtext.
+    gs_updcont_log-aenam = sy-uname.
+    gs_updcont_log-aedat = sy-datum.
+    gs_updcont_log-aezet = sy-uzeit.
+    EXIT.
+  ENDLOOP.
+
+ENDFORM.                                                    " CALL_VA42
+
+*&---------------------------------------------------------------------*
+*&      Form  BDC_DYNPRO
+*&---------------------------------------------------------------------*
+*       Start new screen
+*----------------------------------------------------------------------*
+*      -->PROGRAM : Program name
+*      -->DYNPRO  : Screen number
+*----------------------------------------------------------------------*
+FORM bdc_dynpro USING  program
+                       dynpro.
+
+  CLEAR bdcdata.
+  bdcdata-program  = program.
+  bdcdata-dynpro   = dynpro.
+  bdcdata-dynbegin = 'X'.
+  APPEND bdcdata.
+
+ENDFORM.                    " BDC_DYNPRO
+
+*&---------------------------------------------------------------------*
+*&      Form  BDC_FIELD
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->FNAM : Field name
+*      -->FVAL : Field value
+*----------------------------------------------------------------------*
+FORM bdc_field USING  fnam
+                      fval.
+
+  CLEAR bdcdata.
+  bdcdata-fnam = fnam.
+  bdcdata-fval = fval.
+  APPEND bdcdata.
+
+ENDFORM.                    " BDC_FIELD
+
+*&---------------------------------------------------------------------*
+*&      Form  ADD_ERROR
+*&---------------------------------------------------------------------*
+*       Add error
+*----------------------------------------------------------------------*
+*      -->P_MTEXT : Error text
+*----------------------------------------------------------------------*
+FORM add_error  USING    p_mtext.
+
+  CLEAR gs_err.
+  gs_err-vbeln = gs_updcont_log-vbeln.
+  gs_err-posnr = gs_updcont_log-posnr.
+  gs_err-mtext = p_mtext.
+  APPEND gs_err TO gt_err.
+
+ENDFORM.                    " ADD_ERROR
+
+*&---------------------------------------------------------------------*
+*&      Form  ALV_FCAT
+*&---------------------------------------------------------------------*
+*       ALV field catalog
+*----------------------------------------------------------------------*
+FORM alv_fcat .
+
+  PERFORM add_field USING 'VBELN'  10  'Document'(t01)  'X'.
+  PERFORM add_field USING 'POSNR'  06  'Item'(t02)      ' '.
+  PERFORM add_field USING 'MTEXT'  80  'Message'(t03)   ' '.
+
+ENDFORM.                    " ALV_FCAT
+
+*&---------------------------------------------------------------------*
+*&      Form  ADD_FIELD
+*&---------------------------------------------------------------------*
+*       Add field to field catalog
+*----------------------------------------------------------------------*
+FORM add_field  USING    p_field
+                         p_len
+                         p_descr
+                         p_hotsp.
+
+  gv_col = gv_col + 1.
+
+  CLEAR gs_fcat.
+  gs_fcat-col_pos    = gv_col.
+  gs_fcat-fieldname  = p_field.
+  gs_fcat-outputlen  = p_len.
+  gs_fcat-seltext_l  = p_descr.
+  gs_fcat-seltext_m  = p_descr.
+  gs_fcat-seltext_s  = p_descr.
+  gs_fcat-fix_column = 'X'.
+  gs_fcat-emphasize  = 'X'.
+  gs_fcat-hotspot    = p_hotsp.
+  gs_fcat-key        = p_hotsp.
+
+* Suppress leading zeros for the material number
+  IF p_field = 'VBELN'.
+    gs_fcat-edit_mask = '==ALPHA'.
+  ENDIF.
+
+  APPEND gs_fcat TO gt_fcat.
+
+ENDFORM.                    " ADD_FIELD
+
+*&---------------------------------------------------------------------*
+*&      Form  ALV_LAYOUT
+*&---------------------------------------------------------------------*
+*       Modify ALV layout
+*----------------------------------------------------------------------*
+FORM alv_layout .
+
+  gs_layout-zebra = 'X'.
+*  gs_layout-colwidth_optimize = 'X'.
+*  gs_layout-smalltitle = 'X'.
+*  gs_layout-grid_title = 'title'.
+
+ENDFORM.                    " ALV_LAYOUT
+
+*&---------------------------------------------------------------------*
+*&      Form  ALV_DISPLAY
+*&---------------------------------------------------------------------*
+*       Display ALV grid
+*----------------------------------------------------------------------*
+FORM alv_display .
+
+*  gs_sd_alv_variant = gs_variant.
+  gv_repid = sy-repid.
+
+  SORT gt_err.
+
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+    EXPORTING
+      i_callback_program      = gv_repid
+      i_callback_user_command = gv_user_command
+*      i_callback_top_of_page  = 'ALV_TOP'
+      i_grid_title            = 'Re-derive COPA'(h01)
+      is_layout               = gs_layout
+      it_fieldcat             = gt_fcat
+      it_sort                 = gt_alv_sort
+      i_default               = 'X'
+      i_save                  = 'A'
+*      is_variant              = gs_sd_alv_variant
+      i_screen_start_column   = 0
+      i_screen_start_line     = 0
+      i_screen_end_column     = 0
+      i_screen_end_line       = 0
+    TABLES
+      t_outtab                = gt_err
+    EXCEPTIONS
+      program_error           = 1
+      OTHERS                  = 2.
+
+  IF sy-subrc NE 0.
+    message id sy-msgid type sy-msgty number sy-msgno
+            with sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+ENDFORM.                    " ALV_DISPLAY
+
+*&---------------------------------------------------------------------*
+*&   Form  USER_COMMAND
+*&---------------------------------------------------------------------*
+*    Process user command
+*----------------------------------------------------------------------*
+FORM user_command USING ucomm    LIKE sy-ucomm
+                        selfield TYPE slis_selfield.
+
+* Check function code
+  CASE ucomm.
+    WHEN '&IC1'.
+*     Select hotspot
+      IF NOT selfield-value IS INITIAL.
+        CASE selfield-fieldname.
+          WHEN 'VBELN'.
+            IF NOT selfield-value IS INITIAL.
+*             Sales Order
+              SET PARAMETER ID 'AUN' FIELD selfield-value.
+              CALL TRANSACTION 'VA43' AND SKIP FIRST SCREEN.
+            ENDIF.
+        ENDCASE.
+      ENDIF.
+  ENDCASE.
+
+ENDFORM.                    " USER_COMMAND
+
+*&---------------------------------------------------------------------*
+*&      Form  FILE_F4_HELP
+*&---------------------------------------------------------------------*
+*       File choose help
+*----------------------------------------------------------------------*
+FORM file_f4_help .
+
+  DATA: lt_filetable  TYPE filetable,
+         ls_filetable  TYPE file_table,
+         lv_rc         TYPE i.
+
+  CALL METHOD cl_gui_frontend_services=>file_open_dialog
+*    EXPORTING
+*      window_title            =
+*      default_extension       =
+*      default_filename        =
+*      file_filter             =
+*      with_encoding           =
+*      initial_directory       =
+*      multiselection          =
+    CHANGING
+      file_table              = lt_filetable
+      rc                      = lv_rc
+*      user_action             =
+*      file_encoding           =
+    EXCEPTIONS
+      file_open_dialog_failed = 1
+      cntl_error              = 2
+      error_no_gui            = 3
+      not_supported_by_gui    = 4
+      OTHERS                  = 5
+          .
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+              WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ELSE.
+    READ TABLE lt_filetable INTO ls_filetable INDEX 1.
+    IF sy-subrc = 0.
+      p_file = ls_filetable-filename.
+    ENDIF.
+  ENDIF.
+ENDFORM.                    " FILE_F4_HELP
+*&---------------------------------------------------------------------*
+*&      Form  FRM_SCREEN_SET
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM frm_screen_set .
+  IF rb_upl  IS NOT INITIAL.
+    LOOP AT SCREEN.
+      IF    screen-group1 = 'M1'
+        OR  screen-group1 = 'M2'
+        OR  screen-group1 = 'M9'.
+        screen-input = '0'.
+        screen-invisible = '1'.
+        MODIFY SCREEN .
+      ENDIF.
+    ENDLOOP.
+  ELSEIF rb_upd IS NOT INITIAL.
+    LOOP AT SCREEN.
+      IF    screen-group1 = 'M5'
+        OR  screen-group1 = 'M9'.
+        screen-input = '0'.
+        screen-invisible = '1'.
+        MODIFY SCREEN .
+      ENDIF.
+    ENDLOOP.
+  ELSEIF rb_refr IS NOT INITIAL.
+    LOOP AT SCREEN.
+      IF    screen-group1 = 'M5'
+        OR  screen-group1 = 'M2'
+        OR  screen-group1 = 'M9'.
+        screen-input = '0'.
+        screen-invisible = '1'.
+        MODIFY SCREEN .
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+ENDFORM.                    " FRM_SCREEN_SET
+*&---------------------------------------------------------------------*
+*&      Form  DO_UPLOAD
+*&---------------------------------------------------------------------*
+*       Upload the file to SAP customerizing table
+*----------------------------------------------------------------------*
+FORM do_upload .
+
+  DATA: lt_raw_data     TYPE truxs_t_text_data,
+        ls_vbap         TYPE ty_vbap,
+        ls_mara         TYPE ty_mara,
+        ls_mvke         TYPE ty_mvke,
+        lt_mvke         TYPE STANDARD TABLE OF ty_mvke,
+        ls_so_item      TYPE ty_so_item,
+        lt_so_item      TYPE STANDARD TABLE OF ty_so_item,
+        lt_vbap         TYPE STANDARD TABLE OF ty_vbap,
+        ls_updcont_log  TYPE yse_updcont_log,
+        lt_updcont_log  TYPE STANDARD TABLE OF yse_updcont_log,
+        lt_file_in      TYPE STANDARD TABLE OF ty_file_in,
+        lt_mara         TYPE STANDARD TABLE OF ty_mara,
+        ls_file_in      TYPE ty_file_in.
+
+* Upload the Material data from the excel file
+  CALL FUNCTION 'TEXT_CONVERT_XLS_TO_SAP'
+    EXPORTING
+      i_tab_raw_data       = lt_raw_data
+      i_filename           = p_file
+    TABLES
+      i_tab_converted_data = lt_file_in
+    EXCEPTIONS
+      conversion_failed    = 1
+      OTHERS               = 2.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+           WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+  DELETE lt_file_in INDEX 1.
+  IF lt_file_in IS INITIAL.
+    MESSAGE s001(00) WITH text-m80 DISPLAY LIKE 'E'.
+    LEAVE LIST-PROCESSING.
+  ENDIF.
+
+  CHECK lt_file_in IS NOT INITIAL.
+
+  LOOP AT lt_file_in INTO ls_file_in.
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+      EXPORTING
+        input  = ls_file_in-vbeln
+      IMPORTING
+        output = ls_so_item-vbeln.
+    ls_so_item-posnr = ls_file_in-posnr.
+    APPEND ls_so_item TO lt_so_item.
+  ENDLOOP.
+
+  SELECT  vbak~vbeln
+          vbak~erdat
+          vbak~erzet
+          vbak~ernam
+          vbak~vkorg
+          vbak~vtweg
+          vbap~posnr
+          vbap~matnr
+          vbap~prodh
+          vbap~prctr
+    FROM vbak
+    INNER JOIN vbap
+    ON vbak~vbeln = vbap~vbeln
+    INTO TABLE lt_vbap
+    FOR ALL ENTRIES IN lt_so_item
+    WHERE vbak~vbeln = lt_so_item-vbeln
+      AND vbap~posnr = lt_so_item-posnr.
+  IF sy-subrc <> 0.
+    MESSAGE s001(00) WITH 'No contract found,'(i50)
+                          'please kindly check your file'(i51)
+                     DISPLAY LIKE 'E'.
+    LEAVE LIST-PROCESSING.
+  ENDIF.
+
+  CHECK lt_vbap IS NOT INITIAL.
+
+  SELECT matnr
+         prdha
+    FROM mara
+    INTO TABLE lt_mara
+    FOR ALL ENTRIES IN lt_vbap
+    WHERE matnr = lt_vbap-matnr.
+
+  SELECT matnr vkorg vtweg prodh
+    INTO CORRESPONDING FIELDS OF TABLE lt_mvke
+    FROM mvke
+    FOR ALL ENTRIES IN lt_vbap
+    WHERE matnr = lt_vbap-matnr
+      AND vkorg = lt_vbap-vkorg
+      AND vtweg = '01'.
+
+  LOOP AT lt_so_item INTO ls_so_item.
+    CLEAR: ls_vbap, ls_mara,ls_updcont_log.
+    READ TABLE lt_vbap INTO ls_vbap
+      WITH KEY vbeln = ls_so_item-vbeln
+               posnr = ls_so_item-posnr.
+    IF sy-subrc <> 0.
+      ls_updcont_log-vbeln  = ls_so_item-vbeln.
+      ls_updcont_log-posnr  = ls_so_item-posnr.
+      ls_updcont_log-upd_ind = 'N'.
+      ls_updcont_log-flag_ph = 'E'.
+      ls_updcont_log-txt_ph    = 'Contract Item not exist'(t50).
+      ls_updcont_log-aenam    = sy-uname.
+      ls_updcont_log-aedat    = sy-datum.
+      ls_updcont_log-aezet    = sy-uzeit.
+      APPEND ls_updcont_log TO lt_updcont_log.
+    ELSE.
+      ls_updcont_log-vbeln    = ls_vbap-vbeln.
+      ls_updcont_log-posnr    = ls_vbap-posnr.
+      ls_updcont_log-vkorg    = ls_vbap-vkorg.
+      ls_updcont_log-upd_ind    = 'Y'.
+      ls_updcont_log-oprodh    = ls_vbap-prodh.
+      CASE p_phsou.
+        WHEN 'MARA'.
+          READ TABLE lt_mara INTO ls_mara
+            WITH KEY matnr = ls_vbap-matnr.
+          ls_updcont_log-nprodh    = ls_mara-prdha.
+        WHEN 'MVKE'.
+          READ TABLE lt_mvke INTO ls_mvke
+            WITH KEY matnr = ls_vbap-matnr
+                     vkorg = ls_vbap-vkorg.
+          ls_updcont_log-nprodh    = ls_mvke-prodh.
+        WHEN OTHERS.
+      ENDCASE.
+      ls_updcont_log-ernam    = ls_vbap-ernam.
+      ls_updcont_log-erdat    = ls_vbap-erdat.
+      ls_updcont_log-erzet    = ls_vbap-erzet.
+      ls_updcont_log-aenam    = sy-uname.
+      ls_updcont_log-aedat    = sy-datum.
+      ls_updcont_log-aezet    = sy-uzeit.
+      APPEND ls_updcont_log TO lt_updcont_log.
+    ENDIF.
+  ENDLOOP.
+
+  IF  lt_updcont_log IS NOT INITIAL.
+    MODIFY yse_updcont_log FROM TABLE lt_updcont_log.
+    IF  sy-subrc <> 0.
+      MESSAGE s001(00) WITH text-m06 DISPLAY LIKE 'E'.
+      LEAVE LIST-PROCESSING.
+    ELSE.
+      MESSAGE s001(00) WITH text-m07.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    " DO_UPLOAD
+*&---------------------------------------------------------------------*
+*&      Form  DO_UPDATE
+*&---------------------------------------------------------------------*
+*       Update the contract
+*----------------------------------------------------------------------*
+FORM do_update .
+* Select data
+  PERFORM select_data.
+
+  IF gt_inso[] IS INITIAL.
+    MESSAGE i001(00) WITH 'No contract selected'(i03).
+  ENDIF.
+
+* Process input
+  PERFORM process_data.
+
+* Display errors
+  IF gt_err[] IS INITIAL.
+    MESSAGE i001(00) WITH 'No errors found'(i04).
+  ELSE.
+    PERFORM alv_fcat.
+    PERFORM alv_layout.
+    PERFORM alv_display.
+  ENDIF.
+
+ENDFORM.                    " DO_UPDATE
+*&---------------------------------------------------------------------*
+*&      Form  DO_REFRESH
+*&---------------------------------------------------------------------*
+*       Refresh the old product hierachy
+*----------------------------------------------------------------------*
+FORM do_refresh .
+
+  DATA: lt_updcont_log TYPE STANDARD TABLE OF yse_updcont_log,
+        lt_updcnt_delt TYPE STANDARD TABLE OF yse_updcont_log,
+        ls_updcont_log TYPE yse_updcont_log,
+        lt_vbap        TYPE STANDARD TABLE OF ty_vbap,
+        ls_vbap        TYPE ty_vbap.
+
+  SELECT *
+    FROM yse_updcont_log
+    INTO TABLE lt_updcont_log
+    WHERE posnr <> ''.
+
+  CHECK lt_updcont_log IS NOT INITIAL.
+
+  SELECT  vbak~vbeln
+          vbak~erdat
+          vbak~erzet
+          vbak~ernam
+          vbak~vkorg
+          vbak~vtweg
+          vbap~posnr
+          vbap~matnr
+          vbap~prodh
+          vbap~prctr
+    FROM vbak
+    INNER JOIN vbap
+    ON vbak~vbeln = vbap~vbeln
+    INTO TABLE lt_vbap
+    FOR ALL ENTRIES IN lt_updcont_log
+    WHERE vbak~vbeln = lt_updcont_log-vbeln
+      AND vbap~posnr = lt_updcont_log-posnr.
+  LOOP AT lt_updcont_log INTO ls_updcont_log.
+    READ TABLE lt_vbap INTO ls_vbap
+      WITH KEY vbeln = ls_updcont_log-vbeln
+               posnr = ls_updcont_log-posnr.
+    IF sy-subrc = 0.
+      IF ls_vbap-prodh <> ls_updcont_log-oprodh.
+        ls_updcont_log-oprodh = ls_vbap-prodh.
+        APPEND ls_updcont_log TO lt_updcnt_delt.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+  IF lt_updcnt_delt IS NOT INITIAL.
+    UPDATE yse_updcont_log FROM TABLE lt_updcnt_delt.
+  ENDIF.
+ENDFORM.                    " DO_REFRESH
+
+*Text symbol text£º
+*B01:Select Functionality
+*B02:Select Options
+*H01:Re-derive COPA
+*I03:No contract selected
+*I04:No errors found
+*I50:No contract found,
+*I51:please kindly check your file
+*M06:Failed to update  table YSE_UPDCONT_LOG
+*M07:Successfully upload the data from source file
+*M80:No data extracfted from the file
+*T01:Document
+*T02:Item
+*T03:Message
+
+*T50:Contract Item not exist
+*Selection text£º
+*P_FILE:        Filename
+*P_PHSOU:        PH source table
+*P_UPD:        Update when no difference
+*RB_REFR:        Refresh Log Talble
+*RB_UPD:        Update contract
+*RB_UPL:        Upload open contract
+*S_ERDAT:D       .
+*S_VBELN:D       .
+*S_VKORG:D       .

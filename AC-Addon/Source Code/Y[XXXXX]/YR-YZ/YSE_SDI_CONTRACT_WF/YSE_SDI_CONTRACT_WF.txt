@@ -1,0 +1,2169 @@
+*&---------------------------------------------------------------------*
+*& Report  YSE_SDI_CONTRACT                                            *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+*&                                                                     *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+**********************************************************************
+* DEV request       : CD1K908904                                      *
+* Descr       :    061221-SE-UXT-D232-Post line items via KE21N (contract)*
+* Author            : Christophe Geerts                               *
+* Date              :                                                 *
+* Functional spec   : D232                                            *
+* Description       :
+*This program is executed in a workflow YBUS2088 task 90000014
+*=====================================================================*
+* Change History Log                                                  *
+*---------------------------------------------------------------------*
+* Mod. no.|  Date    | Name           | Correction Number | Change Ref*
+*---------------------------------------------------------------------*
+* MOD-001 |dd/mm/yyyy| xxxxxxxxxxxxxx | XXXXxxxxxx        | XXXXxxxxxx*
+*                                                                     *
+* Description:                                                        *
+*---------------------------------------------------------------------*
+* MOD-002 |dd/mm/yyyy| xxxxxxxxxxxxxx | XXXXxxxxxx                    *
+*                                                                     *
+* Description:                                                        *
+***********************************************************************
+
+
+
+
+REPORT  YSE_SDI_CONTRACT_WF                        .
+
+TABLES: CAUFV,
+        VBAK.
+
+DATA: V_OPERATINGCONCERN TYPE BAPI0017-OP_CONCERN.
+DATA: V_TESTRUN TYPE BAPI0017-TESTRUN.
+DATA: IT_INPUTDATA TYPE TABLE OF BAPI_COPA_DATA.
+DATA: IT_FIELDLIST TYPE TABLE OF BAPI_COPA_FIELD.
+DATA: IT_RETURN TYPE TABLE OF BAPIRET2.
+
+DATA: WA_INPUTDATA TYPE BAPI_COPA_DATA.
+DATA: WA_FIELDLIST TYPE BAPI_COPA_FIELD.
+DATA: WA_RETURN TYPE BAPIRET2.
+
+DATA: IT_BELNR1 TYPE TABLE OF YSE_SDI_BELNR1.
+DATA: IT_BELNR1_FIRST TYPE TABLE OF YSE_SDI_BELNR1.
+DATA: IT_BELNR1_REVERSE TYPE TABLE OF YSE_SDI_BELNR1.
+DATA: IT_BELNR1_FIRST_DEL TYPE TABLE OF YSE_SDI_BELNR1.
+DATA: IT_BELNR1_SECOND_REVERSE TYPE TABLE OF YSE_SDI_BELNR1.
+DATA: IT_BELNR1_SECOND_INIT TYPE TABLE OF YSE_SDI_BELNR1.
+DATA: WA_BELNR1 TYPE YSE_SDI_BELNR1.
+DATA: WA_BELNR1_FIRST TYPE YSE_SDI_BELNR1.
+DATA: WA_BELNR1_REVERSE TYPE YSE_SDI_BELNR1.
+DATA: WA_BELNR1_SECOND_REVERSE TYPE YSE_SDI_BELNR1.
+DATA: WA_BELNR1_SECOND_INIT TYPE YSE_SDI_BELNR1.
+DATA: V_OBJNR_COBRB TYPE J_OBJNR.
+DATA: WA_COBRB TYPE COBRB.
+DATA: WA_CE41000_ACCT TYPE CE41000_ACCT.
+DATA: WA_CE41000 TYPE CE41000.
+DATA: IT_CE41000 TYPE TABLE OF CE41000.
+DATA: WA_CE11000 TYPE CE11000.
+DATA: WA_INSERT_SCHEDUL TYPE YSE_SDI_SCHEDUL.
+DATA: IT_INSERT_SCHEDUL TYPE TABLE OF YSE_SDI_SCHEDUL.
+DATA: V_BELNR TYPE RKE_BELNR.
+
+
+DATA: BEGIN OF IT_CE41000_EXTRA OCCURS 0,
+        VBELN TYPE VBELN,
+        POSNR TYPE POSNR,
+        AUFNR_1 TYPE AUFNR,
+        BELNR1 TYPE RKE_BELNR,
+        BELNR2 TYPE RKE_BELNR.
+        INCLUDE STRUCTURE CE41000.
+DATA: END OF IT_CE41000_EXTRA.
+
+DATA: IT_CE11000 TYPE TABLE OF CE11000.
+
+DATA: WA_CAUFV TYPE CAUFV.
+DATA: WA_CE41000_EXTRA LIKE IT_CE41000_EXTRA.
+
+PARAMETERS: P_AUFNR LIKE AUFK-AUFNR.
+*SELECT-OPTIONS: S_CONTR FOR VBAK-VBELN.
+
+
+
+*--------------------------
+*EXPLANATION
+*When a service order is created via IW31 the implementation in BADI WORKORDER_UPDATE will write an entry to table YSE_SDI_BELNR (only
+*when linked to a contract item)
+*When we run this program we must first check if there are items in the table where BELNR1 is initial.  This means that the initial KE21N
+*posting has not yet been done.  We will do it via this program and then write the newly created BELNR nr to the existing line in field
+*BELNR1
+*This program also checks if there are lines in YSE_SDI_BELNR whereby the field BELNR1 is filled in (intial KE21N has been done) and
+*whereby the field BELNR2 is not yet done.  Here it must cancel the existing COPA line with exactly the same characteristics as the original
+*and with the values for the 5 costs below reversed.
+*Then we do another KE21N with the new values from the PMCO table (not from the original!!)
+*--------------------------
+
+
+*Get the data for the service order
+SELECT SINGLE * FROM CAUFV INTO WA_CAUFV
+        WHERE AUFNR EQ P_AUFNR.
+
+*Do a possible DB update for the YSE_SDI_BELNR
+CALL FUNCTION 'YSE_CHECK_COPA_UPDATE_DOC_FLOW'
+  EXPORTING
+    CAUFV  = WA_CAUFV
+    COMMIT = 'X'     "put on X, because this call does need to do database update (for the create only)
+  EXCEPTIONS
+    ERROR  = 1
+    OTHERS = 2.
+IF SY-SUBRC <> 0.
+ENDIF.
+*If this program was called when a new service order was created, then table YSE_SDI_BELNR is now updated before we execute the rest
+*of the program (via above function call)
+
+data: flag.
+
+do.
+ if not flag is initial.
+   exit.
+ endif.
+  if sy-datum ne '20070220'.
+    exit.
+  endif.
+  if sy-uzeit > '180000'.
+    exit.
+  endif.
+enddo.
+
+*==========================
+*--------------------------
+*Get the records for the 1st process
+*--------------------------
+
+*Just a reminder, we do not use the changed field in the Y-table anymore with the workflow
+SELECT * FROM YSE_SDI_BELNR1 INTO TABLE IT_BELNR1
+                  WHERE AUFNR EQ P_AUFNR AND
+                        BELNR1 EQ '          '.             "#EC *
+IF SY-SUBRC EQ 0.
+*We must make the first posting in KE21N for this service order (where do we keep the reference to this service order for later invest. ???
+*Get the pmco costs over the period
+*Get the data for the existing posting
+  LOOP AT IT_BELNR1 INTO WA_BELNR1.
+    CLEAR V_OBJNR_COBRB.
+    CONCATENATE 'VB' WA_BELNR1-VBELN WA_BELNR1-POSNR INTO V_OBJNR_COBRB.
+    SELECT SINGLE * FROM COBRB INTO WA_COBRB
+                WHERE OBJNR EQ V_OBJNR_COBRB AND
+                      PERBZ EQ 'GES'.
+*Period seems to contain zeros ??? so dont select on this
+    IF SY-SUBRC EQ 0.
+      CLEAR WA_CE41000_ACCT.
+      SELECT SINGLE * FROM CE41000_ACCT INTO WA_CE41000_ACCT
+                   WHERE PAOBJNR EQ WA_COBRB-PAOBJNR.     "#EC *
+      IF SY-SUBRC EQ 0.
+        CLEAR WA_CE41000.
+        SELECT SINGLE * FROM CE41000 INTO WA_CE41000
+                       WHERE PAOBJNR EQ WA_CE41000_ACCT-CE4KEY.   "#EC *
+        MOVE-CORRESPONDING WA_CE41000 TO WA_CE41000_EXTRA.
+        MOVE-CORRESPONDING WA_BELNR1 TO WA_CE41000_EXTRA.
+        WA_CE41000_EXTRA-AUFNR_1 = WA_BELNR1-AUFNR.
+        WA_CE41000_EXTRA-VBELN = WA_BELNR1-VBELN.
+        WA_CE41000_EXTRA-POSNR = WA_BELNR1-POSNR.
+        APPEND WA_CE41000_EXTRA TO IT_CE41000_EXTRA.
+      ENDIF.
+    ENDIF.
+
+  ENDLOOP.
+
+*Outside the loop
+*process the entries (create the first posting)
+  IF NOT IT_CE41000_EXTRA[] IS INITIAL.
+    LOOP AT IT_CE41000_EXTRA INTO WA_CE41000_EXTRA.
+*Create the CE11000 posting
+      PERFORM FIRST_POSTING.  "service order number in DB table 'yse_sdi_belnr1'
+    ENDLOOP.
+  ENDIF.
+ENDIF.
+
+
+
+*==========================
+*--------------------------
+*Get the records for the 2nd process
+*--------------------------
+SELECT * FROM YSE_SDI_BELNR1 INTO TABLE IT_BELNR1
+                  WHERE AUFNR EQ P_AUFNR AND
+                        BELNR1 NE '          ' AND          "10 long
+                        BELNR2 EQ '          '.    "#EC *
+
+IF SY-SUBRC EQ 0.
+*We must first reverse the existing posting and then make the first posting in KE21N for this service order (where do we keep the reference to this service order for later invest. ???
+*Get the pmco costs over the period
+  LOOP AT IT_BELNR1 INTO WA_BELNR1.
+    CLEAR: WA_CE11000, WA_CE41000.
+    SELECT SINGLE * FROM CE11000 INTO WA_CE11000
+                 WHERE PALEDGER EQ '02' AND   "= currency type 10
+                       VRGAR EQ 'A' AND
+                       BELNR EQ WA_BELNR1-BELNR1.
+    IF SY-SUBRC EQ 0.
+      SELECT SINGLE * FROM CE41000 INTO WA_CE41000
+                   WHERE PAOBJNR EQ WA_CE11000-PAOBJNR AND   "= currency type 10
+                         AKTBO EQ 'X'.
+      MOVE-CORRESPONDING WA_CE41000 TO WA_CE11000.
+      WA_CE11000-RKAUFNR = WA_BELNR1-AUFNR.
+      APPEND WA_CE11000 TO IT_CE11000.
+    ENDIF.
+
+  ENDLOOP.
+
+
+  IF NOT IT_CE11000[] IS INITIAL.
+    LOOP AT IT_CE11000 INTO WA_CE11000.
+      CLEAR WA_BELNR1_SECOND_REVERSE.
+      PERFORM REVERSE_POSTING.
+      IF NOT WA_BELNR1_SECOND_REVERSE IS INITIAL.
+        PERFORM SECOND_POSTING.   "is actually then the first posting ????
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+
+
+
+ENDIF.
+
+
+
+*=================================================
+*Update the tables!!!
+*Very first posting (at creation)
+*Modify the DB table
+IF NOT IT_BELNR1_FIRST[] IS INITIAL.
+  MODIFY YSE_SDI_BELNR1 FROM TABLE IT_BELNR1_FIRST.
+  DELETE YSE_SDI_BELNR1 FROM TABLE IT_BELNR1_FIRST_DEL.
+ENDIF.
+
+*Second posting (reverse)
+*Modify the DB table
+IF NOT IT_BELNR1_SECOND_REVERSE[] IS INITIAL.
+  MODIFY YSE_SDI_BELNR1 FROM TABLE IT_BELNR1_SECOND_REVERSE.
+
+*Second posting (initial)
+*Modify the DB table
+  IF NOT IT_BELNR1_SECOND_INIT[] IS INITIAL.
+    MODIFY YSE_SDI_BELNR1 FROM TABLE IT_BELNR1_SECOND_INIT.
+  ENDIF.
+ENDIF.
+
+*Do the commit explicit, because when called via the workflow (submit ...
+*and return it does not happen automatically)
+commit work.
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  first_posting
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM FIRST_POSTING.
+  FREE: IT_INPUTDATA,
+       IT_FIELDLIST,
+       IT_RETURN.
+
+*Always 1000
+  V_OPERATINGCONCERN = '1000'.
+  V_TESTRUN = ''.
+
+  PERFORM ADD_HEADER.
+  PERFORM ADD_CHARAC.   "from CE41 segment
+  PERFORM GET_PMCO.                                         "5 costs
+  PERFORM ADD_PMCO.                                         "5 costs
+
+*Post the COPA document
+  CALL FUNCTION 'BAPI_COPAACTUALS_POSTCOSTDATA'
+    EXPORTING
+      OPERATINGCONCERN = V_OPERATINGCONCERN
+      TESTRUN          = V_TESTRUN
+    TABLES
+      INPUTDATA        = IT_INPUTDATA
+      FIELDLIST        = IT_FIELDLIST
+      RETURN           = IT_RETURN.
+
+  IF IT_RETURN[] IS INITIAL.
+
+
+    CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+      EXPORTING
+        WAIT = 'X'.
+* IMPORTING
+*   RETURN        =.
+
+
+    PERFORM GET_BELNR.
+
+
+  ENDIF.
+
+ENDFORM.                    " first_posting
+*&---------------------------------------------------------------------*
+*&      Form  add_pmco
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM ADD_PMCO .
+
+*Dynamic assignment, but the VV...field can not be mapped dynamically to acpos???
+  LOOP AT IT_INSERT_SCHEDUL INTO WA_INSERT_SCHEDUL.
+    CLEAR WA_INPUTDATA.
+    WA_INPUTDATA-RECORD_ID = '000001'.
+
+    CASE WA_INSERT_SCHEDUL-ACPOS.
+      WHEN 'Z04'.
+*Parts (ZEKP)
+        WA_INPUTDATA-FIELDNAME = 'VV200'.
+      WHEN 'Z03'.
+*Labour (ZEKL)
+        WA_INPUTDATA-FIELDNAME = 'VV300'.
+      WHEN 'Z09'.
+*Mileage (ZEKD)
+        WA_INPUTDATA-FIELDNAME = 'VV400'.
+      WHEN 'Z08'.
+*Subcontracting (ZEKS)
+        WA_INPUTDATA-FIELDNAME = 'VV500'.
+      WHEN 'Z07'.
+*Ad hoc expenses (ZEKO)
+        WA_INPUTDATA-FIELDNAME = 'VV600'.
+    ENDCASE.
+
+*    WA_INPUTDATA-FIELDNAME = 'VV200'.
+
+*    WA_INPUTDATA-VALUE = WA_INSERT_SCHEDUL-LPREIS.
+    WRITE WA_INSERT_SCHEDUL-LPREIS TO WA_INPUTDATA-VALUE LEFT-JUSTIFIED.   "#EC *
+    REPLACE ALL OCCURRENCES OF '.' IN WA_INPUTDATA-VALUE WITH SPACE.
+    CONDENSE WA_INPUTDATA-VALUE.
+    WA_INPUTDATA-CURRENCY = WA_INSERT_SCHEDUL-WAERS.
+    APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+    CLEAR WA_FIELDLIST.
+    WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+    APPEND WA_FIELDLIST TO IT_FIELDLIST.
+
+    CLEAR WA_INSERT_SCHEDUL.
+  ENDLOOP.
+
+**-------------------------------------
+**Parts (ZEKP)
+*  CLEAR WA_INPUTDATA.
+*  WA_INPUTDATA-RECORD_ID = '000001'.
+*  WA_INPUTDATA-FIELDNAME = 'VV200'.
+*  WA_INPUTDATA-VALUE = '234.50'.
+*  WA_INPUTDATA-CURRENCY = 'PLN'.
+*  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+*
+*  CLEAR WA_FIELDLIST.
+*  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+*  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+**-------------------------------------
+*
+**-------------------------------------
+**Labour (ZEKL)
+*  CLEAR WA_INPUTDATA.
+*  WA_INPUTDATA-RECORD_ID = '000001'.
+*  WA_INPUTDATA-FIELDNAME = 'VV300'.
+*  WA_INPUTDATA-VALUE = '234.50'.
+*  WA_INPUTDATA-CURRENCY = 'PLN'.
+*  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+*
+*  CLEAR WA_FIELDLIST.
+*  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+*  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+**-------------------------------------
+*
+**-------------------------------------
+**Mileage (ZEKD)
+*  CLEAR WA_INPUTDATA.
+*  WA_INPUTDATA-RECORD_ID = '000001'.
+*  WA_INPUTDATA-FIELDNAME = 'VV400'.
+*  WA_INPUTDATA-VALUE = '234.50'.
+*  WA_INPUTDATA-CURRENCY = 'PLN'.
+*  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+*
+*  CLEAR WA_FIELDLIST.
+*  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+*  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+**-------------------------------------
+*
+**-------------------------------------
+**Subcontracting (ZEKS)
+*  CLEAR WA_INPUTDATA.
+*  WA_INPUTDATA-RECORD_ID = '000001'.
+*  WA_INPUTDATA-FIELDNAME = 'VV500'.
+*  WA_INPUTDATA-VALUE = '234.50'.
+*  WA_INPUTDATA-CURRENCY = 'PLN'.
+*  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+*
+*  CLEAR WA_FIELDLIST.
+*  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+*  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+**-------------------------------------
+*
+**-------------------------------------
+**Ad hoc expenses (ZEKO)
+*  CLEAR WA_INPUTDATA.
+*  WA_INPUTDATA-RECORD_ID = '000001'.
+*  WA_INPUTDATA-FIELDNAME = 'VV600'.
+*  WA_INPUTDATA-VALUE = '234.50'.
+*  WA_INPUTDATA-CURRENCY = 'PLN'.
+*  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+*
+*  CLEAR WA_FIELDLIST.
+*  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+*  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+**-------------------------------------
+
+ENDFORM.                    " add_pmco
+*&---------------------------------------------------------------------*
+*&      Form  add_charac
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM ADD_CHARAC.
+*=====================================
+*BUKRS (Company code)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'BUKRS'.
+  WA_INPUTDATA-VALUE = WA_CE41000_EXTRA-BUKRS.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*KAUFN (Sales order number)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'KAUFN'.
+  WA_INPUTDATA-VALUE = WA_CE41000_EXTRA-KAUFN.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*KDPOS (Sales order item)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'KDPOS'.
+  WA_INPUTDATA-VALUE = WA_CE41000_EXTRA-KDPOS.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*PSPNR (Work breakdown structure)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'PSPNR'.
+  WA_INPUTDATA-VALUE = WA_CE41000_EXTRA-PSPNR.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*WW001 (Account type)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'WW001'.
+  WA_INPUTDATA-VALUE = WA_CE41000_EXTRA-WW001.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*WW002 (PLC)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'WW002'.
+  WA_INPUTDATA-VALUE = WA_CE41000_EXTRA-WW002.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*WW003 (Accounting indicator)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'WW003'.
+  WA_INPUTDATA-VALUE = WA_CE41000_EXTRA-WW003.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*WW004 (Contract)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'WW004'.
+  WA_INPUTDATA-VALUE = WA_CE41000_EXTRA-WW004.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*WW005 (Sales document type)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'WW005'.
+  WA_INPUTDATA-VALUE = WA_CE41000_EXTRA-WW005.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*WW006 (GAC)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'WW006'.
+  WA_INPUTDATA-VALUE = WA_CE41000_EXTRA-WW006.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*WW007 (PGC)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'WW007'.
+  WA_INPUTDATA-VALUE = WA_CE41000_EXTRA-WW007.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*WW008 (Sales District)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'WW008'.
+  WA_INPUTDATA-VALUE = WA_CE41000_EXTRA-WW008.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*WW009 (Country Ship-to)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'WW009'.
+  WA_INPUTDATA-VALUE = WA_CE41000_EXTRA-WW009.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*KNDNR (Customer)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'KNDNR'.
+  WA_INPUTDATA-VALUE = WA_CE41000_EXTRA-KNDNR.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*ARTNR (Article)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'ARTNR'.
+  WA_INPUTDATA-VALUE = WA_CE41000_EXTRA-ARTNR.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*FKART (Billing type)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'FKART'.
+  WA_INPUTDATA-VALUE = WA_CE41000_EXTRA-FKART.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*KOKRS (Controlling area)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'KOKRS'.
+  WA_INPUTDATA-VALUE = WA_CE41000_EXTRA-KOKRS.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*WERKS (Plant)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'WERKS'.
+  WA_INPUTDATA-VALUE = WA_CE41000_EXTRA-WERKS.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*GSBER (Business area)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'GSBER'.
+  WA_INPUTDATA-VALUE = WA_CE41000_EXTRA-GSBER.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*VKORG (Sales organisation)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'VKORG'.
+  WA_INPUTDATA-VALUE = WA_CE41000_EXTRA-VKORG.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*VTWEG (Distribution channel)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'VTWEG'.
+  WA_INPUTDATA-VALUE = WA_CE41000_EXTRA-VTWEG.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*SPART (Division)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'SPART'.
+  WA_INPUTDATA-VALUE = WA_CE41000_EXTRA-SPART.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*PRCTR (Profit center)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'PRCTR'.
+  WA_INPUTDATA-VALUE = WA_CE41000_EXTRA-PRCTR.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*EQUNR (Equipment number)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'EQUNR'.
+  WA_INPUTDATA-VALUE = WA_CE41000_EXTRA-EQUNR.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*AUART (Order type)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'AUART'.
+  WA_INPUTDATA-VALUE = WA_CE41000_EXTRA-AUART.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*BEMOT (Acc. assignment category)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'BEMOT'.
+  WA_INPUTDATA-VALUE = WA_CE41000_EXTRA-BEMOT.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*PRODH (Product hierarchy)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'PRODH'.
+  WA_INPUTDATA-VALUE = WA_CE41000_EXTRA-PRODH.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*VKBUR (Sales office)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'VKBUR'.
+  WA_INPUTDATA-VALUE = WA_CE41000_EXTRA-VKBUR.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+**=====================================
+**BRSCH (Industry code)
+**=====================================
+*  CLEAR WA_INPUTDATA.
+*  WA_INPUTDATA-RECORD_ID = '000001'.
+*  WA_INPUTDATA-FIELDNAME = 'BRSCH'.
+*  WA_INPUTDATA-VALUE = WA_CE41000_EXTRA-BRSCH.
+**wa_inputdata-currency = ''.
+*  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+*
+*  CLEAR WA_FIELDLIST.
+*  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+*  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+**-------------------------------------
+
+*=====================================
+*KUNWE (Ship-to party)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'KUNWE'.
+  WA_INPUTDATA-VALUE = WA_CE41000_EXTRA-KUNWE.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*KTGRD (acc.assignment group)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'KTGRD'.
+  WA_INPUTDATA-VALUE = WA_CE41000_EXTRA-KTGRD.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+**=====================================
+**VRTNR (Sales employee)
+**=====================================
+*  CLEAR WA_INPUTDATA.
+*  WA_INPUTDATA-RECORD_ID = '000001'.
+*  WA_INPUTDATA-FIELDNAME = 'VRTNR'.
+*  WA_INPUTDATA-VALUE = WA_CE41000_EXTRA-VRTNR.
+**wa_inputdata-currency = ''.
+*  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+*
+*  CLEAR WA_FIELDLIST.
+*  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+*  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+**-------------------------------------
+
+*=====================================
+*KSTRG (Cost object)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'KSTRG'.
+  WA_INPUTDATA-VALUE = WA_CE41000_EXTRA-KSTRG.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*PPRCTR (Partner profit center)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'PPRCTR'.
+  WA_INPUTDATA-VALUE = WA_CE41000_EXTRA-PPRCTR.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*RKAUFNR (reference service order)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'RKAUFNR'.
+  WA_INPUTDATA-VALUE = WA_CE41000_EXTRA-AUFNR_1.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+
+ENDFORM.                    " add_charac
+*&---------------------------------------------------------------------*
+*&      Form  add_header
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM ADD_HEADER .
+*-------------------------------------
+*HEADER DATA
+*-------------------------------------
+*Record type
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'VRGAR'.
+  WA_INPUTDATA-VALUE = 'A'.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+*-------------------------------------
+*Posting date
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'BUDAT'.
+  WA_INPUTDATA-VALUE = SY-DATUM.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+ENDFORM.                    " add_header
+*&---------------------------------------------------------------------*
+*&      Form  get_pmco
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM GET_PMCO .
+  FREE IT_INSERT_SCHEDUL.
+  CALL FUNCTION 'YSE_CORRECT_YSE_SDI_BELNR1'
+    EXPORTING
+      AUFNR             = WA_CE41000_EXTRA-AUFNR_1
+    TABLES
+      IT_INSERT_SCHEDUL = IT_INSERT_SCHEDUL
+    EXCEPTIONS
+      NOT_FOUND         = 1
+      OTHERS            = 2.
+  IF SY-SUBRC <> 0.
+* MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*         WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+  ENDIF.
+
+ENDFORM.                    " get_pmco
+*&---------------------------------------------------------------------*
+*&      Form  reverse_posting
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM REVERSE_POSTING .
+  FREE: IT_INPUTDATA,
+       IT_FIELDLIST,
+       IT_RETURN.
+*Always 1000
+  V_OPERATINGCONCERN = '1000'.
+  V_TESTRUN = ''.
+
+  PERFORM ADD_HEADER_REVERSE.
+  PERFORM ADD_CHARAC_REVERSE.
+  PERFORM REVERSE_PMCO.
+  PERFORM ADD_PMCO_REVERSE.                                 "5 costs
+
+*Post the COPA document
+  CALL FUNCTION 'BAPI_COPAACTUALS_POSTCOSTDATA'
+    EXPORTING
+      OPERATINGCONCERN = V_OPERATINGCONCERN
+      TESTRUN          = V_TESTRUN
+    TABLES
+      INPUTDATA        = IT_INPUTDATA
+      FIELDLIST        = IT_FIELDLIST
+      RETURN           = IT_RETURN.
+
+
+  IF IT_RETURN[] IS INITIAL.
+
+
+    CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+      EXPORTING
+        WAIT = 'X'.
+* IMPORTING
+*   RETURN        =.
+
+
+    PERFORM GET_BELNR_REVERSE.
+
+  ENDIF.
+
+ENDFORM.                    " reverse_posting
+*&---------------------------------------------------------------------*
+*&      Form  second_posting
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM SECOND_POSTING .
+
+  CLEAR: V_OBJNR_COBRB, WA_COBRB.
+  CONCATENATE 'VB' WA_BELNR1_SECOND_REVERSE-VBELN WA_BELNR1_SECOND_REVERSE-POSNR INTO V_OBJNR_COBRB.
+  SELECT SINGLE * FROM COBRB INTO WA_COBRB
+              WHERE OBJNR EQ V_OBJNR_COBRB AND
+                    PERBZ EQ 'GES'.
+*Period seems to contain zeros ??? so dont select on this
+  IF SY-SUBRC EQ 0.
+    CLEAR WA_CE41000_ACCT.
+    SELECT SINGLE * FROM CE41000_ACCT INTO WA_CE41000_ACCT
+                 WHERE PAOBJNR EQ WA_COBRB-PAOBJNR.   "#EC *
+    IF SY-SUBRC EQ 0.
+      CLEAR WA_CE41000.
+      SELECT SINGLE * FROM CE41000 INTO WA_CE41000
+                     WHERE PAOBJNR EQ WA_CE41000_ACCT-CE4KEY.   "#EC *
+      MOVE-CORRESPONDING WA_CE41000 TO WA_CE41000_EXTRA.
+      MOVE-CORRESPONDING WA_BELNR1_REVERSE TO WA_CE41000_EXTRA.
+      WA_CE41000_EXTRA-AUFNR_1 = WA_BELNR1-AUFNR.
+      WA_CE41000_EXTRA-VBELN = WA_BELNR1-VBELN.
+      WA_CE41000_EXTRA-POSNR = WA_BELNR1-POSNR.
+*          APPEND WA_CE41000_EXTRA TO IT_CE41000_EXTRA.
+      PERFORM SECOND_PART_2.
+    ENDIF.
+  ENDIF.
+
+
+
+ENDFORM.                    " second_posting
+*&---------------------------------------------------------------------*
+*&      Form  add_header_reverse
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM ADD_HEADER_REVERSE .
+*-------------------------------------
+*HEADER DATA
+*-------------------------------------
+*Record type
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'VRGAR'.
+  WA_INPUTDATA-VALUE = 'A'.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+*-------------------------------------
+*Posting date
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'BUDAT'.
+  WA_INPUTDATA-VALUE = SY-DATUM.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+ENDFORM.                    " add_header_reverse
+*&---------------------------------------------------------------------*
+*&      Form  add_charac_reverse
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM ADD_CHARAC_REVERSE .
+*=====================================
+*BUKRS (Company code)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'BUKRS'.
+  WA_INPUTDATA-VALUE = WA_CE11000-BUKRS.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*KAUFN (Sales order number)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'KAUFN'.
+  WA_INPUTDATA-VALUE = WA_CE11000-KAUFN.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*KDPOS (Sales order item)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'KDPOS'.
+  WA_INPUTDATA-VALUE = WA_CE11000-KDPOS.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*PSPNR (Work breakdown structure)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'PSPNR'.
+  WA_INPUTDATA-VALUE = WA_CE11000-PSPNR.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*WW001 (Account type)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'WW001'.
+  WA_INPUTDATA-VALUE = WA_CE11000-WW001.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*WW002 (PLC)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'WW002'.
+  WA_INPUTDATA-VALUE = WA_CE11000-WW002.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*WW003 (Accounting indicator)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'WW003'.
+  WA_INPUTDATA-VALUE = WA_CE11000-WW003.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*WW004 (Contract)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'WW004'.
+  WA_INPUTDATA-VALUE = WA_CE11000-WW004.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*WW005 (Sales document type)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'WW005'.
+  WA_INPUTDATA-VALUE = WA_CE11000-WW005.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*WW006 (GAC)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'WW006'.
+  WA_INPUTDATA-VALUE = WA_CE11000-WW006.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*WW007 (PGC)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'WW007'.
+  WA_INPUTDATA-VALUE = WA_CE11000-WW007.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*WW008 (Sales District)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'WW008'.
+  WA_INPUTDATA-VALUE = WA_CE11000-WW008.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*WW009 (Country Ship-to)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'WW009'.
+  WA_INPUTDATA-VALUE = WA_CE11000-WW009.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*KNDNR (Customer)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'KNDNR'.
+  WA_INPUTDATA-VALUE = WA_CE11000-KNDNR.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*ARTNR (Article)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'ARTNR'.
+  WA_INPUTDATA-VALUE = WA_CE11000-ARTNR.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*FKART (Billing type)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'FKART'.
+  WA_INPUTDATA-VALUE = WA_CE11000-FKART.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*KOKRS (Controlling area)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'KOKRS'.
+  WA_INPUTDATA-VALUE = WA_CE11000-KOKRS.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*WERKS (Plant)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'WERKS'.
+  WA_INPUTDATA-VALUE = WA_CE11000-WERKS.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*GSBER (Business area)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'GSBER'.
+  WA_INPUTDATA-VALUE = WA_CE11000-GSBER.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*VKORG (Sales organisation)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'VKORG'.
+  WA_INPUTDATA-VALUE = WA_CE11000-VKORG.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*VTWEG (Distribution channel)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'VTWEG'.
+  WA_INPUTDATA-VALUE = WA_CE11000-VTWEG.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*SPART (Division)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'SPART'.
+  WA_INPUTDATA-VALUE = WA_CE11000-SPART.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*PRCTR (Profit center)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'PRCTR'.
+  WA_INPUTDATA-VALUE = WA_CE11000-PRCTR.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*EQUNR (Equipment number)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'EQUNR'.
+  WA_INPUTDATA-VALUE = WA_CE11000-EQUNR.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*AUART (Order type)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'AUART'.
+  WA_INPUTDATA-VALUE = WA_CE11000-AUART.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*BEMOT (Acc. assignment category)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'BEMOT'.
+  WA_INPUTDATA-VALUE = WA_CE11000-BEMOT.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*PRODH (Product hierarchy)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'PRODH'.
+  WA_INPUTDATA-VALUE = WA_CE11000-PRODH.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*VKBUR (Sales office)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'VKBUR'.
+  WA_INPUTDATA-VALUE = WA_CE11000-VKBUR.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+**=====================================
+**BRSCH (Industry code)
+**=====================================
+*  CLEAR WA_INPUTDATA.
+*  WA_INPUTDATA-RECORD_ID = '000001'.
+*  WA_INPUTDATA-FIELDNAME = 'BRSCH'.
+*  WA_INPUTDATA-VALUE = WA_CE11000-BRSCH.
+**wa_inputdata-currency = ''.
+*  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+*
+*  CLEAR WA_FIELDLIST.
+*  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+*  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+**-------------------------------------
+
+*=====================================
+*KUNWE (Ship-to party)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'KUNWE'.
+  WA_INPUTDATA-VALUE = WA_CE11000-KUNWE.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*KTGRD (acc.assignment group)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'KTGRD'.
+  WA_INPUTDATA-VALUE = WA_CE11000-KTGRD.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+**=====================================
+**VRTNR (Sales employee)
+**=====================================
+*  CLEAR WA_INPUTDATA.
+*  WA_INPUTDATA-RECORD_ID = '000001'.
+*  WA_INPUTDATA-FIELDNAME = 'VRTNR'.
+*  WA_INPUTDATA-VALUE = WA_CE11000-VRTNR.
+**wa_inputdata-currency = ''.
+*  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+*
+*  CLEAR WA_FIELDLIST.
+*  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+*  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+**-------------------------------------
+
+*=====================================
+*KSTRG (Cost object)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'KSTRG'.
+  WA_INPUTDATA-VALUE = WA_CE11000-KSTRG.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*PPRCTR (Partner profit center)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'PPRCTR'.
+  WA_INPUTDATA-VALUE = WA_CE11000-PPRCTR.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*-------------------------------------
+*=====================================
+*RKAUFN (Order number)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'RKAUFNR'.
+  WA_INPUTDATA-VALUE = WA_CE11000-RKAUFNR.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*RBELN (reference copa doc)
+*=====================================
+
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'RBELN'.
+  WA_INPUTDATA-VALUE = WA_CE11000-BELNR.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*=====================================
+*RPOSN (reference copa doc item)
+*=====================================
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'RPOSN'.
+  WA_INPUTDATA-VALUE = WA_CE11000-POSNR. "??????
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+
+
+ENDFORM.                    " add_charac_reverse
+*&---------------------------------------------------------------------*
+*&      Form  reverse_pmco
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM REVERSE_PMCO .
+
+  IF NOT WA_CE11000-VV200 IS INITIAL.
+    WA_CE11000-VV200 = - WA_CE11000-VV200.
+  ENDIF.
+
+  IF NOT WA_CE11000-VV300 IS INITIAL.
+    WA_CE11000-VV300 = - WA_CE11000-VV300.
+  ENDIF.
+
+  IF NOT WA_CE11000-VV400 IS INITIAL.
+    WA_CE11000-VV400 = - WA_CE11000-VV400.
+  ENDIF.
+
+  IF NOT WA_CE11000-VV500 IS INITIAL.
+    WA_CE11000-VV500 = - WA_CE11000-VV500.
+  ENDIF.
+
+  IF NOT WA_CE11000-VV600 IS INITIAL.
+    WA_CE11000-VV600 = - WA_CE11000-VV600.
+  ENDIF.
+
+*----------------------------------------------------
+
+ENDFORM.                    " reverse_pmco
+*&---------------------------------------------------------------------*
+*&      Form  add_pmco_reverse
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM ADD_PMCO_REVERSE .
+
+*-------------------------------------
+*Parts (ZEKP)
+  IF NOT WA_CE11000-VV200 IS INITIAL.
+    CLEAR WA_INPUTDATA.
+    WA_INPUTDATA-RECORD_ID = '000001'.
+    WA_INPUTDATA-FIELDNAME = 'VV200'.
+
+    WRITE WA_CE11000-VV200 TO WA_INPUTDATA-VALUE LEFT-JUSTIFIED.   "#EC *
+    REPLACE ALL OCCURRENCES OF '.' IN WA_INPUTDATA-VALUE WITH SPACE.
+    CONDENSE WA_INPUTDATA-VALUE.
+
+*    WA_INPUTDATA-VALUE = WA_CE11000-VV200.
+    WA_INPUTDATA-CURRENCY = WA_CE11000-REC_WAERS.
+    APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+    CLEAR WA_FIELDLIST.
+    WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+    APPEND WA_FIELDLIST TO IT_FIELDLIST.
+  ENDIF.
+*-------------------------------------
+
+*-------------------------------------
+*Labour (ZEKL)
+  IF NOT WA_CE11000-VV300 IS INITIAL.
+    CLEAR WA_INPUTDATA.
+    WA_INPUTDATA-RECORD_ID = '000001'.
+    WA_INPUTDATA-FIELDNAME = 'VV300'.
+
+    WRITE WA_CE11000-VV300 TO WA_INPUTDATA-VALUE LEFT-JUSTIFIED.   "#EC *
+    REPLACE ALL OCCURRENCES OF '.' IN WA_INPUTDATA-VALUE WITH SPACE.
+    CONDENSE WA_INPUTDATA-VALUE.
+
+*    WA_INPUTDATA-VALUE = WA_CE11000-VV300.
+    WA_INPUTDATA-CURRENCY = WA_CE11000-REC_WAERS.
+    APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+    CLEAR WA_FIELDLIST.
+    WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+    APPEND WA_FIELDLIST TO IT_FIELDLIST.
+  ENDIF.
+*-------------------------------------
+
+*-------------------------------------
+*Mileage (ZEKD)
+  IF NOT WA_CE11000-VV400 IS INITIAL.
+    CLEAR WA_INPUTDATA.
+    WA_INPUTDATA-RECORD_ID = '000001'.
+    WA_INPUTDATA-FIELDNAME = 'VV400'.
+
+    WRITE WA_CE11000-VV400 TO WA_INPUTDATA-VALUE LEFT-JUSTIFIED.    "#EC *
+    REPLACE ALL OCCURRENCES OF '.' IN WA_INPUTDATA-VALUE WITH SPACE.
+    CONDENSE WA_INPUTDATA-VALUE.
+
+*    WA_INPUTDATA-VALUE = WA_CE11000-VV400.
+    WA_INPUTDATA-CURRENCY = WA_CE11000-REC_WAERS.
+    APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+    CLEAR WA_FIELDLIST.
+    WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+    APPEND WA_FIELDLIST TO IT_FIELDLIST.
+  ENDIF.
+*-------------------------------------
+
+*-------------------------------------
+*Subcontracting (ZEKS)
+  IF NOT WA_CE11000-VV500 IS INITIAL.
+    CLEAR WA_INPUTDATA.
+    WA_INPUTDATA-RECORD_ID = '000001'.
+    WA_INPUTDATA-FIELDNAME = 'VV500'.
+
+    WRITE WA_CE11000-VV500 TO WA_INPUTDATA-VALUE LEFT-JUSTIFIED.     "#EC *
+    REPLACE ALL OCCURRENCES OF '.' IN WA_INPUTDATA-VALUE WITH SPACE.
+    CONDENSE WA_INPUTDATA-VALUE.
+
+*    WA_INPUTDATA-VALUE = WA_CE11000-VV500.
+    WA_INPUTDATA-CURRENCY = WA_CE11000-REC_WAERS.
+    APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+    CLEAR WA_FIELDLIST.
+    WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+    APPEND WA_FIELDLIST TO IT_FIELDLIST.
+  ENDIF.
+*-------------------------------------
+
+*-------------------------------------
+*Ad hoc expenses (ZEKO)
+  IF NOT WA_CE11000-VV600 IS INITIAL.
+    CLEAR WA_INPUTDATA.
+    WA_INPUTDATA-RECORD_ID = '000001'.
+    WA_INPUTDATA-FIELDNAME = 'VV600'.
+
+    WRITE WA_CE11000-VV600 TO WA_INPUTDATA-VALUE LEFT-JUSTIFIED.    "#EC *
+    REPLACE ALL OCCURRENCES OF '.' IN WA_INPUTDATA-VALUE WITH SPACE.
+    CONDENSE WA_INPUTDATA-VALUE.
+
+
+*    WA_INPUTDATA-VALUE = WA_CE11000-VV600.
+    WA_INPUTDATA-CURRENCY = WA_CE11000-REC_WAERS.
+    APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+    CLEAR WA_FIELDLIST.
+    WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+    APPEND WA_FIELDLIST TO IT_FIELDLIST.
+  ENDIF.
+*-------------------------------------
+
+ENDFORM.                    " add_pmco_reverse
+*&---------------------------------------------------------------------*
+*&      Form  test
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM TEST .
+*Always 1000
+  V_OPERATINGCONCERN = '1000'.
+
+*Record type
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'BELNR'.
+  WA_INPUTDATA-VALUE = ''.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*Record type
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'POSNR'.
+  WA_INPUTDATA-VALUE = ''.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+
+*-------------------------------------
+*Record type
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'VRGAR'.
+  WA_INPUTDATA-VALUE = 'A'.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+
+*-------------------------------------
+*Posting date
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'BUDAT'.
+  WA_INPUTDATA-VALUE = SY-DATUM.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*-------------------------------------
+*Company code
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'BUKRS'.
+  WA_INPUTDATA-VALUE = 'POLA'.
+*wa_inputdata-currency = ''.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*-------------------------------------
+*Parts (ZEKP)
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'VV200'.
+  WA_INPUTDATA-VALUE = '234.50'.
+  WA_INPUTDATA-CURRENCY = 'PLN'.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*-------------------------------------
+*Labour (ZEKL)
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'VV300'.
+  WA_INPUTDATA-VALUE = '234.50'.
+  WA_INPUTDATA-CURRENCY = 'PLN'.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*-------------------------------------
+*Mileage (ZEKD)
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'VV400'.
+  WA_INPUTDATA-VALUE = '234.50'.
+  WA_INPUTDATA-CURRENCY = 'PLN'.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*-------------------------------------
+*Subcontracting (ZEKS)
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'VV500'.
+  WA_INPUTDATA-VALUE = '234.50'.
+  WA_INPUTDATA-CURRENCY = 'PLN'.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+*-------------------------------------
+*Ad hoc expenses (ZEKO)
+  CLEAR WA_INPUTDATA.
+  WA_INPUTDATA-RECORD_ID = '000001'.
+  WA_INPUTDATA-FIELDNAME = 'VV600'.
+  WA_INPUTDATA-VALUE = '234.50'.
+  WA_INPUTDATA-CURRENCY = 'PLN'.
+  APPEND WA_INPUTDATA TO IT_INPUTDATA.
+
+  CLEAR WA_FIELDLIST.
+  WA_FIELDLIST-FIELDNAME = WA_INPUTDATA-FIELDNAME.
+  APPEND WA_FIELDLIST TO IT_FIELDLIST.
+*-------------------------------------
+
+
+*Lets try this function
+  CALL FUNCTION 'BAPI_COPAACTUALS_POSTCOSTDATA'
+    EXPORTING
+      OPERATINGCONCERN = V_OPERATINGCONCERN
+      TESTRUN          = V_TESTRUN
+    TABLES
+      INPUTDATA        = IT_INPUTDATA
+      FIELDLIST        = IT_FIELDLIST
+      RETURN           = IT_RETURN.
+
+
+  CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+    EXPORTING
+      WAIT = 'X'.
+* IMPORTING
+*   RETURN        =.
+
+
+
+
+ENDFORM.                    " test
+*&---------------------------------------------------------------------*
+*&      Form  get_belnr
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM GET_BELNR .
+  CLEAR V_BELNR.
+  SELECT MAX( BELNR ) FROM CE11000 INTO V_BELNR
+                 WHERE RKAUFNR EQ WA_BELNR1-AUFNR.
+  IF SY-SUBRC EQ 0.
+    MOVE-CORRESPONDING WA_BELNR1 TO WA_BELNR1_FIRST.
+    WA_BELNR1_FIRST-BELNR1 = V_BELNR.
+    WA_BELNR1_FIRST-CHANGED = ''.
+    APPEND WA_BELNR1_FIRST TO IT_BELNR1_FIRST.
+    APPEND WA_BELNR1 TO IT_BELNR1_FIRST_DEL.
+  ENDIF.
+
+*free it_Ce11000.
+*select * from ce11000 into table it_ce11000
+*                      where rkaufnr eq wa_belnr1-aufnr and
+*                            hzdat eq sy-datum.
+
+ENDFORM.                    " get_belnr
+*&---------------------------------------------------------------------*
+*&      Form  get_belnr_reverse
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM GET_BELNR_REVERSE .
+  CLEAR V_BELNR.
+  SELECT MAX( BELNR ) FROM CE11000 INTO V_BELNR
+                 WHERE RKAUFNR EQ WA_BELNR1-AUFNR.
+  IF SY-SUBRC EQ 0.
+    MOVE-CORRESPONDING WA_BELNR1 TO WA_BELNR1_SECOND_REVERSE.
+    WA_BELNR1_SECOND_REVERSE-BELNR2 = V_BELNR.
+    WA_BELNR1_SECOND_REVERSE-CHANGED = ''.
+    APPEND WA_BELNR1_SECOND_REVERSE TO IT_BELNR1_SECOND_REVERSE.
+
+  ENDIF.
+
+*free it_Ce11000.
+*select * from ce11000 into table it_ce11000
+*                      where rkaufnr eq wa_belnr1-aufnr and
+*                            hzdat eq sy-datum.
+
+ENDFORM.                    " get_belnr_reverse
+*&---------------------------------------------------------------------*
+*&      Form  second_part_2
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM SECOND_PART_2 .
+  FREE: IT_INPUTDATA,
+       IT_FIELDLIST,
+       IT_RETURN.
+
+
+*Always 1000
+  V_OPERATINGCONCERN = '1000'.
+  V_TESTRUN = ''.
+
+  PERFORM ADD_HEADER.
+  PERFORM ADD_CHARAC.   "from CE41 segment
+  PERFORM GET_PMCO.                                         "5 costs
+  PERFORM ADD_PMCO.                                         "5 costs
+
+*Post the COPA document
+  CALL FUNCTION 'BAPI_COPAACTUALS_POSTCOSTDATA'
+    EXPORTING
+      OPERATINGCONCERN = V_OPERATINGCONCERN
+      TESTRUN          = V_TESTRUN
+    TABLES
+      INPUTDATA        = IT_INPUTDATA
+      FIELDLIST        = IT_FIELDLIST
+      RETURN           = IT_RETURN.
+
+  IF IT_RETURN[] IS INITIAL.
+
+
+    CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+      EXPORTING
+        WAIT = 'X'.
+* IMPORTING
+*   RETURN        =.
+
+    PERFORM GET_BELNR_REVERSE_INIT.
+
+  ENDIF.
+
+ENDFORM.                    " second_part_2
+*&---------------------------------------------------------------------*
+*&      Form  GET_BELNR_reverse_init
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM GET_BELNR_REVERSE_INIT .
+  CLEAR V_BELNR.
+  SELECT MAX( BELNR ) FROM CE11000 INTO V_BELNR
+                 WHERE RKAUFNR EQ WA_BELNR1_SECOND_REVERSE-AUFNR.
+  IF SY-SUBRC EQ 0.
+    CLEAR WA_BELNR1_SECOND_INIT.
+    MOVE-CORRESPONDING WA_BELNR1_SECOND_REVERSE TO WA_BELNR1_SECOND_INIT.
+    WA_BELNR1_SECOND_INIT-BELNR1 = V_BELNR.
+    WA_BELNR1_SECOND_INIT-CHANGED = ''.
+    CLEAR WA_BELNR1_SECOND_INIT-BELNR2.
+    APPEND WA_BELNR1_SECOND_INIT TO IT_BELNR1_SECOND_INIT.
+  ENDIF.
+
+*free it_Ce11000.
+*select * from ce11000 into table it_ce11000
+*                      where rkaufnr eq wa_belnr1-aufnr and
+*                            hzdat eq sy-datum.
+
+ENDFORM.                    " GET_BELNR_reverse_init
+
+*Selection text£º
+*P_AUFNR:        Order number

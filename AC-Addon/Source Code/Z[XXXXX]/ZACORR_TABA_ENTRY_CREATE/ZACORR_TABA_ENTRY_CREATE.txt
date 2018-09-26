@@ -1,0 +1,416 @@
+*&---------------------------------------------------------------------*
+*& Report  ZACORR_TABA_ENTRY_CREATE                                    *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+*&                                                                     *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+REPORT zacorr_taba_entry_create .
+selection-screen comment 1(60) BUKRS.
+PARAMETERS: p_bukrs TYPE t093d-bukrs OBLIGATORY.
+
+SELECTION-SCREEN SKIP 1.
+selection-screen comment 1(60) test.
+parameters: p_test  default 'X'.
+DATA: ld_previous_fiscal_year TYPE t093d-afblgj.
+DATA: lt_t093b TYPE t093b OCCURS 0.
+DATA: ls_t093b TYPE t093b.
+DATA: ls_t001 TYPE t001.
+DATA: ld_anzbp LIKE  t009-anzbp.
+DATA: lt_taba TYPE taba OCCURS 0.
+DATA: ls_taba TYPE taba.
+DATA: ld_new_documentnumber TYPE taba-blnrt.
+DATA: hlp_new_documentnumber TYPE taba-blnrt.
+DATA: ls_t093c TYPE t093c.
+DATA: ld_nkrs_act TYPE nriv.
+DATA: ls_t003 TYPE t003.
+
+
+initialization.
+move 'Company Code:' to BUKRs.
+move 'Test Option:' to TEST.
+start-of-selection.
+
+* check last closed fiscal year.
+SELECT * FROM t093b INTO TABLE lt_t093b WHERE bukrs = p_bukrs.
+IF sy-subrc = 0.
+  LOOP AT lt_t093b INTO ls_t093b.
+    if ld_previous_fiscal_year is initial.
+       ld_previous_fiscal_year = ls_t093b-abgja.
+    endif.
+    if ld_previous_fiscal_year <> ls_t093b-abgja.
+       write:/ 'The last closed fiscal years differ for different'.
+       write:  'depreciation areas in company code', p_bukrs.
+       write:/ 'No repair possible, close the fiscal years in all'.
+       write: 'depreciation areas'.
+       stop.
+    endif.
+  ENDLOOP.
+ELSE.
+  WRITE:/ 'error with T093B and company code',p_bukrs.
+  STOP.
+ENDIF.
+
+
+* Determine number of periods
+* Determine fiscal year variant for FI posting
+ls_t001-bukrs = p_bukrs.
+CALL FUNCTION 'T001_READ_FIAA'
+     CHANGING
+          f_t001    = ls_t001
+     EXCEPTIONS
+          not_found = 1
+          OTHERS    = 2.
+IF sy-subrc <> 0.
+  WRITE:/ 'error with table T001 and company code', p_bukrs.
+  STOP.
+ENDIF.
+
+CALL FUNCTION 'GET_ACCOUNT_OF_PERIODS'
+  EXPORTING
+    i_gjahr              = ld_previous_fiscal_year
+*   I_MONMIT             = 00
+    i_periv              = ls_t001-periv
+  IMPORTING
+    e_anzbuper           = ld_anzbp
+  EXCEPTIONS
+    input_false          = 1
+    t009b_notfound       = 2
+    t009_notfound        = 3
+    OTHERS               = 4
+          .
+IF sy-subrc <> 0.
+  WRITE:/'error with Get_account_of_periods, fiscal year and variant',
+  ld_previous_fiscal_year, ls_t001-periv.
+  STOP.
+ENDIF.
+
+* Determine new document number
+* Determine taba entry with last fiscal year and period
+SELECT * FROM taba INTO TABLE lt_taba WHERE bukrs = p_bukrs ORDER BY
+                                            afblgj DESCENDING
+                                            afblpe DESCENDING
+                                            afbanz descending.
+* Check first, if entry for last period  for previous required year
+* exists
+* Then no new entry is needed.
+if sy-subrc = 0.
+   Loop at lt_taba into ls_taba where bukrs = p_bukrs
+                                  and afblgj =  ld_previous_fiscal_year
+                                  and afblpe >= ld_anzbp.
+      exit.
+   endloop.
+
+  IF sy-subrc = 0.
+*    entry exists already, no entry may be created
+     WRITE:/ 'No TABA entry may be created,'.
+     WRITE:/ 'Entry exists already for', p_bukrs.
+     WRITE:  ld_previous_fiscal_year.
+     STOP.
+   ENDIF.
+endif.
+
+READ TABLE lt_taba INDEX 1 INTO ls_taba.
+*  if there are already posting runs
+*  take document number from last posting run
+IF sy-subrc = 0.
+   IF ls_taba-xbukz = 'X' OR ls_taba-xbukz = ' '.
+      hlp_new_documentnumber =  ls_taba-blnrt + 1.
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+           EXPORTING
+                input  = hlp_new_documentnumber
+           IMPORTING
+                output = ld_new_documentnumber.
+   ELSEIF ls_taba-xbukz = 'N'.
+      ld_new_documentnumber = ls_taba-blnrf.
+   ELSE.
+      WRITE:/'Automatic repair not possible'.
+      STOP.
+   ENDIF.
+* if no documents are posted yet, take new document number from NRIV
+ELSE.
+  CALL FUNCTION 'T093C_READ'
+    EXPORTING
+      i_bukrs           = p_bukrs
+*        I_PBO_CHECK       = ' '
+    IMPORTING
+      f_t093c           = ls_t093c
+    EXCEPTIONS
+      not_found         = 1
+      OTHERS            = 2
+            .
+  IF sy-subrc = 0.
+    SELECT SINGLE * FROM t003 INTO ls_t003
+                         WHERE blart EQ ls_t093c-afblrt.
+    IF sy-subrc NE 0.
+      MESSAGE e737(aa) WITH ls_t093c-afblrt.
+*           Belegart nicht definiert
+    ENDIF.
+    CALL FUNCTION 'NUMBER_GET_INFO'
+         EXPORTING
+              nr_range_nr        = ls_t003-numkr
+              object             = 'RF_BELEG'
+              subobject          = p_bukrs
+              toyear             = ld_previous_fiscal_year
+         IMPORTING
+              interval           = ld_nkrs_act
+         EXCEPTIONS
+              interval_not_found = 1
+              object_not_found   = 2
+              OTHERS             = 3.
+    IF sy-subrc = 0. "'NUMBER_GET_INFO'
+*       To act like RABUCH take fromnumber
+*       and add 1 for the very first run.
+      hlp_new_documentnumber = ld_nkrs_act-fromnumber + 1.
+
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+           EXPORTING
+                input  = hlp_new_documentnumber
+           IMPORTING
+                output = ld_new_documentnumber.
+    ELSE.
+      WRITE:/ 'automatic repair not possible' .
+      WRITE:  'number_Get_info problem'.
+      STOP.
+    ENDIF.  " sy-subrc = 0. at 'NUMBER_GET_INFO'
+  ELSE.
+    WRITE:/ 'Automatic repair not possible, error with'.
+    WRITE:  'T093c, company code', p_bukrs.
+    STOP.
+  ENDIF. "'T093C_READ'
+ENDIF.
+
+*   TABA update
+ls_taba-bukrs  = p_bukrs.
+ls_taba-afblgj = ld_previous_fiscal_year.
+ls_taba-afblpe = ld_anzbp.
+ls_taba-afbanz = '01'.
+ls_taba-blnrf  = ld_new_documentnumber.
+ls_taba-blnrt  = ld_new_documentnumber.
+ls_taba-xbukz  = 'N'.
+if p_test is initial.
+   INSERT taba FROM ls_taba.
+   IF sy-subrc = 0.
+      WRITE:/ 'TABA entry successfully inserted:'.
+   else.
+      write:/ 'TABA insert failed'.
+   endif.
+else.
+   write:/ 'TABA entry would be created:'.
+endif.
+   WRITE:/ ls_taba-bukrs, ls_taba-afblgj, ls_taba-afblpe,
+           ls_taba-afbanz, ls_taba-blnrf, ls_taba-blnrt,
+           ls_taba-xbukz.
+
+*     T093D updaten
+if p_test is initial.
+   UPDATE t093d SET afblpe = ld_anzbp
+                    afblgj = ld_previous_fiscal_year
+                WHERE bukrs = p_bukrs.
+  IF sy-subrc = 0.
+    WRITE:/ 'T093d update successfully for company code', p_bukrs.
+  ELSE.
+    WRITE:/'T093D update failed for company code', p_bukrs.
+  ENDIF.
+ELSE.
+   write:/ 'T093D update would be created:'.
+ENDIF.
+write:/ 'company code', p_bukrs, 'period of last run', ld_anzbp.
+write: 'year of last run', ld_previous_fiscal_year.
+COMMIT WORK.
+
+
+initialization.
+move 'Company Code:' to BUKRs.
+move 'Test Option:' to TEST.
+start-of-selection.
+
+* check last closed fiscal year.
+SELECT * FROM t093b INTO TABLE lt_t093b WHERE bukrs = p_bukrs.
+IF sy-subrc = 0.
+  LOOP AT lt_t093b INTO ls_t093b.
+    if ld_previous_fiscal_year is initial.
+       ld_previous_fiscal_year = ls_t093b-abgja.
+    endif.
+    if ld_previous_fiscal_year <> ls_t093b-abgja.
+       write:/ 'The last closed fiscal years differ for different'.
+       write:  'depreciation areas in company code', p_bukrs.
+       write:/ 'No repair possible, close the fiscal years in all'.
+       write: 'depreciation areas'.
+       stop.
+    endif.
+  ENDLOOP.
+ELSE.
+  WRITE:/ 'error with T093B and company code',p_bukrs.
+  STOP.
+ENDIF.
+
+
+* Determine number of periods
+* Determine fiscal year variant for FI posting
+ls_t001-bukrs = p_bukrs.
+CALL FUNCTION 'T001_READ_FIAA'
+     CHANGING
+          f_t001    = ls_t001
+     EXCEPTIONS
+          not_found = 1
+          OTHERS    = 2.
+IF sy-subrc <> 0.
+  WRITE:/ 'error with table T001 and company code', p_bukrs.
+  STOP.
+ENDIF.
+
+CALL FUNCTION 'GET_ACCOUNT_OF_PERIODS'
+  EXPORTING
+    i_gjahr              = ld_previous_fiscal_year
+*   I_MONMIT             = 00
+    i_periv              = ls_t001-periv
+  IMPORTING
+    e_anzbuper           = ld_anzbp
+  EXCEPTIONS
+    input_false          = 1
+    t009b_notfound       = 2
+    t009_notfound        = 3
+    OTHERS               = 4
+          .
+IF sy-subrc <> 0.
+  WRITE:/'error with Get_account_of_periods, fiscal year and variant',
+  ld_previous_fiscal_year, ls_t001-periv.
+  STOP.
+ENDIF.
+
+* Determine new document number
+* Determine taba entry with last fiscal year and period
+SELECT * FROM taba INTO TABLE lt_taba WHERE bukrs = p_bukrs ORDER BY
+                                            afblgj DESCENDING
+                                            afblpe DESCENDING
+                                            afbanz descending.
+* Check first, if entry for last period  for previous required year
+* exists
+* Then no new entry is needed.
+if sy-subrc = 0.
+   Loop at lt_taba into ls_taba where bukrs = p_bukrs
+                                  and afblgj =  ld_previous_fiscal_year
+                                  and afblpe >= ld_anzbp.
+      exit.
+   endloop.
+
+  IF sy-subrc = 0.
+*    entry exists already, no entry may be created
+     WRITE:/ 'No TABA entry may be created,'.
+     WRITE:/ 'Entry exists already for', p_bukrs.
+     WRITE:  ld_previous_fiscal_year.
+     STOP.
+   ENDIF.
+endif.
+
+READ TABLE lt_taba INDEX 1 INTO ls_taba.
+*  if there are already posting runs
+*  take document number from last posting run
+IF sy-subrc = 0.
+   IF ls_taba-xbukz = 'X' OR ls_taba-xbukz = ' '.
+      hlp_new_documentnumber =  ls_taba-blnrt + 1.
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+           EXPORTING
+                input  = hlp_new_documentnumber
+           IMPORTING
+                output = ld_new_documentnumber.
+   ELSEIF ls_taba-xbukz = 'N'.
+      ld_new_documentnumber = ls_taba-blnrf.
+   ELSE.
+      WRITE:/'Automatic repair not possible'.
+      STOP.
+   ENDIF.
+* if no documents are posted yet, take new document number from NRIV
+ELSE.
+  CALL FUNCTION 'T093C_READ'
+    EXPORTING
+      i_bukrs           = p_bukrs
+*        I_PBO_CHECK       = ' '
+    IMPORTING
+      f_t093c           = ls_t093c
+    EXCEPTIONS
+      not_found         = 1
+      OTHERS            = 2
+            .
+  IF sy-subrc = 0.
+    SELECT SINGLE * FROM t003 INTO ls_t003
+                         WHERE blart EQ ls_t093c-afblrt.
+    IF sy-subrc NE 0.
+      MESSAGE e737(aa) WITH ls_t093c-afblrt.
+*           Belegart nicht definiert
+    ENDIF.
+    CALL FUNCTION 'NUMBER_GET_INFO'
+         EXPORTING
+              nr_range_nr        = ls_t003-numkr
+              object             = 'RF_BELEG'
+              subobject          = p_bukrs
+              toyear             = ld_previous_fiscal_year
+         IMPORTING
+              interval           = ld_nkrs_act
+         EXCEPTIONS
+              interval_not_found = 1
+              object_not_found   = 2
+              OTHERS             = 3.
+    IF sy-subrc = 0. "'NUMBER_GET_INFO'
+*       To act like RABUCH take fromnumber
+*       and add 1 for the very first run.
+      hlp_new_documentnumber = ld_nkrs_act-fromnumber + 1.
+
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+           EXPORTING
+                input  = hlp_new_documentnumber
+           IMPORTING
+                output = ld_new_documentnumber.
+    ELSE.
+      WRITE:/ 'automatic repair not possible' .
+      WRITE:  'number_Get_info problem'.
+      STOP.
+    ENDIF.  " sy-subrc = 0. at 'NUMBER_GET_INFO'
+  ELSE.
+    WRITE:/ 'Automatic repair not possible, error with'.
+    WRITE:  'T093c, company code', p_bukrs.
+    STOP.
+  ENDIF. "'T093C_READ'
+ENDIF.
+
+*   TABA update
+ls_taba-bukrs  = p_bukrs.
+ls_taba-afblgj = ld_previous_fiscal_year.
+ls_taba-afblpe = ld_anzbp.
+ls_taba-afbanz = '01'.
+ls_taba-blnrf  = ld_new_documentnumber.
+ls_taba-blnrt  = ld_new_documentnumber.
+ls_taba-xbukz  = 'N'.
+if p_test is initial.
+   INSERT taba FROM ls_taba.
+   IF sy-subrc = 0.
+      WRITE:/ 'TABA entry successfully inserted:'.
+   else.
+      write:/ 'TABA insert failed'.
+   endif.
+else.
+   write:/ 'TABA entry would be created:'.
+endif.
+   WRITE:/ ls_taba-bukrs, ls_taba-afblgj, ls_taba-afblpe,
+           ls_taba-afbanz, ls_taba-blnrf, ls_taba-blnrt,
+           ls_taba-xbukz.
+
+*     T093D updaten
+if p_test is initial.
+   UPDATE t093d SET afblpe = ld_anzbp
+                    afblgj = ld_previous_fiscal_year
+                WHERE bukrs = p_bukrs.
+  IF sy-subrc = 0.
+    WRITE:/ 'T093d update successfully for company code', p_bukrs.
+  ELSE.
+    WRITE:/'T093D update failed for company code', p_bukrs.
+  ENDIF.
+ELSE.
+   write:/ 'T093D update would be created:'.
+ENDIF.
+write:/ 'company code', p_bukrs, 'period of last run', ld_anzbp.
+write: 'year of last run', ld_previous_fiscal_year.
+COMMIT WORK.
+
+

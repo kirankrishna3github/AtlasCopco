@@ -1,0 +1,1609 @@
+*----------------------------------------------------------------------*
+***INCLUDE YSE_SDMM_SURPLUS_F01.
+*----------------------------------------------------------------------*
+
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_MATERIALS
+*&---------------------------------------------------------------------*
+FORM select_materials.
+
+* Get all material according to selection options
+  SELECT DISTINCT
+              mara~matnr mara~mtart mara~matkl marc~mmsta mara~meins
+              mara~prdha makt~maktx marc~werks marc~dismm marc~maxlz
+              mard~lgort marc~eisbe mard~labst mard~einme mard~insme
+              mard~speme mard~retme mard~umlme mard~klabs mard~keinm
+              mard~kinsm mard~kspem eord~lifnr mara~brgew mara~gewei
+         INTO TABLE gt_mara
+         FROM mara
+        INNER JOIN makt
+           ON mara~matnr EQ makt~matnr
+        INNER JOIN marc
+           ON mara~matnr EQ marc~matnr
+        INNER JOIN mard
+           ON mara~matnr EQ mard~matnr
+          AND marc~werks EQ mard~werks
+        INNER JOIN eord
+           ON marc~matnr EQ eord~matnr
+          AND marc~werks EQ eord~werks
+        WHERE mara~lvorm EQ space        " NO MAT FLAG FOR DELETION
+          AND mara~prdha IN gr_prdha
+*** MOD-008 * begin ***mod**
+*          AND marc~werks IN so_werks
+          AND marc~werks IN gr_werks[]
+*** MOD-008 * end ***mod**
+          AND makt~spras EQ 'E'
+*** MOD-009 * begin ***mod**
+*          AND mard~lgort IN so_lgort
+          AND mard~lgort IN gr_lgort
+*** MOD-009 * begin ***mod**
+          AND eord~lifnr IN so_lifnr
+          AND eord~flifn EQ 'X'
+          AND mara~matnr IN so_matnr.
+
+  SORT gt_mara BY matnr werks lgort.
+
+* Select special stock with customer when StLoc is part of the selection
+*** MOD-009 * begin ***mod**
+*  IF '1000' IN so_lgort.
+  IF '1000' IN gr_lgort.
+*** MOD-009 * begin ***mod**
+    SELECT      matnr werks SUM( kulab )
+           FROM msku
+           INTO TABLE it_msku
+          WHERE matnr IN so_matnr
+*** MOD-008 * begin ***mod**
+*            AND werks IN so_werks
+            AND werks IN  gr_werks[]
+*** MOD-008 * end ***mod**
+            AND sobkz  = 'W'
+          GROUP BY matnr werks.
+    SORT it_msku BY matnr werks.
+  ENDIF.
+
+ENDFORM.                    " SELECT_MATERIALS
+
+*&---------------------------------------------------------------------*
+*&      Form  PROCESS_DATA
+*&---------------------------------------------------------------------*
+FORM process_data.
+***Begin of mod-008 insert
+  DATA: lflg_continue TYPE char1.
+***End of mod-008 insert
+  SORT gt_allocs  BY matnr werks lgort.
+
+* Process selected materials
+  LOOP AT gt_mara ASSIGNING <fs_mara>.
+***Begin of mod-008 insert
+    CLEAR: lflg_continue.
+***End of mod-008 insert
+*   Copy material details to output table
+    CLEAR gt_mat_surplus.
+    MOVE-CORRESPONDING <fs_mara> TO gt_mat_surplus.
+
+*   Split prdha to GAC and PGC
+    gt_mat_surplus-gac = <fs_mara>-prdha(4).
+    gt_mat_surplus-pgc = <fs_mara>-prdha+4(4).
+
+*** MOD-005 * begin ***
+*   Derivation of PLC
+    IF NOT p_vkorg IS INITIAL.
+      gv_vkorg = p_vkorg.
+    ELSE.
+      CLEAR gt_t001w.
+      READ TABLE gt_t001w WITH KEY werks = <fs_mara>-werks.
+      gv_vkorg = gt_t001w-vkorg.
+    ENDIF.
+    SELECT SINGLE prodh INTO gv_prodh
+           FROM mvke
+           WHERE matnr = <fs_mara>-matnr
+             AND vkorg = gv_vkorg
+             AND vtweg = '01'.
+
+    IF sy-subrc = 0.
+      SELECT SINGLE b~segment INTO gv_plc_temp
+             FROM yse_prctr_deriv AS p
+             INNER JOIN yse_prctr_bl AS b
+                   ON b~prctr = p~prctr
+                 WHERE p~vtweg = '01'
+                   AND p~pgc   = gv_prodh+4(4).
+
+      LOOP AT it_plc WHERE sour1_from LE gv_plc_temp
+                       AND sour1_to   GE gv_plc_temp
+                       AND valid_from LE sy-datum.
+        gt_mat_surplus-plc = it_plc-target1.
+      ENDLOOP.
+    ENDIF.
+*** MOD-005 * end ***
+
+*   Get material group description
+    READ TABLE gt_mat_grp_descr WITH KEY matkl = gt_mat_surplus-matkl
+                                BINARY SEARCH.
+    IF sy-subrc EQ 0.
+      gt_mat_surplus-wgbez = gt_mat_grp_descr-wgbez.
+    ENDIF.
+
+*   Get MRP description
+    READ TABLE gt_mrp_descr WITH KEY dismm = gt_mat_surplus-dismm
+                            BINARY SEARCH.
+    IF sy-subrc EQ 0.
+      gt_mat_surplus-dibez = gt_mrp_descr-dibez.
+    ENDIF.
+
+*   Get material status description
+    READ TABLE gt_mat_stat_descr WITH KEY mmsta = gt_mat_surplus-mmsta
+                                 BINARY SEARCH.
+    IF sy-subrc EQ 0.
+      gt_mat_surplus-mtstb = gt_mat_stat_descr-mtstb.
+    ENDIF.
+
+*   Calculate own stock.
+    gt_mat_surplus-stock_own = <fs_mara>-labst +
+                               <fs_mara>-einme +
+                               <fs_mara>-insme +
+                               <fs_mara>-speme +
+                               <fs_mara>-retme +
+                               <fs_mara>-umlme.
+
+*   Standard price
+    READ TABLE it_t001w WITH KEY werks = gt_mat_surplus-werks
+                        BINARY SEARCH.
+    IF sy-subrc EQ 0.
+      READ TABLE gt_price WITH KEY matnr = gt_mat_surplus-matnr
+                                   bwkey = it_t001w-bwkey
+                          BINARY SEARCH.
+      IF sy-subrc EQ 0.
+        gt_mat_surplus-stprs = gt_price-stprs / gt_price-peinh.
+        gt_mat_surplus-verpr = gt_price-verpr / gt_price-peinh. "MOD-004
+      ENDIF.
+    ENDIF.
+
+*   Calculate own stock value.
+    gt_mat_surplus-stock_ownval =   gt_mat_surplus-stock_own
+                                  * gt_mat_surplus-stprs.
+    gt_mat_surplus-stock_ownval_mvg =   gt_mat_surplus-stock_own "MOD-004
+                                      * gt_mat_surplus-verpr. "MOD-004
+
+*   Total stock when StLoc is 1000: own stock + stock at customer
+    CLEAR it_msku.
+    IF gt_mat_surplus-lgort = '1000'.
+      READ TABLE it_msku WITH KEY matnr = gt_mat_surplus-matnr
+                                  werks = gt_mat_surplus-werks
+                         BINARY SEARCH.
+    ENDIF.
+    gt_mat_surplus-stock_tot = gt_mat_surplus-stock_own + it_msku-kulab.
+*   If total stock is zero, don't keep the line
+    IF gt_mat_surplus-stock_tot = 0.
+*****Begin of mod-008 mod
+      lflg_continue = 'X'.
+*      CONTINUE.
+*****End of mod-008 mod
+    ENDIF.
+
+*   Calculate total stock value.
+    gt_mat_surplus-stock_totval =   gt_mat_surplus-stock_tot
+                                  * gt_mat_surplus-stprs.
+    gt_mat_surplus-stock_totval_mvg =   gt_mat_surplus-stock_tot "MOD-004
+                                      * gt_mat_surplus-verpr. "MOD-004
+
+*   Allocated stock
+    CLEAR gt_allocs.
+    READ TABLE gt_allocs WITH KEY matnr = gt_mat_surplus-matnr
+                                  werks = gt_mat_surplus-werks
+                                  lgort = gt_mat_surplus-lgort
+                         BINARY SEARCH.
+    gt_mat_surplus-stock_alloc = gt_allocs-alloc_quantity.
+
+*   Calculate available stock
+    gt_mat_surplus-stock_avail = gt_mat_surplus-labst -
+                                 gt_mat_surplus-stock_alloc.
+
+*   Copy currency
+    READ TABLE it_waers WITH KEY werks = gt_mat_surplus-werks
+                        BINARY SEARCH.
+    IF sy-subrc EQ 0.
+      gt_mat_surplus-waers = it_waers-waers.
+    ENDIF.
+
+*   Most recent receipt date
+    READ TABLE gt_rec_dat WITH KEY matnr = gt_mat_surplus-matnr
+                                   werks = gt_mat_surplus-werks
+                                   lgort = gt_mat_surplus-lgort
+                          BINARY SEARCH.
+    IF sy-subrc EQ 0.
+      gt_mat_surplus-last_rec_date = gt_rec_dat-budat.
+*********Begin of MOD-007 *********** Add************
+    ELSE.
+*     If the storage location  is not '1000'
+      IF gt_mat_surplus-lgort <> '1000'.
+*       Check if movement type '311' exist
+        READ TABLE it_mseg WITH KEY matnr = gt_mat_surplus-matnr
+                                    werks = gt_mat_surplus-werks
+                                    lgort = gt_mat_surplus-lgort
+                                    bwart = '311'.
+*       If exist, get rec date from 1000
+        IF sy-subrc = 0.
+          READ TABLE gt_rec_dat WITH KEY matnr = gt_mat_surplus-matnr
+                                         werks = gt_mat_surplus-werks
+                                         lgort = '1000'
+                               BINARY SEARCH.
+          IF sy-subrc = 0.
+            gt_mat_surplus-last_rec_date = gt_rec_dat-budat.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+*********End   of MOD-007 *********** Add************
+    ENDIF.
+
+*   Most recent issue date
+    READ TABLE gt_iss_dat WITH KEY matnr = gt_mat_surplus-matnr
+                                   werks = gt_mat_surplus-werks
+                                   lgort = gt_mat_surplus-lgort
+                          BINARY SEARCH.
+    IF sy-subrc EQ 0.
+      gt_mat_surplus-last_iss_date = gt_iss_dat-budat.
+    ENDIF.
+
+**   Get 3 months consumption (also needed for stock level in days)
+*    PERFORM GET_X_MONTHS_CONSUMPTION USING GV_3_MONTHS_AGO  'QUAN_3_MONTHS'.
+**   Get 6 months consumption
+*    PERFORM GET_X_MONTHS_CONSUMPTION USING GV_6_MONTHS_AGO  'QUAN_6_MONTHS'.
+**   Get 12 months consumption
+*    PERFORM GET_X_MONTHS_CONSUMPTION USING GV_12_MONTHS_AGO 'QUAN_12_MONTHS'.
+*   Get 3 months consumption (also needed for stock level in days)
+    PERFORM get_x_months_consumption_new USING gv_3_months_ago  'QUAN_3_MONTHS'.
+*   Get 6 months consumption
+    PERFORM get_x_months_consumption_new USING gv_6_months_ago  'QUAN_6_MONTHS'.
+*   Get 12 months consumption
+    PERFORM get_x_months_consumption_new USING gv_12_months_ago 'QUAN_12_MONTHS'.
+
+*   Calculate stock level in days based on last months' consumptions
+    IF gt_mat_surplus-quan_3_months > 0.
+      gt_mat_surplus-stock_days = 90 * gt_mat_surplus-labst /
+                                       gt_mat_surplus-quan_3_months.
+*    ELSEIF GT_MAT_SURPLUS-QUAN_6_MONTHS > 0.
+*      GT_MAT_SURPLUS-STOCK_DAYS = 180 * GT_MAT_SURPLUS-LABST /
+*                                        GT_MAT_SURPLUS-QUAN_6_MONTHS.
+*    ELSEIF GT_MAT_SURPLUS-QUAN_12_MONTHS > 0.
+*      GT_MAT_SURPLUS-STOCK_DAYS = 360 * GT_MAT_SURPLUS-LABST /
+*                                        GT_MAT_SURPLUS-QUAN_12_MONTHS.
+    ELSE.
+      CALL FUNCTION 'MAXIMAL_VALUE_GET'
+        IMPORTING
+          e_value             = gt_mat_surplus-stock_days
+        EXCEPTIONS
+          type_not_supported  = 1
+          p_len_not_supported = 2
+          OTHERS              = 3.
+      IF sy-subrc NE 0.
+        MESSAGE ID 'YSE_SALES_LOG' TYPE 'E' NUMBER '052' WITH 'STOCK_DAYS'.
+      ENDIF.
+    ENDIF.
+
+*   Calculate turnover
+    IF gt_mat_surplus-quan_12_months NE 0.
+      gt_mat_surplus-turnover = gt_mat_surplus-labst / gt_mat_surplus-quan_12_months.
+    ELSE.
+      CALL FUNCTION 'MAXIMAL_VALUE_GET'
+        IMPORTING
+          e_value             = gt_mat_surplus-turnover
+        EXCEPTIONS
+          type_not_supported  = 1
+          p_len_not_supported = 2
+          OTHERS              = 3.
+      IF sy-subrc NE 0.
+        MESSAGE ID 'YSE_SALES_LOG' TYPE 'E' NUMBER '052' WITH 'TURNOVER'.
+      ENDIF.
+    ENDIF.
+
+*   Non moving stock Last 12 Months
+    IF NOT gt_mat_surplus-last_iss_date IS INITIAL
+       AND gv_cur_minus_24 LT gt_mat_surplus-last_iss_date
+       AND gv_cur_minus_12 GE gt_mat_surplus-last_iss_date.
+      gt_mat_surplus-non_moving_12_months = gt_mat_surplus-stock_tot.
+    ELSE.
+      gt_mat_surplus-non_moving_12_months = 0.
+    ENDIF.
+*   Non moving stock Last 24 Months
+    IF NOT gt_mat_surplus-last_iss_date IS INITIAL
+       AND gv_cur_minus_24 GE gt_mat_surplus-last_iss_date.
+      gt_mat_surplus-non_moving_24_months = gt_mat_surplus-stock_tot.
+    ELSE.
+      gt_mat_surplus-non_moving_24_months = 0.
+    ENDIF.
+    IF gt_mat_surplus-last_iss_date IS INITIAL.
+      gt_mat_surplus-non_moving_12_months = gt_mat_surplus-stock_tot.
+      gt_mat_surplus-non_moving_24_months = gt_mat_surplus-stock_tot.
+    ENDIF.
+
+*   Calculate overstock
+    gt_mat_surplus-overstock =   gt_mat_surplus-stock_tot
+                               - gt_mat_surplus-quan_12_months.
+    IF gt_mat_surplus-overstock < 0.  " Only show when positive
+      CLEAR gt_mat_surplus-overstock.
+    ENDIF.
+*   Overstock = 0 if consumption over last 12 months is 0 (Issue D088)
+    IF gt_mat_surplus-quan_12_months = 0.
+      gt_mat_surplus-overstock = 0.
+    ENDIF.
+
+*   Calculate <= 6 months qty
+    READ TABLE it_rec_qty_6mth WITH KEY matnr = gt_mat_surplus-matnr
+                                        werks = gt_mat_surplus-werks
+                                        lgort = gt_mat_surplus-lgort
+                               BINARY SEARCH.
+    IF sy-subrc EQ 0.
+      gt_mat_surplus-bal_less = it_rec_qty_6mth-menge.
+    ENDIF.
+    IF gt_mat_surplus-bal_less > gt_mat_surplus-stock_own.
+      gt_mat_surplus-bal_less = gt_mat_surplus-stock_own.
+    ENDIF.
+
+*   Calculate <= 6 months value
+    gt_mat_surplus-val_less =   gt_mat_surplus-bal_less
+                              * gt_mat_surplus-stprs.
+    gt_mat_surplus-val_less_mvg =   gt_mat_surplus-bal_less "MOD-004
+                                  * gt_mat_surplus-verpr.   "MOD-004
+
+*   Calculate > 6 months qty
+    gt_mat_surplus-bal_more =   gt_mat_surplus-stock_tot
+                              - gt_mat_surplus-bal_less.
+
+*   Calculate <= 6 months value
+    gt_mat_surplus-val_more =   gt_mat_surplus-bal_more
+                              * gt_mat_surplus-stprs.
+    gt_mat_surplus-val_more_mvg =   gt_mat_surplus-bal_more "MOD-004
+                                  * gt_mat_surplus-verpr.   "MOD-004
+
+* begin of insert MOD-004
+*   Quantity of receipts last 12 months
+    READ TABLE it_rec_qty_12mth WITH KEY matnr = gt_mat_surplus-matnr
+                                         werks = gt_mat_surplus-werks
+                                         lgort = gt_mat_surplus-lgort
+                                BINARY SEARCH.
+    IF sy-subrc EQ 0.
+      gt_mat_surplus-quan_12_months_rec = it_rec_qty_12mth-menge.
+    ENDIF.
+* end of insert MOD-004
+
+*   Transfer price
+*   First get purchasing org for plant
+    IF it_t024w-werks NE gt_mat_surplus-werks.
+      CLEAR it_t024w.
+      READ TABLE it_t024w WITH KEY werks = gt_mat_surplus-werks BINARY SEARCH.
+    ENDIF.
+*   If purch org found
+    IF it_t024w-werks EQ gt_mat_surplus-werks.
+*     Get actual transfer price
+*      READ TABLE IT_EINE WITH KEY MATNR = GT_MAT_SURPLUS-MATNR
+*                                  LIFNR = GT_MAT_SURPLUS-LIFNR
+*                                  EKORG = IT_T024W-EKORG
+*                                  WERKS = GT_MAT_SURPLUS-WERKS
+*                         BINARY SEARCH.
+*      IF SY-SUBRC EQ 0 AND IT_EINE-PEINH NE 0.
+*        GT_MAT_SURPLUS-KBETR = IT_EINE-NETPR / IT_EINE-PEINH.
+*      ENDIF.
+*     Find condition
+      READ TABLE it_a017 WITH KEY lifnr = gt_mat_surplus-lifnr
+                                  matnr = gt_mat_surplus-matnr
+                                  ekorg = it_t024w-ekorg
+                                  werks = gt_mat_surplus-werks
+                         BINARY SEARCH.
+      IF sy-subrc EQ 0.
+*       Transfer price
+        IF it_a017-konwa = gt_mat_surplus-waers.
+          gt_mat_surplus-kbetr = it_a017-kbetr.
+*       If not in CoCo currency, convert the value
+        ELSE.
+          CALL FUNCTION 'CONVERT_AMOUNT_TO_CURRENCY'
+            EXPORTING
+              date             = sy-datum
+              foreign_currency = it_a017-konwa
+              foreign_amount   = it_a017-kbetr
+              local_currency   = gt_mat_surplus-waers
+            IMPORTING
+              local_amount     = gt_mat_surplus-kbetr
+            EXCEPTIONS
+              error            = 0
+              OTHERS           = 0.
+        ENDIF.
+*       Now express it as unit price
+        IF it_a017-kpein NE 0.
+          gt_mat_surplus-kbetr = gt_mat_surplus-kbetr / it_a017-kpein.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+****Begin of mod-008 insert
+    IF lflg_continue IS NOT INITIAL.
+      APPEND gt_mat_surplus TO gt_mat_temp[].
+    ELSE.
+****End of mod-008 insert
+      APPEND gt_mat_surplus.
+      APPEND gt_mat_surplus TO gt_mat_temp[].
+    ENDIF.
+
+  ENDLOOP.
+
+  SORT gt_mat_surplus BY matnr werks lgort.
+****Begin of mod-008 insert
+  DELETE gt_mat_surplus WHERE werks NOT IN so_werks
+                          OR  lgort NOT IN so_lgort.
+****End of mod-008 insert
+
+ENDFORM.                    " PROCESS_DATA
+
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_OTH_DATA
+*&---------------------------------------------------------------------*
+FORM select_oth_data.
+
+* Mat grp descr
+  SELECT      matkl wgbez
+         FROM t023t
+         INTO TABLE gt_mat_grp_descr
+        WHERE spras EQ gc_english.
+  SORT gt_mat_grp_descr BY matkl.
+
+* MRP descriptions
+  SELECT dismm dibez
+      FROM t438t
+      INTO TABLE gt_mrp_descr
+     WHERE spras EQ gc_english.
+  SORT gt_mrp_descr BY dismm.
+
+* Material status
+  SELECT mmsta mtstb
+      FROM t141t
+      INTO TABLE gt_mat_stat_descr
+     WHERE spras EQ gc_english.
+
+ENDFORM.                    " SELECT_OTH_DATA
+
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_CURRENCIES
+*&---------------------------------------------------------------------*
+FORM select_currencies.
+
+* Get currency for companies linked to selected plants
+  SELECT      t001w~werks t001~waers
+         INTO TABLE it_waers
+         FROM t001w
+        INNER JOIN t001k
+           ON t001w~bwkey EQ t001k~bwkey
+        INNER JOIN t001
+           ON t001k~bukrs EQ t001~bukrs
+*** MOD-008 * begin ***mod**
+*        WHERE t001w~werks IN so_werks.     " = P_WERKS. "#EC CI_BUFFJOIN
+        WHERE t001w~werks IN gr_werks[].     " = P_WERKS. "#EC CI_BUFFJOIN
+*** MOD-008 * end ***mod**
+
+  SORT it_waers BY werks.
+
+ENDFORM.                    " SELECT_CURRENCIES
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_X_MONTHS_CONSUMPTION_NEW
+*&---------------------------------------------------------------------*
+FORM get_x_months_consumption_new
+          USING lv_startdate LIKE sy-datum
+                lv_fieldname LIKE lvc_s_fcat-fieldname.
+
+  DATA:
+    lv_enddate   TYPE dats,
+    lv_menge     TYPE menge_d,
+    lv_tabix     LIKE sy-tabix.
+  FIELD-SYMBOLS:
+    <fs_field> TYPE labst.
+
+  lv_enddate = sy-datum.                                    " - 1.
+
+* Position in IT_CONS on first consumption line for current StLoc Mat
+  CLEAR it_cons.
+  READ TABLE it_cons WITH KEY matnr = gt_mat_surplus-matnr
+                              werks = gt_mat_surplus-werks
+                              lgort = gt_mat_surplus-lgort
+                     BINARY SEARCH.
+******Begin of mod-009 add
+  DATA: lfg_old_plant TYPE char1,
+        lv_kunnr      TYPE mseg-kunnr.
+  lv_kunnr = '0102000735'.
+  SELECT COUNT( * )
+    FROM yse_cjal_pltmap
+    WHERE original = gt_mat_surplus-werks.
+  IF sy-subrc = 0.
+    lfg_old_plant = 'X'.
+  ENDIF.
+  CLEAR sy-subrc.
+******End of mod-009 add
+* While the reads are successfull and as long it's the same StLoc Mat
+  WHILE      it_cons-matnr EQ gt_mat_surplus-matnr
+         AND it_cons-werks EQ gt_mat_surplus-werks
+         AND it_cons-lgort EQ gt_mat_surplus-lgort
+         AND sy-subrc      EQ 0.
+
+*   If movement is of interest depending on the date
+    IF it_cons-budat BETWEEN lv_startdate AND lv_enddate.
+******Begin of mod-009 add
+      IF NOT (     lfg_old_plant IS NOT INITIAL
+               AND it_cons-bwart = '601'
+               AND it_cons-kunnr = lv_kunnr ).
+******End of mod-009 add
+*     Aggregate qty
+        lv_menge = lv_menge + it_cons-menge.
+      ENDIF.
+    ENDIF.
+
+*   Go to next consumption line
+    lv_tabix = sy-tabix + 1.
+    READ TABLE it_cons INDEX lv_tabix.
+
+  ENDWHILE.
+
+  ASSIGN COMPONENT lv_fieldname OF STRUCTURE gt_mat_surplus TO <fs_field>.
+  <fs_field> = lv_menge.
+
+ENDFORM.                    " GET_X_MONTHS_CONSUMPTION_NEW
+
+*&---------------------------------------------------------------------*
+*&      Form  FILL_GAC_PGC_TABLE
+*&---------------------------------------------------------------------*
+FORM fill_gac_pgc_table.
+
+  DATA: wa_t179 TYPE t179.
+
+* Select all level 2 hierarchy codes from the prodh table
+  SELECT *
+      FROM t179
+      INTO TABLE it_t179
+     WHERE stufe = '2'.
+
+* Default fields in range
+  gr_prdha-sign   = 'I'.
+  gr_prdha-option = 'EQ'.
+
+* Loop over hierarchy codes where the first 4 char's fit in S_GAC
+  IF NOT so_gac IS INITIAL.
+    LOOP AT it_t179 INTO wa_t179 WHERE prodh(4) IN so_gac.
+      gr_prdha-low = wa_t179-prodh.
+      APPEND gr_prdha.
+    ENDLOOP.
+  ENDIF.
+
+* Loop over hierarchy codes where the second 4 char's fit in S_PGC
+  IF NOT so_pgc IS INITIAL.
+    LOOP AT it_t179 INTO wa_t179 WHERE prodh+4(4) IN so_pgc.
+      gr_prdha-low = wa_t179-prodh.
+      APPEND gr_prdha.
+    ENDLOOP.
+  ENDIF.
+
+ENDFORM.                    " FILL_GAC_PGC_TABLE
+
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_AUTHORIZATION
+*&---------------------------------------------------------------------*
+FORM check_authorization .
+
+  DATA:
+    BEGIN OF lt_werks OCCURS 0,
+      werks LIKE t001w-werks,
+    END OF lt_werks.
+
+  SELECT DISTINCT werks
+      INTO TABLE lt_werks
+      FROM t001w
+*   Begin of MOD-008 MOD
+*     WHERE werks IN so_werks.                            "#EC CI_BYPASS
+     WHERE werks IN gr_werks[].                          "#EC CI_BYPASS
+*   END of MOD-008 MOD
+
+  LOOP AT lt_werks.
+    AUTHORITY-CHECK OBJECT 'M_MATE_WRK'
+             ID 'ACTVT' DUMMY
+             ID 'WERKS' FIELD lt_werks-werks.   " P_WERKS.
+
+    IF sy-subrc = 4.
+*     No authorisation to display data from Sales Organisation p_vkorg
+      MESSAGE ID 'YSE_GENERAL' TYPE 'E' NUMBER '008' WITH lt_werks-werks.
+    ELSEIF sy-subrc <> 0.
+*     Error checking authorization.
+      MESSAGE ID 'YSE_GENERAL' TYPE 'E' NUMBER '004'.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    " CHECK_AUTHORIZATION
+
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_PLANT_VKORG
+*&---------------------------------------------------------------------*
+FORM select_plant_vkorg .
+
+  SELECT      werks vkorg
+         FROM t001w
+         INTO TABLE gt_t001w
+*   Begin of MOD-008 mod
+*        WHERE werks IN so_werks.
+        WHERE werks IN gr_werks[].
+*   End of MOD-008 mod
+  SORT gt_t001w BY werks.
+
+ENDFORM.                    " SELECT_PLANT_VKORG
+
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_OPEN_SALES_ORDERS
+*&---------------------------------------------------------------------*
+FORM select_open_sales_orders.
+
+  RANGES:
+    lr_lgort FOR it_vbap-lgort.
+
+* Move provided StLocs to local range and add '   ' when required
+*******begin of mod-009***mod***
+*  lr_lgort[] = so_lgort[].
+*  IF '1000' IN so_lgort.
+  lr_lgort[] = gr_lgort[].
+  IF '1000' IN gr_lgort.
+*******end of mod-009***mod***
+    lr_lgort-sign   = 'I'.
+    lr_lgort-option = 'EQ'.
+    lr_lgort-low    = '    '.
+    APPEND lr_lgort.
+  ENDIF.
+
+* Get sales order quantity
+  SELECT      vbap~vbeln posnr matnr kwmeng werks lgort
+         INTO TABLE it_vbap
+         FROM vbak
+        INNER JOIN vbap
+           ON vbak~vbeln = vbap~vbeln
+        WHERE matnr IN so_matnr
+*    Begin of MOD-008 MOD
+*          AND werks IN so_werks
+          AND werks IN gr_werks[]
+*    End of MOD-008 MOD
+          AND lgort IN lr_lgort
+          AND pstyv IN so_pstyv
+          AND abgru EQ space
+          AND vbtyp EQ 'C' .     " Only doc Cat 'Orders'
+
+* Don't continue open sales orders if no rows returned
+  CHECK sy-subrc EQ 0.
+
+* Add order quantities to allocations table
+  SORT it_vbap BY matnr werks lgort.
+  LOOP AT it_vbap .
+*   When the sales item's StLoc is initial, treat it is if it were
+*   StLoc 1000
+    IF it_vbap-lgort IS INITIAL.
+      it_vbap-lgort = '1000'.
+    ENDIF.
+    READ TABLE gt_mara ASSIGNING <fs_mara>
+                       WITH KEY matnr = it_vbap-matnr
+                                werks = it_vbap-werks
+                                lgort = it_vbap-lgort
+                       BINARY SEARCH.
+    IF sy-subrc NE 0.
+      DELETE it_vbap.
+    ELSE.
+      gt_allocs-lgort = it_vbap-lgort.
+      gt_allocs-werks = it_vbap-werks.
+      gt_allocs-matnr = it_vbap-matnr.
+      gt_allocs-alloc_quantity = it_vbap-kwmeng.
+      COLLECT gt_allocs.
+    ENDIF.
+  ENDLOOP.
+
+* Get delivered quantities for the above selected order items
+  IF NOT it_vbap[] IS INITIAL.
+    SELECT      lips~vbeln posnr lips~matnr lgort lfimg werks
+           INTO TABLE it_lips
+           FROM vbfa
+           JOIN lips
+             ON vbfa~vbeln EQ lips~vbeln
+            AND vbfa~posnn EQ lips~posnr
+           JOIN vbuk
+             ON vbfa~vbeln EQ vbuk~vbeln
+            FOR ALL entries IN it_vbap
+          WHERE vbfa~vbelv   EQ it_vbap-vbeln
+            AND vbfa~posnv   EQ it_vbap-posnr
+            AND vbfa~vbtyp_n EQ 'J'  " Deliveries
+            AND vbuk~wbstk   EQ 'C'.
+  ENDIF.
+
+* Subtract remaining delivered quantities from allocation table
+  LOOP AT it_lips.
+    gt_allocs-lgort          = it_lips-lgort.
+    gt_allocs-werks          = it_lips-werks.
+    gt_allocs-matnr          = it_lips-matnr.
+    gt_allocs-alloc_quantity = it_lips-lfimg * ( -1 ).
+    COLLECT gt_allocs.
+  ENDLOOP.
+
+ENDFORM.                    " SELECT_OPEN_SALES_ORDERS
+
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_OPEN_RESERVATIONS
+*&---------------------------------------------------------------------*
+FORM select_open_reservations .
+
+  SELECT      matnr werks lgort bdmng enmng
+         INTO TABLE it_resb
+         FROM resb
+        WHERE matnr IN so_matnr
+*    Begin of MOD-008 mod
+*          AND werks IN so_werks
+          AND werks IN gr_werks[]
+*    End of MOD-008 mod
+*    Begin of MOD-009 mod
+*          AND lgort IN so_lgort
+          AND lgort IN gr_lgort
+*    End of MOD-009 mod
+          AND xloek EQ space
+          AND xwaok EQ 'X'.
+
+* Add open reservation quantities to allocations table
+  SORT it_resb BY matnr.
+  LOOP AT it_resb.
+    IF it_resb-lgort EQ space.
+      it_resb-lgort = '1000'.
+    ENDIF.
+    READ TABLE gt_mara ASSIGNING <fs_mara>
+                       WITH KEY matnr = it_resb-matnr
+                                werks = it_resb-werks
+                                lgort = it_resb-lgort
+                       BINARY SEARCH.
+    IF sy-subrc NE 0.
+      DELETE it_resb.
+    ELSE.
+      gt_allocs-matnr          = it_resb-matnr.
+      gt_allocs-werks          = it_resb-werks.
+      gt_allocs-lgort          = it_resb-lgort.
+      gt_allocs-alloc_quantity = it_resb-bdmng - it_resb-enmng.
+      COLLECT gt_allocs.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    " SELECT_OPEN_RESERVATIONS
+
+*&---------------------------------------------------------------------*
+*&      Form  SEND2SPOOL
+*&---------------------------------------------------------------------*
+FORM send2spool .
+
+  DATA:
+    fnam             LIKE rlgrap-filename,
+    it_dd03l         LIKE dd03l OCCURS 0 WITH HEADER LINE,
+    it_dd04t         LIKE dd04t OCCURS 0 WITH HEADER LINE,
+    it_outxls(4096)  TYPE c OCCURS 0,
+    wa_outxls(4096)  TYPE c.
+
+  CONSTANTS:
+    c_tab TYPE c VALUE cl_abap_char_utilities=>horizontal_tab.
+
+* Get fields of structure 'YSE_SD_SALES_OUT'
+  SELECT *
+         FROM dd03l
+         INTO TABLE it_dd03l
+        WHERE tabname = 'YSE_SDMM_SURPLUS_OUTPUT'.
+
+* Get the descriptions of the fields in the structure
+  SELECT *
+         FROM dd04t
+         INTO TABLE it_dd04t
+          FOR ALL ENTRIES IN it_dd03l
+        WHERE rollname EQ it_dd03l-rollname
+          AND ddlanguage EQ 'EN'.
+
+* Build filename
+  v_dat = sy-datum.
+  v_tim = sy-uzeit.
+  CONCATENATE '/var/load/' sy-sysid '/UK/original/YSE_SURPLUS_'
+              user_name '_' v_dat '_' v_tim '.TXT'
+         INTO fnam.
+
+* Make the output table ; delimited
+  CALL FUNCTION 'SAP_CONVERT_TO_CSV_FORMAT'
+    TABLES
+      i_tab_sap_data       = gt_mat_surplus
+    CHANGING
+      i_tab_converted_data = it_outxls
+    EXCEPTIONS
+      conversion_failed    = 1
+      OTHERS               = 2.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+* Open file
+  OPEN DATASET fnam FOR OUTPUT IN TEXT MODE ENCODING DEFAULT.
+  IF sy-subrc <> 0.
+    WRITE 'Error opening file. Action aborted.'(001).
+    EXIT.
+  ENDIF.
+
+* Write header line
+  CLEAR wa_outxls.
+  SORT it_dd03l BY position.
+  LOOP AT it_dd03l.
+    READ TABLE it_dd04t WITH KEY rollname = it_dd03l-rollname.
+    IF wa_outxls IS INITIAL.
+      wa_outxls = it_dd04t-reptext.
+    ELSE.
+      CONCATENATE wa_outxls c_tab it_dd04t-reptext INTO wa_outxls.
+    ENDIF.
+  ENDLOOP.
+  TRANSFER wa_outxls TO fnam.
+
+* Process lines
+  LOOP AT it_outxls INTO wa_outxls.
+    REPLACE ALL OCCURRENCES OF ';' IN wa_outxls WITH c_tab.
+    TRANSFER wa_outxls TO fnam.
+  ENDLOOP.
+
+  CLOSE DATASET fnam.
+
+  WRITE: 'Report output written to file:'(002),
+         fnam.
+
+ENDFORM.                    " SEND2SPOOL
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_DATES
+*&---------------------------------------------------------------------*
+FORM get_dates .
+
+* Go 3 months back and put it in GV_3_MONTHS_AGO, then add 1 day to it
+  CALL FUNCTION 'MONTH_PLUS_DETERMINE'
+    EXPORTING
+      months  = '-3'
+      olddate = sy-datum
+    IMPORTING
+      newdate = gv_3_months_ago.
+  gv_3_months_ago = gv_3_months_ago + 1.
+
+* Go 6 months back and put it in GV_6_MONTHS_AGO, then add 1 day to it
+  CALL FUNCTION 'MONTH_PLUS_DETERMINE'
+    EXPORTING
+      months  = '-6'
+      olddate = sy-datum
+    IMPORTING
+      newdate = gv_6_months_ago.
+  gv_6_months_ago = gv_6_months_ago + 1.
+
+* Go 12 months back and put it in GV_12_MONTHS_AGO, then add 1 day to it
+  CALL FUNCTION 'MONTH_PLUS_DETERMINE'
+    EXPORTING
+      months  = '-12'
+      olddate = sy-datum
+    IMPORTING
+      newdate = gv_12_months_ago.
+  gv_12_months_ago = gv_12_months_ago + 1.
+
+* Go 12 months back and put it in GV_CUR_MINUS_12
+  CALL FUNCTION 'MONTH_PLUS_DETERMINE'
+    EXPORTING
+      months  = '-12'
+      olddate = sy-datum
+    IMPORTING
+      newdate = gv_cur_minus_12.
+
+* Go 24 months back and put it in GV_CUR_MINUS_24
+  CALL FUNCTION 'MONTH_PLUS_DETERMINE'
+    EXPORTING
+      months  = '-24'
+      olddate = sy-datum
+    IMPORTING
+      newdate = gv_cur_minus_24.
+
+* Go 6 months back and put it in GV_CUR_MINUS_6
+  CALL FUNCTION 'MONTH_PLUS_DETERMINE'
+    EXPORTING
+      months  = '-6'
+      olddate = sy-datum
+    IMPORTING
+      newdate = gv_cur_minus_6.
+
+ENDFORM.                    " GET_DATES
+
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_MSEG_DATA
+*&---------------------------------------------------------------------*
+FORM select_mseg_data .
+***********Begin of MOD-007 ***Add**************
+  RANGES:
+    lr_lgort FOR it_vbap-lgort.
+
+* Move provided StLocs to local range and add '   ' when required
+***********Begin of MOD-009 ***MOD**************
+*  lr_lgort[] = so_lgort[].
+*  IF '1000' NOT IN so_lgort.
+  lr_lgort[] = gr_lgort[].
+  IF '1000' NOT IN gr_lgort.
+***********Begin of MOD-009 ***MOD**************
+    lr_lgort-sign   = 'I'.
+    lr_lgort-option = 'EQ'.
+    lr_lgort-low    = '1000'.
+    APPEND lr_lgort.
+  ENDIF.
+***********End   of MOD-007 ***Add**************
+  SELECT      mseg~mblnr mseg~mjahr
+              zeile matnr werks lgort
+***********Begin of MOD-009 ***ADD**************
+              mseg~lifnr mseg~kunnr
+***********Begin of MOD-009 ***ADD**************
+              menge meins erfmg erfme bwart budat
+              ebeln                                         "MOD-005
+         INTO TABLE it_mseg
+         FROM mseg
+         JOIN mkpf
+           ON mseg~mblnr EQ mkpf~mblnr
+          AND mseg~mjahr EQ mkpf~mjahr
+        WHERE matnr IN so_matnr
+*     Begin of MOD-008 MOD
+*          AND werks IN so_werks
+          AND werks IN gr_werks[]
+*     End of MOD-008 MOD
+***********Begin of MOD-007 ***Mod**************
+*          AND lgort IN so_lgort
+          AND lgort IN lr_lgort[]
+***********End   of MOD-007 ***Mod**************
+          AND bwart IN gr_bwart_all.
+
+ENDFORM.                    " SELECT_MSEG_DATA
+
+*&---------------------------------------------------------------------*
+*&      Form  FILL_BWART_RANGES
+*&---------------------------------------------------------------------*
+FORM fill_bwart_ranges .
+
+  DATA:
+    BEGIN OF it_t156 OCCURS 0,
+      bwart LIKE t156-bwart,
+    END OF it_t156,
+    ls_bwart_range LIKE LINE OF gr_bwart_iss.
+
+* Prepare header line for the ranges
+  ls_bwart_range-sign = 'I'.
+  ls_bwart_range-option = 'EQ'.
+
+* Select all valid movement types provided by the user
+  SELECT      bwart
+         INTO TABLE it_t156
+         FROM t156
+        WHERE bwart IN so_bwart.
+
+* Add the MovtTypes selected by user to GR_BWART_ALL
+  LOOP AT it_t156.
+    ls_bwart_range-low = it_t156-bwart.
+    APPEND ls_bwart_range TO gr_bwart_all.
+  ENDLOOP.
+
+* Add the Receipts movt types to appropriate ranges
+  ls_bwart_range-low = '101'.
+  APPEND ls_bwart_range TO gr_bwart_all.
+  APPEND ls_bwart_range TO gr_bwart_rec.
+  ls_bwart_range-low = '651'.
+  APPEND ls_bwart_range TO gr_bwart_all.
+  APPEND ls_bwart_range TO gr_bwart_rec.
+  ls_bwart_range-low = '634'.
+  APPEND ls_bwart_range TO gr_bwart_all.
+  APPEND ls_bwart_range TO gr_bwart_rec.
+*********Begin of MOD-007 *****Add**************
+  ls_bwart_range-low = '653'.
+  APPEND ls_bwart_range TO gr_bwart_all.
+  APPEND ls_bwart_range TO gr_bwart_rec.
+  ls_bwart_range-low = '311'.
+  APPEND ls_bwart_range TO gr_bwart_all.
+*********End  of MOD-007 *****Add***************
+* Add the Issues movt types to appropriate ranges
+  ls_bwart_range-low = '261'.
+  APPEND ls_bwart_range TO gr_bwart_all.
+  APPEND ls_bwart_range TO gr_bwart_iss.
+  ls_bwart_range-low = '601'.
+  APPEND ls_bwart_range TO gr_bwart_all.
+  APPEND ls_bwart_range TO gr_bwart_iss.
+  ls_bwart_range-low = '633'.
+  APPEND ls_bwart_range TO gr_bwart_all.
+  APPEND ls_bwart_range TO gr_bwart_iss.
+
+ENDFORM.                    " FILL_BWART_RANGES
+
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_SURPLUS_HD
+*&---------------------------------------------------------------------*
+FORM select_surplus_hd .
+***********Begin of MOD-007 ***Add**************
+  RANGES:
+    lr_lgort FOR it_vbap-lgort.
+
+* Move provided StLocs to local range and add '   ' when required
+***********Begin of MOD-009 ***mod**************
+*  lr_lgort[] = so_lgort[].
+*  IF '1000' NOT IN so_lgort.
+  lr_lgort[] = gr_lgort[].
+  IF '1000' NOT IN gr_lgort.
+***********End   of MOD-009 ***mod**************
+    lr_lgort-sign   = 'I'.
+    lr_lgort-option = 'EQ'.
+    lr_lgort-low    = '1000'.
+    APPEND lr_lgort.
+  ENDIF.
+***********End   of MOD-007 ***Add**************
+  SELECT      *
+         INTO TABLE gt_surplus_hd
+         FROM yse_surplus_hd01
+        WHERE matnr IN so_matnr
+***********Begin of MOD-008 ***Mod**************
+*          AND werks IN so_werks
+          AND werks IN gr_werks[]
+***********End   of MOD-008 ***Mod**************
+***********Begin of MOD-007 ***Mod**************
+*          AND lgort IN so_lgort.
+          AND lgort IN lr_lgort.
+***********End   of MOD-007 ***Mod**************
+
+ENDFORM.                    " SELECT_SURPLUS_HD
+
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_STPRICE
+*&---------------------------------------------------------------------*
+FORM select_stprice .
+
+* Select valuation areas corr to the selected plants from T001W
+  SELECT      werks bwkey
+         FROM t001w
+         INTO TABLE it_t001w
+* begin of change MOD-008
+*        WHERE werks IN so_werks.
+        WHERE werks IN gr_werks[].
+* end of change MOD-008
+  SORT it_t001w BY werks.
+
+* Get standard prices for materials from selection screen
+* begin of change MOD-004
+*  SELECT      MATNR BWKEY STPRS PEINH ZKDAT
+  SELECT      matnr bwkey stprs peinh zkdat verpr
+* end of change MOD-004
+         INTO TABLE gt_price
+         FROM mbew
+          FOR ALL ENTRIES IN it_t001w
+        WHERE matnr IN so_matnr
+          AND bwkey EQ it_t001w-bwkey
+          AND bwtar EQ space.
+  SORT gt_price BY matnr bwkey.
+
+ENDFORM.                    " SELECT_STPRICE
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_SAFETY_STOCK
+*&---------------------------------------------------------------------*
+FORM get_safety_stock .
+
+* Only consider safety stock if "safety stock indicator" is flagged
+  CHECK p_saf = 'X'.
+* Only consider safety stock if storage location includes 1000
+* CHECK P_LGORT = '1000'.
+***Begin of MOD-009*******mod****
+*  CHECK '1000' IN so_lgort.
+  CHECK '1000' IN gr_lgort.
+***End of MOD-009*******mod****
+
+* Safety stock has already been fetched from MARC, just copy it over into IT_ALLOC_EXT
+* Put material with it's safety stock in allocations table
+  LOOP AT gt_mara WHERE lgort = '1000'.
+    gt_allocs-lgort          = '1000'.
+    gt_allocs-matnr          = gt_mara-matnr.
+    gt_allocs-werks          = gt_mara-werks.
+    gt_allocs-alloc_quantity = gt_mara-eisbe.
+    COLLECT gt_allocs.
+  ENDLOOP.
+
+ENDFORM.                    " GET_SAFETY_STOCK
+
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_OPEN_TRANSPORT_REQ
+*&---------------------------------------------------------------------*
+FORM select_open_transport_req.
+
+* Only consider open transport req if storage location = 1000
+* CHECK P_LGORT = '1000'.
+*    Begin of MOD-009 MOD
+  CHECK '1000' IN so_lgort.
+  CHECK '1000' IN gr_lgort.
+*    Begin of MOD-009 MOD
+
+  SELECT      matnr reswk menge
+         INTO TABLE it_eban
+         FROM eban
+        WHERE matnr IN so_matnr
+          AND bsart EQ c_po_replenishment
+          AND pstyp EQ c_pstyp_stock_tr      "STOCK TRANSFER
+          AND statu EQ 'N'
+          AND loekz EQ space
+          AND ebakz EQ space
+*    Begin of MOD-008 MOD
+*          AND reswk IN so_werks
+          AND reswk IN gr_werks[]
+*    End of MOD-008 MOD
+          AND lgort EQ '1000'.
+
+* Add open transport req quant's to allocations table
+  LOOP AT it_eban.
+    READ TABLE gt_mara  ASSIGNING <fs_mara>
+                        WITH KEY matnr = it_eban-matnr
+                                 werks = it_eban-reswk
+                                 lgort = '1000'
+                        BINARY SEARCH.
+    IF sy-subrc EQ 0.
+      gt_allocs-matnr = it_eban-matnr.
+      gt_allocs-werks = it_eban-reswk.
+      gt_allocs-lgort = '1000'.
+      gt_allocs-alloc_quantity = it_eban-menge.
+      COLLECT gt_allocs.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    " SELECT_OPEN_TRANSPORT_REQ
+
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_OPEN_TRANSPORT_ORDERS
+*&---------------------------------------------------------------------*
+FORM select_open_transport_orders .
+
+* Only consider open transport orders if storage location = 1000
+* CHECK p_lgort = '1000'.
+*    Begin of MOD-009 MOD
+*  CHECK '1000' IN so_lgort.
+  CHECK '1000' IN gr_lgort.
+*    end of MOD-009 MOD
+
+* Select from ekpo/ekko
+  SELECT      ekpo~ebeln ebelp matnr reswk lgort menge
+         INTO TABLE it_ekpo
+         FROM ekko
+         JOIN ekpo
+           ON ekko~ebeln = ekpo~ebeln
+        WHERE matnr IN so_matnr
+          AND (    bsart EQ 'ZUB1'
+                OR bsart EQ 'ZNB4' )
+*    Begin of MOD-008 MOD
+*          AND reswk IN so_werks
+          AND reswk IN gr_werks[]
+*    Begin of MOD-008 MOD
+          AND ekpo~loekz EQ space.
+
+* Don't continue open transport orders if no rows returned
+  CHECK sy-subrc EQ 0.
+
+* Select receipted quantities for the open transport order items
+  SELECT      ebeln ebelp matnr menge belnr bwart
+         INTO TABLE it_ekbe
+         FROM ekbe
+         FOR ALL ENTRIES IN it_ekpo
+        WHERE ebeln EQ it_ekpo-ebeln
+          AND ebelp EQ it_ekpo-ebelp
+          AND vgabe = '6'.
+
+* Add transport orders to allocation table
+  LOOP AT it_ekpo.
+    READ TABLE gt_mara ASSIGNING <fs_mara>
+                       WITH KEY matnr = it_ekpo-matnr
+                                werks = it_ekpo-reswk
+                                lgort = '1000'
+                       BINARY SEARCH.
+    IF sy-subrc EQ 0.
+      gt_allocs-matnr          = it_ekpo-matnr.
+      gt_allocs-werks          = it_ekpo-reswk.
+      gt_allocs-lgort          = '1000'.
+      gt_allocs-alloc_quantity = it_ekpo-menge.
+      COLLECT gt_allocs.
+      LOOP AT it_ekbe WHERE ebeln EQ it_ekpo-ebeln
+                        AND ebelp EQ it_ekpo-ebelp.
+        IF it_ekbe-bwart EQ '641'.
+          gt_allocs-alloc_quantity = it_ekbe-menge * ( -1 ).
+        ELSEIF it_ekbe-bwart EQ '642'.
+          gt_allocs-alloc_quantity = it_ekbe-menge.
+        ENDIF.
+        COLLECT gt_allocs.
+      ENDLOOP.
+    ELSE.
+      DELETE it_ekpo.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    " SELECT_OPEN_TRANSPORT_ORDERS
+
+*&---------------------------------------------------------------------*
+*&      Form  PROCESS_MSEG_SURPLUS_NEW
+*&---------------------------------------------------------------------*
+* In this routine, some internal tables will be filled based on the
+* data in IT_MSEG and GT_SURPLUS_HD:
+* - GT_REC_DAT: first receives all the receipts from IT_MSEG and
+*               GT_SURPLUS_HD. Then the less recent dates per
+*               Mat/Plt/Stl are thrown away
+* - GT_ISS_DAT: first receives all the issues from IT_MSEG and
+*               GT_SURPPLUS_HD. Then the less recent dates per
+*               Mat/Plt/Stl are thrown away
+* - IT_REC_QTY_6MTH: will hold aggregated qty per Mat/Plt/Stl for all
+*               receipts in IT_MSEG and GT_SURPLUS_HD
+* - IT_REC_QTY_12MTH: will hold aggregated qty per Mat/Plt/Stl for all
+*               receipts in IT_MSEG and GT_SURPLUS_HD
+*               (exclude stock transports)        "MOD-005
+* - IT_CONS:    will hold compiled list of IT_MSEG where movement type
+*               matches selection criteria and GT_SURPLUS_HD where ZMOVT
+*               is 'I'ssue.
+*&---------------------------------------------------------------------*
+FORM process_mseg_surplus_new.
+
+  DATA:
+    lwa_rec_dat    LIKE LINE OF gt_rec_dat,
+    lwa_iss_dat    LIKE LINE OF gt_iss_dat.
+
+* Process all goods movements
+  LOOP AT it_mseg.
+*   If the movement is a receipt
+    IF it_mseg-bwart IN gr_bwart_rec.
+*     Copy line to "receipts" table
+      MOVE-CORRESPONDING it_mseg TO gt_rec_dat.
+      APPEND gt_rec_dat.
+*     If movement was in the last 6 months, aggregate the "Received qty 6 months"
+      IF it_mseg-budat GE gv_cur_minus_6.
+        MOVE-CORRESPONDING it_mseg TO it_rec_qty_6mth.
+        COLLECT it_rec_qty_6mth.
+      ENDIF.
+* begin of insert MOD-004
+*     If movement was in the last 12 months, aggregate the "Received qty 12 months"
+      IF it_mseg-budat GE gv_cur_minus_12.
+*** MOD-005 * begin ***
+*       Check if stock transport
+        READ TABLE it_ekko WITH TABLE KEY ebeln = it_mseg-ebeln.
+        IF sy-subrc NE 0.
+*** MOD-005 * end ***
+          MOVE-CORRESPONDING it_mseg TO it_rec_qty_12mth.
+          COLLECT it_rec_qty_12mth.
+        ENDIF.                                              "MOD-005
+      ENDIF.
+* end of insert MOD-004
+    ENDIF.
+*   If the movement is an issue
+    IF it_mseg-bwart IN gr_bwart_iss.
+*     Copy line to "Issues" table
+      MOVE-CORRESPONDING it_mseg TO gt_iss_dat.
+      APPEND gt_iss_dat.
+    ENDIF.
+*   If the movement matches the selection criteria
+    IF it_mseg-bwart IN so_bwart.
+*     Copy line to consumption table
+      MOVE-CORRESPONDING it_mseg TO it_cons.
+      APPEND it_cons.
+    ENDIF.
+  ENDLOOP.
+
+* Process all movements (historical data)
+  LOOP AT gt_surplus_hd.
+*   If the movement is a receipt
+    IF gt_surplus_hd-zmovt EQ 'R'.
+*     Copy line to "receipts" table
+      MOVE-CORRESPONDING gt_surplus_hd TO gt_rec_dat.
+      APPEND gt_rec_dat.
+*     If movement was in the last 6 months, aggregate the "Received qty 6 months"
+      IF gt_surplus_hd-budat GE gv_cur_minus_6.
+        MOVE-CORRESPONDING gt_surplus_hd TO it_rec_qty_6mth.
+        COLLECT it_rec_qty_6mth.
+      ENDIF.
+* begin of insert MOD-004
+*     If movement was in the last 12 months, aggregate the "Received qty 12 months"
+      IF gt_surplus_hd-budat GE gv_cur_minus_12.
+        MOVE-CORRESPONDING gt_surplus_hd TO it_rec_qty_12mth.
+        COLLECT it_rec_qty_12mth.
+      ENDIF.
+* end of insert MOD-004
+    ENDIF.
+*   If the movement is an issue
+    IF gt_surplus_hd-zmovt EQ 'I'.
+*     Copy line to "Issues" table
+      MOVE-CORRESPONDING gt_surplus_hd TO gt_iss_dat.
+      APPEND gt_iss_dat.
+*     Copy line to consumption table
+      MOVE-CORRESPONDING gt_surplus_hd TO it_cons.
+      APPEND it_cons.
+    ENDIF.
+  ENDLOOP.
+
+* Sort tables
+  SORT:
+    gt_rec_dat      BY matnr ASCENDING werks ASCENDING lgort ASCENDING budat DESCENDING,
+    gt_iss_dat      BY matnr ASCENDING werks ASCENDING lgort ASCENDING budat DESCENDING,
+    it_rec_qty_6mth BY matnr werks lgort,
+    it_rec_qty_12mth BY matnr werks lgort,                  "MOD-004
+    it_cons         BY matnr werks lgort.
+
+* Throw away less recent receipts
+* begin of mod-009 mod
+*  LOOP AT gt_rec_dat.
+*    IF     gt_rec_dat-matnr EQ lwa_rec_dat-matnr
+*       AND gt_rec_dat-werks EQ lwa_rec_dat-werks
+*       AND gt_rec_dat-lgort EQ lwa_rec_dat-lgort.
+*      DELETE gt_rec_dat.
+*      CONTINUE.
+*    ELSE.
+*      MOVE-CORRESPONDING gt_rec_dat TO lwa_rec_dat.
+*    ENDIF.
+*  ENDLOOP.
+  DATA: lfg_continue TYPE char1,
+        invaild_lifnr TYPE mseg-lifnr.
+  invaild_lifnr = '0102000662'.
+  LOOP AT gt_rec_dat.
+    IF     gt_rec_dat-matnr EQ lwa_rec_dat-matnr
+       AND gt_rec_dat-werks EQ lwa_rec_dat-werks
+       AND gt_rec_dat-lgort EQ lwa_rec_dat-lgort.
+      IF lfg_continue IS NOT INITIAL.
+        DELETE gt_rec_dat.
+        CONTINUE.
+      ENDIF.
+    ELSE.
+      CLEAR lfg_continue.
+    ENDIF.
+    MOVE-CORRESPONDING gt_rec_dat TO lwa_rec_dat.
+    IF gt_rec_dat-lifnr = invaild_lifnr.
+      DELETE gt_rec_dat.
+    ELSE.
+      lfg_continue = 'X'.
+    ENDIF.
+  ENDLOOP.
+*Begin of mod-009
+* Throw away less recent issues
+  LOOP AT gt_iss_dat.
+    IF     gt_iss_dat-matnr EQ lwa_iss_dat-matnr
+       AND gt_iss_dat-werks EQ lwa_iss_dat-werks
+       AND gt_iss_dat-lgort EQ lwa_iss_dat-lgort.
+      DELETE gt_iss_dat.
+      CONTINUE.
+    ELSE.
+      MOVE-CORRESPONDING gt_iss_dat TO lwa_iss_dat.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    " PROCESS_MSEG_SURPLUS_NEW
+
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_TRANSFER_PRICES
+*&---------------------------------------------------------------------*
+FORM select_transfer_prices .
+
+  SELECT      *
+         INTO TABLE it_t024w
+         FROM t024w
+*    Begin of MOD-008 MOD
+*        WHERE werks IN so_werks.
+        WHERE werks IN gr_werks[].
+*    END of MOD-008 MOD
+  SORT it_t024w BY werks.
+
+*  SELECT      EINA~INFNR EINA~MATNR EINA~LIFNR
+*              EINE~EKORG EINE~ESOKZ EINE~WERKS
+*              EINE~NETPR EINE~PEINH EINE~PRDAT
+*         INTO TABLE IT_EINE
+*         FROM EINA
+*         JOIN EINE
+*           ON EINA~INFNR EQ EINE~INFNR
+*          FOR ALL ENTRIES IN GT_MARA
+*        WHERE EINA~MATNR EQ GT_MARA-MATNR
+*          AND EINA~LIFNR EQ GT_MARA-LIFNR
+*          AND EINA~LOEKZ EQ SPACE
+*          AND EINE~ESOKZ EQ '0'
+*          AND EINE~LOEKZ EQ SPACE
+*          AND EINE~PRDAT GT SY-DATUM.
+*  SORT IT_EINE  BY MATNR LIFNR EKORG WERKS.
+***********Begin of MOD-007 *******Add*************
+  CHECK gt_mara IS NOT INITIAL.
+***********End of MOD-007   *******Add*************
+* Get transfer prices
+  SELECT      kappl kschl lifnr matnr ekorg werks esokz datbi datab knumh
+         INTO CORRESPONDING FIELDS OF TABLE it_a017
+         FROM a017
+          FOR ALL ENTRIES IN gt_mara
+        WHERE kappl EQ 'M'
+          AND kschl EQ 'PB00'
+          AND lifnr EQ gt_mara-lifnr
+          AND matnr EQ gt_mara-matnr
+          AND datbi GT sy-datum
+          AND esokz EQ '0'.
+  SORT it_a017 BY lifnr matnr ekorg werks.
+  LOOP AT it_a017.
+    SELECT SINGLE kopos kbetr kpein konwa
+             INTO (it_a017-kopos, it_a017-kbetr, it_a017-kpein, it_a017-konwa)
+             FROM konp
+            WHERE knumh EQ it_a017-knumh.
+    MODIFY it_a017.
+  ENDLOOP.
+
+ENDFORM.                    " SELECT_TRANSFER_PRICES
+
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_PO_TYPE                               "MOD-005
+*&---------------------------------------------------------------------*
+*       Select purchase order types
+*----------------------------------------------------------------------*
+FORM select_po_type .
+
+  CHECK NOT it_mseg[] IS INITIAL.
+
+  SELECT ebeln bsart INTO TABLE it_ekko
+         FROM ekko
+         FOR ALL ENTRIES IN it_mseg
+         WHERE ebeln = it_mseg-ebeln
+           AND bsart = 'ZUB1'.
+
+ENDFORM.                    " SELECT_PO_TYPE
+
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_PLC_CODES                             "MOD-005
+*&---------------------------------------------------------------------*
+*       Get PLC codes
+*----------------------------------------------------------------------*
+FORM select_plc_codes .
+
+  SELECT * FROM k9rcd11000010 INTO TABLE it_plc.
+
+ENDFORM.                    " SELECT_PLC_CODES
+***********Begin of MOD-008 *******Insert*************
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_PLANT_CJAL
+*&---------------------------------------------------------------------*
+*       Check if plants belong to CJAL and get CJAL plants
+*----------------------------------------------------------------------*
+FORM get_plant_cjal .
+
+  DATA: ls_cjal_plant TYPE yse_cjal_pltmap.
+  APPEND LINES OF so_werks[] TO gr_werks[].
+*******begin of mod-009 insert***********
+  APPEND LINES OF so_lgort[] TO gr_lgort[].
+*******end of mod-009 insert*************
+  SELECT *
+    INTO TABLE gt_cjal_plant
+    FROM yse_cjal_pltmap
+    WHERE new_werks  IN so_werks
+*******begin of mod-009 insert***********
+      AND new_lgort  IN so_lgort.
+*******end of mod-009 insert*************
+  IF sy-subrc = 0.
+    gv_flag_cjal = 'X'.
+    LOOP AT  gt_cjal_plant INTO ls_cjal_plant.
+      gr_werks_cjal-sign   = 'I'.
+      gr_werks_cjal-option = 'EQ'.
+      gr_werks_cjal-low    = ls_cjal_plant-original.
+      APPEND gr_werks_cjal.
+*******begin of mod-009 insert***********
+      gr_lgort_cjal-sign   = 'I'.
+      gr_lgort_cjal-option = 'EQ'.
+      gr_lgort_cjal-low    = ls_cjal_plant-old_lgort.
+      APPEND gr_lgort_cjal.
+*******end of mod-009 insert*************
+    ENDLOOP.
+*******begin of mod-009 insert***********
+    APPEND LINES OF gr_lgort_cjal[] TO gr_lgort[].
+*******end of mod-009 insert*************
+    APPEND LINES OF gr_werks_cjal[] TO gr_werks[].
+*******begin of mod-009 insert***********
+    SORT: gr_lgort_cjal[] ,gr_werks_cjal[].
+    DELETE ADJACENT DUPLICATES FROM: gr_lgort_cjal[],gr_werks_cjal[].
+*******end of mod-009 insert*************
+  ENDIF.
+
+ENDFORM.                    " CHECK_PLANT_CJAL
+*&---------------------------------------------------------------------*
+*&      Form  UPDATE_LASTGRDATE
+*&---------------------------------------------------------------------*
+*       Update table YSE_MR_LASTGR
+*----------------------------------------------------------------------*
+FORM update_lastgrdate.
+
+  DATA: ls_cjal_plant   TYPE yse_cjal_pltmap,
+        lv_index        TYPE sy-index,
+        ls_mr_his       TYPE yse_mr_history,
+        lt_mr_his       TYPE STANDARD TABLE OF yse_mr_history,
+        ls_mat_surplus  TYPE yse_sdmm_surplus_output,
+**********BEGIN OF MOD-009****MOD******
+        lv_grdate_old   TYPE char10,
+**********end OF MOD-009****MOD******
+        ls_mr_lastgr    TYPE yse_mr_lastgr.
+
+  FIELD-SYMBOLS: <lfs_mat_surplus>  TYPE yse_sdmm_surplus_output.
+  CHECK gv_flag_cjal IS NOT INITIAL.
+
+  LOOP AT gt_mat_surplus.
+    lv_index = sy-tabix.
+    READ TABLE gt_cjal_plant INTO ls_cjal_plant
+      WITH KEY new_werks = gt_mat_surplus-werks
+               new_lgort = gt_mat_surplus-lgort.
+    IF sy-subrc = 0.
+      ls_mr_lastgr-werks      = ls_cjal_plant-original.
+      ls_mr_lastgr-matnr      = gt_mat_surplus-matnr.
+**********BEGIN OF MOD-009****MOD******
+*      IF    gt_mat_surplus-last_rec_date >= '20150101'
+*        AND gt_mat_surplus-last_rec_date <= '20150103'.
+*        READ TABLE gt_mat_surplus INTO ls_mat_surplus
+*          WITH KEY  werks = ls_cjal_plant-original
+*                    matnr = gt_mat_surplus-matnr
+*                    lgort = gt_mat_surplus-lgort.
+*        IF sy-subrc = 0.
+*          ls_mr_lastgr-grdat      = ls_mat_surplus-last_rec_date.
+*        ELSE.
+*          CLEAR: ls_mat_surplus.
+
+*        ENDIF.
+*      ELSE.
+*        ls_mr_lastgr-grdat      = gt_mat_surplus-last_rec_date.
+*      ENDIF.
+      READ TABLE gt_mat_temp INTO ls_mat_surplus
+        WITH KEY  werks = ls_cjal_plant-original
+                  matnr = gt_mat_surplus-matnr
+                 lgort = ls_cjal_plant-old_lgort.
+      IF sy-subrc = 0.
+        lv_grdate_old      = ls_mat_surplus-last_rec_date.
+        gt_mat_surplus-quan_3_months = ls_mat_surplus-quan_3_months.
+        gt_mat_surplus-quan_6_months = ls_mat_surplus-quan_6_months.
+        gt_mat_surplus-quan_12_months = ls_mat_surplus-quan_12_months.
+*        gt_mat_surplus-quan_12_months_rec = ls_mat_surplus-quan_12_months_rec.
+      ENDIF.
+      IF gt_mat_surplus-last_rec_date IS INITIAL.
+        ls_mr_lastgr-grdat      = lv_grdate_old.
+      ELSE.
+        ls_mr_lastgr-grdat      = gt_mat_surplus-last_rec_date.
+      ENDIF.
+      gt_mat_surplus-last_rec_date = ls_mr_lastgr-grdat.
+**********END OF MOD-009****MOD******
+      MODIFY gt_mat_surplus INDEX lv_index.
+      APPEND ls_mr_lastgr TO gt_mr_lastgr.
+    ENDIF.
+  ENDLOOP.
+
+  CHECK gt_mr_lastgr IS NOT INITIAL.
+  MODIFY yse_mr_lastgr FROM TABLE gt_mr_lastgr.
+
+  LOOP AT gt_mat_surplus ASSIGNING <lfs_mat_surplus>.
+    READ TABLE gt_cjal_plant INTO ls_cjal_plant
+      WITH KEY new_werks = <lfs_mat_surplus>-werks.
+    IF sy-subrc = 0.
+      ls_mr_his-werks             = ls_cjal_plant-original.
+      ls_mr_his-logrt             = <lfs_mat_surplus>-lgort.
+      ls_mr_his-matnr             = <lfs_mat_surplus>-matnr .
+      ls_mr_his-quan_3_months     = <lfs_mat_surplus>-quan_3_months.
+      ls_mr_his-quan_6_months     = <lfs_mat_surplus>-quan_6_months.
+      ls_mr_his-quan_12_months    = <lfs_mat_surplus>-quan_12_months.
+      ls_mr_his-meins             = <lfs_mat_surplus>-meins.
+      APPEND ls_mr_his TO lt_mr_his.
+***********BEING OF MOD-009 MOD
+*      CLEAR ls_mat_surplus.
+*
+**      READ TABLE gt_mat_surplus INTO ls_mat_surplus
+*      READ TABLE gt_mat_temp INTO ls_mat_surplus
+*
+*        WITH KEY werks = ls_cjal_plant-original
+*                 lgort = <lfs_mat_surplus>-lgort
+*                 matnr = <lfs_mat_surplus>-matnr.
+*      IF sy-subrc = 0.
+*        <lfs_mat_surplus>-quan_3_months = <lfs_mat_surplus>-quan_3_months
+*                                        + ls_mat_surplus-quan_3_months.
+*        <lfs_mat_surplus>-quan_6_months = <lfs_mat_surplus>-quan_6_months
+*                                        + ls_mat_surplus-quan_6_months.
+*        <lfs_mat_surplus>-quan_12_months = <lfs_mat_surplus>-quan_12_months
+*                                        + ls_mat_surplus-quan_12_months.
+*      ENDIF.
+***********END OF MOD-009 MOD
+    ENDIF.
+
+  ENDLOOP.
+  LOOP AT gt_mat_surplus.
+    lv_index = sy-tabix.
+    IF NOT ( gt_mat_surplus-werks IN so_werks ).
+      DELETE gt_mat_surplus INDEX lv_index.
+    ENDIF.
+  ENDLOOP.
+  IF lt_mr_his IS NOT INITIAL.
+    MODIFY yse_mr_history FROM TABLE lt_mr_his.
+  ENDIF.
+ENDFORM.                    " UPDATE_LASTGRDATE
+***********End of MOD-008 *******Insert*************

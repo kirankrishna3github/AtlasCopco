@@ -1,0 +1,199 @@
+*&---------------------------------------------------------------------*
+*&  Include           YRD_RM08RELEASE_F0I
+*&---------------------------------------------------------------------*
+
+*---------------------------------------------------------------------*
+*       FORM DOCUMENT_CHANGE_UPDATE                                   *
+*---------------------------------------------------------------------*
+* Update DB with document changes                                     *
+*---------------------------------------------------------------------*
+* ---> i_arbkp_delete - indicates if released invoices have to be     *
+*                       deleted from t_arbkp                          *
+*---------------------------------------------------------------------*
+
+FORM document_change_update TABLES t_arbkp TYPE mrm_tab_arbkp
+                                   ti_arseg TYPE mrm_tab_arseg
+                            te_rbkp_blocked TYPE mrm_tab_rbkp_blocked
+                            USING i_arbkp_delete TYPE i.
+
+  DATA: tab_upd_arseg TYPE mrm_tab_upd_arseg,
+        tab_rbkp_blocked TYPE mrm_tab_rbkp_blocked,
+        tab_rbkp_blocked_mod TYPE mrm_tab_rbkp_blocked.
+  DATA: s_arbkp TYPE mrm_arbkp,
+        s_rbkp_blocked TYPE mrm_rbkp_blocked.
+  DATA: f_lines TYPE i,
+        f_lines_mod TYPE i,
+        f_lines_ges TYPE i,
+        f_message_number LIKE sy-msgno,
+        f_message_text LIKE sy-lisel.
+  DATA: s_arseg TYPE mrm_arseg, s_upd_arseg TYPE mrm_upd_arseg.
+
+  CLEAR: s_rbkp_blocked, s_arseg, s_upd_arseg.
+
+
+
+*----- RSEG und RBKP_BLOCKED #nderungen sammeln ----------------------*
+  PERFORM document_change_create TABLES t_arbkp
+                                        ti_arseg
+                                        tab_upd_arseg
+                                        tab_rbkp_blocked.
+
+*----- CHECK RW , hier evtl. RBKP_blocked und tab_upd_rseg #ndern ----*
+* PERFORM rw_interface_check    TABLES     t_arbkp
+*                               CHANGING   tab_rbkp_blocked.
+
+*----- Check RW, Update RW-Schnittstelle, Ereignisse ausl#sen --------*
+  CALL FUNCTION 'MRM_INVOICE_RELEASE_UPDATE'  " in Update Task
+       EXPORTING
+            ti_rbkp_blocked = tab_rbkp_blocked
+       IMPORTING
+            te_rbkp_blocked = tab_rbkp_blocked
+            te_rbkp_blocked_mod = tab_rbkp_blocked_mod.
+
+*----- Belege mit Fehler ... -----------------------------------------*
+  LOOP AT tab_rbkp_blocked INTO s_rbkp_blocked
+             WHERE NOT subrc IS INITIAL.
+
+*----- ... keine Updates RSEG: ---------------------------------------*
+    DELETE tab_upd_arseg WHERE belnr = s_rbkp_blocked-belnr
+                           AND gjahr = s_rbkp_blocked-gjahr.
+
+*----- ... Meldungen in ARBKP aufbereiten: ---------------------------*
+    f_message_number = s_rbkp_blocked-txtnr.
+    CALL FUNCTION 'RPY_MESSAGE_COMPOSE'
+      EXPORTING
+        message_id        = s_rbkp_blocked-arbgb
+        message_number    = f_message_number
+        message_var1      = s_rbkp_blocked-msgv1
+        message_var2      = s_rbkp_blocked-msgv2
+        message_var3      = s_rbkp_blocked-msgv3
+        message_var4      = s_rbkp_blocked-msgv4
+      IMPORTING
+        message_text      = f_message_text
+      EXCEPTIONS
+        message_not_found = 1
+        OTHERS            = 2.
+    READ TABLE t_arbkp WITH KEY  belnr = s_rbkp_blocked-belnr
+                                 bukrs = s_rbkp_blocked-bukrs
+                                 gjahr = s_rbkp_blocked-gjahr
+                            INTO s_arbkp.
+    s_arbkp-text = f_message_text(73).
+    MODIFY TABLE t_arbkp FROM s_arbkp.
+
+  ENDLOOP.
+
+*----- RSEG create change documents  ----------------------------------*
+  PERFORM changedocuments_create TABLES t_arbkp
+                                        tab_rbkp_blocked
+                                        ti_arseg
+                                        tab_upd_arseg.
+
+*----- Update RSEG ---------------------------------------------------*
+  CALL FUNCTION 'MRM_CHANGE_RSEG_UPDATE' IN UPDATE TASK
+    EXPORTING
+      i_upd_arseg = tab_upd_arseg.
+
+*----- save IVEXT data -----------------------------------------------*
+  if gv_ivext_changed = 'X'.                                    "NCF IV
+    perform ivext_save using t_arbkp[]
+                             ti_arseg[].
+  endif.
+
+  COMMIT WORK.
+
+  te_rbkp_blocked[] = tab_rbkp_blocked[].
+
+* check whether released invoices have to be deleted from t_arbkp *
+* (online processing) or not (batch processing).                  *
+
+  IF i_arbkp_delete EQ c_bool_true .   "online processing
+
+* die auf der DB freigegebenen Rechnungen aus der Liste entfernen -*
+    LOOP AT tab_rbkp_blocked INTO s_rbkp_blocked
+             WHERE subrc IS INITIAL.
+      DELETE t_arbkp  WHERE belnr = s_rbkp_blocked-belnr
+                      AND   gjahr = s_rbkp_blocked-gjahr.
+      DELETE ti_arseg WHERE belnr = s_rbkp_blocked-belnr
+                      AND   gjahr = s_rbkp_blocked-gjahr.
+      CLEAR s_rbkp_blocked.
+    ENDLOOP.
+
+* die auf der DB als 'manuell gesperrt' umgesetzten Rechnungen    -*
+* aus der Liste entfernen                                         -*
+    LOOP AT tab_rbkp_blocked_mod INTO s_rbkp_blocked.
+      DELETE t_arbkp  WHERE belnr = s_rbkp_blocked-belnr
+                      AND   gjahr = s_rbkp_blocked-gjahr.
+      DELETE ti_arseg WHERE belnr = s_rbkp_blocked-belnr
+                      AND   gjahr = s_rbkp_blocked-gjahr.
+
+      CLEAR s_rbkp_blocked.
+    ENDLOOP.
+
+* die auf der DB gel#schten Sperrgr¨¹nde aus der Liste entfernen -*
+    LOOP AT tab_upd_arseg INTO s_upd_arseg.
+      LOOP AT ti_arseg INTO s_arseg
+                       WHERE belnr = s_upd_arseg-belnr
+                       AND   gjahr = s_upd_arseg-gjahr
+                       and   koart = s_upd_arseg-koart
+                       and   buzei = s_upd_arseg-buzei.
+* delete icon on output list, if blocking reason is deleted
+        IF NOT s_arseg-spgrg IS INITIAL AND
+               s_upd_arseg-spgrg IS INITIAL.
+          s_arseg-icon_spgrg = s_upd_arseg-spgrg.
+        ENDIF.
+        IF NOT s_arseg-spgrm IS INITIAL AND
+               s_upd_arseg-spgrm IS INITIAL.
+          s_arseg-icon_spgrm = s_upd_arseg-spgrm.
+        ENDIF.
+        IF NOT s_arseg-spgrp IS INITIAL AND
+               s_upd_arseg-spgrp IS INITIAL.
+          s_arseg-icon_spgrp = s_upd_arseg-spgrp.
+        ENDIF.
+        IF NOT s_arseg-spgrc IS INITIAL AND
+               s_upd_arseg-spgrc IS INITIAL.
+          s_arseg-icon_spgrc = s_upd_arseg-spgrc.
+        ENDIF.
+        IF NOT s_arseg-spgrs IS INITIAL AND
+               s_upd_arseg-spgrs IS INITIAL.
+          s_arseg-icon_spgrs = s_upd_arseg-spgrs.
+        ENDIF.
+        IF NOT s_arseg-spgrt IS INITIAL AND
+               s_upd_arseg-spgrt IS INITIAL.
+          s_arseg-icon_spgrt = s_upd_arseg-spgrt.
+        ENDIF.
+        IF NOT s_arseg-spgrq IS INITIAL AND
+               s_upd_arseg-spgrq IS INITIAL.
+          s_arseg-icon_spgrq = s_upd_arseg-spgrq.
+        ENDIF.
+        s_arseg-spgrg = s_upd_arseg-spgrg.
+        s_arseg-spgrm = s_upd_arseg-spgrm.
+        s_arseg-spgrp = s_upd_arseg-spgrp.
+        s_arseg-spgrc = s_upd_arseg-spgrc.
+        s_arseg-spgrs = s_upd_arseg-spgrs.
+        s_arseg-spgrt = s_upd_arseg-spgrt.
+        s_arseg-spgrq = s_upd_arseg-spgrq.
+ENHANCEMENT-POINT RM08RELEASE_F0I_01 SPOTS ES_RM08RELEASE.
+        MODIFY ti_arseg FROM s_arseg.
+        CLEAR: s_arseg.
+      ENDLOOP.
+      CLEAR: s_upd_arseg.
+    ENDLOOP.
+
+  ELSE.                                "batch processing
+
+  ENDIF.
+
+  DELETE tab_rbkp_blocked WHERE NOT subrc IS INITIAL.
+  DESCRIBE TABLE tab_rbkp_blocked LINES f_lines.
+  DESCRIBE TABLE tab_rbkp_blocked_mod LINES f_lines_mod.
+  f_lines_ges = f_lines + f_lines_mod.
+  IF f_lines_mod GT 0.
+    MESSAGE s659 with f_lines f_lines_mod f_lines_ges.
+  ELSEIF f_lines GT 0.
+    MESSAGE s652 WITH f_lines.
+  ELSE.
+    DESCRIBE TABLE tab_upd_arseg LINES f_lines.
+    MESSAGE s656 WITH f_lines.
+  ENDIF.
+
+ENDFORM.                    "document_change_update

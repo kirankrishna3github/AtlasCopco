@@ -1,0 +1,156 @@
+*&---------------------------------------------------------------------*
+*& Report  Z_AFRC_CLEANUP
+*&
+*&---------------------------------------------------------------------*
+*&
+*&
+*&---------------------------------------------------------------------*
+
+REPORT  Z_AFRC_CLEANUP.
+* This report repairs the problem that is described in note 151396
+* It deletes entries from AFRC, CMFK and CMFP
+
+TABLES: AFRC, COBK, AFRU, CMFK, CMFP.
+
+DATA: BEGIN OF AFRC_TAB OCCURS 500,
+        MANDT LIKE AFRC-MANDT,
+        AUFNR LIKE AFRC-AUFNR,
+        RUECK LIKE AFRC-RUECK,
+        RMZHL LIKE AFRC-RMZHL,
+        CMFNR LIKE AFRC-CMFNR,
+        STOKZ LIKE AFRU-STOKZ,
+        STZHL LIKE AFRU-STZHL,
+      END OF AFRC_TAB.
+
+DATA: BEGIN OF AFRC_DEL OCCURS 500.
+        INCLUDE STRUCTURE AFRC_TAB.
+DATA  END OF AFRC_DEL.
+
+DATA: BEGIN OF CMF_DEL OCCURS 500,
+        MANDT LIKE CMFK-MANDT,
+        APLID LIKE CMFK-APLID,
+        NR LIKE CMFK-NR,
+      END OF CMF_DEL.
+
+DATA: HLP_TABIX LIKE SY-TABIX,
+      HLP_CNT LIKE SY-DBCNT.
+
+*                          Matchcode object ORDB selects process orders
+SELECT-OPTIONS: PAORDER FOR AFRC-AUFNR MATCHCODE OBJECT ORDB, "orderNr.
+                PACONFI FOR AFRC-RUECK,       "confirmation number
+                PACOUNT FOR AFRC-RMZHL.       "confirmation counter
+
+PARAMETERS: TESTFLAG AS CHECKBOX DEFAULT 'X'. "default: Testmode
+
+CONSTANTS: AFRU_REFBT LIKE COBK-REFBT VALUE 'R',
+           AFRU_AWTYP LIKE COBK-AWTYP VALUE 'AFRU'.
+
+* select all COFC records
+SELECT * FROM AFRC INTO CORRESPONDING FIELDS OF TABLE AFRC_TAB
+         WHERE AUFNR IN PAORDER
+         AND   RUECK IN PACONFI
+         AND   RMZHL IN PACOUNT.
+
+LOOP AT AFRC_TAB.
+* check, whether cost doc. already exist for corresponding AFRC
+  SELECT SINGLE * FROM COBK WHERE REFBT = AFRU_REFBT
+                            AND   REFBN = AFRC_TAB-RUECK
+                            AND   AWORG = AFRC_TAB-RMZHL
+                            AND   AWTYP = AFRU_AWTYP.
+
+  IF SY-SUBRC IS INITIAL.
+* Error if there are already costs, don't touch the AFRC entry
+    WRITE : / 'Error(?): Costs already posted:', AFRC_TAB-RUECK,
+            AFRC_TAB-RMZHL, COBK-KOKRS, COBK-BELNR.
+    DELETE AFRC_TAB.
+  ELSE.
+* no costs -> entry is OK. Now get information about cancelations
+    SELECT SINGLE * FROM AFRU WHERE RUECK = AFRC_TAB-RUECK
+                              AND   RMZHL = AFRC_TAB-RMZHL.
+    IF SY-SUBRC IS INITIAL.
+      AFRC_TAB-STOKZ = AFRU-STOKZ.   "  X : canceled
+      AFRC_TAB-STZHL = AFRU-STZHL.   " <>0: rmzhl of canceled conf.
+      MODIFY AFRC_TAB.
+    ENDIF.
+  ENDIF.
+ENDLOOP.
+
+* afrc_tab contains now all COFC entries that have no cost postings.
+* Next we need to extract all canceled confirmations. Only such pair
+* of confirmation and cancelation can be deleted without problem
+
+LOOP AT AFRC_TAB WHERE STZHL <> '00000000'.
+  HLP_TABIX = SY-TABIX.
+  READ TABLE AFRC_TAB WITH KEY AUFNR = AFRC_TAB-AUFNR
+                               RUECK = AFRC_TAB-RUECK
+                               RMZHL = AFRC_TAB-STZHL.
+  IF SY-SUBRC IS INITIAL AND AFRC_TAB-STOKZ = 'X'.    "found a pair
+*   remember canceled confirmation including errorlog
+    AFRC_DEL = AFRC_TAB.
+    APPEND AFRC_DEL.
+    CMF_DEL-MANDT = AFRC_DEL-MANDT.
+    CMF_DEL-APLID = 'PPRU'.
+    CMF_DEL-NR = AFRC_DEL-CMFNR.
+    APPEND CMF_DEL.
+*   remember cancelation
+    READ TABLE AFRC_TAB INDEX HLP_TABIX.
+    AFRC_DEL = AFRC_TAB.
+    APPEND AFRC_DEL.
+    CMF_DEL-MANDT = AFRC_DEL-MANDT.
+    CMF_DEL-APLID = 'PPRU'.
+    CMF_DEL-NR = AFRC_DEL-CMFNR.
+    APPEND CMF_DEL.
+  ELSE.
+    READ TABLE AFRC_TAB INDEX HLP_TABIX.
+  ENDIF.
+ENDLOOP.
+
+* All entries that can be deleted from AFRC are now in afrc_del
+* Show them to the user
+WRITE: /.
+WRITE: / 'The following pairs of confirmation and coresponding',
+         'cancelation are shown in COFC.'.
+WRITE: / 'No costs have been posted sofar, thus the entries can be',
+         'deleted.'.
+WRITE: /.
+WRITE: / 'AUFNR        RUECK      RMZHL    STOKZ STZHL'.
+LOOP AT AFRC_DEL.
+  WRITE: / AFRC_DEL-AUFNR,AFRC_DEL-RUECK, AFRC_DEL-RMZHL,
+           AFRC_DEL-STOKZ,'   ',AFRC_DEL-STZHL.
+ENDLOOP.
+WRITE: /.
+
+* Finally delete them if not in testmode
+IF TESTFLAG IS INITIAL.
+* cleanup COFC entries
+  DELETE AFRC FROM TABLE AFRC_DEL.
+  IF NOT SY-SUBRC IS INITIAL.
+    WRITE: / 'Error: Could not delete entries from AFRC'.
+  ELSE.
+    WRITE: / SY-DBCNT, ' entries deleted from AFRC'.
+*   cleanup protocol header
+    DELETE CMFK FROM TABLE CMF_DEL.
+    IF NOT SY-SUBRC IS INITIAL.
+      WRITE: / 'Error: Could not delete entries from CMFK'.
+    ELSE.
+      WRITE: / SY-DBCNT, ' entries deleted from CMFK'.
+*     cleanup protocol entries
+      HLP_CNT = 0.
+      LOOP AT CMF_DEL.
+        DELETE FROM CMFP WHERE APLID = CMF_DEL-APLID AND
+                                  NR = CMF_DEL-NR.
+        HLP_CNT = HLP_CNT + SY-DBCNT.
+      ENDLOOP.
+      WRITE: / HLP_CNT, ' entries deleted from CMFP'.
+      COMMIT WORK.
+    ENDIF.
+  ENDIF.
+ELSE.
+  WRITE: / 'Test only, nothing deleted'.
+ENDIF.
+
+*Selection text£º
+*PACONFI:D       .
+*PACOUNT:D       .
+*PAORDER:D       .
+*TESTFLAG:        Test

@@ -1,0 +1,379 @@
+report rkaafru3 line-size 120.
+**********************************************************************
+* Repost confirmations (AFRU-documents) to CO, FI-SL, EC-PCA, ...
+* for Release 4.7 Enterprise
+***********************************************************************
+
+tables: cobk, afru, afvc, t430, t100.
+
+data: caufv_pre like ord_pre occurs 0 with header line.
+
+data: caufv_pre_qm  like ord_pre   occurs 0 with header line,
+      lt_aufpl_qm   like aufpl_pre occurs 0 with header line,
+      lt_number_tab like rcotnr    occurs 0 with header line,
+      lt_autab_tab  like autab     occurs 0 with header line.
+
+data: afru_tab like afru occurs 0 with header line.
+
+data: begin of tca11_str.
+        include structure tca11.
+data: end of tca11_str.
+
+data: tmp_afrud like afrud,
+      tmp_caufv like caufvd,
+      yx value 'X'.
+data: crid_tab like crid occurs 0 with header line.
+
+data: t_cmfmsg like cmfmsg occurs 0 with header line.
+data: gd_cnt_doc like sy-tabix,
+      gd_flg_error type c,
+      gd_cnt_error like sy-tabix.
+*      gd_act_alloc type co_vorgang value 'RKL',
+*      gd_nwa_text  type symsgv.
+
+select-options:
+  s_rueck for afru-rueck,
+  s_rmzhl for afru-rmzhl,
+  s_ersda for afru-ersda,
+  s_budat for afru-budat.
+
+selection-screen skip 1.
+parameters:
+  list    like cofi_scr-flg_list  default yx,
+  testrun like cofi_scr-flg_test  default yx,
+  qm-ord  like rc27x-flg_sel      default space.
+
+data: aplid like tcmf6-aplid.          "Applikations-ID
+if sy-saprl(1) >= '4'.                 "#EC PORTABLE
+  aplid = 'PPRU'.
+else.
+  aplid = 'PPCO'.
+endif.
+
+perform select_afru
+        tables afru_tab
+               s_rueck
+               s_rmzhl
+               s_ersda
+               s_budat.
+if afru_tab[] is initial.
+  write: /5 'Can not find incorrect confirmations for',  "#EC NOTEXT
+         /  'specified selection criteria.'.             "#EC NOTEXT
+  exit.
+else.
+  write: / 'Incorrect confirmations found:'.
+  write: /, 'RUECK', 12 'RMZHL', 22 'AUFNR',
+         37 'ISMNW', 47 'ISMNE', 55 'STZHL'.
+endif.
+clear crid_tab.
+crid_tab-mandt = sy-mandt.
+loop at afru_tab.
+  write: / afru_tab-rueck under 'RUECK',
+           afru_tab-rmzhl under 'RMZHL',
+           afru_tab-aufnr under 'AUFNR',
+           afru_tab-ismnw under 'ISMNW',
+           afru_tab-ismne under 'ISMNE',
+           afru_tab-stzhl under 'STZHL'.
+* AFRU-Belegtabelle f¨¹r Kostenermittlung f¨¹llen
+  move-corresponding afru_tab to tmp_afrud.
+* Kontierung auf Netzplanuntervorgang
+  if not tmp_afrud-sumnr is initial.
+    tmp_afrud-uvorn = tmp_afrud-vornr.
+  endif.
+  call function 'CO_RU_BT_AFRU_APPEND'
+       exporting
+            afrud_app = tmp_afrud.
+* Pre-Tabellen f¨¹r Belegtabellen-Pre-Read erstellen,
+  caufv_pre-aufnr = afru_tab-aufnr.
+  append caufv_pre.
+  crid_tab-objid = afru_tab-arbid.
+  append crid_tab.
+endloop.
+sort crid_tab by objid.
+delete adjacent duplicates from crid_tab.
+if not crid_tab[] is initial.
+  call function 'CR_WORKCENTER_PRE_READ'
+       exporting
+            view_rcr01 = 'X'
+       tables
+            tarbid     = crid_tab.
+endif.
+
+sort caufv_pre.
+delete adjacent duplicates from caufv_pre.
+* Auftragsbelegtabelle aufbauen
+clear tca11_str.
+tca11_str-flg_alt = yx.
+tca11_str-flg_opr = yx.
+call function 'CO_DB_ORDER_PRE_READ'
+     exporting
+          flg_check          = yx
+          objects            = tca11_str
+          flg_no_gui_message = yx
+     tables
+          ord_pre_imp        = caufv_pre
+     exceptions
+          not_found          = 1
+          release_no_change  = 2
+          others             = 3.
+if sy-subrc <> 0.
+  write: / 'Error while reading orders' intensified.   "#EC NOTEXT
+  exit.
+endif.
+
+* QM-Auftragsabwicklung
+if not qm-ord is initial.
+  loop at caufv_pre.
+*   Auftrag nachlesen
+    call function 'CO_BT_CAUFV_READ_WITH_KEY'
+         exporting
+              aufnr_act      = caufv_pre-aufnr
+              no_dialog_info = yx
+         importing
+              caufvd_exp     = tmp_caufv
+         exceptions
+              not_found      = 1
+              others         = 2.
+    if sy-subrc <> 0.
+      write: / 'Can not read order' intensified,
+                caufv_pre-aufnr intensified.                 "#EC NOTEXT
+      exit.
+    endif.
+    if tmp_caufv-aufpl is initial and
+       tmp_caufv-autyp = '06'.
+*     QM-Auftragsnummern sammeln
+      caufv_pre_qm-aufnr = tmp_caufv-aufnr.
+      append caufv_pre_qm.
+    endif.
+  endloop.
+  if not caufv_pre_qm[] is initial.
+*   AUFPL von QALS (Pr¨¹flos) holen
+    select aufpl into corresponding fields of table lt_aufpl_qm
+      from qals
+       for all entries in caufv_pre_qm
+     where aufnr_co = caufv_pre_qm-aufnr.
+    if sy-subrc is initial.
+*     Belegtabelle f¨¹r Vorg#nge aufbauen
+      CALL FUNCTION 'CO_BO_OPR_SEQ_PRE_READ'
+           EXPORTING
+                TRTYP_IMP                 = 'A'
+           TABLES
+                AUFPL_PRE_TAB             = lt_aufpl_qm
+                NUMBER_TAB                = lt_number_tab
+                ORD_PRE_TAB               = caufv_pre_qm
+                AUTAB_TAB                 = lt_autab_tab
+           EXCEPTIONS
+                RELEASE_NO_CHANGE         = 1
+                OTHERS                    = 2.
+    else.
+      write: / 'Error reading table QALS'.                   "#EC NOTEXT
+      exit.
+    endif.
+  else.
+    write: / 'No QM orders selected !'.                      "#EC NOTEXT
+    exit.
+  endif.
+endif.
+
+
+format intensified off.
+clear gd_cnt_error.
+clear gd_cnt_doc.
+* Pro Auftrag Kostenanalyse aufrufen
+loop at caufv_pre.
+  clear gd_flg_error.
+  add 1 to gd_cnt_doc.
+*   Auftrag nachlesen
+  call function 'CO_BT_CAUFV_READ_WITH_KEY'
+       exporting
+            aufnr_act      = caufv_pre-aufnr
+            no_dialog_info = yx
+       importing
+            caufvd_exp     = tmp_caufv
+       exceptions
+            not_found      = 1
+            others         = 2.
+  if sy-subrc <> 0.
+    gd_flg_error = 'X'.
+    add 1 to gd_cnt_error.
+    write: / 'Can not read order' intensified,
+             caufv_pre-aufnr intensified.   "#EC NOTEXT
+    continue.
+  endif.
+* Kostenanalyse aufrufen
+  call function 'K_CONF_ACTUAL_COSTS_POST'
+       exporting
+            caufvd_imp = tmp_caufv
+       exceptions
+            no_costing = 1
+            others = 2.
+*  if sy-subrc EQ 2.
+*    continue.
+*  endif.
+*   Meldungen der Budgetverprobung in Kostenprotokoll ¨¹bernehmen
+  call function 'CM_F_SMSG_MESSAGES_READ'.
+*   Enth#lt das Kostenprotokoll Fehlermeldungen ?
+  call function 'CK_F_COSTING_PROTOCOL'
+       exporting
+            protocol     = 'E'
+            aplid        = aplid
+       exceptions
+            errors_found = 01.
+*   pr¨¹fen, ob Fehler bei der Istkostenermittlung ?
+  if sy-subrc <> 0.
+    gd_flg_error = 'X'.
+    add 1 to gd_cnt_error.
+    write: /
+    'Error during cost calculation for order' intensified,  "#EC NOTEXT
+            caufv_pre-aufnr intensified.
+    call function 'CM_F_MESSAGES_GET'
+         exporting
+              aplid      = aplid
+         tables
+              e_msgprot  = t_cmfmsg
+         exceptions
+              not_active = 0.
+    loop at t_cmfmsg.
+      clear t100.
+      select single * from  t100
+             where  sprsl  = sy-langu
+             and    arbgb  = t_cmfmsg-arbgb
+             and    msgnr  = t_cmfmsg-msgnr.
+      concatenate t_cmfmsg-arbgb  t_cmfmsg-msgnr into sy-msgv1.
+      concatenate t_cmfmsg-msgv1 t_cmfmsg-msgv2 t_cmfmsg-msgv3
+                  t_cmfmsg-msgv4 into sy-msgv2 separated by ' '.
+      write: /4 t_cmfmsg-msgty,
+                sy-msgv1, 14 t100-text,
+             / sy-msgv2 under t100-text.
+    endloop.
+  endif.
+* von hier an alle Meldungen wieder auf dem Bildschirm senden
+  call function 'CM_F_INITIALIZE'
+       exporting
+            msg_on_screen = yx
+       exceptions
+            others        = 1.
+  call function 'MESSAGES_STOP'
+       exceptions
+            others = 1.
+*  if sy-saprl(1) >= '4'                "#EC PORTABLE
+*  and testrun is initial
+*  and gd_flg_error is initial.
+*   Verbuchungsaufruf f¨¹r Istkostenermittlung
+*   call function 'K_CONFIRMATION_POST'.
+*  endif.
+endloop.
+if testrun is initial.
+*   Allahopp
+  commit work.
+else.
+  if sy-saprl(1) < '4'.
+    rollback work.
+  endif.
+  skip 1.
+  write / 'Testrun' color col_heading.
+  skip 1.
+endif.
+write: / 'Documents processed:', gd_cnt_doc left-justified.
+write: / 'Errors             :', gd_cnt_error left-justified color
+                                 col_negative.
+*======================================================================
+form select_afru
+          tables t_afru    structure afru
+                 t_rueck   structure s_rueck
+                 t_rmzhl   structure s_rmzhl
+                 t_ersda   structure s_ersda
+                 t_budat   structure s_budat.
+
+  data:      dummy_afrc(300) type c,
+             dummy_afrp3(40) type c.
+
+  constants: afrc(4)  type c value 'AFRC',
+             afrp3(5) type c value 'AFRP3'.
+
+  refresh t_afru.
+  select * from afru
+    where rueck in t_rueck
+    and   rmzhl in t_rmzhl
+    and   ersda in t_ersda
+    and   budat in t_budat
+    and (    ( ism01 <> 0  or
+               ism02 <> 0  or
+               ism03 <> 0  or
+               ism04 <> 0  or
+               ism05 <> 0  or
+               ism06 <> 0 )
+          or ( ismnw <> 0 ) )
+    order by primary key.
+    if sy-saprl(1) >= '4'.
+*     fehlerhafte Istkosten vorhanden?
+      select single * from (afrc) into dummy_afrc
+                      where aufnr = afru-aufnr
+                      and   rueck = afru-rueck
+                      and   rmzhl = afru-rmzhl.
+      if sy-subrc = 0.
+        write: / 'COFC entry for: RUECK ', afru-rueck,
+               ', RMZHL ', afru-rmzhl, ' -> will not be processed!'.
+        continue.
+      endif.
+*     Vorgemerkte Istkosten vorhanden?
+      select single * from (afrp3) into dummy_afrp3
+                      where aufnr = afru-aufnr
+                      and   rueck = afru-rueck
+                      and   rmzhl = afru-rmzhl.
+      if sy-subrc = 0.
+        write: / 'AFRP3 entry for: RUECK ', afru-rueck,
+               ', RMZHL ', afru-rmzhl, ' -> will not be processed!'.
+        continue.
+      endif.
+    endif.
+    select single steus lar01 lar02 lar03 lar04 lar05 lar06 selkz larnt
+                        from afvc into corresponding fields of afvc
+           where aufpl = afru-aufpl
+            and  aplzl = afru-aplzl.
+    check sy-subrc = 0.
+    check not afvc-selkz is initial.
+    call function 'CO_TA_T430_READ'
+         exporting
+              steus  = afvc-steus
+         importing
+              struct = t430.
+    check not t430-kalkz is initial.
+*   keine Eigenbearbeitungsdaten
+    check t430-lief is initial or
+        ( t430-lief = 'X' and not afru-arbid is initial ).
+    check ( afru-ism01 <> 0 and not afvc-lar01 is initial ) or
+          ( afru-ism02 <> 0 and not afvc-lar02 is initial ) or
+          ( afru-ism03 <> 0 and not afvc-lar03 is initial ) or
+          ( afru-ism04 <> 0 and not afvc-lar04 is initial ) or
+          ( afru-ism05 <> 0 and not afvc-lar05 is initial ) or
+          ( afru-ism06 <> 0 and not afvc-lar06 is initial ) or
+          ( afru-ismnw <> 0 and
+           ( not afvc-larnt is initial or not afru-learr is initial ) ).
+
+    select count(*) from cobk
+           where   refbt = 'R'
+           and     awtyp = 'AFRU'
+           and     refbn = afru-rueck
+           and     aworg = afru-rmzhl.
+    if sy-dbcnt = 0.
+      append afru to t_afru.
+    endif.
+    sy-msgv1 = 'RUECK:'.
+    write afru-rueck to sy-msgv2 left-justified.
+    concatenate sy-msgv1 sy-msgv2 into
+                sy-msgv1 separated by ' '.
+    call function 'SAPGUI_PROGRESS_INDICATOR'
+         exporting
+              text = sy-msgv1.
+  endselect.
+endform.
+
+*Selection text£º
+*LIST:D       Detail Lists
+*QM-ORD:D       Selection
+*S_BUDAT:D       Posting Date
+*S_ERSDA:D       Entered on
+*S_RMZHL:D       Counter
+*S_RUECK:D       Confirmation
+*TESTRUN:D       Test Run

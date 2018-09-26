@@ -1,0 +1,59 @@
+
+*-----------------------------------------------------------------------
+*        Datenbank-Tabelle VBADR
+*-----------------------------------------------------------------------
+TABLES:  VBADR,
+        *VBADR.
+DATA:  ADDRESS_SELECTION LIKE ADDR1_SEL.
+DATA:  READ_SADR_ONLY.
+
+* Alter Tabellenstand beim aendern
+
+DATA: BEGIN OF COMMON PART VBADRCOM.
+
+DATA:    BEGIN OF YVBADR OCCURS 1.
+           INCLUDE STRUCTURE SADRVB.
+DATA:    END OF YVBADR.
+
+* Aktueller Tabellenstand
+
+DATA:    BEGIN OF XVBADR OCCURS 5.
+           INCLUDE STRUCTURE SADRVB.
+DATA:    END OF XVBADR.
+
+DATA: END OF COMMON PART.
+
+* Savearea
+DATA:    BEGIN OF WAXVBADR.
+           INCLUDE STRUCTURE SADRVB.
+DATA:    END OF WAXVBADR.
+
+*TKA-begin-------------------------------------------------P30K75351
+DATA:    BEGIN OF XVBADR_SAV OCCURS 5.
+           INCLUDE STRUCTURE SADRVB.
+DATA:    END OF XVBADR_SAV.
+DATA:    BEGIN OF YVBADR_SAV OCCURS 5.
+           INCLUDE STRUCTURE SADRVB.
+DATA:    END OF YVBADR_SAV.
+*TKA-end---------------------------------------------------P30K75351
+
+* Tabellenkey
+
+DATA:    BEGIN OF XVBADRKEY,
+           ADRNR LIKE VBADR-ADRNR,
+           ADRNP LIKE VBADR-ADRNP,
+         END OF XVBADRKEY.
+
+* Hilfsfelder fuer Blaettern
+
+DATA:   XVBADR_FIRSTIND(3) TYPE P,         "erster Index
+        XVBADR_AKTIND(3)   TYPE P,         "aktueller Index
+        XVBADR_MAXIND(3)   TYPE P,         "maximaler Index
+        XVBADR_PAGIND(3)   TYPE P,         "aktueller Index der Seite
+        XVBADR_SELIND(3)   TYPE P,         "markierter Index
+        XVBADR_LOOPIND1(3) TYPE P VALUE 13, "Anzahl LOOXVBADR-Zeilen 1 z
+        XVBADR_LOOPIND2(3) TYPE P VALUE 06. "Anzahl LOOXVBADR-Zeilen 2 z
+
+
+* data for access to central address maintenance
+INCLUDE SDZAVDAT.

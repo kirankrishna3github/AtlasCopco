@@ -1,0 +1,738 @@
+*----------------------------------------------------------------------
+* PROGRAM ID           : YAM_UPD_SERV_CONTR_ITEMCAT                    *
+* PROGRAM TITLE        : Update program FOR SERVICE CONTRACTS          *
+* AUTHOR               : LUC MERTENS                                   *
+* DATE                 : 07/10/2005                                    *
+* DEVELOPMENT ID       :                                               *
+* CHANGE REQUEST NUMBER: CD1K903481                                    *
+* PROGRAM DESCRIPTION  : THIS IS A program to change the service       *
+*                        CONTRACTS - itemcategory                      *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME     |CORRECTION NUMBER| CHANGE REFERENCE #
+*----------------------------------------------------------------------*
+*
+************************************************************************
+REPORT YAM_UPD_SERV_CONTR_ITEMCAT
+       NO STANDARD PAGE HEADING
+       LINE-SIZE 270
+       MESSAGE-ID yam_dc.
+
+*---------------------------------------------------------------------*
+* PARAMETER DECLARATION
+*---------------------------------------------------------------------*
+PARAMETERS: p_infile  LIKE /sapdmc/lsoinp-filename, " FILE
+            p_pstyv   like vbap-pstyv.              " New itemcategory
+
+*---------------------------------------------------------------------*
+* TABLES DECLARATION
+*---------------------------------------------------------------------*
+TABLES: viser02.
+
+*---------------------------------------------------------------------*
+* TYPE DEFINITIONS
+*---------------------------------------------------------------------*
+* - DECLARATION FOR STRUCTURE TO READ THE FLAT FILE STRING PER STRING
+TYPES: BEGIN OF ty_upload,
+         v_text(30)    TYPE c,            " FILE UPLOAD TEXT
+       END OF ty_upload.
+
+* -
+TYPES: BEGIN OF ty_head,
+         vbeln     like vbak-vbeln,
+       END OF ty_head.
+
+* -
+TYPES: BEGIN OF ty_det,
+         vbeln     like vbak-vbeln,
+         posnr     like vbap-posnr,
+       END OF ty_det.
+
+* -
+TYPES: BEGIN OF ty_techobj,
+         sdaufnr   like vbak-vbeln,
+         posnr     like vbap-posnr,
+         equnr     like viser02-equnr,
+       END OF ty_techobj.
+
+TYPES: BEGIN OF ty_matnr,
+         vbeln     like vbap-vbeln,
+         posnr     like vbap-posnr,
+         matnr     like vbap-matnr,
+       END OF ty_matnr.
+
+*---------------------------------------------------------------------*
+* WORK AREA DECLARATIONS                                              *
+*---------------------------------------------------------------------*
+DATA : wa_contractheaderc TYPE  bapisdh1.  " WORK AREA CONTRACT HEADER
+DATA : wa_contractheaderx TYPE  bapisdh1x. " WORK AREA CONTRACT UPDATE
+DATA : wa_contractitemsc  TYPE  bapisditm. " WORK AREA CONTRACT ITEMS
+DATA : wa_contractitemsx  TYPE  bapisditmx." WORK AREA ITEMS UPDATE
+DATA : wa_bapiret2        TYPE  bapiret2.  " WORK AREA CREATE RETURN
+
+*---------------------------------------------------------------------*
+* INTERNAL TABLE DECLARATIONS                                         *
+*---------------------------------------------------------------------*
+* - INTERNAL TABLE FOR THE FILE UPLOAD FOR CONTRACTS
+DATA : i_upload TYPE STANDARD TABLE OF ty_upload
+                       INITIAL SIZE 0 WITH HEADER LINE.
+
+DATA : i_head   TYPE STANDARD TABLE OF ty_head
+                       INITIAL SIZE 0 WITH HEADER LINE.
+
+DATA : i_det    TYPE STANDARD TABLE OF ty_det
+                       INITIAL SIZE 0 WITH HEADER LINE.
+
+DATA : i_techobj TYPE STANDARD TABLE OF ty_techobj
+                       INITIAL SIZE 0 WITH HEADER LINE.
+
+DATA : i_matnr  TYPE STANDARD TABLE OF ty_matnr
+                       INITIAL SIZE 0 WITH HEADER LINE.
+
+* - INTERNAL TABLE FOR BAPI STRUCTURE OF THE CONTRACT ITEM DATA
+DATA : i_contract_itemsc TYPE STANDARD TABLE OF bapisditm
+                      INITIAL SIZE 0 WITH HEADER LINE.
+
+* - INTERNAL TABLE FOR BAPI STRUCTURE OF THE CONTRACT ITEM UPDATE
+DATA : i_contract_itemsx TYPE STANDARD TABLE OF bapisditmx
+                      INITIAL SIZE 0 WITH HEADER LINE.
+
+* - INTERNAL TABLE MANIPULATING THE HEADER AND DETAIL AND PASSING TO
+* - BAPI.
+DATA : i_contract_items1 LIKE i_contract_itemsc
+                            OCCURS 0 WITH HEADER LINE.
+
+* - INTERNAL TABLE FOR THE BAPI STRUCTUE OF THE RETURN DATA
+DATA : i_bapiret2 TYPE STANDARD TABLE OF bapiret2
+                      INITIAL SIZE 0 WITH HEADER LINE.
+
+*---------------------------------------------------------------------*
+* INTERNAL TABLE FOR BDC AND CONTRACT DETAILS                         *
+*---------------------------------------------------------------------*
+DATA : i_bdcdata LIKE bdcdata OCCURS 0 WITH HEADER LINE,
+       struct_bdcdata TYPE bdcdata.
+
+*---------------------------------------------------------------------*
+* VARIABLE DECLARATIONS                                               *
+*---------------------------------------------------------------------*
+DATA : g_filename type string.
+
+*---------------------------------------------------------------------*
+* CONSTANT DECLARATIONS                                               *
+*---------------------------------------------------------------------*
+CONSTANTS : c_filetype(10)   TYPE c VALUE 'ASC',     " FILE TYPE
+            c_x(1)           TYPE c VALUE 'X',
+            c_1(1)           type c value '1',
+            c_error          LIKE bapiret2-type VALUE 'E',
+            c_d(1)           TYPE c VALUE 'D',       " BAPI DELETE FLAG
+            c_u(1)           TYPE c VALUE 'U',       " BAPI UPDATE FLAG
+            c_blank          TYPE c VALUE ' '.
+
+*---------------------------------------------------------------------*
+* CONSTANT DECLARATIONS FOR BDC
+*
+*---------------------------------------------------------------------*
+CONSTANTS : c_group     LIKE apqi-groupid VALUE 'Y_VA42',
+            c_trans     LIKE tstc-tcode   VALUE 'VA42'.
+
+*- AT selection-screen  ----------------------------------------------*
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_infile.
+
+  CALL FUNCTION 'WS_FILENAME_GET'
+    EXPORTING
+      def_path = 'C:\SAP\'
+      mask     = ',*,*.txt.'
+    IMPORTING
+      filename = p_infile
+    EXCEPTIONS
+      OTHERS   = 5.
+
+*--------- S T A R T   O F   M A I N   P R O C E S S I N G -----------*
+
+*---------------------------------------------------------------------*
+* START-OF-SELECTION                                                  *
+*---------------------------------------------------------------------*
+START-OF-SELECTION.
+
+* - READ INPUT FILE FROM PRES SERVER INTO INTERNAL TABLE
+  PERFORM get_input_file.
+
+* -
+  LOOP AT i_upload.
+
+    MOVE i_upload-v_text+00(10)    TO i_head-vbeln.
+    append i_head.
+    clear i_head.
+
+    MOVE i_upload-v_text+00(10)    TO i_det-vbeln.
+    move i_upload-v_text+10(06)    to i_det-posnr.
+    append i_det.
+    clear i_det.
+
+* - Get equipment no. to fill techn.objects again after delete of
+*   contract item
+    select sdaufnr posnr equnr
+       appending corresponding fields of table i_techobj
+       from viser02
+       where sdaufnr = i_upload-v_text+00(10)
+         and posnr   = i_upload-v_text+10(06).
+
+* - get materialno.
+    select vbeln posnr matnr
+       appending corresponding fields of table i_matnr
+       from vbap
+       where vbeln = i_upload-v_text+00(10)
+         and posnr = i_upload-v_text+10(06).
+
+  ENDLOOP.
+
+* - SORT THE HEADER INTERNAL TABLE AND DELETE THE DUPLICATES
+  SORT i_head BY vbeln.
+  DELETE ADJACENT DUPLICATES FROM i_head COMPARING vbeln.
+
+* - SORT THE DETAIL INTERNAL TABLE
+  sort i_det by vbeln posnr.
+
+* - SORT THE TECHOBJ INTERNAL TABLE
+  sort i_techobj by sdaufnr posnr.
+
+* - SORT THE MATNR INTERNAL TABLE
+  sort i_matnr by vbeln posnr.
+
+* - Delete contractitems using BAPI
+  IF NOT i_head[] IS INITIAL.
+
+    LOOP AT i_head.
+
+      PERFORM fill_data_to_delete.
+      PERFORM bapi_delete_contracts.
+
+    ENDLOOP.
+
+  ENDIF.
+
+* - Add contractitems with new itemcategory (BTCI)
+  IF NOT i_head[] IS INITIAL.
+
+    perform open_group.
+
+    LOOP AT i_head.
+
+* -   Change contract - item category
+      PERFORM sales_contract_doc.
+
+    ENDLOOP.
+
+    perform close_group.
+
+  ENDIF.
+
+
+*----------------------------------------------------------------------*
+* END-OF-SELECTION                                                     *
+*----------------------------------------------------------------------*
+END-OF-SELECTION.
+
+*&---------------------------------------------------------------------*
+*&      FORM  GET_INPUT_FILE
+*&---------------------------------------------------------------------*
+*       TEXT
+*----------------------------------------------------------------------*
+*  -->  P1        TEXT
+*  <--  P2        TEXT
+*----------------------------------------------------------------------*
+FORM get_input_file .
+
+* - FILE READ FROM PRESENTATION SERVER
+  move p_infile to g_filename.
+  PERFORM get_from_pres IN PROGRAM yam_common_routines
+                                   TABLES  i_upload
+                                   USING   g_filename
+                                           c_filetype
+                                           c_blank.
+
+ENDFORM.                    " GET_INPUT_FILE
+
+*&---------------------------------------------------------------------*
+*&   FORM SALES_CONTRACT_DOC
+*&---------------------------------------------------------------------*
+*       TEXT
+*----------------------------------------------------------------------*
+*  -->  P1        TEXT
+*  <--  P2        TEXT
+*----------------------------------------------------------------------*
+FORM sales_contract_doc .
+
+  PERFORM bdc_filldata.
+  perform bdc_transaction using c_trans.
+  refresh i_bdcdata.
+
+ENDFORM.                    "SALES_CONTRACT_DOC
+
+*&---------------------------------------------------------------------*
+*&      Form  bdc_filldata
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM bdc_filldata .
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                     USING: 'SAPMV45A' '0102' 'X' ' ' ' '
+                     CHANGING struct_bdcdata.
+
+  APPEND struct_bdcdata TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                     USING: '' '' '' 'VBAK-VBELN' i_head-vbeln
+                     CHANGING struct_bdcdata.
+
+  APPEND struct_bdcdata TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                      USING: '' '' '' 'BDC_OKCODE' '/00'
+                      CHANGING struct_bdcdata.
+
+  APPEND struct_bdcdata TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+* Overview
+* Add items
+  loop at i_det where vbeln = i_head-vbeln.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                       USING: 'SAPMV45A' '4001' 'X' ' ' ' '
+                       CHANGING struct_bdcdata.
+
+    APPEND struct_bdcdata TO i_bdcdata.
+    CLEAR  struct_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                        USING: '' '' '' 'BDC_CURSOR' 'RV45A-MABNR(01)'
+                        CHANGING struct_bdcdata.
+
+    APPEND struct_bdcdata TO i_bdcdata.
+    CLEAR  struct_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                        USING: '' '' '' 'BDC_OKCODE' '=POAN'
+                        CHANGING struct_bdcdata.
+
+    APPEND struct_bdcdata TO i_bdcdata.
+    CLEAR  struct_bdcdata.
+
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                       USING: 'SAPMV45A' '4001' 'X' ' ' ' '
+                       CHANGING struct_bdcdata.
+
+    APPEND struct_bdcdata TO i_bdcdata.
+    CLEAR  struct_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                        USING: '' '' '' 'BDC_OKCODE' '/00'
+                        CHANGING struct_bdcdata.
+
+    APPEND struct_bdcdata TO i_bdcdata.
+    CLEAR  struct_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                       USING: '' '' '' 'VBAP-POSNR(02)' i_det-posnr
+                       CHANGING struct_bdcdata.
+
+    APPEND struct_bdcdata TO i_bdcdata.
+    CLEAR  struct_bdcdata.
+
+    read table i_matnr with key vbeln = i_det-vbeln
+                                posnr = i_det-posnr
+                          binary search.
+
+    if sy-subrc = 0.
+      PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                       USING: '' '' '' 'RV45A-MABNR(02)' i_matnr-matnr
+                       CHANGING struct_bdcdata.
+
+      APPEND struct_bdcdata TO i_bdcdata.
+      CLEAR  struct_bdcdata.
+    endif.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                       USING: '' '' '' 'VBAP-ZMENG(02)' c_1
+                       CHANGING struct_bdcdata.
+
+    APPEND struct_bdcdata TO i_bdcdata.
+    CLEAR  struct_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                       USING: '' '' '' 'VBAP-PSTYV(02)' p_pstyv
+                       CHANGING struct_bdcdata.
+
+    APPEND struct_bdcdata TO i_bdcdata.
+    CLEAR  struct_bdcdata.
+
+*   positioning on added item --> put it on top of frame
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                       USING: 'SAPMV45A' '4001' 'X' ' ' ' '
+                       CHANGING struct_bdcdata.
+
+    APPEND struct_bdcdata TO i_bdcdata.
+    CLEAR  struct_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                      USING: '' '' '' 'BDC_OKCODE' '=POPO'
+                      CHANGING struct_bdcdata.
+
+    APPEND struct_bdcdata TO i_bdcdata.
+    CLEAR  struct_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                       USING: 'SAPMV45A' '0251' 'X' ' ' ' '
+                       CHANGING struct_bdcdata.
+
+    APPEND struct_bdcdata TO i_bdcdata.
+    CLEAR  struct_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                      USING: '' '' '' 'BDC_OKCODE' '=POSI'
+                      CHANGING struct_bdcdata.
+
+    APPEND struct_bdcdata TO i_bdcdata.
+    CLEAR  struct_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                       USING: '' '' '' 'RV45A-POSNR' i_det-posnr
+                       CHANGING struct_bdcdata.
+
+    APPEND struct_bdcdata TO i_bdcdata.
+    CLEAR  struct_bdcdata.
+
+    read table i_techobj with key sdaufnr = i_det-vbeln
+                                  posnr   = i_det-posnr
+                            binary search.
+
+    if sy-subrc = 0.
+
+      PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                         USING: 'SAPMV45A' '4001' 'X' ' ' ' '
+                         CHANGING struct_bdcdata.
+
+      APPEND struct_bdcdata TO i_bdcdata.
+      CLEAR  struct_bdcdata.
+
+      PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                        USING: '' '' '' 'BDC_OKCODE' '=POTO'
+                        CHANGING struct_bdcdata.
+
+      APPEND struct_bdcdata TO i_bdcdata.
+      CLEAR  struct_bdcdata.
+
+      PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                        USING: '' '' '' 'BDC_CURSOR' 'VBAP-POSNR(01)'
+                        CHANGING struct_bdcdata.
+
+      APPEND struct_bdcdata TO i_bdcdata.
+      CLEAR  struct_bdcdata.
+
+      PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                        USING: '' '' '' 'RV45A-VBAP_SELKZ(01)' c_x
+                        CHANGING struct_bdcdata.
+
+      APPEND struct_bdcdata TO i_bdcdata.
+      CLEAR  struct_bdcdata.
+
+      PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                        USING: 'SAPLIWOL' '0220' 'X' ' ' ' '
+                        CHANGING struct_bdcdata.
+
+      APPEND struct_bdcdata TO i_bdcdata.
+      CLEAR  struct_bdcdata.
+
+      PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                      USING: '' '' '' 'RIWOL-EQUNR(01)' i_techobj-equnr
+                      CHANGING struct_bdcdata.
+
+      APPEND struct_bdcdata TO i_bdcdata.
+      CLEAR  struct_bdcdata.
+
+      PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                        USING: '' '' '' 'BDC_OKCODE' '=BACK'
+                        CHANGING struct_bdcdata.
+
+      APPEND struct_bdcdata TO i_bdcdata.
+      CLEAR  struct_bdcdata.
+    endif.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                       USING: 'SAPMV45A' '4001' 'X' ' ' ' '
+                       CHANGING struct_bdcdata.
+
+    APPEND struct_bdcdata TO i_bdcdata.
+    CLEAR  struct_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                      USING: '' '' '' 'BDC_OKCODE' '=PKSE'
+                      CHANGING struct_bdcdata.
+
+    APPEND struct_bdcdata TO i_bdcdata.
+    CLEAR  struct_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                      USING: '' '' '' 'BDC_CURSOR' 'VBAP-POSNR(01)'
+                      CHANGING struct_bdcdata.
+
+    APPEND struct_bdcdata TO i_bdcdata.
+    CLEAR  struct_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                      USING: '' '' '' 'RV45A-VBAP_SELKZ(01)' c_x
+                      CHANGING struct_bdcdata.
+
+    APPEND struct_bdcdata TO i_bdcdata.
+    CLEAR  struct_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                       USING: 'SAPMV13A' '3001' 'X' ' ' ' '
+                       CHANGING struct_bdcdata.
+
+    APPEND struct_bdcdata TO i_bdcdata.
+    CLEAR  struct_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                      USING: '' '' '' 'BDC_OKCODE' '=SICH'
+                      CHANGING struct_bdcdata.
+
+    APPEND struct_bdcdata TO i_bdcdata.
+    CLEAR  struct_bdcdata.
+
+  endloop.
+
+* Save
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                     USING: 'SAPMV45A' '4001' 'X' ' ' ' '
+                     CHANGING struct_bdcdata.
+
+  APPEND struct_bdcdata TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                      USING: '' '' '' 'BDC_OKCODE' '=SICH'
+                      CHANGING struct_bdcdata.
+
+  APPEND struct_bdcdata TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+ENDFORM.        "bdc_filldata
+
+*&---------------------------------------------------------------------*
+*&      Form  BDC_TRANSACTION
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_C_TRANS  text
+*----------------------------------------------------------------------*
+FORM bdc_transaction USING p_c_trans.
+
+  CALL FUNCTION 'BDC_INSERT'
+    EXPORTING
+      tcode            = p_c_trans
+    TABLES
+      dynprotab        = i_bdcdata
+    EXCEPTIONS
+      internal_error   = 1
+      not_open         = 2
+      queue_error      = 3
+      tcode_invalid    = 4
+      printing_invalid = 5
+      posting_invalid  = 6
+      OTHERS           = 7.
+  .
+  IF sy-subrc <> 0.
+    MESSAGE e014.
+  ENDIF.
+
+ENDFORM.                    " BDC_TRANSACTION
+
+*&---------------------------------------------------------------------*
+*&      Form  open_group
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM open_group .
+
+  CALL FUNCTION 'BDC_OPEN_GROUP'
+    EXPORTING
+      client = sy-mandt
+      group  = c_group
+      user   = sy-uname
+      keep   = ' '.
+  .
+  IF sy-subrc <> 0.
+    MESSAGE e013. " OPEN SESSION FAILED
+  ENDIF.
+
+ENDFORM.                    " open_group
+
+*&---------------------------------------------------------------------*
+*&      Form  close_group
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM close_group .
+
+  CALL FUNCTION 'BDC_CLOSE_GROUP'.
+
+ENDFORM.                    " close_group
+
+*&---------------------------------------------------------------------*
+*&      Form  bapi_delete_contracts
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM bapi_delete_contracts .
+
+  LOOP AT i_det where vbeln eq i_head-vbeln.
+
+    REFRESH i_contract_items1.
+
+    MOVE i_det-posnr        TO   wa_contractitemsc-itm_number.
+    MOVE i_det-posnr        TO   wa_contractitemsx-itm_number.
+    MOVE c_d                TO   wa_contractitemsx-updateflag.
+    APPEND wa_contractitemsc TO i_contract_itemsc.
+    APPEND wa_contractitemsx TO i_contract_itemsx.
+
+    CLEAR wa_contractitemsc.
+    CLEAR wa_contractitemsx.
+
+  ENDLOOP.
+
+  i_contract_items1[] = i_contract_itemsc[].
+  REFRESH i_contract_itemsc.
+
+* - CHANGE BAPI FOR THE EXISTING SINGLE CONTRACT
+  PERFORM bapi_change_function.
+
+ENDFORM.                    " bapi_delete_contracts
+
+*&---------------------------------------------------------------------*
+*&      Form  fill_data_to_delete
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM fill_data_to_delete .
+
+  move i_head-vbeln         to  wa_contractheaderc-collect_no.
+  move c_u                  to  wa_contractheaderx-updateflag.
+
+ENDFORM.                    " fill_data_to_delete
+
+*&---------------------------------------------------------------------*
+*&      Form  bapi_change_function
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM bapi_change_function .
+
+  CALL FUNCTION 'BAPI_CUSTOMERCONTRACT_CHANGE'
+    EXPORTING
+      salesdocument       = i_head-vbeln
+      contract_header_in  = wa_contractheaderc
+      contract_header_inx = wa_contractheaderx
+    TABLES
+      return              = i_bapiret2
+      contract_item_in    = i_contract_items1[]
+      contract_item_inx   = i_contract_itemsx[].
+
+  IF sy-subrc EQ 0.
+
+* -   COMMIT THE BAPI WHICH WILL FINALLY CHANGE SERVICE CONTRACTS
+    CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'.
+
+  ENDIF.
+
+* - DISPLAY ERROR LOG
+  IF NOT i_bapiret2[] IS INITIAL.
+    PERFORM write_errorlist.
+  ENDIF.
+
+  REFRESH: i_contract_items1, i_contract_itemsx, i_bapiret2.
+  CLEAR: i_contract_items1, i_contract_itemsx.
+
+ENDFORM.                    " bapi_change_function
+
+*&---------------------------------------------------------------------*
+*&      Form  write_errorlist
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM write_errorlist .
+
+  CLEAR i_bapiret2.
+
+* WRITE ALL THE BAPI ERRORS
+
+  LOOP AT i_bapiret2 WHERE type = c_error.
+    write: / i_head-vbeln.
+    WRITE: /001 i_bapiret2-type,
+            006 i_bapiret2-id,
+            028 i_bapiret2-number,
+            035 i_bapiret2-message,
+            074 i_bapiret2-log_no,
+            096 i_bapiret2-log_msg_no,
+            104 i_bapiret2-message_v1,
+            121 i_bapiret2-message_v2,
+            138 i_bapiret2-message_v3,
+            155 i_bapiret2-message_v4,
+            172 i_bapiret2-parameter,
+            206 i_bapiret2-row,
+            218 i_bapiret2-field,
+            250 i_bapiret2-system.
+  ENDLOOP.
+  WRITE: /001 sy-uline.
+
+ENDFORM.                    " write_errorlist
+
+*Text symbol text£º
+*009:BAPI Error Log
+*010:Message Type
+*011:Message Class
+*012:Message Number
+*013:Error Message
+*014:Application Log Number
+*015:Application Message Number
+*016:Message variable1
+*017:Message Variable2
+*018:Message Variable3
+*019:Message Variable4
+*020:Parameter Name
+*021:Line in Parameter
+*022:Field in Parameter
+*023:Error !!! Service Contract already exists for this entry
+*024:Error !!! Multiple Service Contracts found for this entry
+
+*025:No printer setting defined for user
+*Selection text£º
+*P_INFILE:        Input filename
+*P_PSTYV:        New Item category

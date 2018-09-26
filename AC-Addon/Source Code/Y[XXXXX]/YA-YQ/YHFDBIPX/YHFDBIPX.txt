@@ -1,0 +1,1593 @@
+***********************************************************************
+*         Copyright(c) 2003 Deutsche Bank AG
+* All rights reserved. This Software is proprietary to Deutsche Bank AG
+* and is protected by copyright law and international treaties. Under no
+* circumstances are you permitted to make any attempt to alter, decrypt
+* or reverse engineer this software, and any unauthorised reproduction
+* of this software or any portion thereof may result in severe civil and
+* criminal penalties, and will be prosecuted to the maximum extent
+* possible under the law.
+************************************************************************
+report yhfdbipx no standard page heading
+                line-count 65
+                line-size  100
+                message-id 38.
+************************************************************************
+*  Author       :  Deutsche Bank AG
+*  Date         :  Dec/2003
+*  Description  :  This program is used to download the payment details
+*                  for Auto or Outgoing payment.
+*  Assumption   :  WTX not netted for partial payment in foreign ccy.
+************************************************************************
+** DDIC-Customized Objects ********************************************
+tables: reguh, regup, with_item, t059p.
+tables: bsik, bsak, bseg, bkpf, t001.
+tables: bsid, bsad, tcurf.
+*TABLES: yhfparmi.
+tables: rseg, bnka,lfa1, kna1,
+        bsec,
+        knb1,
+        knbk,
+        lfb1,
+        lfbk,
+        tiban.
+
+
+** Global fields *******************************************************
+** Global constants ****************************************************
+************************* Data Declaration *****************************
+data : itab_bsak like bsak occurs 0 with header line.
+data : itab_bsad like bsad occurs 0 with header line.
+data : itab_bsik2 like bsik occurs 0 with header line.
+data:  itab_rseg like rseg occurs 0 with header line.
+
+* Format mapping table struct with two additional columns
+* order and header name
+data: begin of itab_fm_struct occurs 0,
+*        format_no LIKE yhffmtdt-format_no,
+*        column_no LIKE yhffmtdt-column_no,
+*        column_nme LIKE yhffmtdt-column_nme,
+*        max_length LIKE yhffmtdt-max_length,
+*        source_typ LIKE yhffmtdt-source_typ,
+        source_val like yhffmtdt-source_val,
+*        default_v LIKE yhffmtdt-default_v,
+        order type i,
+        header_name like yhffmtdt-column_nme,
+        column_value(1000),
+        max_length(4) type n,
+  end of itab_fm_struct.
+
+data : dc_ind like bseg-shkzg,
+              amount like bseg-wrbtr,
+              gross_amt like bseg-wrbtr,
+              in_amt like rseg-wrbtr,
+             temp_wht like bseg-qbshb,
+             ws_text like bseg-sgtxt,
+              ws_augbl like bseg-augbl.
+
+data: w_sno(4) type n, inv_curr like bkpf-waers,
+            amount1(15), v_wtx_option like yhfparmi-parm_val,
+            in_amt1(15),
+            v_amt_option like yhfparmi-parm_val.
+
+*DATA: itab_bsik LIKE bsik OCCURS 0 WITH HEADER LINE.
+data: begin of itab_bsik occurs 0.
+        include structure bsik.
+data: reguh like reguh.
+data: end of itab_bsik.
+
+data: sel_ind(1) type c, wht_inv_flag(1),flag(1).
+data: v_inv_tot like bseg-wrbtr, v_opy_flag(1) , v_rem_sro_flag(1).
+data: v_wht_amt like with_item-wt_qbshb, pay_curr like bkpf-waers.
+data: loc_curr like bkpf-waers, v_wtx_amt like bseg-wrbtr.
+data: v_wtx_amt1 like bseg-wrbtr,
+      inv_wtx_amt like bseg-wrbtr,
+      tax_amt LIKE bseg-wrbtr,
+      amt1 LIKE with_item-wt_qsshb,
+       flag_loc_curr.
+
+data: cash_disc like bseg-sknto.
+data: yhlive(1) type c value 'X'.
+
+*  PLPPF = previous line partial payment
+data: plppf(1).
+
+** Global arrays and internal tables **********************************
+data: begin of i_reguh occurs 0.
+        include structure reguh.
+data: end of i_reguh.
+
+*to extract invoice description
+data:  ldocno  type bseg-belnr,
+           ldescp  type bseg-sgtxt,
+           orig_docno type bseg-belnr.
+
+data : begin of downtab occurs 1,
+        line(100),
+end   of downtab.
+
+* variable for write_payment and get_table_value subroutines
+* TODO: move this to local subroutine
+data: v_column_value(1000).
+
+data: begin of bnkai.
+        include structure bnka.
+data: end of bnkai.
+
+data : serial(100) type n, curr_maxlength  type i.
+
+data : v_countries2 like yhfparmi-parm_val, v_ck_acct(35),
+       v_countries1 like yhfparmi-parm_val, v_acct_ref(35).
+************************* User Selection ******************************
+** Selection screen parameters ****************************************
+select-options: w_laufi for reguh-laufi no intervals.
+selection-screen skip 1.
+
+selection-screen begin of block criteria with frame title text-012.
+parameters: co_code  like bsik-bukrs.
+select-options: w_docno  for bsik-belnr,
+pay_meth for bseg-zlsch.
+parameters:  w_fyr like bseg-gjahr.
+selection-screen end of block criteria.
+
+parameters: paydet like yhfhelp-yhpayfile.
+
+selection-screen skip 1.
+
+selection-screen begin of line.
+parameters: ref1 radiobutton group rad.
+selection-screen comment 4(50) text-010 .
+selection-screen end of line.
+
+selection-screen begin of line.
+parameters: ref2 radiobutton group rad.
+selection-screen comment 4(50) text-011 .
+selection-screen end of line.
+
+selection-screen begin of line.
+parameters: ref3 radiobutton group rad.
+selection-screen comment 4(50) text-009 .
+selection-screen end of line.
+
+start-of-selection.
+
+* get company details from company table based on input
+  select single * from t001 where bukrs = co_code.
+
+* get all payments based on selection criteria
+  perform get_payment.
+
+* sort payments by cc, clearing doc no, full/partial, docno
+  sort itab_bsik by bukrs augbl penrc descending belnr.
+
+* This is the main loop to go through all payments
+  loop at itab_bsik.
+
+    clear: pay_curr, inv_curr.
+
+*   v_opy_flag = outgoing payment flag (manual payment flag)
+    if v_opy_flag = 'Y'.
+      select single * from bkpf where bukrs = itab_bsik-bukrs
+                                and   belnr = itab_bsik-augbl
+                                and   gjahr = w_fyr.
+
+*     Don't process reverse documents
+*     bkpf-stblg = reverse doc number
+      if not bkpf-stblg is initial.
+        continue.
+      endif.
+
+*     use currency from bkpf table if it's manual payment
+      pay_curr = bkpf-waers.
+    else.
+*     use currency from bsik table if it's auto payment
+      pay_curr = itab_bsik-waers.
+    endif.
+
+*   get invoice number
+*   bsik-penrc = partial payment flag
+*   Fully paid
+    if itab_bsik-penrc ne 'Y'.
+
+*     bsik-belnr = Invoice number (payment doc number)
+      ldocno = itab_bsik-belnr.
+*   Partial paid
+    else.
+*     bsik-rebzg = invoice number this transaction
+*     belongs to
+      ldocno = itab_bsik-rebzg.
+    endif.
+
+
+*   bseg-sgtxt = Item text description
+*   bsik-gjahr = Fiscal year
+    select single sgtxt into ldescp from bseg
+                        where bukrs = itab_bsik-bukrs
+                          and gjahr = itab_bsik-gjahr
+                          and belnr = ldocno
+                          and buzei = 1.
+
+
+*   PLPPF = Previous Line Partial Payment Flag
+*   PLPPF EQ Y to separate first part pay from second
+    if itab_bsik-augbl ne ws_augbl or plppf eq 'Y'.
+
+*      CLEAR: plppf.
+
+*      w_sno = 1.
+*      ws_augbl = itab_bsik-augbl.
+      write:/.
+
+      if itab_bsik-penrc ne 'Y'. "Fully Paid
+        write: / text-001, itab_bsik-augbl, itab_bsik-bukrs.
+        if orig_docno ne itab_bsik-augbl.
+          clear serial.
+        endif.
+
+      else. "Partial paid
+        write: / text-001, itab_bsik-belnr, itab_bsik-bukrs.
+        if orig_docno ne itab_bsik-belnr.
+          clear serial.
+        endif.
+      endif.
+    endif.
+
+    clear:bkpf.
+
+    select single * from bkpf where bukrs = itab_bsik-bukrs
+                              and   belnr = ldocno
+                              and   gjahr = itab_bsik-gjahr.
+    inv_curr = bkpf-waers.
+
+    clear:bseg.
+
+*   buzei = Number of Line Item Within Accounting Document
+    select single * from bseg where bukrs = itab_bsik-bukrs
+                              and belnr = ldocno
+                              and gjahr = itab_bsik-gjahr
+                              and buzei = itab_bsik-buzei.
+
+    dc_ind = itab_bsik-shkzg.
+    translate dc_ind using 'H+S-'.
+
+
+*   amount value needs to be obtained from here
+*   bsik-wrbtr = amount in document currency
+*   bsik-qbshb = withholding tax amount in document currency
+*   bsik-wskto = cash discount amount in document currency
+*    IF v_opy_flag = 'Y'.
+*      PERFORM get_opy_amount.
+*    ELSE.
+*      amount = itab_bsik-wrbtr - itab_bsik-qbshb - itab_bsik-wskto.
+*    ENDIF.
+
+    perform get_add_info.
+*   Get values from YHFFMTDT (or YHFFMTOW)
+    refresh itab_fm_struct.
+    perform get_column_values.
+
+*   print itab_fm_struct header_name & column_value
+    perform print_results.
+*
+    if itab_bsik-augbl ne ws_augbl or plppf eq 'Y'.
+      clear plppf.
+      w_sno = 1.
+      ws_augbl = itab_bsik-augbl.
+
+    endif.
+    w_sno = w_sno + 1.
+    plppf = itab_bsik-penrc.
+
+    if itab_bsik-penrc ne 'Y'. "Fully Paid
+      orig_docno = itab_bsik-augbl.
+
+    else. "Partial paid
+      orig_docno = itab_bsik-belnr.
+    endif.
+
+  endloop.
+
+*  LOOP AT itab_bsik.
+*    PERFORM print_results.
+
+*    w_sno = w_sno + 1.
+*  endloop.
+
+  refresh downtab.
+  call function 'LIST_TO_ASCI'
+    exporting
+      list_index         = sy-lsind
+    tables
+      listasci           = downtab
+    exceptions
+      empty_list         = 1
+      list_index_invalid = 2
+      others             = 3.
+*FOR 4.6
+*  open dataset paydet for output in text mode.
+*END 4.6
+
+*FOR 4.7
+  OPEN DATASET PAYDET FOR OUTPUT IN TEXT MODE ENCODING DEFAULT.
+*END 4.7
+
+  if sy-subrc <> 0.
+    message i001 with 'Could not open file'.
+  else.
+    loop at downtab.
+      transfer downtab to paydet.
+    endloop.
+    close dataset paydet.
+  endif.
+
+*---------------------------------------------------------------------*
+*       FORM GET_PAYMETH                                              *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+form get_paymeth.
+  clear bseg.
+  select single zlsch into itab_bsik-zlsch  from bseg
+                      where bukrs = itab_bsik-bukrs
+                      and belnr   = itab_bsik-belnr
+                      and gjahr   = itab_bsik-gjahr
+                      and zlsch   ne space.
+endform.                    "get_paymeth
+
+*---------------------------------------------------------------------*
+*       FORM GET_PAYMENT                                              *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+form get_payment.
+  data: ireguh like reguh occurs 0 with header line.
+  data: iregup like regup occurs 0 with header line.
+
+** zw_laufi = Run ID (Additional information)
+*  IF zw_laufi NE space.
+*
+*    IF w_laufi EQ space.
+*
+**     get header info from reguh based on Run Date and Run ID
+**     reguh-xvorl = "Only Proposal Run?" flag
+*      SELECT * FROM reguh INTO TABLE ireguh
+*                          WHERE laufd = zw_laufd
+*                          AND laufi = zw_laufi
+*                          AND xvorl = ' '.
+*      LOOP AT ireguh.
+*        SELECT * FROM regup INTO TABLE iregup
+*                            WHERE laufd  = ireguh-laufd
+*                            AND   laufi = ireguh-laufi
+*                            AND   xvorl = ' '
+*                            AND   zbukr = ireguh-zbukr
+*                            AND   vblnr = ireguh-vblnr.
+**         zbukr is the Paying company code
+**         Document Number of the Payment Document
+*        LOOP AT iregup.
+*          MOVE-CORRESPONDING iregup TO itab_bsik.
+**         regup-vblnr = clearing doc number
+*          itab_bsik-augbl = iregup-vblnr.
+*
+*          APPEND itab_bsik.
+*          CLEAR itab_bsik.
+*        ENDLOOP.
+*      ENDLOOP.
+*    ELSE.
+*      SELECT * FROM reguh INTO TABLE ireguh
+*                          WHERE laufd = zw_laufd
+*                          AND ( laufi = zw_laufi OR laufi IN w_laufi )
+*                          AND xvorl = ' '.
+*      LOOP AT ireguh.
+*        SELECT * FROM regup INTO TABLE iregup
+*                            WHERE laufd  = ireguh-laufd
+*                            AND   laufi = ireguh-laufi
+*                            AND   xvorl = ' '
+*                            AND   zbukr = ireguh-zbukr
+*                            AND   vblnr = ireguh-vblnr.
+*        LOOP AT iregup.
+*          MOVE-CORRESPONDING iregup TO itab_bsik.
+*
+**         regup-vblnr = clearing doc number
+*          itab_bsik-augbl = iregup-vblnr.
+*
+*          APPEND itab_bsik.
+*          CLEAR itab_bsik.
+*        ENDLOOP.
+*      ENDLOOP.
+*    ENDIF.
+*
+** Manual payment (Run ID is empty)
+*  ELSE.
+*    v_opy_flag = 'Y'.
+*    PERFORM get_outgoing_details.
+*  ENDIF.
+
+  if zw_laufi ne space.
+* For extracting WTX from auto payment.
+    if w_laufi eq space.
+      select * from reguh
+             where laufd = zw_laufd
+               and laufi = zw_laufi
+               and xvorl = ' '.
+        move-corresponding reguh to itab_bsik-reguh.
+        select * from regup where laufd  = reguh-laufd
+                            and laufi = reguh-laufi
+                            and xvorl = ' '
+                            and zbukr = reguh-zbukr
+                            and vblnr = reguh-vblnr.
+          move-corresponding regup to itab_bsik.
+          itab_bsik-augbl = regup-vblnr.
+          append itab_bsik.
+        endselect.
+      endselect.
+    else.
+      select * from reguh where laufd = zw_laufd
+                          and ( laufi = zw_laufi or laufi in w_laufi )
+                          and xvorl = ' '.
+        move-corresponding reguh to itab_bsik-reguh.
+        select * from regup where laufd  = reguh-laufd
+                            and laufi = reguh-laufi
+                            and xvorl = ' '
+                            and zbukr = reguh-zbukr
+                            and vblnr = reguh-vblnr.
+          move-corresponding regup to itab_bsik.
+          itab_bsik-augbl = regup-vblnr.
+          append itab_bsik.
+        endselect.
+      endselect.
+    endif.
+  else.
+    v_opy_flag = 'Y'.
+    perform get_outgoing_details.
+  endif.
+endform.                    "get_payment
+*---------------------------------------------------------------------*
+*       FORM GET_OUTGOING_DETAILS                                     *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+form get_outgoing_details.
+  data: c_factor type p decimals 8.
+
+
+  data: itab_bseg like bseg occurs 0 with header line.
+
+  clear: itab_bsik.
+  select * from bseg into table itab_bseg
+                     where  bukrs = co_code
+                    and    belnr in w_docno "document number
+                     and    gjahr = w_fyr. "fiscal year
+*                     and    augbl ne space. "Document Number of
+  "the Clearing Document
+
+ loop at itab_bseg.
+    if itab_bseg-augbl is initial.
+      delete itab_bseg.
+     endif.
+   endloop.
+
+  sort itab_bseg by bukrs augbl belnr.
+
+  delete adjacent duplicates from itab_bseg comparing bukrs belnr.
+
+
+  loop at itab_bseg.
+    select * from bsak into table itab_bsak
+                      where  bukrs = co_code
+                      and   augbl  = itab_bseg-belnr
+                     and   augdt  = itab_bseg-augdt.
+*                      AND GJAHR    = ITAB_BSEG-GJAHR.
+    if sy-subrc ne 0.
+      select * from bsak into table itab_bsak
+                         where  bukrs = co_code
+                         and   belnr  = itab_bseg-belnr
+                        and   augdt  = itab_bseg-augdt.
+*                        AND GJAHR    = ITAB_BSEG-GJAHR.
+    endif.
+    select * from bsad into table itab_bsad
+                       where bukrs = co_code
+                       and   augbl = itab_bseg-belnr
+*                      AND GJAHR    = ITAB_BSEG-GJAHR.
+                     and   augdt = itab_bseg-augdt.
+*    ENDAT.
+    loop at itab_bsak where  bukrs = co_code
+                      and   augbl  = itab_bseg-belnr
+                      and   augdt  = itab_bseg-augdt.
+**                     AND GJAHR    = ITAB_BSEG-GJAHR.
+      if itab_bsak-augbl ne itab_bsak-belnr.
+        move-corresponding itab_bsak to itab_bsik.
+        perform get_paymeth.
+        append itab_bsik.
+      endif.
+    endloop.
+    if sy-subrc ne 0.
+      loop at itab_bsak where  bukrs = co_code
+                      and   belnr  = itab_bseg-belnr
+*                      AND   AUGBL  = ITAB_BSEG-BELNR
+                        and   augdt  = itab_bseg-augdt.
+**                       AND GJAHR    = ITAB_BSEG-GJAHR.
+*      IF ITAB_BSAK-AUGBL NE ITAB_BSAK-BELNR.
+        move-corresponding itab_bsak to itab_bsik.
+        flag ='Y'.
+*       For fixing the partial paymnt missing extended dtls prob
+*       Use PENRC field as a flag - assume it is unused in future
+        itab_bsik-penrc = 'Y'.
+        perform get_paymeth.
+        append itab_bsik.
+      endloop.
+    endif.
+
+    loop at itab_bsad where bukrs = co_code
+                      and   augbl = itab_bseg-belnr
+                      and   augdt = itab_bseg-augdt.
+
+      if itab_bsad-belnr ne itab_bsad-augbl.
+        move-corresponding itab_bsad to itab_bsik.
+        perform get_paymeth.
+        append itab_bsik.
+      endif.
+    endloop.
+
+  endloop.
+
+  clear: itab_bsik.
+  select * from bsik into table itab_bsik2
+                     where ( bukrs = co_code
+                     and   belnr in w_docno
+                     and   gjahr = w_fyr
+                     and   augbl = space ).
+  loop at itab_bsik2.
+    move-corresponding itab_bsik2 to itab_bsik.
+    itab_bsik-augbl = itab_bsik2-belnr.
+    itab_bsik-belnr = itab_bsik2-rebzg.
+    itab_bsik-shkzg = '+'.
+
+    perform get_paymeth.
+    append itab_bsik.
+  endloop.
+
+  clear: itab_bsik.
+
+  select * from bsid into corresponding fields of table itab_bsik2
+                     where ( bukrs = co_code
+                     and   belnr in w_docno
+                     and   gjahr = w_fyr
+                     and   augbl = space ).
+  loop at itab_bsik2.
+    move-corresponding itab_bsik2 to itab_bsik.
+    itab_bsik-augbl = itab_bsik2-belnr.
+    itab_bsik-belnr = itab_bsik2-rebzg.
+    itab_bsik-shkzg = '+'.
+    perform get_paymeth.
+    append itab_bsik.
+  endloop.
+endform.                    "get_outgoing_details
+
+*---------------------------------------------------------------------*
+*       FORM print_totals                                             *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+form print_totals.
+  if ws_augbl ne space.
+    uline: /65(15).
+    write v_inv_tot currency bseg-pswsl to amount1.
+    write: /50 'Total',
+    65(15) amount1.
+    uline: /65(15).
+  endif.
+  v_inv_tot = 0.
+endform.                    "print_totals
+
+*---------------------------------------------------------------------*
+*       FORM GET_OPY_AMOUNT                                           *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+FORM get_opy_amount.
+
+  SELECT SINGLE * FROM t001 WHERE bukrs EQ itab_bsik-bukrs.
+
+  IF sy-subrc EQ '0'.
+
+    loc_curr = t001-waers.
+
+  ENDIF.
+
+  CLEAR: v_wtx_amt, v_wtx_amt1, cash_disc, amount, inv_wtx_amt, amt1.
+
+  IF itab_bsik-rebzg NE space. " Partial Payment
+    SELECT * FROM with_item WHERE bukrs = itab_bsik-bukrs
+                            AND gjahr = itab_bsik-gjahr
+                            AND belnr = itab_bsik-belnr.
+*                            AND buzei = itab_bsik-buzei.
+
+      v_wtx_amt1 = v_wtx_amt1 + ABS( with_item-wt_qbshb ).
+*      amt1 = amt1 + ABS( with_item-wt_qsshb ).
+    ENDSELECT.
+*    gross_amt = amount.
+    gross_amt = itab_bsik-wrbtr.
+*    amount = ITAB_BSIK-SKFBT - itab_bsik-qbshb - itab_bsik-wskto.
+    amount = itab_bsik-wrbtr - v_wtx_amt1 - itab_bsik-wskto.
+    v_wtx_amt = v_wtx_amt1.
+
+**scenario where invoice is in fcy and payment is done in lcy
+**in this case the gross amt, tax amt and net amt must be in lcy
+
+  ELSEIF ( pay_curr EQ loc_curr AND inv_curr NE loc_curr ).
+
+    flag_loc_curr = 'Y'.
+
+    SELECT * FROM with_item WHERE bukrs = itab_bsik-bukrs
+                            AND gjahr = itab_bsik-gjahr
+                            AND belnr = itab_bsik-belnr
+                            AND buzei = itab_bsik-buzei.
+
+      v_wtx_amt1 = v_wtx_amt1 + ABS( with_item-wt_qbshb ).
+*      amt1 = amt1 + ABS( with_item-wt_qsshb ).
+*   ENDSELECT.
+***decide which whtax is at the invoice level
+***need to add inv whtax to wrbtr
+***whtax at invoice has with_item-witht linked to
+***t059p-wt_postm = 1
+***whtax at paylevel has t059p-wt_postm = 2
+*
+    SELECT SINGLE * FROM t059p WHERE land1 = t001-land1
+                                 AND witht = with_item-witht.
+*
+    IF t059p-wt_postm EQ '1'.
+*
+     inv_wtx_amt = inv_wtx_amt + ABS( with_item-wt_qbshb ).
+*
+    ENDIF.
+   endselect.
+*
+*    IF sy-subrc =  0.
+*
+*
+*      amount = ABS( with_item-wt_qsshh ) + inv_wtx_amt.
+*      COMPUTE amount = ABS( amount ).
+*
+*    ELSE.
+*
+*      v_wtx_amt1 = 0.
+*      amount = with_item-wt_qsshh.
+*      COMPUTE amount = ABS( amount ).
+*
+*    ENDIF.
+
+    IF sy-subrc =  0.
+
+      v_wtx_amt = v_wtx_amt1.
+      COMPUTE v_wtx_amt = ABS( v_wtx_amt ).
+      amount = ABS( itab_bsik-wrbtr ).
+*      amount = with_item-wt_qsshb.
+      COMPUTE amount = ABS( amount ).
+      cash_disc = itab_bsik-wskto.
+      COMPUTE cash_disc = ABS( cash_disc ).
+      gross_amt = amount.
+*      amount = amount - v_wtx_amt - cash_disc.
+*      amount = amount - cash_disc.
+      gross_amt = itab_bsik-wrbtr + inv_wtx_amt.
+      amount = gross_amt - v_wtx_amt1 - cash_disc.
+    ELSE.
+
+      inv_wtx_amt = 0.
+      cash_disc = itab_bsik-wskto.
+      COMPUTE cash_disc = ABS( cash_disc ).
+      amount = itab_bsik-wrbtr.
+      COMPUTE amount = ABS( amount ).
+*      amount = amount - cash_disc.
+      gross_amt = itab_bsik-wrbtr + inv_wtx_amt.
+      amount = gross_amt - v_wtx_amt1 - cash_disc.
+    ENDIF.
+
+  ELSE.
+
+    CLEAR v_wtx_amt1.
+
+    SELECT * FROM with_item WHERE bukrs = itab_bsik-bukrs
+                            AND gjahr = itab_bsik-gjahr
+                            AND belnr = itab_bsik-belnr
+                            AND buzei = itab_bsik-buzei.
+
+      v_wtx_amt1 = v_wtx_amt1 + ABS( with_item-wt_qbshb ).
+*      amt1 = amt1 + ABS( with_item-wt_qsshb ).
+
+
+
+
+***decide which whtax is at the invoice level
+***need to add inv whtax to wrbtr
+***whtax at invoice has with_item-witht linked to
+***t059p-wt_postm = 1
+***whtax at paylevel has t059p-wt_postm = 2
+*
+    SELECT SINGLE * FROM t059p WHERE land1 = t001-land1
+                                 AND witht = with_item-witht.
+*
+    IF t059p-wt_postm EQ '1'.
+*
+      inv_wtx_amt = inv_wtx_amt + ABS( with_item-wt_qbshb ).
+*
+    ENDIF.
+   endselect.
+*
+*    IF sy-subrc =  0.
+*
+*
+*      amount = ABS( with_item-wt_qsshh ) + inv_wtx_amt.
+*      COMPUTE amount = ABS( amount ).
+*
+*    ELSE.
+*
+*      v_wtx_amt1 = 0.
+*      amount = with_item-wt_qsshh.
+*      COMPUTE amount = ABS( amount ).
+*
+*    ENDIF.
+
+    IF sy-subrc =  0.
+
+      v_wtx_amt = v_wtx_amt1.
+      COMPUTE v_wtx_amt = ABS( v_wtx_amt ).
+      amount = ABS( itab_bsik-wrbtr ).
+*      amount = with_item-wt_qsshb.
+      COMPUTE amount = ABS( amount ).
+      cash_disc = itab_bsik-wskto.
+      COMPUTE cash_disc = ABS( cash_disc ).
+*      write: amount currency itab_bsik-waers to amount.
+*      write: cash_disc currency itab_bsik-waers to cash_disc.
+
+      gross_amt = itab_bsik-wrbtr + inv_wtx_amt.
+      amount = gross_amt - v_wtx_amt1 - cash_disc.
+*      write: gross_amt currency itab_bsik-waers to gross_amt.
+    ELSE.
+
+      inv_wtx_amt = 0.
+      cash_disc = itab_bsik-wskto.
+      COMPUTE cash_disc = ABS( cash_disc ).
+      amount = itab_bsik-wrbtr.
+      COMPUTE amount = ABS( amount ).
+
+      gross_amt = itab_bsik-wrbtr + inv_wtx_amt.
+      amount = gross_amt - v_wtx_amt1 - cash_disc.
+    ENDIF.
+
+  ENDIF.
+
+ENDFORM.                    "get_opy_amount
+*---------------------------------------------------------------------*
+*      Form get_column_headers
+*---------------------------------------------------------------------*
+*FORM get_column_headers.
+*  DATA res(150).
+*  DATA: itab LIKE yhffmtdt OCCURS 0 WITH HEADER LINE.
+*
+*  SELECT * INTO TABLE itab
+*  FROM yhffmtdt
+*  WHERE
+*    format_no = 'EP1'
+*    AND column_nme = 'HEADER'.
+*
+*  LOOP AT itab.
+*    DATA temporder(20).
+*
+*    SPLIT itab-source_val AT ';'
+*    INTO
+*      temporder
+*      itab_fm_struct-header_name
+*      itab_fm_struct-source_val.
+*
+*    itab_fm_struct-format_no = itab-format_no.
+*    itab_fm_struct-column_no = itab-column_no.
+*    itab_fm_struct-column_nme = itab-column_nme.
+*    itab_fm_struct-max_length = itab-max_length.
+*    itab_fm_struct-source_typ = itab-source_typ.
+*    itab_fm_struct-default_v = itab-default_v.
+*    itab_fm_struct-order = temporder.
+*
+*    APPEND itab_fm_struct.
+*  ENDLOOP.
+*ENDFORM.                    "get_column_headers
+
+*---------------------------------------------------------------------*
+*      Form  get_column_values
+*---------------------------------------------------------------------*
+form get_column_values.
+
+  tables:  yhffmtxr, yhfparmi, yhffmtdt, yhffmtow,rlgrap.
+
+  data: itab_fmt_det like yhffmtdt,
+        v_exceed type c,
+        v_size type i.
+
+  select * from yhffmtdt
+  where
+    format_no = 'EP1'
+    and column_nme = 'HEADER'.
+
+    data: temporder(20), overriden type i,
+          temp_maxlength(4) type n.
+    move-corresponding yhffmtdt to itab_fmt_det.
+
+    clear: temporder, overriden, itab_fm_struct,
+    v_exceed, v_size, v_column_value.
+
+*   Take the mapping from the overrides table if exists.
+*   Allow blank pay method applies to all
+*   Company Code and Format Number is mandatory.
+    select single * from yhffmtow
+         where format_no = yhffmtdt-format_no
+         and   column_no = yhffmtdt-column_no
+         and pay_method  = itab_bsik-zlsch
+         and co_code     = itab_bsik-bukrs.
+
+    if sy-subrc eq 0.
+      move-corresponding yhffmtow to itab_fmt_det.
+      overriden = 1.
+    else.
+      select single * from yhffmtow
+           where format_no = yhffmtdt-format_no
+           and   column_no = yhffmtdt-column_no
+           and pay_method  = space
+           and co_code     = itab_bsik-bukrs.
+      if sy-subrc eq 0.
+        move-corresponding yhffmtow to itab_fmt_det.
+        overriden = 1.
+      else.
+        select single * from yhffmtow
+              where format_no = yhffmtdt-format_no
+              and   column_no = yhffmtdt-column_no
+              and pay_method  = itab_bsik-zlsch
+              and co_code     = space.
+
+        if sy-subrc eq 0.
+          move-corresponding yhffmtow to itab_fmt_det.
+          overriden = 1.
+        else.
+          select single * from yhffmtow
+                where format_no = yhffmtdt-format_no
+                and   column_no = yhffmtdt-column_no
+                and  pay_method = space
+                and co_code     = space.
+          if sy-subrc eq 0.
+            move-corresponding yhffmtow to itab_fmt_det.
+            overriden = 1.
+          endif.
+        endif.
+      endif.
+    endif.
+
+*   Must tokenize itab_fmt_det-source_val by ';'
+    if overriden eq 1.
+      split itab_fmt_det-source_val at ';'
+      into
+        temporder
+        temp_maxlength
+        itab_fm_struct-header_name
+        itab_fm_struct-source_val.
+      itab_fm_struct-order = temporder.
+
+    else.
+      split itab_fmt_det-source_val at ';'
+      into
+        temporder
+        itab_fm_struct-header_name
+        itab_fm_struct-source_val.
+      itab_fm_struct-order = temporder.
+    endif.
+
+    curr_maxlength = itab_fmt_det-max_length.
+    if temp_maxlength ne space.
+      move temp_maxlength to curr_maxlength.
+    endif.
+
+*   Deal with source value first, default value later
+    if itab_fmt_det-source_typ = 'FUNCTION'.
+      perform call_func using itab_fm_struct-source_val.
+
+    elseif itab_fmt_det-source_typ = 'TABLE'.
+      search itab_fm_struct-source_val for ',,'.
+      if sy-subrc eq 0.
+        perform concat_fields
+                       using itab_fm_struct-source_val ',,'
+                       changing v_column_value.
+      else.
+        search itab_fm_struct-source_val for ','.
+        if sy-subrc eq 0.
+
+          perform concat_fields
+                         using itab_fm_struct-source_val ','
+                         changing v_column_value.
+        else.
+          perform get_table_value using itab_fm_struct-source_val.
+        endif.
+      endif.
+    else.
+      v_column_value = itab_fm_struct-source_val.
+    endif.
+
+*   use default value if column value is still blank
+    if ( v_column_value = space or v_column_value eq '00000000' )
+      and itab_fmt_det-default_v <> space.
+
+      clear: itab_fm_struct.
+
+*     Must tokenize itab_fmt_det-default_v by ';'
+      if overriden eq 1.
+        split itab_fmt_det-source_val at ';'
+        into
+          temporder
+          temp_maxlength
+          itab_fm_struct-header_name
+          itab_fm_struct-source_val.
+        itab_fm_struct-order = temporder.
+
+      else.
+        split itab_fmt_det-default_v at ';'
+        into
+          temporder
+          itab_fm_struct-header_name
+          itab_fm_struct-source_val.
+        itab_fm_struct-order = temporder.
+      endif.
+
+
+      if itab_fmt_det-source_typ = 'FUNCTION'.
+        perform call_func using itab_fm_struct-source_val.
+
+      elseif itab_fmt_det-source_typ = 'TABLE'.
+        search itab_fm_struct-source_val for ',,'.
+        if sy-subrc eq 0.
+          perform concat_fields
+                         using itab_fm_struct-source_val ',,'
+                         changing v_column_value.
+        else.
+          search itab_fm_struct-source_val for ','.
+          if sy-subrc eq 0.
+            perform concat_fields
+                           using itab_fm_struct-source_val ','
+                           changing v_column_value.
+          else.
+            perform get_table_value using itab_fm_struct-source_val.
+          endif.
+        endif.
+      else.
+        v_column_value = itab_fm_struct-source_val.
+      endif.
+
+    endif.
+
+*   v_column_value is a global data variable
+*   store the fetched data into the struct
+
+    itab_fm_struct-max_length = itab_fmt_det-max_length.
+    if temp_maxlength ne space.
+      move temp_maxlength to itab_fm_struct-max_length.
+    endif.
+    itab_fm_struct-column_value = v_column_value.
+    if
+*      NOT itab_fm_struct-column_value IS INITIAL
+*              AND
+      not itab_fm_struct-header_name is initial.
+      append itab_fm_struct.
+    endif.
+    clear : overriden, temp_maxlength.
+  endselect.
+endform.                    "get_column_values
+
+*---------------------------------------------------------------------*
+*       FORM GET_TABLE_VALUE                                          *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  VALUE(P_SOURCE_VALUE)                                         *
+*---------------------------------------------------------------------*
+form get_table_value
+             using
+                value(p_source_value) type c.
+
+  field-symbols: <fs_column>.
+  data: field_type type char01.
+
+*  DATA: V_PREFIX(3) TYPE C.
+*
+*  V_PREFIX = P_SOURCE_VALUE.
+
+*  SEARCH P_SOURCE_VALUE FOR ',,'.
+*
+*  IF SY-SUBRC EQ 0.
+*    PERFORM CONCAT_FIELDS
+*                   USING P_SOURCE_VALUE ',,'
+*                   CHANGING V_COLUMN_VALUE.
+*  ELSE.
+*    SEARCH P_SOURCE_VALUE FOR ','.
+*    IF SY-SUBRC EQ 0.
+*      PERFORM CONCAT_FIELDS
+*                     USING P_SOURCE_VALUE ','
+*                     CHANGING V_COLUMN_VALUE.
+*    ELSE.
+  assign (p_source_value) to <fs_column>.
+
+  if sy-subrc = 0.
+
+    describe field <fs_column> type field_type.
+
+    if field_type = 'D'.
+*     format the date to be dd.mm.yyyy
+      write <fs_column> to v_column_value.
+    else.
+      v_column_value = <fs_column>.
+    endif.
+
+*      This check is redundant
+*      ELSE.
+*        CLEAR: SY-SUBRC.
+*        SEARCH P_SOURCE_VALUE FOR '-'.
+*        IF SY-SUBRC NE 0.
+*          V_COLUMN_VALUE = P_SOURCE_VALUE.
+*        ENDIF.
+  endif.
+*    ENDIF.
+*  ENDIF.
+
+endform.                    "get_table_value
+*&--------------------------------------------------------------------*
+*&      Form  print_results
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*---------------------------------------------------------------------*
+form print_results.
+  data: divider_length type i,
+        offset type i,
+        separation type i value 2,
+*        header_line(1200),
+*        value_line(1200).
+        end_of_line type i,
+        orig_header_line(95),
+        orig_value_line(95),
+        header_line(1200),
+        value_line(1200).
+  data : begin of header occurs 0,
+         header(1200),
+         end of header.
+
+  data : begin of value occurs 0,
+         value(1200),
+         end of value.
+  data : split_flag.
+* Order itab_fm_struct by order due to override
+  sort itab_fm_struct by order ascending.
+
+*  loop at itab_fm_struct.
+*      if sy-tabix eq 1.
+*         orig_header_line = itab_fm_struct-header_name.
+*         orig_value_line = itab_fm_struct-column_value.
+*
+*      endif.
+*    endloop.
+
+  loop at itab_fm_struct.
+
+    data: header_length type i,
+          value_length type i,
+          max type i,
+          header_done.
+
+    orig_header_line = header_line.
+    orig_value_line = value_line.
+*    if sy-tabix ne 1 and itab_fm_struct-order eq 10.
+*
+*      if header_done is initial.
+*        WRITE:/ header_line.
+*        divider_length = STRLEN( header_line ).
+*        ULINE AT /1(divider_length).
+*        header_done = 'X'.
+*        clear header_line.
+*      endif.
+** write values
+*      WRITE:/ value_line.
+*      clear value_line.
+*      clear max.
+*      clear offset.
+*    endif.
+
+    if offset eq 0.
+
+      move
+        itab_fm_struct-header_name
+      to header_line.
+      condense itab_fm_struct-column_value.
+      move
+        itab_fm_struct-column_value
+      to value_line.
+
+      offset = 1.
+
+    else.
+
+      move
+        itab_fm_struct-header_name
+      to header_line+max.
+      value_length = strlen( itab_fm_struct-column_value ).
+      if value_length > itab_fm_struct-max_length.
+        condense itab_fm_struct-column_value.
+        move
+          itab_fm_struct-column_value(itab_fm_struct-max_length)
+        to value_line+max.
+      else.
+        condense itab_fm_struct-column_value.
+        move
+          itab_fm_struct-column_value
+        to value_line+max.
+      endif.
+    endif.
+
+    header_length = strlen( itab_fm_struct-header_name ).
+
+    if not itab_fm_struct-column_value is initial.
+      condense itab_fm_struct-column_value.
+      value_length =
+       strlen( itab_fm_struct-column_value(itab_fm_struct-max_length) ).
+    else.
+      value_length = header_length.
+    endif.
+*   compare string lengths of header_name & column_value
+*   get the longest length and add 3 spaces
+    if header_length > value_length.
+      if header_length > itab_fm_struct-max_length.
+        max = max + header_length + separation.
+      else.
+        max = max + itab_fm_struct-max_length + separation.
+      endif.
+
+    else.
+      if value_length > itab_fm_struct-max_length.
+        max = max + value_length + separation.
+      else.
+        max = max + itab_fm_struct-max_length + separation.
+      endif.
+    endif.
+
+    if max > 95.
+      header-header = orig_header_line.
+      append header.
+      clear header_line.
+      move
+          itab_fm_struct-header_name
+          to header_line.
+      value-value = orig_value_line.
+      append value.
+      clear value_line.
+      move
+        itab_fm_struct-column_value
+        to value_line.
+      clear max.
+      split_flag = 'X'.
+      header_length = strlen( itab_fm_struct-header_name ).
+
+      if not itab_fm_struct-column_value is initial.
+        condense itab_fm_struct-column_value.
+        value_length =
+       strlen( itab_fm_struct-column_value(itab_fm_struct-max_length) ).
+      else.
+        value_length = header_length.
+      endif.
+*   compare string lengths of header_name & column_value
+*   get the longest length and add 3 spaces
+      if header_length > value_length.
+        if header_length > itab_fm_struct-max_length.
+          max = max + header_length + separation.
+        else.
+          max = max + itab_fm_struct-max_length + separation.
+        endif.
+
+      else.
+        if value_length > itab_fm_struct-max_length.
+          max = max + value_length + separation.
+        else.
+          max = max + itab_fm_struct-max_length + separation.
+        endif.
+      endif.
+
+    endif.
+
+  endloop.
+
+  if not split_flag is initial.
+    header-header = header_line.
+    append header.
+    value-value = value_line.
+    append value.
+  endif.
+
+  if not header[] is initial.
+    if itab_bsik-augbl ne ws_augbl or plppf eq 'Y'.
+      loop at header.
+        write: / header-header.
+      endloop.
+    endif.
+    loop at value.
+
+      if sy-tabix eq 1.
+        if itab_bsik-augbl ne ws_augbl or plppf eq 'Y'.
+          divider_length = strlen( value-value ).
+          uline at /1(divider_length).
+        endif.
+      endif.
+
+      write: / value-value.
+    endloop.
+  else.
+** write header names
+    if itab_bsik-augbl ne ws_augbl or plppf eq 'Y'.
+      write:/ header_line.
+*
+** display line across screen
+      divider_length = strlen( header_line ).
+      uline at /1(divider_length).
+    endif.
+*
+** write values
+    write:/ value_line.
+  endif.
+endform.                    " print_results
+*&--------------------------------------------------------------------*
+*&      Form  call_func
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*---------------------------------------------------------------------*
+
+form call_func
+   using value(p_source_value) type c.
+
+* TODO: Add more cases for functions here!
+  if p_source_value = 'EPDFN_EXTPD_AMOUNT'. "Net Amount
+    perform fn_extpd_amount.
+  elseif p_source_value = 'EPDFN_GROSS_AMT'. "Gross Amount
+    perform fn_gross_amt.
+  elseif p_source_value = 'EPDFN_SERIAL_NUM'.
+    perform fn_serial_num.
+  ELSEIF p_source_value = 'EPDFN_WITH_TAX'.
+    PERFORM fn_withholding_tax.
+  ELSEIF p_source_value = 'EPDFN_TAX'.
+    PERFORM FN_TAX.
+  endif.
+endform.                    " call_func
+
+FORM FN_TAX.
+     clear tax_amt.
+     SELECT * FROM bseg WHERE bukrs = itab_bsik-bukrs
+                            AND gjahr = itab_bsik-gjahr
+                            AND belnr = itab_bsik-belnr.
+      if not bseg-buzid is initial.
+       tax_amt = tax_amt + ABS( bseg-dmbtr ).
+      endif.
+     ENDSELECT.
+     v_column_value = tax_amt.
+ENDFORM.
+
+FORM fn_withholding_tax.
+  PERFORM get_opy_amount.
+*   data: net_amount like bseg-wrbtr.
+*   amount = amount - v_wtx_amt.
+    v_column_value = v_wtx_amt.
+  ENDFORM.
+
+*&--------------------------------------------------------------------*
+*&      Form  fn_serial_num
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+form fn_serial_num.
+  data : lv_offset type i.
+  lv_offset = 100 - curr_maxlength.
+  serial = serial + 1.
+  move serial+lv_offset(curr_maxlength) to v_column_value.
+endform.                    "fn_serial_num
+
+*&--------------------------------------------------------------------*
+*&      Form  FN_GROSS_AMT
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+form fn_gross_amt.
+  perform get_opy_amount.
+*   data: net_amount like bseg-wrbtr.
+*   amount = amount - v_wtx_amt.
+  v_column_value = gross_amt.
+endform.                    "FN_GROSS_AMT
+*&--------------------------------------------------------------------*
+*&      Form  fn_extpd_amount
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+form fn_extpd_amount.
+
+  data: c(200).
+
+*   amount value needs to be obtained from here
+*   bsik-wrbtr = amount in document currency
+*   bsik-qbshb = withholding tax amount in document currency
+*   bsik-wskto = cash discount amount in document currency
+*  IF v_opy_flag = 'Y'.
+  perform get_opy_amount.
+*  ELSE.
+*    amount = itab_bsik-wrbtr - itab_bsik-qbshb - itab_bsik-wskto.
+*  ENDIF.
+
+  c = amount.
+  v_column_value = c.
+  shift v_column_value left deleting leading ' '.
+
+endform.                    " fn_extpd_amount
+
+*&--------------------------------------------------------------------*
+*&      Form  GET_ADD_INFO
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+form get_add_info.
+  data: w_empfg(11) type c.
+  data: w_adrnr like adrc-addrnumber.
+  data: w_size type i.
+  data: v_cc_vblnr like reguh-vblnr,
+        v_cc_bvorg like bkpf-bvorg,
+        v_absbu like reguh-absbu.
+  data: v_cc_bkpf like bkpf.
+  clear: bnka,
+         bnkai,
+*         bsec,
+*         bseg,
+         knb1,
+         knbk,
+         lfb1,
+         lfbk,
+         reguh.
+
+  move-corresponding itab_bsik-reguh to reguh.
+
+*get IBAN info
+
+**for countries maintained under parm
+**ACC REF, tiban must be selected with account number = accnt num + ref
+**ACC CK , tiban must be selected with account number = CK + accnt num
+  clear: v_countries1, v_countries2, v_acct_ref, v_ck_acct.
+
+* Handle Reference
+  select single parm_val into v_countries1 from yhfparmi
+          where bukrs = reguh-zbukr
+            and parm1 = 'ACC'
+            and parm2 = 'REF'.
+  search v_countries1 for reguh-zbnks.
+
+  if sy-subrc = 0.
+    concatenate reguh-zbnkn reguh-bkref into v_acct_ref.
+    select single * from tiban
+           where banks  = reguh-zbnks
+           and   bankl  = reguh-zbnky
+           and   bankn  = v_acct_ref.
+
+  else.
+* Handle Control key
+    select single parm_val into v_countries2 from yhfparmi
+            where bukrs = reguh-zbukr
+              and parm1 = 'ACC'
+              and parm2 = 'CK'.
+    search v_countries2 for reguh-zbnks.
+
+    if sy-subrc = 0.
+      concatenate reguh-zbkon reguh-zbnkn into v_ck_acct.
+      select single * from tiban
+             where banks  = reguh-zbnks
+             and   bankl  = reguh-zbnky
+             and   bankn  = v_ck_acct.
+    else.
+      select single * from tiban
+             where banks  = reguh-zbnks
+             and   bankl  = reguh-zbnky
+             and   bankn  = reguh-zbnkn.
+
+    endif.
+  endif.
+
+* get payment header
+*  SELECT * FROM bkpf
+*         WHERE belnr = reguh-vblnr
+*         AND   bukrs = reguh-zbukr.
+*    IF bkpf-budat EQ reguh-zaldt.
+*      EXIT.
+*    ENDIF.
+*  ENDSELECT.
+
+  clear: bnkai, bnka.
+* store intermediary bank to view BNKAI for mapping
+  if reguh-bnks1 ne space.
+    select single * from bnka where banks = reguh-bnks1 "bk ctry
+                              and   bankl = reguh-bnkl1."bk key
+    move-corresponding bnka to bnkai.
+  endif.
+
+  clear: bnka.
+* get housebank
+  select single * from bnka
+       where banks = reguh-zbnks "bk ctry key
+       and   bankl = reguh-zbnky."bk key
+
+* get partner info
+  if not reguh-empfg is initial.
+    clear w_empfg.
+    w_empfg = reguh-empfg.
+    shift w_empfg by 1 places.
+    condense w_empfg.
+  endif.
+  if reguh-lifnr ne space.
+    select single * from lfa1 where lifnr = w_empfg.
+    if sy-subrc eq 0.
+      reguh-lifnr = lfa1-lifnr.
+    else.
+      select single * from lfa1 where lifnr = reguh-lifnr.
+    endif.
+    w_adrnr = lfa1-adrnr.
+  else.
+    select single * from kna1 where kunnr = w_empfg.
+    if sy-subrc ne 0.
+      select single * from kna1 where kunnr = reguh-kunnr.
+    endif.
+    w_adrnr = kna1-adrnr.
+  endif.
+
+* get one-time or alternate (individual) payee contact info
+* from BSEC. If not exists, get from ADRC.
+* 02-dec-02 use payment doc no. of sending company code for
+* for cross company payments.
+  clear: bsec, v_cc_bvorg, v_cc_vblnr, v_absbu, v_cc_bkpf.
+  if bkpf-bvorg ne space.
+    concatenate reguh-vblnr reguh-zbukr bkpf-gjahr+2(2) into
+    v_cc_bvorg.
+
+    types: begin of ts_cc_belnr,
+             bukrs type bukrs,
+             gjahr type gjahr,
+             belnr type belnr_d,
+           end of ts_cc_belnr.
+    data:  lt_cc_belnr type table of ts_cc_belnr with header line.
+*For one-time there can be multiple A/P documents that
+*are paid together as long as Name, Bank, etc. are the same
+    select  bukrs gjahr belnr from bvor into table lt_cc_belnr
+                              where bvorg = v_cc_bvorg
+                              and   bukrs ne reguh-zbukr
+                              and   gjahr = bkpf-gjahr.
+*In case of multiple A/P records - as all information for
+*db-Direct is the same (Name, Bank, etc.) we can read from the
+*first record in lt_cc_belnr
+    read table lt_cc_belnr index 1.
+    select single * into v_cc_bkpf
+    from bkpf where bukrs = lt_cc_belnr-bukrs
+              and   gjahr = lt_cc_belnr-gjahr
+              and   belnr = lt_cc_belnr-belnr.
+
+    v_cc_vblnr = v_cc_bkpf-belnr.
+    v_absbu = v_cc_bkpf-bukrs.
+  else.
+    v_cc_vblnr = reguh-vblnr.
+    v_absbu = reguh-zbukr.
+  endif.
+
+  clear: lfbk, lfb1, knbk, knb1.
+* get partner bank info for mapping
+  if reguh-lifnr ne space.
+* 02-dec-02 use sending company code
+    select single * from lfb1 where bukrs = v_absbu
+                                and lifnr = lfa1-lifnr.
+    select single * from lfbk where lifnr = lfa1-lifnr
+                     and   banks = reguh-zbnks
+                     and   bankl = reguh-zbnky
+                     and   bankn = reguh-zbnkn.
+  else.
+* 02-dec-03 use sending company code
+    select single * from knb1 where bukrs = v_absbu
+                                and kunnr = kna1-kunnr.
+    select single * from knbk where kunnr = kna1-kunnr
+                     and   banks = reguh-zbnks
+                     and   bankl = reguh-zbnky
+                     and   bankn = reguh-zbnkn.
+  endif.
+endform.                    "GET_ADD_INFO
+
+*--------------------------------------------------------------------*
+*       FORM CONCAT_FIELDS                                           *
+*--------------------------------------------------------------------*
+*       ........                                                     *
+*--------------------------------------------------------------------*
+*  -->  VALUE(P_SOURCE_VALUE)                                        *
+*  -->  VALUE(P_DELIMITER)                                           *
+*  -->  VALUE(P_OUT)                                                 *
+*--------------------------------------------------------------------*
+form concat_fields using
+                     value(p_source_value) type c
+                     value(p_delimiter) type c
+                   changing
+                     value(p_out) type c.
+  data: v_f1(100), v_f2(100), v_f3(100), v_f4(100), v_f5(100),
+        v_f6(100), v_f7(100), v_f8(100), v_f9(100), v_f10(100).
+  field-symbols: <fs1>, <fs2>, <fs3>, <fs4>, <fs5>,
+               <fs6>, <fs7>, <fs8>, <fs9>, <fs10>.
+  split p_source_value at p_delimiter
+     into v_f1 v_f2 v_f3 v_f4 v_f5
+          v_f6 v_f7 v_f8 v_f9 v_f10.
+  perform concat_fields_assign using v_f1 changing v_f1.
+  perform concat_fields_assign using v_f2 changing v_f2.
+  perform concat_fields_assign using v_f3 changing v_f3.
+  perform concat_fields_assign using v_f4 changing v_f4.
+  perform concat_fields_assign using v_f5 changing v_f5.
+  perform concat_fields_assign using v_f6 changing v_f6.
+  perform concat_fields_assign using v_f7 changing v_f7.
+  perform concat_fields_assign using v_f8 changing v_f8.
+  perform concat_fields_assign using v_f9 changing v_f9.
+  perform concat_fields_assign using v_f10 changing v_f10.
+  if p_delimiter = ',,'.
+    concatenate v_f1 v_f2 v_f3 v_f4 v_f5
+                v_f6 v_f7 v_f8 v_f9 v_f10
+                into p_out separated by space.
+  else.
+    concatenate v_f1 v_f2 v_f3 v_f4 v_f5
+                v_f6 v_f7 v_f8 v_f9 v_f10
+                into p_out.
+  endif.
+endform.                    "CONCAT_FIELDS
+
+*--------------------------------------------------------------------*
+*       FORM CONCAT_FIELDS_ASSIGN                                    *
+*--------------------------------------------------------------------*
+*       ........                                                     *
+*--------------------------------------------------------------------*
+*  -->  VALUE(P_FIELD)                                               *
+*  -->  VALUE(P_VALUE)                                               *
+*--------------------------------------------------------------------*
+form concat_fields_assign using
+                            value(p_field) type c
+                          changing
+                            value(p_value) type c.
+  field-symbols: <fs1>.
+  assign (p_field) to <fs1>.
+  if sy-subrc = 0.
+    p_value = <fs1>.
+  else.
+    p_value = p_field.
+  endif.
+endform.
+ "CONCAT_FIELDS_ASSIGN
+
+                             .
+
+*Text symbol text£º
+*001:>>PAYMENT :
+*007:S/No Inv No.     Inv Date   Our Ref    Description      Curr            Amount
+*008:S/No Inv No.     Inv Date   Our Ref    Description      Curr      PM    Amount
+*009:'Invoice No.' from 'Assignment'
+*010:'Invoice No.' from 'Reference'
+*011:'Invoice No.' from 'Doc.Header Text'
+*012:Outgoing Payment Selection
+*013:S/No Inv No.     Inv Date   Our Ref    Description      Curr            Amount        WTaxAmt
+*014:S/No Inv No.     Inv Date   Our Ref    Description      Curr  PM        Amount        WTaxAmt
+*015:Inv No.     Inv Date              Description            Curr            Amount
+*016:Inv No.     Inv Date              Description            Curr            Amount
+*017:Inv No.          Inv Date   Our Ref    Description      Curr             Amount
+*018:Inv No.          Inv Date   Our Ref    Description      Curr  PM        Amount
+
+*019:S/No Inv No.     Inv Date   Delivery Note    P.O.No.     G.R.No.        Amount
+*Selection text£º
+*CO_CODE:        Company Code
+*PAYDET:        Output File
+*PAY_METH:        Payment Method
+*W_DOCNO:        Payment document number
+*W_FYR:        Fiscal Year
+*W_LAUFI:        Additional Identification

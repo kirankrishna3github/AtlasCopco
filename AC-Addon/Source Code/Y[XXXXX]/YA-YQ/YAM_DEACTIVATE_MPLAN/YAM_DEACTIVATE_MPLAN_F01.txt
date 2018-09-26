@@ -1,0 +1,806 @@
+*&---------------------------------------------------------------------*
+*&  Include           YAM_DEACTIVATE_MPLAN_F01                         *
+*&---------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  initialization
+*&---------------------------------------------------------------------*
+*       Perform the necessary initialization actions
+*----------------------------------------------------------------------*
+FORM initialization .
+
+*.. Local variables
+  DATA: ls_log    TYPE bal_s_log.
+
+  ls_log-object = 'YAM_EXP_MPLAN'.
+
+*.. Create application log
+  CALL FUNCTION 'BAL_LOG_CREATE'
+    EXPORTING
+      i_s_log                 = ls_log
+    IMPORTING
+      e_log_handle            = gv_handle
+    EXCEPTIONS
+      log_header_inconsistent = 1
+      OTHERS                  = 2.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+ENDFORM.                    " initialization
+
+*eject
+*&---------------------------------------------------------------------*
+*&      Form  select_maintplans
+*&---------------------------------------------------------------------*
+*       Select the relevant maintenance plans
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM select_maintplans .
+
+*>>> Begin replace MOD-003
+*    Rewrite of selection, because VEDA doesn't always have item details so the join with MPOS didn't work correctly
+  TYPES: BEGIN OF lty_veda_vbak,
+           vbeln TYPE vbeln_va,
+           vposn TYPE posnr_va,
+           venddat TYPE vndat_veda,
+           vuntdat TYPE vudat_veda,
+           vkorg TYPE vkorg,
+           kunnr TYPE kunag,
+         END OF lty_veda_vbak.
+
+  TYPES: BEGIN OF lty_mpos_mpla,
+           kdauf TYPE vbeln_va,
+           kdpos TYPE posnr_va,
+           warpl TYPE warpl,
+           equnr TYPE equnr,
+           wptxt TYPE wptxt,
+           plan_sort TYPE plan_sort,
+         END OF lty_mpos_mpla.
+
+  DATA: lt_veda_vbak TYPE TABLE OF lty_veda_vbak,
+        ls_veda_vbak TYPE lty_veda_vbak,
+        lt_mpos_mpla TYPE TABLE OF lty_mpos_mpla,
+        lt_veda TYPE TABLE OF veda,
+        ls_veda TYPE veda,                          "+MOD-004
+        lt_vbap TYPE TABLE OF vbap.
+
+  FIELD-SYMBOLS: <ls_vbap> TYPE vbap,
+                 <ls_veda_vbak> TYPE lty_veda_vbak,
+                 <ls_mpos_mpla> TYPE lty_mpos_mpla.
+
+  REFRESH: gt_mpla.
+
+* Select VEDA and VBAK data
+  IF p_kunnr IS NOT INITIAL.
+    IF p_vbeln IS NOT INITIAL.
+      SELECT veda~vbeln veda~vposn veda~venddat veda~vuntdat
+             vbak~vkorg vbak~kunnr
+        INTO TABLE lt_veda_vbak
+        FROM veda AS veda
+        INNER JOIN vbak AS vbak
+          ON vbak~vbeln = veda~vbeln
+        WHERE veda~venddat IN s_vendda
+          AND veda~vuntdat IN s_vuntda
+          AND vbak~vkorg   EQ p_vkorg
+          AND veda~vbeln   EQ p_vbeln
+          AND vbak~kunnr   EQ p_kunnr.
+    ELSE.
+      SELECT veda~vbeln veda~vposn veda~venddat veda~vuntdat
+             vbak~vkorg vbak~kunnr
+        INTO TABLE lt_veda_vbak
+        FROM veda AS veda
+        INNER JOIN vbak AS vbak
+          ON vbak~vbeln = veda~vbeln
+        WHERE veda~venddat IN s_vendda
+          AND veda~vuntdat IN s_vuntda
+          AND vbak~vkorg   EQ p_vkorg
+          AND vbak~kunnr   EQ p_kunnr.
+    ENDIF.
+  ELSE.
+    IF p_vbeln IS NOT INITIAL.
+      SELECT veda~vbeln veda~vposn veda~venddat veda~vuntdat
+             vbak~vkorg vbak~kunnr
+        INTO TABLE lt_veda_vbak
+        FROM veda AS veda
+        INNER JOIN vbak AS vbak
+          ON vbak~vbeln = veda~vbeln
+        WHERE veda~venddat IN s_vendda
+          AND veda~vuntdat IN s_vuntda
+          AND vbak~vkorg   EQ p_vkorg
+          AND veda~vbeln   EQ p_vbeln.
+    ELSE.
+      SELECT veda~vbeln veda~vposn veda~venddat veda~vuntdat
+             vbak~vkorg vbak~kunnr
+        INTO TABLE lt_veda_vbak
+        FROM veda AS veda
+        INNER JOIN vbak AS vbak
+          ON vbak~vbeln = veda~vbeln
+        WHERE veda~venddat IN s_vendda
+          AND veda~vuntdat IN s_vuntda
+          AND vbak~vkorg   EQ p_vkorg.
+    ENDIF.
+  ENDIF.
+
+* Add item numbers when no VEDA records exist
+  LOOP AT lt_veda_vbak INTO ls_veda_vbak WHERE vposn IS INITIAL.
+    REFRESH: lt_veda, lt_vbap.
+    SELECT * FROM veda
+      INTO TABLE lt_veda
+      WHERE vbeln EQ ls_veda_vbak-vbeln
+        AND vposn NE ls_veda_vbak-vposn.
+*    CHECK sy-subrc NE 0. "No item records found in VEDA             "-MOD-004
+    if sy-subrc ne 0.
+      "Select items from VBAP
+      SELECT * FROM vbap
+        INTO TABLE lt_vbap
+        WHERE vbeln EQ ls_veda_vbak-vbeln.
+      "Add items to our temporary table
+      LOOP AT lt_vbap ASSIGNING <ls_vbap>.
+        ls_veda_vbak-vposn = <ls_vbap>-posnr.
+        APPEND ls_veda_vbak TO lt_veda_vbak.
+      ENDLOOP.
+* begin of insert MOD-004
+    else.
+      "Select items from VBAP
+      SELECT * FROM vbap
+        INTO TABLE lt_vbap
+        WHERE vbeln EQ ls_veda_vbak-vbeln.
+      "Add items to our temporary table
+      LOOP AT lt_vbap ASSIGNING <ls_vbap>.
+        READ TABLE lt_veda INTO ls_veda
+           WITH KEY vposn = <ls_vbap>-posnr.
+        IF sy-subrc <> 0.
+          ls_veda_vbak-vposn = <ls_vbap>-posnr.
+          APPEND ls_veda_vbak TO lt_veda_vbak.
+        ENDIF.
+      ENDLOOP.
+    endif.
+* end of insert MOD-004
+  ENDLOOP.
+
+* Delete header lines
+  DELETE lt_veda_vbak WHERE vposn IS INITIAL.
+
+* Select MPOS and MPLA data
+  SELECT mpos~kdauf mpos~kdpos mpos~warpl
+         mpla~equnr mpla~wptxt mpla~plan_sort
+    INTO TABLE lt_mpos_mpla
+    FROM mpos AS mpos
+    INNER JOIN mpla AS mpla
+      ON mpla~warpl EQ mpos~warpl
+    FOR ALL ENTRIES IN lt_veda_vbak
+    WHERE mpos~kdauf EQ lt_veda_vbak-vbeln
+      AND mpos~kdpos EQ lt_veda_vbak-vposn.
+
+* Merge all data into GT_MPLA
+  LOOP AT lt_veda_vbak ASSIGNING <ls_veda_vbak>.
+* begin of change MOD-004
+*    READ TABLE lt_mpos_mpla ASSIGNING <ls_mpos_mpla>
+*      WITH KEY kdauf = <ls_veda_vbak>-vbeln
+*               kdpos = <ls_veda_vbak>-vposn.
+*    CHECK sy-subrc EQ 0.
+    LOOP AT lt_mpos_mpla ASSIGNING <ls_mpos_mpla>
+      WHERE kdauf = <ls_veda_vbak>-vbeln
+        AND kdpos = <ls_veda_vbak>-vposn.
+* end of change MOD-004
+      MOVE-CORRESPONDING <ls_veda_vbak> TO gt_mpla.
+      MOVE-CORRESPONDING <ls_mpos_mpla> TO gt_mpla.
+      APPEND gt_mpla.
+* begin of change MOD-004
+    ENDLOOP.
+* end of change MOD-004
+  ENDLOOP.
+
+  SORT gt_mpla.
+
+*  IF NOT p_kunnr IS INITIAL.
+*    IF NOT p_vbeln IS INITIAL.
+*      SELECT
+*        c~warpl d~wptxt d~plan_sort b~kunnr c~equnr
+*        a~vbeln c~kdpos a~venddat
+*        a~vuntdat                                           "+MOD-003
+*      INTO CORRESPONDING FIELDS OF TABLE gt_mpla
+*      FROM veda AS a
+*      INNER JOIN vbak AS b
+*        ON a~vbeln = b~vbeln
+*      INNER JOIN mpos AS c
+*        ON c~kdauf = a~vbeln
+*           AND c~kdpos = a~vposn                            "+MOD-003
+*      INNER JOIN mpla AS d
+*        ON c~warpl = d~warpl
+*      WHERE  a~venddat IN s_vendda
+*        AND  a~vuntdat IN s_vuntda                          "+MOD-003
+** begin of insertion MOD-002
+**        AND   a~vposn EQ 0                                 "-MOD-003
+** end of insertion MOD-002
+*        AND    b~vkorg EQ p_vkorg
+*        AND    a~vbeln EQ p_vbeln
+*        AND    b~kunnr EQ p_kunnr.
+** begin of insertion MOD-001
+**        AND    b~gueen IN s_vendda.                        "-MOD-003
+** end of insertion MOD-001.
+*    ELSE.
+*      SELECT
+*        c~warpl d~wptxt d~plan_sort b~kunnr c~equnr
+*        a~vbeln c~kdpos a~venddat
+*        a~vuntdat                                           "+MOD-003
+*      INTO CORRESPONDING FIELDS OF TABLE gt_mpla
+*      FROM veda AS a
+*      INNER JOIN vbak AS b
+*        ON a~vbeln = b~vbeln
+*      INNER JOIN mpos AS c
+*        ON c~kdauf = a~vbeln
+*           AND c~kdpos = a~vposn                            "+MOD-003
+*      INNER JOIN mpla AS d
+*        ON c~warpl = d~warpl
+*      WHERE  a~venddat IN s_vendda
+*        AND  a~vuntdat IN s_vuntda                          "+MOD-003
+** begin of insertion MOD-002
+**        AND   a~vposn EQ 0                                 "-MOD-003
+** end of insertion MOD-002
+*        AND    b~vkorg EQ p_vkorg
+*        AND    b~kunnr EQ p_kunnr.
+** begin of insertion MOD-001
+**        AND    b~gueen IN s_vendda.                        "-MOD-003
+** end of insertion MOD-001.
+*    ENDIF.
+*  ELSE.
+*    IF NOT p_vbeln IS INITIAL.
+*      SELECT
+*        c~warpl d~wptxt d~plan_sort b~kunnr c~equnr
+*        a~vbeln c~kdpos a~venddat
+*        a~vuntdat                                           "+MOD-003
+*      INTO CORRESPONDING FIELDS OF TABLE gt_mpla
+*      FROM veda AS a
+*      INNER JOIN vbak AS b
+*        ON a~vbeln = b~vbeln
+*      INNER JOIN mpos AS c
+*        ON c~kdauf = a~vbeln
+*           AND c~kdpos = a~vposn                            "+MOD-003
+*      INNER JOIN mpla AS d
+*        ON c~warpl = d~warpl
+*      WHERE  a~venddat IN s_vendda
+*        AND  a~vuntdat IN s_vuntda                          "+MOD-003
+**begin of insertion MOD-002
+**      AND    a~vposn EQ 0                                  "-MOD-003
+**end of insertion MOD-002
+*      AND    b~vkorg EQ p_vkorg
+*      AND    a~vbeln EQ p_vbeln.
+**begin of insertion MOD-001
+**        AND    b~gueen IN s_vendda.                        "-MOD-003
+** end of insertion MOD-001.
+*    ELSE.
+*      SELECT
+*        c~warpl d~wptxt d~plan_sort b~kunnr c~equnr
+*        a~vbeln c~kdpos a~venddat
+*        a~vuntdat                                           "+MOD-003
+*      INTO CORRESPONDING FIELDS OF TABLE gt_mpla
+*      FROM veda AS a
+*      INNER JOIN vbak AS b
+*        ON a~vbeln = b~vbeln
+*      INNER JOIN mpos AS c
+*        ON c~kdauf = a~vbeln
+*           AND c~kdpos = a~vposn                            "+MOD-003
+*      INNER JOIN mpla AS d
+*        ON c~warpl = d~warpl
+*      WHERE  a~venddat IN s_vendda
+*        AND  a~vuntdat IN s_vuntda                          "+MOD-003
+**begin of insertion MOD-002
+**      AND   a~vposn EQ 0                                   "-MOD-003
+**end of insertion MOD-002
+*      AND    b~vkorg EQ p_vkorg.
+**begin of insertion MOD-001
+**        AND    b~gueen IN s_vendda.                        "-MOD-003
+** end of insertion MOD-001.
+*    ENDIF.
+*  ENDIF.
+*<<< End replace MOD-003
+
+* delete adjacent records
+
+  DELETE ADJACENT DUPLICATES FROM gt_mpla.
+
+* check status not deleted or inactive
+
+  LOOP AT gt_mpla.
+    CONCATENATE 'WO' gt_mpla-warpl INTO gv_objnr.
+
+    CALL FUNCTION 'STATUS_CHECK'
+      EXPORTING
+        objnr             = gv_objnr
+        status            = c_i0320
+      EXCEPTIONS
+        object_not_found  = 1
+        status_not_active = 2
+        OTHERS            = 3.
+    IF sy-subrc NE 0.
+      CALL FUNCTION 'STATUS_CHECK'
+        EXPORTING
+          objnr             = gv_objnr
+          status            = c_i0076
+        EXCEPTIONS
+          object_not_found  = 1
+          status_not_active = 2
+          OTHERS            = 3.
+    ENDIF.
+
+    IF sy-subrc EQ 0.
+      DELETE gt_mpla.
+    ENDIF.
+
+  ENDLOOP.
+
+*.. Add additional fields to internal table
+
+  LOOP AT gt_mpla.
+
+    SELECT SINGLE * FROM kna1 WHERE kunnr = gt_mpla-kunnr.
+    IF sy-subrc IS INITIAL.
+      CONCATENATE kna1-name1 kna1-stras kna1-ort01
+        INTO gt_mpla-txtpa SEPARATED BY '/'.
+    ENDIF.
+
+    MODIFY gt_mpla.
+
+  ENDLOOP.
+
+  SORT gt_mpla BY vbeln kdpos.
+
+ENDFORM.                    " select_maintplans
+
+*eject
+*&---------------------------------------------------------------------*
+*&      Form  select_orders
+*&---------------------------------------------------------------------*
+*       Select the relevant orders for selected maintenance plans
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM select_orders.
+
+  SELECT aufnr FROM viqmel INTO gv_aufnr WHERE warpl = gt_mpla-warpl.
+
+* check status created or released
+
+    IF sy-subrc IS INITIAL.
+      CONCATENATE 'OR' gv_aufnr INTO gv_objnr.
+
+      CALL FUNCTION 'STATUS_CHECK'
+        EXPORTING
+          objnr             = gv_objnr
+          status            = c_i0001
+        EXCEPTIONS
+          object_not_found  = 1
+          status_not_active = 2
+          OTHERS            = 3.
+      IF sy-subrc NE 0.
+        CALL FUNCTION 'STATUS_CHECK'
+          EXPORTING
+            objnr             = gv_objnr
+            status            = c_i0002
+          EXCEPTIONS
+            object_not_found  = 1
+            status_not_active = 2
+            OTHERS            = 3.
+      ENDIF.
+      IF sy-subrc EQ 0.
+        MOVE gv_aufnr TO gt_orde-aufnr.
+        MOVE gt_mpla-warpl TO gt_orde-warpl.
+        MOVE gt_mpla-equnr TO gt_orde-equnr.
+        MOVE gt_mpla-kunnr TO gt_orde-kunnr.
+        MOVE gt_mpla-vbeln TO gt_orde-vbeln.
+        SELECT SINGLE name1 FROM kna1 INTO gt_orde-name1
+            WHERE kunnr = gt_orde-kunnr.
+        SELECT SINGLE ktext FROM aufk INTO gt_orde-ktext
+            WHERE aufnr = gt_orde-aufnr.
+        APPEND gt_orde.
+        CLEAR gt_orde.
+      ENDIF.
+    ENDIF.
+
+  ENDSELECT.
+
+ENDFORM.                    "select_orders
+
+*eject
+*&---------------------------------------------------------------------*
+*&      Form  select_notifications
+*&---------------------------------------------------------------------*
+*       Select the relevant notifications for selected maintenance plans
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM select_notifications.
+
+  SELECT qmnum FROM mhio INTO gv_qmnum WHERE warpl = gt_mpla-warpl.
+
+    IF sy-subrc IS INITIAL.
+      CONCATENATE 'QM' gv_qmnum INTO gv_objnr.
+
+* notification may not be assigned to service order yet
+
+      CALL FUNCTION 'STATUS_CHECK'
+        EXPORTING
+          objnr             = gv_objnr
+          status            = c_i0071
+        EXCEPTIONS
+          object_not_found  = 1
+          status_not_active = 2
+          OTHERS            = 3.
+      IF sy-subrc NE 0.
+
+* notification must be outstanding
+
+        CALL FUNCTION 'STATUS_CHECK'
+          EXPORTING
+            objnr             = gv_objnr
+            status            = c_i0068
+          EXCEPTIONS
+            object_not_found  = 1
+            status_not_active = 2
+            OTHERS            = 3.
+        IF sy-subrc EQ 0.
+          MOVE gv_qmnum TO gt_noti-qmnum.
+          MOVE gt_mpla-warpl TO gt_noti-warpl.
+          MOVE gt_mpla-equnr TO gt_noti-equnr.
+          MOVE gt_mpla-kunnr TO gt_noti-kunnr.
+          MOVE gt_mpla-vbeln TO gt_noti-vbeln.
+          SELECT SINGLE name1 FROM kna1 INTO gt_noti-name1
+              WHERE kunnr = gt_noti-kunnr.
+* begin of deletion MOD-001
+**            IF sy-subrc IS INITIAL.
+**              MOVE kna1-name1 TO gt_noti-name1.
+**            ENDIF.
+* end of deletion MOD-001
+          APPEND gt_noti.
+          CLEAR gt_noti.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDSELECT.
+
+  LOOP AT gt_noti.
+    SELECT SINGLE qmtxt FROM qmel INTO CORRESPONDING
+     FIELDS OF gt_noti WHERE qmnum = gt_noti-qmnum.
+    IF sy-subrc IS INITIAL.
+      MODIFY gt_noti.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    "select_notifications
+*eject
+*&---------------------------------------------------------------------*
+*&      Form  output_list_mpla
+*&---------------------------------------------------------------------*
+*       Output the maintenance plan list
+*----------------------------------------------------------------------*
+FORM output_list_mpla.
+
+*.. Local variables
+  DATA: ls_layout TYPE slis_layout_alv,
+        ls_grid   TYPE lvc_s_glay,
+        ls_events TYPE slis_alv_event.
+
+  DATA: lt_events TYPE slis_t_event,
+        lt_event_exits TYPE slis_t_event_exit,
+        lt_fieldcat TYPE slis_t_fieldcat_alv.
+
+  FIELD-SYMBOLS: <ls_fieldcat> TYPE slis_fieldcat_alv. "MOD-003 insert
+
+*.. Fill events
+  REFRESH lt_events.
+  ls_events-name = 'USER_COMMAND'.
+  ls_events-form = 'USER_COMMAND_MPLA'.
+  APPEND ls_events TO lt_events.
+  ls_events-name = 'PF_STATUS_SET'.
+  ls_events-form = 'PF_STATUS_SET_MPLA'.
+  APPEND ls_events TO lt_events.
+  ls_events-name = 'TOP_OF_PAGE'.
+  ls_events-form = 'TOP_OF_PAGE_MPLA'.
+  APPEND ls_events TO lt_events.
+* --> Start modif 20080420 Tom Van Oevelen: it looks like ECC6 doesn't like the
+* idea of specifing an "end of list" event with a routine (form) that doesn't
+* exist. Therefore I have commented out the following 2 lines
+*  ls_events-form = ls_events-name = 'END_OF_LIST'.
+*  APPEND ls_events TO lt_events.
+* <-- End modif 20080420
+
+*.. Define layout
+  CLEAR ls_layout.
+  ls_layout-get_selinfos      = gc_charx.
+  ls_layout-colwidth_optimize = gc_charx.
+  ls_layout-detail_popup      = gc_charx.
+  ls_layout-box_fieldname     = 'SELKZ'.
+  ls_layout-no_keyfix         = gc_charx.
+  ls_layout-info_fieldname    = 'ZZCOL'.
+
+*.. Define grid settings
+  ls_grid-coll_end_l = gc_charx.
+
+*.. Prepare field catalog
+  CALL FUNCTION 'REUSE_ALV_FIELDCATALOG_MERGE'
+    EXPORTING
+      i_structure_name       = 'YAM_CR307_MPLA'
+      i_client_never_display = 'X'
+    CHANGING
+      ct_fieldcat            = lt_fieldcat
+    EXCEPTIONS
+      inconsistent_interface = 1
+      program_error          = 2
+      OTHERS                 = 3.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+*>>> MOD-003 begin insert
+  "Fix the text of column VUNTDAT to avoid the heading text 'ContrctEnd' instead of the short text 'ContrSignd'
+  LOOP AT lt_fieldcat ASSIGNING <ls_fieldcat> WHERE fieldname EQ 'VUNTDAT'.
+    <ls_fieldcat>-reptext_ddic = <ls_fieldcat>-seltext_s.
+  ENDLOOP.
+*<<< MOD-003 end insert
+
+*.. Call ALV grid output
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+    EXPORTING
+      i_callback_program = 'YAM_DEACTIVATE_MPLAN'
+      i_structure_name   = 'YAM_CR307_MPLA'
+      i_grid_settings    = ls_grid
+      is_layout          = ls_layout
+      i_save             = 'A'
+      it_fieldcat        = lt_fieldcat
+      it_events          = lt_events
+    TABLES
+      t_outtab           = gt_mpla
+    EXCEPTIONS
+      program_error      = 1
+      OTHERS             = 2.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+ENDFORM.                    " output_list_mpla
+*eject
+*&---------------------------------------------------------------------*
+*&      Form  output_list_orde
+*&---------------------------------------------------------------------*
+*       Output the results of the queries
+*----------------------------------------------------------------------*
+FORM output_list_orde.
+
+*.. Local variables
+  DATA: ls_layout TYPE slis_layout_alv,
+        ls_grid   TYPE lvc_s_glay,
+        ls_events TYPE slis_alv_event.
+
+  DATA: lt_events TYPE slis_t_event,
+        lt_event_exits TYPE slis_t_event_exit,
+        lt_fieldcat TYPE slis_t_fieldcat_alv.
+
+*.. Fill events
+  REFRESH lt_events.
+  ls_events-name = 'USER_COMMAND'.
+  ls_events-form = 'USER_COMMAND_ORDE'.
+  APPEND ls_events TO lt_events.
+  ls_events-name = 'PF_STATUS_SET'.
+  ls_events-form = 'PF_STATUS_SET_ORDE'.
+  APPEND ls_events TO lt_events.
+  ls_events-name = 'TOP_OF_PAGE'.
+  ls_events-form = 'TOP_OF_PAGE_ORDE'.
+  APPEND ls_events TO lt_events.
+
+*.. Define layout
+  CLEAR ls_layout.
+  ls_layout-get_selinfos      = gc_charx.
+  ls_layout-colwidth_optimize = gc_charx.
+  ls_layout-detail_popup      = gc_charx.
+  ls_layout-no_keyfix         = gc_charx.
+  ls_layout-box_fieldname     = 'SELKZ'.
+  ls_layout-no_min_linesize   = gc_charx.
+  ls_layout-info_fieldname    = 'ZZCOL'.
+
+*.. Define grid settings
+  ls_grid-coll_end_l = gc_charx.
+
+*.. Prepare field catalog
+  CALL FUNCTION 'REUSE_ALV_FIELDCATALOG_MERGE'
+    EXPORTING
+      i_structure_name       = 'YAM_CR307_ORDE'
+      i_client_never_display = 'X'
+    CHANGING
+      ct_fieldcat            = lt_fieldcat
+    EXCEPTIONS
+      inconsistent_interface = 1
+      program_error          = 2
+      OTHERS                 = 3.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+*.. Call ALV grid output
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+    EXPORTING
+      i_callback_program    = 'YAM_DEACTIVATE_MPLAN'
+      i_structure_name      = 'YAM_CR307_ORDE'
+      i_screen_start_column = 10
+      i_screen_end_column   = 150
+      i_screen_start_line   = 10
+      i_screen_end_line     = 30
+      i_grid_settings       = ls_grid
+      is_layout             = ls_layout
+      i_save                = 'A'
+      it_fieldcat           = lt_fieldcat
+      it_events             = lt_events
+    TABLES
+      t_outtab              = gt_orde
+    EXCEPTIONS
+      program_error         = 1
+      OTHERS                = 2.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+ENDFORM.                    " output_list_orde
+*eject
+*&---------------------------------------------------------------------*
+*&      Form  output_list_noti
+*&---------------------------------------------------------------------*
+*       Output the results : notifications
+*----------------------------------------------------------------------*
+FORM output_list_noti.
+
+*.. Local variables
+  DATA: ls_layout TYPE slis_layout_alv,
+        ls_grid   TYPE lvc_s_glay,
+        ls_events TYPE slis_alv_event.
+
+  DATA: lt_events TYPE slis_t_event,
+        lt_event_exits TYPE slis_t_event_exit,
+        lt_fieldcat TYPE slis_t_fieldcat_alv.
+
+*.. Fill events
+  REFRESH lt_events.
+  ls_events-name = 'USER_COMMAND'.
+  ls_events-form = 'USER_COMMAND_NOTI'.
+  APPEND ls_events TO lt_events.
+  ls_events-name = 'PF_STATUS_SET'.
+  ls_events-form = 'PF_STATUS_SET_NOTI'.
+  APPEND ls_events TO lt_events.
+  ls_events-name = 'TOP_OF_PAGE'.
+  ls_events-form = 'TOP_OF_PAGE_NOTI'.
+  APPEND ls_events TO lt_events.
+
+*.. Define layout
+  CLEAR ls_layout.
+  ls_layout-get_selinfos      = gc_charx.
+  ls_layout-colwidth_optimize = gc_charx.
+  ls_layout-detail_popup      = gc_charx.
+  ls_layout-no_keyfix         = gc_charx.
+  ls_layout-box_fieldname     = 'SELKZ'.
+  ls_layout-no_min_linesize   = gc_charx.
+  ls_layout-info_fieldname    = 'ZZCOL'.
+
+*.. Define grid settings
+  ls_grid-coll_end_l = gc_charx.
+
+*.. Prepare field catalog
+  CALL FUNCTION 'REUSE_ALV_FIELDCATALOG_MERGE'
+    EXPORTING
+      i_structure_name       = 'YAM_CR307_NOTI'
+      i_client_never_display = 'X'
+    CHANGING
+      ct_fieldcat            = lt_fieldcat
+    EXCEPTIONS
+      inconsistent_interface = 1
+      program_error          = 2
+      OTHERS                 = 3.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+*.. Call ALV grid output
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+    EXPORTING
+      i_callback_program    = 'YAM_DEACTIVATE_MPLAN'
+      i_structure_name      = 'YAM_CR307_NOTI'
+      i_screen_start_column = 10
+      i_screen_end_column   = 150
+      i_screen_start_line   = 10
+      i_screen_end_line     = 30
+      i_grid_settings       = ls_grid
+      is_layout             = ls_layout
+      i_save                = 'A'
+      it_fieldcat           = lt_fieldcat
+      it_events             = lt_events
+    TABLES
+      t_outtab              = gt_noti
+    EXCEPTIONS
+      program_error         = 1
+      OTHERS                = 2.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+ENDFORM.                    " output_list_noti
+*eject
+*&---------------------------------------------------------------------*
+*&      Form  add_message_to_log
+*&---------------------------------------------------------------------*
+*       Add a generated message to the application log
+*----------------------------------------------------------------------*
+FORM add_message_to_log .
+
+*.. Local variables
+  DATA: ls_msg TYPE bal_s_msg.
+
+  MOVE-CORRESPONDING syst TO ls_msg.
+  CALL FUNCTION 'BAL_LOG_MSG_ADD'
+    EXPORTING
+*     I_LOG_HANDLE              =
+      i_s_msg                   = ls_msg
+*   IMPORTING
+*     E_S_MSG_HANDLE            =
+*     E_MSG_WAS_LOGGED          =
+*     E_MSG_WAS_DISPLAYED       =
+    EXCEPTIONS
+      log_not_found             = 1
+      msg_inconsistent          = 2
+      log_is_full               = 3
+      OTHERS                    = 4
+            .
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+*.. Flag log as having entries
+  IF gv_log IS INITIAL.
+    gv_log = gc_charx.
+  ENDIF.
+
+ENDFORM.                    " add_message_to_log
+
+*eject
+*&---------------------------------------------------------------------*
+*&      Form  save_application_log
+*&---------------------------------------------------------------------*
+*       Save the current application log to database
+*----------------------------------------------------------------------*
+FORM save_application_log .
+
+*.. Local variables
+  DATA: lt_handle TYPE bal_t_logh.
+
+  APPEND gv_handle TO lt_handle.
+
+  CALL FUNCTION 'BAL_DB_SAVE'
+    EXPORTING
+*     I_CLIENT               = SY-MANDT
+      i_in_update_task       = 'X'
+      i_t_log_handle         = lt_handle
+*   IMPORTING
+*     E_NEW_LOGNUMBERS       =
+    EXCEPTIONS
+      log_not_found          = 1
+      save_not_allowed       = 2
+      numbering_error        = 3
+      OTHERS                 = 4
+            .
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+  COMMIT WORK.
+
+ENDFORM.                    " save_application_log

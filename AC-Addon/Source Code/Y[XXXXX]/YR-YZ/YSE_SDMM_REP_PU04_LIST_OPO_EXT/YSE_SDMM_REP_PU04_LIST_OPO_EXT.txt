@@ -1,0 +1,2510 @@
+*&---------------------------------------------------------------------*
+*& Report   YSE_SDMM_REP_PU04_LIST_OPO                                 *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+*&                                                                     *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+************************************************************************
+* Program ID           : YSE_SDMM_REP_PU40_LIST_OPO_EXT                *
+*                                                                      *
+* Program Title        : Purchase orders list                          *
+* Author               : AIR21243                                      *
+* Date                 : 10.09.2008                                    *
+* Development Number:    D430-SDMM-REP-PU_04:List  POs                 *
+************************************************************************
+*    CHANGE HISTORY LOG                                                *
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME     |CORRECTION NUMBER| CHANGE REFERENCE # *
+*----------------------------------------------------------------------*
+* MOD-001 | 2009.04.17 | Geert Rutten |CD1K947681 | CR0770             *
+* Transfer PO data to Business Objects                                 *
+*                                                                      *
+* MOD-002 | 07/05/2010 | Geert Rutten    |CR 1358 | CD1K956554         *
+* Extension of table YSE_PO_PLDELTIME                                  *
+*                                                                      *
+* MOD-003 | 07/23/2012 | Johnny Wu       |CR 2576 | CD1K972646         *
+* Add new selection criteria                                           *
+************************************************************************
+* MOD-004 | 10/24/2014 | D.Shireesha     |CR 3161 | CD1K983566         *
+* Description: Changes made to avoid dump while fetching data from MBEW*
+*              table to pick unique combination of material and plant  *
+*----------------------------------------------------------------------*
+* MOD-005 | 06/02/2017 | Dashmantha      |CR4222 | CD1K992245          *
+*Description: Fix the issue to avoid job cancellation due to internal  *
+*table entries not checked before using for all entries on it.         *
+************************************************************************
+
+REPORT  yse_sdmm_rep_pu04_list_opo_ext_po MESSAGE-ID yam_re.
+
+*-----------------------------------------------------------------------
+* DATA DECLARATION
+*-----------------------------------------------------------------------
+INCLUDE: yse_sdmm_rep_pu04_list_ext_top.
+
+
+*--- ALV
+*--- Type pools
+TYPE-POOLS slis.
+
+*--- Structures
+DATA: gs_layout         TYPE slis_layout_alv.
+
+*--- Internal tables
+DATA: it_fieldcat       TYPE slis_t_fieldcat_alv.
+DATA: wa_fieldcat TYPE slis_fieldcat_alv.
+DATA: it_dates   TYPE TABLE OF rke_dat WITH HEADER LINE.
+DATA: e_anz_tage LIKE komp-anz_tage.
+DATA: it_vbap      LIKE vbap OCCURS 0 WITH HEADER LINE.
+
+*--- Variables
+DATA: x_repid      LIKE sy-repid,
+      i_fakca      LIKE fplt-fakca,
+      lv_prodh     LIKE mvke-prodh,
+      l_index      LIKE sy-tabix,
+      lv_vkorg     TYPE vkorg.
+
+DATA: BEGIN OF it_acct OCCURS 0,
+        aktbo      LIKE ce41000_acct-aktbo,
+        paobjnr    LIKE ce41000_acct-paobjnr,
+        pasubnr    LIKE ce41000_acct-pasubnr,
+        ce4key     LIKE ce41000_acct-ce4key.
+DATA: END OF it_acct.
+
+* Begin of insert MOD-001
+DATA:  wa_purch_orders_bo    TYPE yse_po_bo.
+DATA:  wa_purch_orders_bo2   TYPE yse_po_bo.
+* Contains open purchase orders for BO to reload
+DATA:  i_purch_orders_bo    TYPE TABLE OF yse_po_bo.
+DATA:  i_purch_orders_bo2   TYPE TABLE OF yse_po_bo.
+DATA:  wa_purch_order_bo_print   TYPE yse_po_bo.
+* End of insert MOD-001
+
+
+DATA: lv_prctr   TYPE z_prctr,
+      lv_segment TYPE z_prctr,
+      it_plc     TYPE k9rcd11000010    OCCURS 0 WITH HEADER LINE.
+
+
+
+
+
+
+
+
+*----------------------------------------------------------------------*
+*- SELECTION SCREEN
+*----------------------------------------------------------------------*
+
+SELECTION-SCREEN: BEGIN OF BLOCK b1 WITH FRAME.
+SELECT-OPTIONS: s_ernam   FOR ekko-ernam,"MOD-003
+                s_aedat   FOR  ekko-aedat,
+                s_lifnr   FOR  ekko-lifnr,
+                s_werks   FOR  ekpo-werks.
+PARAMETERS    : p_ekorg   LIKE ekko-ekorg OBLIGATORY.
+SELECT-OPTIONS: s_gac   FOR  gv_gac,
+                s_pgc   FOR  gv_pgc.
+*PARAMETERS:
+*                p_prodh LIKE mara-prdha.
+SELECT-OPTIONS: s_matnr   FOR  mara-matnr,
+                s_po_typ  FOR  ekko-bsart,
+                s_po_num  FOR  ekko-ebeln,
+                s_sup_pl  FOR  ekko-reswk,
+                s_pu_grp  FOR  ekko-ekgrp,
+                s_due_da  FOR  eket-eindt.
+
+SELECTION-SCREEN: END OF BLOCK b1.
+
+SELECTION-SCREEN BEGIN OF BLOCK 2 WITH FRAME TITLE text-002.
+SELECTION-SCREEN: BEGIN OF LINE.
+PARAMETERS: p_eisbe AS CHECKBOX.
+SELECTION-SCREEN COMMENT 15(50) text-002 FOR FIELD p_eisbe.
+SELECTION-SCREEN: END OF LINE.
+SELECT-OPTIONS s_pstyv FOR vbap-pstyv.
+SELECTION-SCREEN END OF BLOCK 2.
+
+SELECTION-SCREEN BEGIN OF BLOCK b03 WITH FRAME TITLE text-004.
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT (25) text-s04.
+SELECTION-SCREEN POSITION POS_LOW.
+PARAMETERS: p_var   LIKE disvariant-variant.
+SELECTION-SCREEN END OF LINE.
+SELECTION-SCREEN END OF BLOCK b03.
+
+* Begin of Insert MOD-001
+
+PARAMETERS: p_daily TYPE c  DEFAULT ' '.
+
+PARAMETERS: p_ini_ld TYPE c DEFAULT ' '.
+
+
+
+************************************************************************
+AT SELECTION-SCREEN OUTPUT.
+************************************************************************
+  IF sy-batch = ' '.
+    LOOP AT SCREEN.
+      IF    screen-name EQ 'P_DAILY' OR screen-name EQ 'P_INI_LD'.
+        screen-active = 0.
+        MODIFY SCREEN.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+* End of Insert MOD-001
+
+
+*----------------------------------------------------------------------*
+* AT SELECTION SCREEN
+*----------------------------------------------------------------------*
+AT SELECTION-SCREEN.
+
+  PERFORM check_authorization.
+  PERFORM existence_variant USING p_var.
+
+
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_var.
+  PERFORM variant_inputhelp USING p_var.
+
+  PERFORM variant_init.
+  IF p_var IS INITIAL AND g_variant_flag IS INITIAL.
+    PERFORM get_default_variant USING p_var.
+    g_variant_flag = 'X'.
+  ENDIF.
+
+
+
+*----------------------------------------------------------------------*
+*- Start-of-selection.
+*----------------------------------------------------------------------*
+START-OF-SELECTION.
+
+  PERFORM init.
+* Begin of insert MOD-001
+* Delete the open PO data which needs to be reloaded
+  IF sy-batch = 'X'.
+    IF p_daily = 'X'.
+      PERFORM del_openpo_po_tab.
+    ENDIF.
+  ENDIF.
+* End of insert MOD-001
+  PERFORM get_data_purch_orders.
+  PERFORM determine_allocation.
+  " done after get_data_pur_orders to limit to the extracted matnr/werks
+  PERFORM prepare_data.
+  PERFORM display_data.
+
+*&---------------------------------------------------------------------*
+*&      Form  INIT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM init.
+
+  SELECT * FROM  yse_po_pldeltime
+           INTO  CORRESPONDING FIELDS OF TABLE i_yse_po_pldeltime
+           WHERE
+                 ekorg  = p_ekorg
+            AND lifnr   IN s_lifnr
+            AND werks   IN s_werks.
+
+  SELECT * FROM  yse_em_plant
+          INTO  CORRESPONDING FIELDS OF TABLE i_yse_em_plant
+          WHERE
+                whtype = 'D'.
+
+* Select all level 2 hierarchy codes from the prodh table
+  SELECT *
+         FROM t179
+         INTO TABLE it_t179
+        WHERE stufe = '2'.
+
+* Default fields in range
+  r_prdha-sign   = 'I'.
+  r_prdha-option = 'EQ'.
+
+* Loop over hierarchy codes where the first 4 char's fit in S_GAC
+  IF NOT s_gac IS INITIAL.
+    LOOP AT it_t179 INTO wa_t179 WHERE prodh(4) IN s_gac.
+      r_prdha-low = wa_t179-prodh.
+      APPEND r_prdha.
+    ENDLOOP.
+  ENDIF.
+
+* Loop over hierarchy codes where the second 4 char's fit in S_PGC
+  IF NOT s_pgc IS INITIAL.
+    LOOP AT it_t179 INTO wa_t179 WHERE prodh+4(4) IN s_pgc.
+      r_prdha-low = wa_t179-prodh.
+      APPEND r_prdha.
+    ENDLOOP.
+  ENDIF.
+
+ENDFORM.                    "INIT
+*
+FORM get_data_purch_orders.
+  SELECT
+      ekko~ekorg  " PO Purch organisation
+      ekko~bsart  " PO doc type
+      ekko~aedat  " PO creation date
+      ekpo~ebeln  " PO num
+      ekpo~ebelp  " PO item  num
+      ekpo~matnr  " material
+      ekpo~werks  " plant
+      ekko~lifnr  " vendor number
+*      lfa1~name1  " Vendor Name
+      ekpo~afnam  " Name of Requisitioner/Requester
+      ekko~reswk  " supplying plant
+      ekpo~menge  " quantities
+      ekpo~meins  " unit of measure
+      ekpo~peinh  " price unit
+      ekpo~netpr  " net price
+      ekko~waers  " currency
+      ekpo~zztranspmode   " transportation mode
+      ekpo~zzconscode     " transportation mode
+      ekpo~bednr  "
+      ekpo~infnr  "
+      ekpo~elikz  "
+      ekpo~erekz  "
+      ekko~ekgrp
+      eket~eindt
+      ekpo~lgort
+      ekpo~zzeeind
+      ekko~lands
+      ekpo~bukrs
+* Begin of insert MOd-002
+      ekpo~zzvtweg
+* End of insert MOd-002
+
+  INTO CORRESPONDING FIELDS OF TABLE i_purch_orders
+  FROM ekpo
+  INNER JOIN  ekko  ON ekpo~ebeln =  ekko~ebeln
+  INNER JOIN  eket  ON ekpo~ebeln =  eket~ebeln
+                  AND  ekpo~ebelp =  eket~ebelp
+*  JOIN lfa1 ON ekko~lifnr EQ lfa1~lifnr
+
+  WHERE
+          ekpo~retpo    <>  'X'
+    AND   ekko~ekorg     = p_ekorg
+    AND   ekko~aedat     IN  s_aedat
+    AND   ekko~ernam     IN s_ernam
+    AND   ekko~lifnr     IN s_lifnr
+    AND   ekko~bsart     IN s_po_typ
+    AND   ekpo~ebeln     IN s_po_num
+    AND   ekpo~werks     IN s_werks
+    AND   ekpo~matnr     IN s_matnr
+    AND   ekko~reswk     IN s_sup_pl
+    AND   ekko~ekgrp     IN s_pu_grp
+    AND   eket~eindt     IN s_due_da
+    AND   ekpo~loekz     EQ space
+*    AND   ( ekpo~elikz  NE 'X'
+*    OR   ekpo~erekz     NE 'X' )
+    AND   eket~etenr      = ( SELECT MAX( etenr ) FROM eket
+                                                WHERE ebeln =
+                                                ekpo~ebeln AND ebelp =
+                                                ekpo~ebelp ).
+
+ENDFORM.                    "get_data_purch_orders
+
+
+*&---------------------------------------------------------------------*
+*&      Form  prepare_data
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM prepare_data.
+* Prepare i_purch_orders
+*
+*  determine material
+
+  DATA:  l_moff TYPE i.
+
+  CHECK NOT i_purch_orders[] IS INITIAL.                    " MOD-017
+  SELECT matnr prdha matkl FROM mara
+                          INTO CORRESPONDING FIELDS OF TABLE i_mara
+                          FOR ALL ENTRIES IN i_purch_orders
+                          WHERE matnr = i_purch_orders-matnr.
+*                            AND prdha IN r_prdha.
+
+
+
+  CHECK NOT i_mara[] IS INITIAL.                            " MOD-017
+  SELECT matnr maktx       FROM makt
+                          INTO CORRESPONDING FIELDS OF TABLE i_makt
+                          FOR ALL ENTRIES IN i_mara
+                          WHERE
+                               matnr = i_mara-matnr
+                          AND  spras = sy-langu.
+* determine material plant level
+
+  SELECT matnr werks prctr      FROM marc
+                          INTO CORRESPONDING FIELDS OF TABLE i_marc
+                          FOR ALL ENTRIES IN i_purch_orders
+                          WHERE matnr = i_purch_orders-matnr
+                            AND werks = i_purch_orders-werks.
+
+*  determine  Requested Delivery Date.
+  CHECK NOT i_purch_orders[] IS INITIAL.                    " MOD-017
+  SELECT ebeln ebelp etens ebtyp menge erdat eindt     FROM ekes
+                          INTO TABLE it_ekes
+                          FOR ALL ENTRIES IN i_purch_orders
+                          WHERE
+                               ebeln = i_purch_orders-ebeln
+                          AND  ebelp = i_purch_orders-ebelp
+                          AND  ebtyp = 'AB'.
+  IF sy-subrc EQ 0.
+    SORT it_ekes BY  ebeln  ebelp  etens DESCENDING.
+    DELETE ADJACENT DUPLICATES FROM it_ekes COMPARING ebeln ebelp.
+  ENDIF.
+
+  APPEND LINES OF it_ekes  TO i_ekes.
+  FREE it_ekes.
+*  determine  First Confirmation Date.
+  CHECK NOT i_purch_orders[] IS INITIAL.                    " MOD-017
+  SELECT ebeln ebelp zzeindt  FROM yse_po_confirm
+                          INTO TABLE i_yse_po_confirm
+                          FOR ALL ENTRIES IN i_purch_orders
+                          WHERE
+                               ebeln = i_purch_orders-ebeln
+                          AND  ebelp = i_purch_orders-ebelp.
+
+* determine Last inbound delivery date
+  CHECK NOT i_purch_orders[] IS INITIAL.                    " MOD-017
+  SELECT ebeln ebelp etens ebtyp menge erdat eindt     FROM ekes
+                          INTO TABLE it_ekes
+                          FOR ALL ENTRIES IN i_purch_orders
+                          WHERE
+                               ebeln = i_purch_orders-ebeln
+                          AND  ebelp = i_purch_orders-ebelp
+                          AND  ebtyp = 'LA'.
+  IF sy-subrc EQ 0.
+    SORT it_ekes BY  ebeln  ebelp  erdat DESCENDING.
+    DELETE ADJACENT DUPLICATES FROM it_ekes COMPARING ebeln ebelp.
+  ENDIF.
+
+  APPEND LINES OF it_ekes  TO i_ekes.
+  FREE it_ekes.
+
+
+
+
+
+*  determine  standard cost
+  CHECK NOT i_purch_orders[] IS INITIAL.                    " MOD-017
+
+  PERFORM fill_internal_tables_werks.
+
+
+*  determine  received quantity
+  CHECK NOT i_purch_orders[] IS INITIAL.                    " MOD-017
+  SELECT ebeln ebelp etenr wemng
+  FROM eket
+  INTO TABLE it_eket
+  FOR ALL ENTRIES IN i_purch_orders
+  WHERE ebeln = i_purch_orders-ebeln
+  AND  ebelp  = i_purch_orders-ebelp.
+
+  SORT it_eket BY ebeln  ebelp.
+*
+  LOOP AT it_eket INTO wa_eket_2.
+    MOVE-CORRESPONDING wa_eket_2 TO wa_eket.
+    COLLECT wa_eket INTO i_eket.
+  ENDLOOP.
+  FREE it_eket.
+
+*
+*  determine  Invoive quantity
+  CHECK NOT i_purch_orders[] IS INITIAL.                    " MOD-017
+  SELECT ebeln ebelp zekkn vgabe gjahr belnr buzei menge shkzg
+  INTO TABLE it_ekbe_invqty
+   FROM ekbe
+  FOR ALL ENTRIES IN i_purch_orders
+  WHERE
+           ebeln EQ i_purch_orders-ebeln
+       AND ebelp EQ i_purch_orders-ebelp
+  AND vgabe = '2'.                  " invoice receipt
+
+  SORT  it_ekbe_invqty  BY  ebeln  ebelp.
+*
+  LOOP AT  it_ekbe_invqty   INTO  wa_ekbe_invqty.
+    IF wa_ekbe_invqty-shkzg EQ 'H'.
+      wa_ekbe_invqty-menge =  wa_ekbe_invqty-menge * -1.
+    ENDIF.
+    MOVE-CORRESPONDING wa_ekbe_invqty TO wa_ekbe_invqty_aggr.
+    COLLECT wa_ekbe_invqty_aggr  INTO  it_ekbe_invqty_aggr.
+  ENDLOOP.
+  FREE it_ekbe_invqty.
+*
+*  determine  book date
+  CHECK NOT i_purch_orders[] IS INITIAL.                    " MOD-017
+  SELECT ebeln ebelp zekkn budat
+  INTO CORRESPONDING FIELDS OF TABLE it_ekbe_date
+   FROM ekbe
+  FOR ALL ENTRIES IN i_purch_orders
+  WHERE
+           ebeln EQ i_purch_orders-ebeln
+       AND ebelp EQ i_purch_orders-ebelp
+  AND vgabe = '2'.                  " invoice receipt
+
+  SORT  it_ekbe_date  BY  ebeln  ebelp zekkn budat ASCENDING.
+  DELETE ADJACENT DUPLICATES FROM it_ekes COMPARING ebeln ebelp.
+
+* determine  GR date
+  CHECK NOT i_purch_orders[] IS INITIAL.                    " MOD-017
+  SELECT ebeln ebelp zekkn budat
+  INTO CORRESPONDING FIELDS OF TABLE it_ekbe_grdate
+   FROM ekbe
+  FOR ALL ENTRIES IN i_purch_orders
+  WHERE
+           ebeln EQ i_purch_orders-ebeln
+       AND ebelp EQ i_purch_orders-ebelp
+  AND vgabe = '1'.                  " invoice receipt
+
+  SORT  it_ekbe_grdate  BY  ebeln  ebelp zekkn budat ASCENDING.
+  DELETE ADJACENT DUPLICATES FROM it_ekes COMPARING ebeln ebelp.
+
+
+  PERFORM fill_internal_table_lifnr.
+
+*
+* fill in data in table
+*
+  CLEAR wa_purch_orders.
+  LOOP AT i_purch_orders INTO   wa_purch_orders.
+    l_index = sy-tabix.
+* Purchase order should not be shown if it is not open
+
+
+*   get received quantity.
+    CLEAR wa_eket.
+    READ TABLE i_eket      WITH TABLE KEY  ebeln = wa_purch_orders-ebeln
+                                           ebelp = wa_purch_orders-ebelp
+                           INTO       wa_eket.
+
+
+*   get invoiced  quantity.
+    CLEAR wa_ekbe_invqty_aggr.
+    READ TABLE it_ekbe_invqty_aggr WITH TABLE KEY  ebeln =
+    wa_purch_orders-ebeln
+                                                   ebelp =
+                                                   wa_purch_orders-ebelp
+                                   INTO wa_ekbe_invqty_aggr.
+
+* Begin of Insert MOD-001
+* Closed for GR point of view
+    IF ( wa_purch_orders-elikz EQ 'X'
+    OR wa_eket-wemng GE wa_purch_orders-menge )
+    AND ( wa_purch_orders-erekz EQ 'X'
+    OR wa_ekbe_invqty_aggr-menge GE wa_purch_orders-menge ).
+      wa_purch_orders-elikz = 'X'.
+    ELSE.
+      wa_purch_orders-elikz = ' '.
+    ENDIF.
+* End of Insert MOD-001
+
+    CLEAR wa_mara.
+    READ TABLE i_mara WITH TABLE KEY  matnr = wa_purch_orders-matnr
+                           INTO       wa_mara.
+    IF sy-subrc NE 0.
+*     CONTINUE.
+    ENDIF.
+
+    MOVE wa_mara-matkl      TO wa_purch_orders-matkl.
+
+
+    CLEAR wa_marc.
+    READ TABLE i_marc WITH TABLE KEY  matnr = wa_purch_orders-matnr
+                                      werks = wa_purch_orders-werks
+                           INTO       wa_marc.
+    IF sy-subrc NE 0.
+      CONTINUE.
+    ENDIF.
+
+*        move wa_marc-prctr+7(3) to wa_purch_orders-plc.
+
+    CLEAR wa_makt.
+    READ TABLE i_makt WITH KEY  matnr = wa_purch_orders-matnr
+                           INTO       wa_makt.
+    MOVE wa_makt-maktx     TO wa_purch_orders-maktx.
+
+    MOVE wa_eket-wemng     TO wa_purch_orders-wemng.
+    MOVE wa_ekbe_invqty_aggr-menge    TO wa_purch_orders-invqty.
+
+    CLEAR wa_yse_po_confirm.
+    READ TABLE i_yse_po_confirm WITH TABLE KEY ebeln =
+                                              wa_purch_orders-ebeln
+                                               ebelp =
+                                              wa_purch_orders-ebelp
+                           INTO    wa_yse_po_confirm.
+    MOVE wa_yse_po_confirm-zzeindt TO wa_purch_orders-zzeindt.
+
+
+
+
+
+
+*   get lead time
+    PERFORM determine_lead_time.
+
+* ORDER SOURCE
+
+    IF     wa_purch_orders-bsart =  'ZNB2'.
+
+      SELECT SINGLE  vbeln FROM  ekkn
+        INTO h_vbeln
+        WHERE ebeln = wa_purch_orders-ebeln
+                                     AND  ebelp = wa_purch_orders-ebelp
+                                     AND  zekkn = ( SELECT MAX( zekkn )
+                                     FROM ekkn
+      WHERE ebeln = wa_purch_orders-ebeln
+      AND ebelp = wa_purch_orders-ebelp ).
+
+* get order source
+      SELECT SINGLE vkgrp
+      FROM vbak
+      INTO wa_purch_orders-vkgrp
+      WHERE vbeln = h_vbeln.
+
+
+      CLEAR l_moff.
+      FIND '-' IN wa_purch_orders-afnam MATCH OFFSET l_moff.
+      IF l_moff NE 0.
+
+        CALL FUNCTION 'CONVERSION_EXIT_MATN1_OUTPUT'
+          EXPORTING
+            input  = wa_purch_orders-afnam+0(l_moff)
+          IMPORTING
+            output = wa_purch_orders-ordid.
+
+        IF l_moff < 11.
+          ADD 1 TO l_moff.
+
+          CALL FUNCTION 'CONVERSION_EXIT_MATN1_OUTPUT'
+            EXPORTING
+              input  = wa_purch_orders-afnam+l_moff(2)
+            IMPORTING
+              output = wa_purch_orders-ordlin.
+        ENDIF.
+
+      ENDIF.
+* Update field requisitioner
+      CLEAR l_moff.
+      FIND '-' IN wa_purch_orders-afnam MATCH OFFSET l_moff.
+      IF l_moff NE 0.
+        wa_purch_orders-afnam = wa_purch_orders-afnam+0(l_moff).
+        CALL FUNCTION 'CONVERSION_EXIT_MATN1_OUTPUT'
+          EXPORTING
+            input  = wa_purch_orders-afnam
+          IMPORTING
+            output = wa_purch_orders-afnam.
+      ENDIF.
+    ENDIF.
+
+    IF wa_purch_orders-bsart =  'ZNB3'.
+      CALL FUNCTION 'CONVERSION_EXIT_MATN1_OUTPUT'
+        EXPORTING
+          input  = wa_purch_orders-afnam+2(10)
+        IMPORTING
+          output = wa_purch_orders-ordid.
+
+      CALL FUNCTION 'CONVERSION_EXIT_MATN1_OUTPUT'
+        EXPORTING
+          input  = wa_purch_orders-afnam
+        IMPORTING
+          output = wa_purch_orders-afnam.
+    ENDIF.
+
+* decided to pick up PLC in different way... see below
+
+    "DATA: lv_vbeln    TYPE  vbap-vbeln,
+    "      lv_posnr    TYPE  vbap-posnr.
+
+
+    "clear lv_vbeln.
+    "clear lv_posnr.
+
+    "      SELECT SINGLE  vbeln vbelp    FROM  ekkn
+    "                                     INTO (lv_vbeln , lv_posnr)
+    "                                    WHERE ebeln = wa_purch_orders-ebeln
+    "                                     AND  ebelp = wa_purch_orders-ebelp
+    "                                     AND  zekkn = ( SELECT MAX( zekkn )
+    "                                     FROM ekkn
+    "                                     WHERE ebeln = wa_purch_orders-ebeln
+    "                                     AND ebelp = wa_purch_orders-ebelp ).
+
+    "  SELECT  * FROM vbap INTO
+    "                       CORRESPONDING FIELDS OF TABLE it_vbap
+    "                       WHERE vbeln = lv_vbeln
+    "                       AND posnr = lv_posnr.
+
+    "if not it_vbap[] is INITIAL.
+    "      SELECT aktbo paobjnr pasubnr ce4key
+    "             FROM ce41000_acct
+    "             INTO TABLE it_acct
+    "             FOR ALL ENTRIES IN it_vbap
+    "             WHERE aktbo   EQ 'X'
+    "               AND paobjnr EQ it_vbap-paobjnr.
+
+    "      IF NOT it_acct[] IS INITIAL.
+    "        SORT it_acct BY paobjnr.
+    "        DELETE ADJACENT DUPLICATES FROM it_acct.
+
+    "        SELECT aktbo paobjnr pasubnr prctr ww002 ww006 ww007
+    "               FROM ce41000
+    "               INTO TABLE it_ce41000
+    "               FOR ALL ENTRIES IN it_acct
+    "               WHERE aktbo EQ 'X'
+    "                 AND paobjnr EQ it_acct-ce4key
+    "                 AND ww006   IN s_gac
+    "                 AND ww007   IN s_pgc.
+    "        SORT it_ce41000 BY paobjnr.
+    "        DELETE ADJACENT DUPLICATES FROM it_ce41000.
+    "      ENDIF.
+
+
+    "READ TABLE it_ce41000 INTO wa_ce41000 INDEX 1.
+    "* move wa_ce41000-ww002 to wa_purch_orders-plc.
+
+    "clear wa_ce41000.
+    "clear it_ce41000.
+    "ENDIF.
+
+
+    IF wa_purch_orders-gac = ' ' OR wa_purch_orders-pgc = ' '.
+      SELECT SINGLE prodh
+             FROM mvke
+             INTO lv_prodh
+             WHERE vkorg = lv_vkorg AND matnr = wa_purch_orders-matnr.
+      MOVE lv_prodh(4)   TO wa_purch_orders-gac.
+      MOVE lv_prodh+4(4) TO wa_purch_orders-pgc.
+    ENDIF.
+
+    IF wa_purch_orders-gac NOT IN s_gac.
+      DELETE i_purch_orders INDEX l_index.
+      CONTINUE.
+    ENDIF.
+    IF wa_purch_orders-pgc NOT IN s_pgc.
+      DELETE i_purch_orders INDEX l_index.
+      CONTINUE.
+    ENDIF.
+    lv_prctr = ' '.
+    lv_segment = ' '.
+*    Get PLC
+
+    SELECT SINGLE prctr INTO lv_prctr FROM yse_prctr_deriv
+     WHERE vtweg = '01' AND pgc = wa_purch_orders-pgc
+      AND class = ' '.
+    IF lv_prctr = ' '.
+      SELECT SINGLE prctr INTO lv_prctr FROM yse_prctr_deriv
+      WHERE vtweg = '01' AND pgc = wa_purch_orders-pgc
+      AND class = 'GIN'.
+      IF lv_prctr = ' '.
+        SELECT SINGLE prctr INTO lv_prctr FROM yse_prctr_deriv
+        WHERE vtweg = '01' AND pgc = wa_purch_orders-pgc
+        AND class = 'MVI'.
+      ENDIF.
+    ENDIF.
+
+    IF lv_prctr <> ' '.
+
+      CALL FUNCTION 'YSE_CONVERT_PRCTR_BL'
+        EXPORTING
+          prctr_in    = lv_prctr
+          bukrs       = wa_purch_orders-bukrs
+        IMPORTING
+          segment_out = lv_segment.
+
+      SELECT      *
+         FROM k9rcd11000010
+         INTO TABLE it_plc.
+
+      LOOP AT it_plc WHERE sour1_from LE lv_segment
+                    AND sour1_to   GE lv_segment
+                    AND valid_from LE sy-datum.
+        wa_purch_orders-plc = it_plc-target1.
+        EXIT.
+      ENDLOOP.
+    ELSE.
+      wa_purch_orders-plc = ' '.
+    ENDIF.
+
+
+
+*   get requested delivery date
+    CLEAR wa_ekes.
+    READ TABLE i_ekes WITH KEY  ebeln = wa_purch_orders-ebeln
+                                      ebelp = wa_purch_orders-ebelp
+                                      ebtyp = 'AB'
+                           INTO       wa_ekes.
+*  MOVE wa_ekes-eindt     TO wa_purch_orders-eindt.
+
+
+*   get last inbound delivery date
+    CLEAR wa_ekes.
+    READ TABLE i_ekes WITH KEY  ebeln = wa_purch_orders-ebeln
+                                      ebelp = wa_purch_orders-ebelp
+                                      ebtyp = 'LA'
+                           INTO       wa_ekes.
+    IF NOT wa_ekes-menge IS INITIAL.
+      MOVE wa_ekes-erdat     TO wa_purch_orders-zeindt.
+    ENDIF.
+
+* Difference requested vs shipped date
+
+    IF NOT wa_purch_orders-zeindt IS INITIAL AND
+       NOT wa_purch_orders-zzeeind IS INITIAL.
+
+      i_fakca = wa_purch_orders-lands.
+      IF  wa_purch_orders-zeindt >=  wa_purch_orders-zzeeind.
+
+*     Determine the number of working days in the period provided
+        REFRESH it_dates.
+        CALL FUNCTION 'RKE_SELECT_FACTDAYS_FOR_PERIOD'
+          EXPORTING
+            i_datab  = wa_purch_orders-zzeeind
+            i_datbi  = wa_purch_orders-zeindt
+            i_factid = i_fakca
+          TABLES
+            eth_dats = it_dates.
+        DESCRIBE TABLE it_dates LINES e_anz_tage.
+
+        wa_purch_orders-zzday = e_anz_tage - 1.
+      ELSE.
+
+*     Determine the number of working days in the period provided
+        REFRESH it_dates.
+        CALL FUNCTION 'RKE_SELECT_FACTDAYS_FOR_PERIOD'
+          EXPORTING
+            i_datab  = wa_purch_orders-zeindt
+            i_datbi  = wa_purch_orders-zzeeind
+            i_factid = i_fakca
+          TABLES
+            eth_dats = it_dates.
+        DESCRIBE TABLE it_dates LINES e_anz_tage.
+
+        wa_purch_orders-zzday = e_anz_tage * ( -1 ) + 1.
+      ENDIF.
+    ENDIF.
+
+* Get standard cost
+
+    CLEAR wa_mbew.
+    READ TABLE i_mbew WITH TABLE KEY  matnr = wa_purch_orders-matnr
+                                      bwkey = wa_purch_orders-werks
+                           INTO       wa_mbew.
+    MOVE wa_mbew-stprs     TO wa_purch_orders-stprs.
+    MOVE wa_mbew-peinh     TO wa_purch_orders-mpeinh.
+*
+*   unrestricted use stock
+    CLEAR wa_mard.
+    READ TABLE i_mard_stk  WITH TABLE KEY  matnr = wa_purch_orders-matnr
+                                           werks = wa_purch_orders-werks
+                           INTO       wa_mard.
+    MOVE wa_mard-labst     TO wa_purch_orders-labst.
+*
+*   get available quantity
+    CLEAR wa_alloc2.
+    READ TABLE it_alloc2 WITH KEY matnr = wa_purch_orders-matnr
+                                  werks = wa_purch_orders-werks
+                         INTO  wa_alloc2
+                                  BINARY SEARCH.
+
+*   calculate it_alloc-qty  available quantity
+    wa_purch_orders-alloc        = wa_alloc2-qty.
+    wa_purch_orders-availableqty =  wa_purch_orders-labst -
+    wa_alloc2-qty.
+
+
+*
+** calculate purchased value
+    wa_purch_orders-purvalue =  ( wa_purch_orders-netpr /
+    wa_purch_orders-peinh ) *
+    wa_purch_orders-menge.
+
+* get book date/Last Invoice Date
+    LOOP AT it_ekbe_date    WHERE   ebeln = wa_purch_orders-ebeln
+                               AND  ebelp = wa_purch_orders-ebelp.
+      MOVE  it_ekbe_date-budat     TO  wa_purch_orders-bookdate.
+    ENDLOOP.
+
+* get Last GR date
+    IF wa_purch_orders-grdate IS INITIAL.
+      LOOP AT it_ekbe_grdate    WHERE   ebeln = wa_purch_orders-ebeln
+                               AND  ebelp = wa_purch_orders-ebelp.
+        MOVE  it_ekbe_grdate-budat     TO  wa_purch_orders-grdate.
+
+      ENDLOOP.
+    ENDIF.
+
+
+
+* fill lifnr name1
+    READ TABLE i_lfa1 WITH TABLE KEY lifnr = wa_purch_orders-lifnr
+    INTO       wa_lfa1.
+    IF sy-subrc EQ 0.
+      MOVE wa_lfa1-name1 TO wa_purch_orders-name1.
+    ENDIF.
+
+    IF wa_purch_orders-bsart = 'ZUB1'.
+      wa_purch_orders-lifnr = wa_purch_orders-reswk.
+    ENDIF.
+
+
+    IF wa_purch_orders-pgc IN s_pgc AND
+       wa_purch_orders-gac IN s_gac.
+      MODIFY i_purch_orders  FROM   wa_purch_orders.
+      CLEAR wa_purch_orders.
+    ENDIF.
+  ENDLOOP.
+
+
+ENDFORM.                    "prepare_data
+
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  determine_lead_time
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_I_YSE_EM_PLANT  text
+*      <--P_WA_PURCH_ORDERS  text
+*----------------------------------------------------------------------*
+*FORM determine_lead_time  TABLES   P_I_YSE_EM_PLANT LIKE I_YSE_EM_PLANT
+*                      CHANGING P_WA_PURCH_ORDERS like  WA_PURCH_ORDERS.
+FORM determine_lead_time.
+
+  DATA: lv_vbeln    TYPE  vbap-vbeln.
+  DATA: lv_posnr    TYPE  vbap-posnr.
+
+* Begin of insert MOD-002
+  DATA: lv_found    TYPE c.
+* End of insert MOD-002
+
+*clear p_wa_purch_orders.
+
+  LOOP AT  i_yse_em_plant INTO wa_yse_em_plant
+                               WHERE    whtype = 'D'
+                                    AND  werks = wa_purch_orders-werks.
+
+    IF     wa_purch_orders-bsart =  'ZNB2'.
+
+      SELECT SINGLE  vbeln vbelp    FROM  ekkn
+                                     INTO (lv_vbeln , lv_posnr)
+                                    WHERE ebeln = wa_purch_orders-ebeln
+                                     AND  ebelp = wa_purch_orders-ebelp
+                                     AND  zekkn = ( SELECT MAX( zekkn )
+                                     FROM ekkn
+WHERE ebeln = wa_purch_orders-ebeln
+AND ebelp = wa_purch_orders-ebelp ).
+
+
+      SELECT SINGLE vstel  FROM vbap
+                           INTO wa_purch_orders-vstel
+                           WHERE
+                                vbeln  = lv_vbeln
+                            AND posnr  = lv_posnr.
+
+    ELSEIF   wa_purch_orders-bsart =  'ZNB3'.
+
+      IF  wa_purch_orders-bednr IS INITIAL.
+        MOVE  '1000'   TO  wa_purch_orders-vstel.
+      ELSE.
+        MOVE wa_purch_orders-bednr  TO wa_purch_orders-vstel.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+  IF (    wa_purch_orders-bsart =  'ZNB1'
+      OR  wa_purch_orders-bsart =  'ZNB2'
+      OR  wa_purch_orders-bsart =  'ZNB3'  ).
+
+    CLEAR wa_yse_po_pldeltime.
+
+* Begin of change MOD-002
+*    READ  TABLE i_yse_po_pldeltime  WITH TABLE KEY
+*                               ekorg        = wa_purch_orders-ekorg
+*                               lifnr        = wa_purch_orders-lifnr
+*                               werks        = wa_purch_orders-werks
+*                               zztranspmode =
+*                               wa_purch_orders-zztranspmode
+*                               vstel        = wa_purch_orders-vstel
+*
+*         INTO wa_yse_po_pldeltime.
+
+    lv_found = ' '.
+    IF NOT wa_purch_orders-zzvtweg IS INITIAL.
+      READ  TABLE i_yse_po_pldeltime  WITH TABLE KEY
+                                 ekorg        = wa_purch_orders-ekorg
+                                 lifnr        = wa_purch_orders-lifnr
+                                 werks        = wa_purch_orders-werks
+                                 zztranspmode =
+                                 wa_purch_orders-zztranspmode
+                                 vtweg        = wa_purch_orders-zzvtweg
+                                 vstel        = wa_purch_orders-vstel
+
+           INTO wa_yse_po_pldeltime.
+
+      IF sy-subrc = 0.
+        lv_found = 'X'.
+      ELSE.
+        READ  TABLE i_yse_po_pldeltime  WITH TABLE KEY
+                              ekorg        = wa_purch_orders-ekorg
+                              lifnr        = wa_purch_orders-lifnr
+                              werks        = wa_purch_orders-werks
+                              zztranspmode =
+                              wa_purch_orders-zztranspmode
+                              vtweg      = '*'
+                              vstel        = wa_purch_orders-vstel
+
+        INTO wa_yse_po_pldeltime.
+        IF sy-subrc = 0.
+          lv_found = 'X'.
+        ENDIF..
+      ENDIF.
+    ELSE.
+      READ  TABLE i_yse_po_pldeltime  WITH TABLE KEY
+                              ekorg        = wa_purch_orders-ekorg
+                              lifnr        = wa_purch_orders-lifnr
+                              werks        = wa_purch_orders-werks
+                              zztranspmode =
+                              wa_purch_orders-zztranspmode
+                              vtweg      = '01'
+                              vstel        = wa_purch_orders-vstel
+
+        INTO wa_yse_po_pldeltime.
+
+      IF sy-subrc = 0.
+        lv_found = 'X'.
+      ELSE.
+        READ  TABLE i_yse_po_pldeltime  WITH TABLE KEY
+                        ekorg        = wa_purch_orders-ekorg
+                        lifnr        = wa_purch_orders-lifnr
+                        werks        = wa_purch_orders-werks
+                        zztranspmode =
+                        wa_purch_orders-zztranspmode
+                        vtweg      = '*'
+                        vstel        = wa_purch_orders-vstel
+
+        INTO wa_yse_po_pldeltime.
+        IF sy-subrc = 0.
+          lv_found = 'X'.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+* End of Change MOD-002
+
+  ENDIF.
+
+ENDFORM.                    " determine_lead_time.
+*
+*
+FORM  determine_allocation.
+*
+*
+
+  SELECT SINGLE vkorg
+           INTO lv_vkorg
+           FROM yse_po_sorg_porg
+          WHERE ekorg = p_ekorg.
+
+  CLEAR wa_purch_orders.
+  LOOP AT i_purch_orders INTO   wa_purch_orders.
+    it_sohist-matnr = wa_purch_orders-matnr.
+    it_sohist-werks = wa_purch_orders-werks.
+    COLLECT it_sohist.
+  ENDLOOP.
+
+*
+  SORT it_sohist BY  werks matnr.
+*
+  CLEAR wa_sohist_werks.
+  CLEAR wa_sohist.
+  LOOP AT it_sohist INTO wa_sohist_werks.
+    IF wa_sohist_werks-werks NE wa_sohist-werks.
+      REFRESH it_alloc.
+      REFRESH it_matnr.
+      CLEAR   wa_sohist.
+      LOOP AT it_sohist INTO wa_sohist
+              WHERE
+              werks EQ wa_sohist_werks-werks.
+        APPEND wa_sohist-matnr  TO it_matnr.
+      ENDLOOP.
+      DELETE it_matnr WHERE matnr EQ space.
+      CALL FUNCTION 'YSE_GET_ALLOCATIONS'
+        EXPORTING
+          werks    = wa_sohist_werks-werks
+          vkorg    = lv_vkorg
+          eisbe    = p_eisbe
+          lgort    = '1000'
+        TABLES
+          it_alloc = it_alloc
+          it_matnr = it_matnr
+          r_pstyv  = s_pstyv.
+      LOOP AT it_alloc.
+        CLEAR wa_alloc2.
+        MOVE wa_sohist_werks-werks  TO wa_alloc2-werks.
+        MOVE it_alloc-matnr   TO wa_alloc2-matnr.
+        MOVE it_alloc-qty     TO wa_alloc2-qty.
+        APPEND  wa_alloc2 TO it_alloc2.
+      ENDLOOP.
+    ENDIF.
+  ENDLOOP.
+*
+*
+ENDFORM.                    " determine_allocation
+*
+*&---------------------------------------------------------------------*
+*&      Form  display_data
+*&---------------------------------------------------------------------*
+
+FORM display_data .
+  SORT i_purch_orders BY ebeln ebelp.
+* Begin of insert MOD-001
+  IF sy-batch = 'X'.
+* Daily job LOAD
+    IF p_daily = 'X'.
+
+* Fill Table for BO with the open and closed PO data of yesterday.
+      PERFORM fill_po_tab.
+* Fill/reload all the open PO data.
+      PERFORM reload_po_tab.
+      PERFORM fill_po_tab2.
+    ENDIF.
+* Initial LOAD
+    IF p_ini_ld = 'X'.
+* Fill Table for BO with the open and closed PO data.
+      PERFORM fill_po_tab.
+
+    ENDIF.
+
+  ENDIF.
+
+
+  IF sy-batch = ' ' AND p_daily  = ' '.
+* End of insert MOD-001
+    PERFORM fill_field_catalog.
+    PERFORM alv_output.
+* Begin of insert MOD-001
+  ENDIF.
+* End of insert MOD-001
+
+ENDFORM.                    " display_data
+
+
+**
+*----------------------------------------------------------------------*
+*       Form  FILL_FIELD_CATALOG                                       *
+*----------------------------------------------------------------------*
+*       text                                                           *
+*----------------------------------------------------------------------*
+FORM fill_field_catalog.
+
+  x_repid = sy-repid.
+  CALL FUNCTION 'REUSE_ALV_FIELDCATALOG_MERGE'
+       EXPORTING
+            i_program_name         = x_repid
+*            i_internal_tabname     = 'i_output'      " 'i_purch_orders'
+            i_structure_name       = 'YSE_SD_ALV_REP_PU04_EXT'
+*           i_client_never_display = 'X'
+            i_inclname             = x_repid
+*           i_bypassing_buffer     =
+*           i_buffer_active        =
+       CHANGING
+            ct_fieldcat            = it_fieldcat
+       EXCEPTIONS
+            inconsistent_interface = 1
+            program_error          = 2
+            OTHERS                 = 3.
+  IF sy-subrc <> 0.
+*   message id sy-msgid type sy-msgty number sy-msgno
+*           with sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+  LOOP AT it_fieldcat INTO wa_fieldcat.
+    IF wa_fieldcat-fieldname EQ 'EREKZ'
+    OR wa_fieldcat-fieldname EQ 'ELIKZ'
+    OR wa_fieldcat-fieldname EQ 'INFNR'
+    OR wa_fieldcat-fieldname EQ 'BEDNR'
+    OR wa_fieldcat-fieldname EQ 'RESWK'
+*    OR wa_fieldcat-fieldname EQ 'PLIFZ'
+    OR wa_fieldcat-fieldname EQ 'VSTEL'
+    OR wa_fieldcat-fieldname EQ 'LABST'
+    OR wa_fieldcat-fieldname EQ 'AVAILABLEQTY'
+    OR wa_fieldcat-fieldname EQ 'MEINS'
+    OR wa_fieldcat-fieldname EQ 'PURVALUE'
+    OR wa_fieldcat-fieldname EQ 'ALLOC'
+    OR wa_fieldcat-fieldname EQ 'VKGRP'
+    OR wa_fieldcat-fieldname EQ 'EKORG'
+    OR wa_fieldcat-fieldname EQ 'LANDS'
+    OR wa_fieldcat-fieldname EQ 'BUKRS'
+*   OR wa_fieldcat-fieldname EQ 'PEINH'
+
+    .
+      wa_fieldcat-tech = 'X'.
+      MODIFY it_fieldcat FROM wa_fieldcat.
+    ENDIF.
+
+  ENDLOOP.
+ENDFORM.                    "fill_field_catalog
+
+*----------------------------------------------------------------------*
+*       Form  ALV_OUTPUT                                               *
+*----------------------------------------------------------------------*
+*       text                                                           *
+*----------------------------------------------------------------------*
+FORM alv_output.
+
+
+*  LEAVE TO LIST-PROCESSING.
+
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+       EXPORTING
+*           i_interface_check           = ' '
+*           i_bypassing_buffer          =
+*           i_buffer_active             = ' '
+            i_callback_program          =
+'YSE_SDMM_REP_PU04_LIST_OPO_EXT'
+*           i_callback_pf_status_set    = ' '
+*           i_callback_user_command     = ' '
+*           i_callback_top_of_page      = ' '
+*           i_callback_html_top_of_page = ' '
+*           i_callback_html_end_of_list = ' '
+*           i_structure_name            =
+*           i_background_id             = ' '
+            i_grid_title                = text-001
+*           i_grid_settings             =
+            is_layout                   = gs_layout
+            it_fieldcat                 = it_fieldcat
+*           it_excluding                =
+*           it_special_groups           =
+*            it_sort                     = it_sort
+*           it_filter                   =
+*           is_sel_hide                 =
+*            i_default                   = 'X'
+             i_save                     = 'A'
+            is_variant                  = gv_variant
+*           it_events                   =
+*           it_event_exit               =
+*           is_print                    =
+*           is_reprep_id                =
+            i_screen_start_column       = 0
+            i_screen_start_line         = 0
+            i_screen_end_column         = 0
+            i_screen_end_line           = 0
+*           it_alv_graphics             =
+*           it_add_fieldcat             =
+*           it_hyperlink                =
+*      importing
+*           e_exit_caused_by_caller     =
+*           es_exit_caused_by_user      =
+       TABLES
+            t_outtab                    = i_purch_orders
+       EXCEPTIONS
+            program_error               = 1
+            OTHERS                      = 2.
+  IF sy-subrc NE 0.
+*   message id sy-msgid type sy-msgty number sy-msgno
+*           with sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+ENDFORM.                    " ALV_OUTPUT
+*&---------------------------------------------------------------------*
+*&      Form  Check_Authorization
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM check_authorization .
+
+  AUTHORITY-CHECK OBJECT 'V_KONH_EKO'
+           ID 'EKORG' FIELD p_ekorg
+           ID 'ACTVT' DUMMY.
+
+  IF sy-subrc = 4.
+*   No authorisation to display the data
+    MESSAGE ID 'YSE_GENERAL' TYPE 'E' NUMBER '002' WITH p_ekorg.
+  ELSEIF sy-subrc <> 0.
+*   Error checking authorization.
+    MESSAGE ID 'YSE_GENERAL' TYPE 'E' NUMBER '001'.
+  ENDIF.
+
+ENDFORM.                    " Check_Authorization
+
+*&---------------------------------------------------------------------*
+*&      Form  variant_init
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM variant_init.
+
+  CLEAR gv_variant.
+
+  x_repid = sy-repid.
+  gv_variant-report    = x_repid.
+
+ENDFORM.                    "variant_init
+
+*&---------------------------------------------------------------------*
+*&      Form  VARIANT_INPUTHELP
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->VAR        text
+*----------------------------------------------------------------------*
+FORM variant_inputhelp USING var.
+
+  CLEAR h_exit.
+
+  DATA:
+    lv_variant LIKE gv_variant.
+
+  gv_variant-variant = var.
+
+  CALL FUNCTION 'REUSE_ALV_VARIANT_F4'
+    EXPORTING
+      is_variant    = gv_variant
+      i_save        = gv_variant_save
+    IMPORTING
+      e_exit        = h_exit
+      es_variant    = lv_variant
+    EXCEPTIONS
+      not_found     = 1
+      program_error = 2
+      OTHERS        = 3.
+
+  IF sy-subrc IS INITIAL AND h_exit IS INITIAL.
+    var               = lv_variant-variant.
+  ENDIF.
+
+ENDFORM.                    "VARIANT_INPUTHELP
+*&---------------------------------------------------------------------*
+*&      Form  get_default_variant
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->VAR        text
+*----------------------------------------------------------------------*
+FORM get_default_variant USING var.
+
+  gx_variant = gv_variant.
+  CALL FUNCTION 'REUSE_ALV_VARIANT_DEFAULT_GET'
+    EXPORTING
+      i_save     = gv_variant_save
+    CHANGING
+      cs_variant = gx_variant
+    EXCEPTIONS
+      not_found  = 2.
+
+  IF sy-subrc IS INITIAL.
+    var = gx_variant-variant.
+  ENDIF.
+
+ENDFORM.                    "get_default_variant
+*&---------------------------------------------------------------------*
+*&      Form  EXISTENCE_VARIANT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_P_VAR  text
+*----------------------------------------------------------------------*
+
+FORM existence_variant USING var LIKE gv_variant-variant.
+
+  IF NOT var IS INITIAL.
+    gv_variant-variant = var.
+    CALL FUNCTION 'REUSE_ALV_VARIANT_EXISTENCE'
+      EXPORTING
+        i_save     = gv_variant_save
+      CHANGING
+        cs_variant = gv_variant.
+  ELSE.
+    PERFORM variant_init.
+  ENDIF.
+
+ENDFORM.                    " EXISTENCE_VARIANT
+*&---------------------------------------------------------------------*
+*&      Form  FILL_INTERNAL_TABLES
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM fill_internal_tables_werks .
+
+  TYPES: BEGIN OF  t_locl,
+         matnr     TYPE makt-matnr,
+         werks     TYPE mard-werks,
+         END OF t_locl.
+
+  DATA: it_locl TYPE  TABLE OF t_locl WITH HEADER LINE.
+
+  LOOP AT i_purch_orders INTO wa_purch_orders.
+    MOVE: wa_purch_orders-matnr TO it_locl-matnr,
+          wa_purch_orders-werks TO it_locl-werks.
+    APPEND it_locl.
+  ENDLOOP.
+
+  DELETE ADJACENT DUPLICATES FROM it_locl.
+* just select the single combination matnr, werks
+  CHECK NOT it_locl[] IS INITIAL.
+* Begin of deletion MOD-004
+*SELECT matnr bwkey stprs peinh     FROM mbew
+*                       INTO CORRESPONDING FIELDS OF TABLE i_mbew
+*                       FOR ALL ENTRIES IN it_locl
+*                       WHERE
+*                            matnr = it_locl-matnr
+*                       AND  bwkey = it_locl-werks.
+* End of deletion MOD-004
+* Begin of insertion MOD-004
+*  Clear and Refresh entries from i_mbew_new
+  CLEAR: i_mbew_new.
+  REFRESH: i_mbew_new[].
+* Fetch data to get unique combination of matnr,werks from MBEW
+  SELECT matnr  "Material Number
+         bwkey  "Valuation Area
+         stprs  "Standard price
+         peinh  "Price Unit
+         FROM mbew
+         INTO TABLE i_mbew_new
+         FOR ALL ENTRIES IN it_locl
+         WHERE matnr = it_locl-matnr
+         AND   bwkey = it_locl-werks.
+  IF sy-subrc = 0.
+*  Sort i_mbew_new
+    SORT i_mbew_new BY matnr bwkey ASCENDING.
+*  Delete duplicates entries from i_mbew_new table to get single combination matnr, werks
+    DELETE ADJACENT DUPLICATES FROM i_mbew_new COMPARING matnr bwkey.
+*  Clear and Refresh entries from i_mbew
+    CLEAR: i_mbew.
+    REFRESH: i_mbew[].
+*  Move entries from i_mbew_new to i_mbew
+    i_mbew[] = i_mbew_new[].
+  ENDIF.
+* End of insertion MOD-004
+
+  SELECT matnr werks labst     FROM mard
+                           INTO CORRESPONDING FIELDS OF TABLE i_mard
+                           FOR ALL ENTRIES IN it_locl
+                           WHERE
+                                matnr = it_locl-matnr
+                           AND  werks = it_locl-werks.
+
+  LOOP AT i_mard INTO wa_mard.
+    COLLECT wa_mard INTO i_mard_stk.
+  ENDLOOP.
+
+  FREE it_locl.
+
+ENDFORM.                    " FILL_INTERNAL_TABLES
+*&---------------------------------------------------------------------*
+*&      Form  FILL_INTERNAL_TABLE_LIFNR
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM fill_internal_table_lifnr .
+  TYPES: BEGIN OF  t_locl,
+         lifnr     TYPE lifnr,
+         END OF t_locl.
+
+  DATA: it_locl TYPE  TABLE OF t_locl WITH HEADER LINE.
+
+  LOOP AT i_purch_orders INTO wa_purch_orders.
+    MOVE: wa_purch_orders-lifnr TO it_locl-lifnr.
+    APPEND it_locl.
+  ENDLOOP.
+
+  DELETE ADJACENT DUPLICATES FROM it_locl.
+
+
+  CHECK NOT it_locl[] IS INITIAL.
+* just select the single lifnr
+  SELECT lifnr name1
+  FROM lfa1
+  INTO CORRESPONDING FIELDS OF TABLE i_lfa1
+  FOR ALL ENTRIES IN it_locl
+  WHERE lifnr = it_locl-lifnr.
+
+  FREE it_locl.
+
+ENDFORM.                    " FILL_INTERNAL_TABLE_LIFNR
+
+
+* Begin of insert MOD-001
+*----------------------------------------------------------------------*
+*       Form  FILL_PO_TAB                                              *
+*----------------------------------------------------------------------*
+*                                                                      *
+*----------------------------------------------------------------------*
+FORM fill_po_tab.
+
+* Fill data of current date - 1 into table YSE_PO_BO
+  LOOP AT i_purch_orders INTO wa_purch_orders_bo_temp.
+
+    MOVE-CORRESPONDING wa_purch_orders_bo_temp TO  wa_purch_orders_bo.
+
+
+    INSERT into yse_po_bo values wa_purch_orders_bo.
+
+    CLEAR wa_purch_orders_bo_temp.
+    CLEAR wa_purch_orders_bo.
+
+  ENDLOOP.
+
+ENDFORM.                    "FILL_PO_TAB
+
+*&---------------------------------------------------------------------*
+*&      Form  DEL_OPENPO_PO_TAB
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM del_openpo_po_tab.
+
+* Fill internal table i_purch_orders_bo with open PO to reload
+  SELECT * FROM
+    yse_po_bo INTO TABLE i_purch_orders_bo
+              WHERE elikz = ' ' AND ekorg = p_ekorg.
+
+* Fill internal table i_purch_orders_bo2 with closed PO to be deleted in YSE_PO_BO
+  SELECT * FROM
+    yse_po_bo INTO TABLE i_purch_orders_bo2
+              WHERE elikz = 'X' AND ekorg = p_ekorg.
+
+  WRITE:/ text-t03.
+  SKIP 2.
+  ULINE /2(039).
+  WRITE: /002 sy-vline.
+  WRITE: 003 'PO number'.
+  WRITE: 025 sy-vline.
+  WRITE: 026 'PO line'.
+  WRITE: 040 sy-vline.
+  ULINE /2(039).
+
+
+  IF NOT i_purch_orders_bo[] IS INITIAL.
+    LOOP AT i_purch_orders_bo INTO wa_purch_orders_bo.
+
+      DELETE yse_po_bo FROM wa_purch_orders_bo.
+
+    ENDLOOP.
+    LOOP AT i_purch_orders_bo INTO wa_purch_order_bo_print.
+      WRITE: /002 sy-vline.
+      WRITE: 003 wa_purch_order_bo_print-ebeln.
+      WRITE: 025 sy-vline.
+      WRITE: 026 wa_purch_order_bo_print-ebelp.
+      WRITE: 040 sy-vline.
+    ENDLOOP.
+  ENDIF.
+
+  CLEAR wa_purch_order_bo_print.
+  CLEAR wa_purch_orders_bo.
+
+  WRITE:/.
+  WRITE:/ text-t04.
+  SKIP 2.
+  ULINE /2(039).
+  WRITE: /002 sy-vline.
+  WRITE: 003 'PO number'.
+  WRITE: 025 sy-vline.
+  WRITE: 026 'PO line'.
+  WRITE: 040 sy-vline.
+  ULINE /2(039).
+
+
+  IF NOT i_purch_orders_bo2[] IS INITIAL.
+    LOOP AT i_purch_orders_bo2 INTO wa_purch_orders_bo2.
+
+      DELETE yse_po_bo FROM wa_purch_orders_bo2.
+
+    ENDLOOP.
+    LOOP AT i_purch_orders_bo2 INTO wa_purch_order_bo_print.
+      WRITE: /002 sy-vline.
+      WRITE: 003 wa_purch_order_bo_print-ebeln.
+      WRITE: 025 sy-vline.
+      WRITE: 026 wa_purch_order_bo_print-ebelp.
+      WRITE: 040 sy-vline.
+    ENDLOOP.
+  ENDIF.
+
+ENDFORM.                    "DEL_OPENPO_PO_TAB
+
+*&---------------------------------------------------------------------*
+*&      Form  RELOAD_PO_TAB
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM reload_po_tab.
+  PERFORM get_data_purch_orders2.
+  PERFORM determine_allocation2.
+  " done after get_data_pur_orders to limit to the extracted matnr/werks
+  PERFORM prepare_data2.
+ENDFORM.                    "RELOAD_PO_TAB
+
+*&---------------------------------------------------------------------*
+*&      Form  get_data_purch_orders2
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM get_data_purch_orders2.
+  IF NOT i_purch_orders_bo[] IS INITIAL. "+MOD-005
+  SELECT
+      ekko~ekorg  " PO Purch organisation
+      ekko~bsart  " PO doc type
+      ekko~aedat  " PO creation date
+      ekpo~ebeln  " PO num
+      ekpo~ebelp  " PO item  num
+      ekpo~matnr  " material
+      ekpo~werks  " plant
+      ekko~lifnr  " vendor number
+*      lfa1~name1  " Vendor Name
+      ekpo~afnam  " Name of Requisitioner/Requester
+      ekko~reswk  " supplying plant
+      ekpo~menge  " quantities
+      ekpo~meins  " unit of measure
+      ekpo~peinh  " price unit
+      ekpo~netpr  " net price
+      ekko~waers  " currency
+      ekpo~zztranspmode   " transportation mode
+      ekpo~zzconscode     " transportation mode
+      ekpo~bednr  "
+      ekpo~infnr  "
+      ekpo~elikz  "
+      ekpo~erekz  "
+      ekko~ekgrp
+      eket~eindt
+      ekpo~lgort
+      ekpo~zzeeind
+      ekko~lands
+
+  INTO CORRESPONDING FIELDS OF TABLE i_purch_orders2
+  FROM ekpo
+  INNER JOIN  ekko  ON ekpo~ebeln =  ekko~ebeln
+  INNER JOIN  eket  ON ekpo~ebeln =  eket~ebeln
+                  AND  ekpo~ebelp =  eket~ebelp
+  FOR ALL entries IN i_purch_orders_bo
+*  JOIN lfa1 ON ekko~lifnr EQ lfa1~lifnr
+
+  WHERE ekpo~ebeln = i_purch_orders_bo-ebeln
+    AND ekpo~ebelp = i_purch_orders_bo-ebelp
+    AND   ekpo~retpo    <>  'X'
+    AND   ekko~ekorg     = p_ekorg
+    AND   ekpo~loekz     EQ space
+*    AND   ( ekpo~elikz  NE 'X'
+*    OR   ekpo~erekz     NE 'X' )
+    AND   eket~etenr      = ( SELECT MAX( etenr ) FROM eket
+                                                WHERE ebeln =
+                                                ekpo~ebeln AND ebelp =
+                                                ekpo~ebelp ).
+  ENDIF. "+MOD-005
+ENDFORM.                    "get_data_purch_orders
+
+
+*&---------------------------------------------------------------------*
+*&      Form  determine_allocation2
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM  determine_allocation2.
+*
+*
+  CLEAR it_sohist[].
+
+  SELECT SINGLE vkorg
+           INTO lv_vkorg
+           FROM yse_po_sorg_porg
+          WHERE ekorg = p_ekorg.
+
+  CLEAR wa_purch_orders.
+  LOOP AT i_purch_orders2 INTO   wa_purch_orders.
+    it_sohist-matnr = wa_purch_orders-matnr.
+    it_sohist-werks = wa_purch_orders-werks.
+    COLLECT it_sohist.
+  ENDLOOP.
+
+*
+  SORT it_sohist BY  werks matnr.
+*
+  CLEAR wa_sohist_werks.
+  CLEAR wa_sohist.
+  LOOP AT it_sohist INTO wa_sohist_werks.
+    IF wa_sohist_werks-werks NE wa_sohist-werks.
+      REFRESH it_alloc.
+      REFRESH it_matnr.
+      CLEAR   wa_sohist.
+      LOOP AT it_sohist INTO wa_sohist
+              WHERE
+              werks EQ wa_sohist_werks-werks.
+        APPEND wa_sohist-matnr  TO it_matnr.
+      ENDLOOP.
+      DELETE it_matnr WHERE matnr EQ space.
+      CALL FUNCTION 'YSE_GET_ALLOCATIONS'
+        EXPORTING
+          werks    = wa_sohist_werks-werks
+          vkorg    = lv_vkorg
+          eisbe    = p_eisbe
+          lgort    = '1000'
+        TABLES
+          it_alloc = it_alloc
+          it_matnr = it_matnr
+          r_pstyv  = s_pstyv.
+      LOOP AT it_alloc.
+        CLEAR wa_alloc2.
+        MOVE wa_sohist_werks-werks  TO wa_alloc2-werks.
+        MOVE it_alloc-matnr   TO wa_alloc2-matnr.
+        MOVE it_alloc-qty     TO wa_alloc2-qty.
+        APPEND  wa_alloc2 TO it_alloc2.
+      ENDLOOP.
+    ENDIF.
+  ENDLOOP.
+*
+*
+ENDFORM.                    " determine_allocation
+
+*&---------------------------------------------------------------------*
+*&      Form  prepare_data2
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM prepare_data2.
+* Prepare i_purch_orders2
+*
+*  determine material
+
+  DATA:  l_moff TYPE i.
+
+  CLEAR i_mara[].
+  CHECK NOT i_purch_orders2[] IS INITIAL.
+  SELECT matnr prdha matkl FROM mara
+                          INTO CORRESPONDING FIELDS OF TABLE i_mara
+                          FOR ALL ENTRIES IN i_purch_orders2
+                          WHERE matnr = i_purch_orders2-matnr.
+*                            AND prdha IN r_prdha.
+
+
+  CLEAR i_makt[].
+  CHECK NOT i_mara[] IS INITIAL.
+  SELECT matnr maktx       FROM makt
+                          INTO CORRESPONDING FIELDS OF TABLE i_makt
+                          FOR ALL ENTRIES IN i_mara
+                          WHERE
+                               matnr = i_mara-matnr
+                          AND  spras = sy-langu.
+* determine material plant level
+  CLEAR i_marc[].
+  SELECT matnr werks prctr      FROM marc
+                          INTO CORRESPONDING FIELDS OF TABLE i_marc
+                          FOR ALL ENTRIES IN i_purch_orders2
+                          WHERE matnr = i_purch_orders2-matnr
+                            AND werks = i_purch_orders2-werks.
+
+*  determine  Requested Delivery Date.
+  CLEAR it_ekes[].
+  CHECK NOT i_purch_orders2[] IS INITIAL.
+  SELECT ebeln ebelp etens ebtyp menge erdat eindt     FROM ekes
+                          INTO TABLE it_ekes
+                          FOR ALL ENTRIES IN i_purch_orders2
+                          WHERE
+                               ebeln = i_purch_orders2-ebeln
+                          AND  ebelp = i_purch_orders2-ebelp
+                          AND  ebtyp = 'AB'.
+  IF sy-subrc EQ 0.
+    SORT it_ekes BY  ebeln  ebelp  etens DESCENDING.
+    DELETE ADJACENT DUPLICATES FROM it_ekes COMPARING ebeln ebelp.
+  ENDIF.
+  CLEAR i_ekes.
+  APPEND LINES OF it_ekes  TO i_ekes.
+  FREE it_ekes.
+*  determine  First Confirmation Date.
+  CLEAR i_yse_po_confirm[].
+  CHECK NOT i_purch_orders2[] IS INITIAL.
+  SELECT ebeln ebelp zzeindt  FROM yse_po_confirm
+                        INTO TABLE i_yse_po_confirm
+                        FOR ALL ENTRIES IN i_purch_orders2
+                        WHERE
+                             ebeln = i_purch_orders2-ebeln
+                        AND  ebelp = i_purch_orders2-ebelp.
+
+* determine Last inbound delivery date
+  CHECK NOT i_purch_orders2[] IS INITIAL.
+  SELECT ebeln ebelp etens ebtyp menge erdat eindt     FROM ekes
+                          INTO TABLE it_ekes
+                          FOR ALL ENTRIES IN i_purch_orders2
+                          WHERE
+                               ebeln = i_purch_orders2-ebeln
+                          AND  ebelp = i_purch_orders2-ebelp
+                          AND  ebtyp = 'LA'.
+  IF sy-subrc EQ 0.
+    SORT it_ekes BY  ebeln  ebelp  erdat DESCENDING.
+    DELETE ADJACENT DUPLICATES FROM it_ekes COMPARING ebeln ebelp.
+  ENDIF.
+
+  APPEND LINES OF it_ekes  TO i_ekes.
+  FREE it_ekes.
+
+
+*  determine  standard cost
+  CHECK NOT i_purch_orders2[] IS INITIAL.                    " MOD-017
+
+  PERFORM fill_internal_tables_werks2.
+
+
+*  determine  received quantity
+  CLEAR it_eket[].
+  CHECK NOT i_purch_orders2[] IS INITIAL.                    " MOD-017
+  SELECT ebeln ebelp etenr wemng
+  FROM eket
+  INTO TABLE it_eket
+  FOR ALL ENTRIES IN i_purch_orders2
+  WHERE ebeln = i_purch_orders2-ebeln
+  AND  ebelp  = i_purch_orders2-ebelp.
+
+  SORT it_eket BY ebeln  ebelp.
+*
+  CLEAR wa_eket.
+  CLEAR wa_eket_2.
+  CLEAR i_eket[].
+  LOOP AT it_eket INTO wa_eket_2.
+    MOVE-CORRESPONDING wa_eket_2 TO wa_eket.
+    COLLECT wa_eket INTO i_eket.
+  ENDLOOP.
+  FREE it_eket.
+
+*
+*  determine  Invoive quantity
+  CLEAR it_ekbe_invqty[].
+  CHECK NOT i_purch_orders2[] IS INITIAL.                    " MOD-017
+  SELECT ebeln ebelp zekkn vgabe gjahr belnr buzei menge shkzg
+  INTO TABLE it_ekbe_invqty
+    FROM ekbe
+  FOR ALL ENTRIES IN i_purch_orders2
+  WHERE
+           ebeln EQ i_purch_orders2-ebeln
+       AND ebelp EQ i_purch_orders2-ebelp
+  AND vgabe = '2'.                  " invoice receipt
+
+  SORT  it_ekbe_invqty  BY  ebeln  ebelp.
+*
+  CLEAR wa_ekbe_invqty.
+  LOOP AT  it_ekbe_invqty   INTO  wa_ekbe_invqty.
+    IF wa_ekbe_invqty-shkzg EQ 'H'.
+      wa_ekbe_invqty-menge =  wa_ekbe_invqty-menge * -1.
+    ENDIF.
+    MOVE-CORRESPONDING wa_ekbe_invqty TO wa_ekbe_invqty_aggr.
+    COLLECT wa_ekbe_invqty_aggr  INTO  it_ekbe_invqty_aggr.
+  ENDLOOP.
+  FREE it_ekbe_invqty.
+*
+*  determine  book date
+  CLEAR it_ekbe_date[].
+  CHECK NOT i_purch_orders2[] IS INITIAL.                    " MOD-017
+  SELECT ebeln ebelp zekkn budat
+  INTO CORRESPONDING FIELDS OF TABLE it_ekbe_date
+   FROM ekbe
+  FOR ALL ENTRIES IN i_purch_orders2
+  WHERE
+           ebeln EQ i_purch_orders2-ebeln
+       AND ebelp EQ i_purch_orders2-ebelp
+  AND vgabe = '2'.                  " invoice receipt
+
+  SORT  it_ekbe_date  BY  ebeln  ebelp zekkn budat ASCENDING.
+  DELETE ADJACENT DUPLICATES FROM it_ekes COMPARING ebeln ebelp.
+
+* determine  GR date
+  CLEAR it_ekbe_grdate[].
+  CHECK NOT i_purch_orders2[] IS INITIAL.                    " MOD-017
+  SELECT ebeln ebelp zekkn budat
+  INTO CORRESPONDING FIELDS OF TABLE it_ekbe_grdate
+   FROM ekbe
+  FOR ALL ENTRIES IN i_purch_orders2
+  WHERE
+           ebeln EQ i_purch_orders2-ebeln
+       AND ebelp EQ i_purch_orders2-ebelp
+  AND vgabe = '1'.                  " invoice receipt
+
+  SORT  it_ekbe_grdate  BY  ebeln  ebelp zekkn budat ASCENDING.
+  DELETE ADJACENT DUPLICATES FROM it_ekes COMPARING ebeln ebelp.
+
+
+  PERFORM fill_internal_table_lifnr2.
+
+*
+* fill in data in table
+*
+  CLEAR wa_purch_orders.
+  LOOP AT i_purch_orders2 INTO   wa_purch_orders.
+    l_index = sy-tabix.
+* Purchase order should not be shown if it is not open
+
+
+*   get received quantity.
+    CLEAR wa_eket.
+    READ TABLE i_eket      WITH TABLE KEY  ebeln = wa_purch_orders-ebeln
+                                           ebelp = wa_purch_orders-ebelp
+                           INTO       wa_eket.
+
+
+*   get invoiced  quantity.
+    CLEAR wa_ekbe_invqty_aggr.
+    READ TABLE it_ekbe_invqty_aggr WITH TABLE KEY  ebeln =
+    wa_purch_orders-ebeln
+                                                   ebelp =
+                                                   wa_purch_orders-ebelp
+                                   INTO wa_ekbe_invqty_aggr.
+
+* Begin of Insert MOD-001
+* Closed for GR point of view
+    IF ( wa_purch_orders-elikz EQ 'X'
+    OR wa_eket-wemng GE wa_purch_orders-menge )
+    AND ( wa_purch_orders-erekz EQ 'X'
+    OR wa_ekbe_invqty_aggr-menge GE wa_purch_orders-menge ).
+      wa_purch_orders-elikz = 'X'.
+    ELSE.
+      wa_purch_orders-elikz = ' '.
+    ENDIF.
+* End of Insert MOD-001
+
+    CLEAR wa_mara.
+    READ TABLE i_mara WITH TABLE KEY  matnr = wa_purch_orders-matnr
+                           INTO       wa_mara.
+    IF sy-subrc NE 0.
+*     CONTINUE.
+    ENDIF.
+
+    MOVE wa_mara-matkl      TO wa_purch_orders-matkl.
+
+
+    CLEAR wa_marc.
+    READ TABLE i_marc WITH TABLE KEY  matnr = wa_purch_orders-matnr
+                                      werks = wa_purch_orders-werks
+                           INTO       wa_marc.
+    IF sy-subrc NE 0.
+      CONTINUE.
+    ENDIF.
+
+*        move wa_marc-prctr+7(3) to wa_purch_orders-plc.
+
+    CLEAR wa_makt.
+    READ TABLE i_makt WITH KEY  matnr = wa_purch_orders-matnr
+                           INTO       wa_makt.
+    MOVE wa_makt-maktx     TO wa_purch_orders-maktx.
+
+    MOVE wa_eket-wemng     TO wa_purch_orders-wemng.
+    MOVE wa_ekbe_invqty_aggr-menge    TO wa_purch_orders-invqty.
+
+    CLEAR wa_yse_po_confirm.
+    READ TABLE i_yse_po_confirm WITH TABLE KEY ebeln =
+                                              wa_purch_orders-ebeln
+                                               ebelp =
+                                              wa_purch_orders-ebelp
+                           INTO    wa_yse_po_confirm.
+    MOVE wa_yse_po_confirm-zzeindt TO wa_purch_orders-zzeindt.
+
+*   get lead time
+    PERFORM determine_lead_time.
+
+* ORDER SOURCE
+
+    IF     wa_purch_orders-bsart =  'ZNB2'.
+
+      SELECT SINGLE  vbeln FROM  ekkn
+        INTO h_vbeln
+        WHERE ebeln = wa_purch_orders-ebeln
+                                     AND  ebelp = wa_purch_orders-ebelp
+                                     AND  zekkn = ( SELECT MAX( zekkn )
+                                     FROM ekkn
+      WHERE ebeln = wa_purch_orders-ebeln
+      AND ebelp = wa_purch_orders-ebelp ).
+
+* get order source
+      SELECT SINGLE vkgrp
+      FROM vbak
+      INTO wa_purch_orders-vkgrp
+      WHERE vbeln = h_vbeln.
+
+
+      CLEAR l_moff.
+      FIND '-' IN wa_purch_orders-afnam MATCH OFFSET l_moff.
+      IF l_moff NE 0.
+
+        CALL FUNCTION 'CONVERSION_EXIT_MATN1_OUTPUT'
+          EXPORTING
+            input  = wa_purch_orders-afnam+0(l_moff)
+          IMPORTING
+            output = wa_purch_orders-ordid.
+
+        IF l_moff < 11.
+          ADD 1 TO l_moff.
+
+          CALL FUNCTION 'CONVERSION_EXIT_MATN1_OUTPUT'
+            EXPORTING
+              input  = wa_purch_orders-afnam+l_moff(2)
+            IMPORTING
+              output = wa_purch_orders-ordlin.
+        ENDIF.
+
+      ENDIF.
+* Update field requisitioner
+      CLEAR l_moff.
+      FIND '-' IN wa_purch_orders-afnam MATCH OFFSET l_moff.
+      IF l_moff NE 0.
+        wa_purch_orders-afnam = wa_purch_orders-afnam+0(l_moff).
+        CALL FUNCTION 'CONVERSION_EXIT_MATN1_OUTPUT'
+          EXPORTING
+            input  = wa_purch_orders-afnam
+          IMPORTING
+            output = wa_purch_orders-afnam.
+      ENDIF.
+    ENDIF.
+
+    IF wa_purch_orders-bsart =  'ZNB3'.
+      CALL FUNCTION 'CONVERSION_EXIT_MATN1_OUTPUT'
+        EXPORTING
+          input  = wa_purch_orders-afnam+2(10)
+        IMPORTING
+          output = wa_purch_orders-ordid.
+
+      CALL FUNCTION 'CONVERSION_EXIT_MATN1_OUTPUT'
+        EXPORTING
+          input  = wa_purch_orders-afnam
+        IMPORTING
+          output = wa_purch_orders-afnam.
+    ENDIF.
+
+* Decided to pick up PLC in different way... see below
+    "DATA: lv_vbeln    TYPE  vbap-vbeln,
+    "      lv_posnr    TYPE  vbap-posnr.
+
+
+    "clear lv_vbeln.
+    "clear lv_posnr.
+
+    "      SELECT SINGLE  vbeln vbelp    FROM  ekkn
+    "                                     INTO (lv_vbeln , lv_posnr)
+    "                                    WHERE ebeln = wa_purch_orders-ebeln
+    "                                     AND  ebelp = wa_purch_orders-ebelp
+    "                                     AND  zekkn = ( SELECT MAX( zekkn )
+    "                                     FROM ekkn
+    "                                     WHERE ebeln = wa_purch_orders-ebeln
+    "                                     AND ebelp = wa_purch_orders-ebelp ).
+    "  CLEAR it_vbap[].
+    "  SELECT  * FROM vbap INTO
+    "                       CORRESPONDING FIELDS OF TABLE it_vbap
+    "                       WHERE vbeln = lv_vbeln
+    "                       AND posnr = lv_posnr.
+
+    "CLEAR it_acct[].
+    "if not it_vbap[] is INITIAL.
+    "      SELECT aktbo paobjnr pasubnr ce4key
+    "             FROM ce41000_acct
+    "             INTO TABLE it_acct
+    "             FOR ALL ENTRIES IN it_vbap
+    "             WHERE aktbo   EQ 'X'
+    "               AND paobjnr EQ it_vbap-paobjnr.
+
+    "CLEAR it_ce41000[].
+    "      IF NOT it_acct[] IS INITIAL.
+    "        SORT it_acct BY paobjnr.
+    "        DELETE ADJACENT DUPLICATES FROM it_acct.
+
+    "        SELECT aktbo paobjnr pasubnr prctr ww002 ww006 ww007
+    "               FROM ce41000
+    "               INTO TABLE it_ce41000
+    "               FOR ALL ENTRIES IN it_acct
+    "               WHERE aktbo EQ 'X'
+    "                 AND paobjnr EQ it_acct-ce4key
+    "                 AND ww006   IN s_gac
+    "                 AND ww007   IN s_pgc.
+    "        SORT it_ce41000 BY paobjnr.
+    "        DELETE ADJACENT DUPLICATES FROM it_ce41000.
+    "      ENDIF.
+
+
+    "READ TABLE it_ce41000 INTO wa_ce41000 INDEX 1.
+    "move wa_ce41000-ww002 to wa_purch_orders-plc.
+
+    "clear wa_ce41000.
+    "clear it_ce41000.
+    "ENDIF.
+
+    CLEAR lv_prodh.
+    IF wa_purch_orders-gac = ' ' OR wa_purch_orders-pgc = ' '.
+      SELECT SINGLE prodh
+             FROM mvke
+             INTO lv_prodh
+             WHERE vkorg = lv_vkorg AND matnr = wa_purch_orders-matnr.
+      MOVE lv_prodh(4)   TO wa_purch_orders-gac.
+      MOVE lv_prodh+4(4) TO wa_purch_orders-pgc.
+    ENDIF.
+
+    IF wa_purch_orders-gac NOT IN s_gac.
+      DELETE i_purch_orders2 INDEX l_index.
+      CONTINUE.
+    ENDIF.
+    IF wa_purch_orders-pgc NOT IN s_pgc.
+      DELETE i_purch_orders2 INDEX l_index.
+      CONTINUE.
+    ENDIF.
+
+*    Get PLC
+    SELECT SINGLE prctr INTO lv_prctr FROM yse_prctr_deriv
+  WHERE vtweg = '01' AND pgc = wa_purch_orders-pgc
+   AND class = ' '.
+    IF lv_prctr = ' '.
+      SELECT SINGLE prctr INTO lv_prctr FROM yse_prctr_deriv
+      WHERE vtweg = '01' AND pgc = wa_purch_orders-pgc
+      AND class = 'GIN'.
+      IF lv_prctr = ' '.
+        SELECT SINGLE prctr INTO lv_prctr FROM yse_prctr_deriv
+        WHERE vtweg = '01' AND pgc = wa_purch_orders-pgc
+        AND class = 'MVI'.
+      ENDIF.
+    ENDIF.
+
+    IF lv_prctr <> ' '.
+      CALL FUNCTION 'YSE_CONVERT_PRCTR_BL'
+        EXPORTING
+          prctr_in    = lv_prctr
+          bukrs       = wa_purch_orders-bukrs
+        IMPORTING
+          segment_out = lv_segment.
+
+      SELECT      *
+         FROM k9rcd11000010
+         INTO TABLE it_plc.
+
+      LOOP AT it_plc WHERE sour1_from LE lv_segment
+                    AND sour1_to   GE lv_segment
+                    AND valid_from LE sy-datum.
+        wa_purch_orders-plc = it_plc-target1.
+        EXIT.
+      ENDLOOP.
+    ELSE.
+      lv_prctr = ' '.
+    ENDIF.
+
+*   get requested delivery date
+    CLEAR wa_ekes.
+    READ TABLE i_ekes WITH KEY  ebeln = wa_purch_orders-ebeln
+                                      ebelp = wa_purch_orders-ebelp
+                                      ebtyp = 'AB'
+                           INTO       wa_ekes.
+*  MOVE wa_ekes-eindt     TO wa_purch_orders-eindt.
+
+
+*   get last inbound delivery date
+    CLEAR wa_ekes.
+    READ TABLE i_ekes WITH KEY  ebeln = wa_purch_orders-ebeln
+                                      ebelp = wa_purch_orders-ebelp
+                                      ebtyp = 'LA'
+                           INTO       wa_ekes.
+    IF NOT wa_ekes-menge IS INITIAL.
+      MOVE wa_ekes-erdat     TO wa_purch_orders-zeindt.
+    ENDIF.
+
+* Difference requested vs shipped date
+
+    IF NOT wa_purch_orders-zeindt IS INITIAL AND
+       NOT wa_purch_orders-zzeeind IS INITIAL.
+
+      i_fakca = wa_purch_orders-lands.
+      IF  wa_purch_orders-zeindt >=  wa_purch_orders-zzeeind.
+
+*     Determine the number of working days in the period provided
+        REFRESH it_dates.
+        CALL FUNCTION 'RKE_SELECT_FACTDAYS_FOR_PERIOD'
+          EXPORTING
+            i_datab  = wa_purch_orders-zzeeind
+            i_datbi  = wa_purch_orders-zeindt
+            i_factid = i_fakca
+          TABLES
+            eth_dats = it_dates.
+        DESCRIBE TABLE it_dates LINES e_anz_tage.
+
+        wa_purch_orders-zzday = e_anz_tage - 1.
+      ELSE.
+
+*     Determine the number of working days in the period provided
+        REFRESH it_dates.
+        CALL FUNCTION 'RKE_SELECT_FACTDAYS_FOR_PERIOD'
+          EXPORTING
+            i_datab  = wa_purch_orders-zeindt
+            i_datbi  = wa_purch_orders-zzeeind
+            i_factid = i_fakca
+          TABLES
+            eth_dats = it_dates.
+        DESCRIBE TABLE it_dates LINES e_anz_tage.
+
+        wa_purch_orders-zzday = e_anz_tage * ( -1 ) + 1.
+      ENDIF.
+    ENDIF.
+
+* Get standard cost
+
+    CLEAR wa_mbew.
+    READ TABLE i_mbew WITH TABLE KEY  matnr = wa_purch_orders-matnr
+                                      bwkey = wa_purch_orders-werks
+                           INTO       wa_mbew.
+    MOVE wa_mbew-stprs     TO wa_purch_orders-stprs.
+    MOVE wa_mbew-peinh     TO wa_purch_orders-mpeinh.
+*
+*   unrestricted use stock
+    CLEAR wa_mard.
+    READ TABLE i_mard_stk  WITH TABLE KEY  matnr = wa_purch_orders-matnr
+                                           werks = wa_purch_orders-werks
+                           INTO       wa_mard.
+    MOVE wa_mard-labst     TO wa_purch_orders-labst.
+*
+*   get available quantity
+    CLEAR wa_alloc2.
+    READ TABLE it_alloc2 WITH KEY matnr = wa_purch_orders-matnr
+                                  werks = wa_purch_orders-werks
+                         INTO  wa_alloc2
+                                  BINARY SEARCH.
+
+*   calculate it_alloc-qty  available quantity
+    wa_purch_orders-alloc        = wa_alloc2-qty.
+    wa_purch_orders-availableqty =  wa_purch_orders-labst -
+    wa_alloc2-qty.
+
+
+*
+** calculate purchased value
+    wa_purch_orders-purvalue =  ( wa_purch_orders-netpr /
+    wa_purch_orders-peinh ) *
+    wa_purch_orders-menge.
+
+* get book date/Last Invoice Date
+    LOOP AT it_ekbe_date    WHERE   ebeln = wa_purch_orders-ebeln
+                               AND  ebelp = wa_purch_orders-ebelp.
+      MOVE  it_ekbe_date-budat     TO  wa_purch_orders-bookdate.
+    ENDLOOP.
+
+* get Last GR date
+    IF wa_purch_orders-grdate IS INITIAL.
+      LOOP AT it_ekbe_grdate    WHERE   ebeln = wa_purch_orders-ebeln
+                               AND  ebelp = wa_purch_orders-ebelp.
+        MOVE  it_ekbe_grdate-budat     TO  wa_purch_orders-grdate.
+
+      ENDLOOP.
+    ENDIF.
+
+
+
+* fill lifnr name1
+    READ TABLE i_lfa1 WITH TABLE KEY lifnr = wa_purch_orders-lifnr
+    INTO       wa_lfa1.
+    IF sy-subrc EQ 0.
+      MOVE wa_lfa1-name1 TO wa_purch_orders-name1.
+    ENDIF.
+
+    IF wa_purch_orders-bsart = 'ZUB1'.
+      wa_purch_orders-lifnr = wa_purch_orders-reswk.
+    ENDIF.
+
+
+    IF wa_purch_orders-pgc IN s_pgc AND
+       wa_purch_orders-gac IN s_gac.
+      MODIFY i_purch_orders2  FROM   wa_purch_orders.
+      CLEAR wa_purch_orders.
+    ENDIF.
+  ENDLOOP.
+
+
+ENDFORM.                    "prepare_data
+
+*&---------------------------------------------------------------------*
+*&      Form  fill_internal_tables_werks2
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM fill_internal_tables_werks2 .
+
+  TYPES: BEGIN OF  t_locl,
+         matnr     TYPE makt-matnr,
+         werks     TYPE mard-werks,
+         END OF t_locl.
+
+  DATA: it_locl TYPE  TABLE OF t_locl WITH HEADER LINE.
+
+  LOOP AT i_purch_orders2 INTO wa_purch_orders.
+    MOVE: wa_purch_orders-matnr TO it_locl-matnr,
+          wa_purch_orders-werks TO it_locl-werks.
+    APPEND it_locl.
+  ENDLOOP.
+
+  DELETE ADJACENT DUPLICATES FROM it_locl.
+
+  CLEAR i_mbew[].
+  CHECK NOT it_locl[] IS INITIAL.
+* just select the single combination matnr, werks
+* Begin of deletion MOD-004
+*  SELECT matnr bwkey stprs peinh     FROM mbew
+*                       INTO CORRESPONDING FIELDS OF TABLE i_mbew
+*                       FOR ALL ENTRIES IN it_locl
+*                       WHERE
+*                            matnr = it_locl-matnr
+*                       AND  bwkey = it_locl-werks.
+* End of deletion MOD-004
+* Begin of insertion MOD-004
+* Clear and Refresh entries from i_mbew_new
+  CLEAR: i_mbew_new.
+  REFRESH: i_mbew_new[].
+* Fetch data to get unique combination of matnr,werks from MBEW
+  SELECT matnr  "Material Number
+         bwkey  "Valuation Area
+         stprs  "Standard price
+         peinh  "Price Unit
+         FROM mbew
+         INTO TABLE i_mbew_new
+         FOR ALL ENTRIES IN it_locl
+         WHERE matnr = it_locl-matnr
+         AND   bwkey = it_locl-werks.
+  IF sy-subrc = 0.
+*  Sort i_mbew_new
+    SORT i_mbew_new BY matnr bwkey ASCENDING.
+*  Delete duplicates entries from i_mbew_new table to get single combination matnr, werks
+    DELETE ADJACENT DUPLICATES FROM i_mbew_new COMPARING matnr bwkey.
+*  Move entries from i_mbew_new to i_mbew
+    i_mbew[] = i_mbew_new[].
+  ENDIF.
+* End of insertion MOD-004
+
+  CLEAR i_mard[].
+  SELECT matnr werks labst     FROM mard
+                           INTO CORRESPONDING FIELDS OF TABLE i_mard
+                           FOR ALL ENTRIES IN it_locl
+                           WHERE
+                                matnr = it_locl-matnr
+                           AND  werks = it_locl-werks.
+  CLEAR wa_mard.
+  LOOP AT i_mard INTO wa_mard.
+    COLLECT wa_mard INTO i_mard_stk.
+  ENDLOOP.
+
+  FREE it_locl.
+
+ENDFORM.                    " FILL_INTERNAL_TABLES
+
+*&---------------------------------------------------------------------*
+*&      Form  fill_internal_table_lifnr2
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM fill_internal_table_lifnr2 .
+  TYPES: BEGIN OF  t_locl,
+         lifnr     TYPE lifnr,
+         END OF t_locl.
+
+  DATA: it_locl TYPE  TABLE OF t_locl WITH HEADER LINE.
+
+  LOOP AT i_purch_orders2 INTO wa_purch_orders.
+    MOVE: wa_purch_orders-lifnr TO it_locl-lifnr.
+    APPEND it_locl.
+  ENDLOOP.
+
+  DELETE ADJACENT DUPLICATES FROM it_locl.
+
+
+  CHECK NOT it_locl[] IS INITIAL.
+* just select the single lifnr
+  CLEAR i_lfa1[].
+  SELECT lifnr name1
+  FROM lfa1
+  INTO CORRESPONDING FIELDS OF TABLE i_lfa1
+  FOR ALL ENTRIES IN it_locl
+  WHERE lifnr = it_locl-lifnr.
+
+  FREE it_locl.
+
+ENDFORM.                    " FILL_INTERNAL_TABLE_LIFNR
+
+*&---------------------------------------------------------------------*
+*&      Form  determine_lead_time2
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM determine_lead_time2.
+
+  DATA: lv_vbeln    TYPE  vbap-vbeln.
+  DATA: lv_posnr    TYPE  vbap-posnr.
+
+* Begin of insert MOD-002
+  DATA: lv_found TYPE c.
+* End of insert MOD-002
+
+*clear p_wa_purch_orders.
+
+  LOOP AT  i_yse_em_plant INTO wa_yse_em_plant
+                               WHERE    whtype = 'D'
+                                    AND  werks = wa_purch_orders-werks.
+
+    IF     wa_purch_orders-bsart =  'ZNB2'.
+
+      SELECT SINGLE  vbeln vbelp    FROM  ekkn
+                                     INTO (lv_vbeln , lv_posnr)
+                                    WHERE ebeln = wa_purch_orders-ebeln
+                                     AND  ebelp = wa_purch_orders-ebelp
+                                     AND  zekkn = ( SELECT MAX( zekkn )
+                                     FROM ekkn
+WHERE ebeln = wa_purch_orders-ebeln
+AND ebelp = wa_purch_orders-ebelp ).
+
+
+      SELECT SINGLE vstel  FROM vbap
+                           INTO wa_purch_orders-vstel
+                           WHERE
+                                vbeln  = lv_vbeln
+                            AND posnr  = lv_posnr.
+
+    ELSEIF   wa_purch_orders-bsart =  'ZNB3'.
+
+      IF  wa_purch_orders-bednr IS INITIAL.
+        MOVE  '1000'   TO  wa_purch_orders-vstel.
+      ELSE.
+        MOVE wa_purch_orders-bednr  TO wa_purch_orders-vstel.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+  IF (    wa_purch_orders-bsart =  'ZNB1'
+      OR  wa_purch_orders-bsart =  'ZNB2'
+      OR  wa_purch_orders-bsart =  'ZNB3'  ).
+
+    CLEAR wa_yse_po_pldeltime.
+* Begin of change MOD-002
+*    READ  TABLE i_yse_po_pldeltime  WITH TABLE KEY
+*                               ekorg        = wa_purch_orders-ekorg
+*                               lifnr        = wa_purch_orders-lifnr
+*                               werks        = wa_purch_orders-werks
+*                               zztranspmode =
+*                               wa_purch_orders-zztranspmode
+*                               vstel        = wa_purch_orders-vstel
+*
+*         INTO wa_yse_po_pldeltime.
+
+    lv_found = ' '.
+    IF NOT wa_purch_orders-zzvtweg IS INITIAL.
+      READ  TABLE i_yse_po_pldeltime  WITH TABLE KEY
+                                 ekorg        = wa_purch_orders-ekorg
+                                 lifnr        = wa_purch_orders-lifnr
+                                 werks        = wa_purch_orders-werks
+                                 zztranspmode =
+                                 wa_purch_orders-zztranspmode
+                                 vtweg        = wa_purch_orders-zzvtweg
+                                 vstel        = wa_purch_orders-vstel
+
+           INTO wa_yse_po_pldeltime.
+
+      IF sy-subrc = 0.
+        lv_found = 'X'.
+      ELSE.
+        READ  TABLE i_yse_po_pldeltime  WITH TABLE KEY
+                              ekorg        = wa_purch_orders-ekorg
+                              lifnr        = wa_purch_orders-lifnr
+                              werks        = wa_purch_orders-werks
+                              zztranspmode =
+                              wa_purch_orders-zztranspmode
+                              vtweg      = '*'
+                              vstel        = wa_purch_orders-vstel
+
+        INTO wa_yse_po_pldeltime.
+        IF sy-subrc = 0.
+          lv_found = 'X'.
+        ENDIF..
+      ENDIF.
+    ELSE.
+      READ  TABLE i_yse_po_pldeltime  WITH TABLE KEY
+                              ekorg        = wa_purch_orders-ekorg
+                              lifnr        = wa_purch_orders-lifnr
+                              werks        = wa_purch_orders-werks
+                              zztranspmode =
+                              wa_purch_orders-zztranspmode
+                              vtweg      = '01'
+                              vstel        = wa_purch_orders-vstel
+
+        INTO wa_yse_po_pldeltime.
+
+      IF sy-subrc = 0.
+        lv_found = 'X'.
+      ELSE.
+        READ  TABLE i_yse_po_pldeltime  WITH TABLE KEY
+                        ekorg        = wa_purch_orders-ekorg
+                        lifnr        = wa_purch_orders-lifnr
+                        werks        = wa_purch_orders-werks
+                        zztranspmode =
+                        wa_purch_orders-zztranspmode
+                        vtweg      = '*'
+                        vstel        = wa_purch_orders-vstel
+
+        INTO wa_yse_po_pldeltime.
+        IF sy-subrc = 0.
+          lv_found = 'X'.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+* End of change MOD-002
+
+
+  ENDIF.
+
+ENDFORM.                    " determine_lead_time.
+*&---------------------------------------------------------------------*
+*&      Form  FILL_PO_TAB2
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM fill_po_tab2.
+
+* Fill data of current date - 1 into table YSE_PO_BO
+  LOOP AT i_purch_orders2 INTO wa_purch_orders_bo_temp2.
+
+    MOVE-CORRESPONDING wa_purch_orders_bo_temp2 TO  wa_purch_orders_bo2.
+
+
+    INSERT into yse_po_bo values wa_purch_orders_bo2.
+
+    CLEAR wa_purch_orders_bo_temp2.
+    CLEAR wa_purch_orders_bo2.
+
+  ENDLOOP.
+
+ENDFORM.                    "FILL_PO_TAB2
+
+
+*
+
+* End of insert MOD-001
+*Text symbol text£º
+*001:List of Purchase orders
+*002:Include Safety Stock in Calculation of Allocations
+*003:Calculation of allocations
+*004:Variant
+*S04:Variant to use ALV-output
+*T03:Deleted table open PO records
+
+*T04:Deleted table closed PO records
+*Selection text£º
+*P_DAILY:        Daily Load
+*P_EISBE:        Include Safety Stock
+*P_EKORG:D       .
+*P_INI_LD:        Initial Load
+*S_AEDAT:        PO creation date
+*S_DUE_DA:D       .
+*S_ERNAM:D       .
+*S_GAC:        GAC
+*S_LIFNR:D       .
+*S_MATNR:D       .
+*S_PGC:        PGC
+*S_PO_NUM:D       .
+*S_PO_TYP:D       .
+*S_PSTYV:D       .
+*S_PU_GRP:D       .
+*S_SUP_PL:D       .
+*S_WERKS:D       .

@@ -1,0 +1,706 @@
+*----------------------------------------------------------------------
+* PROGRAM ID           : YAM_SPAREPART_RETURN                          *
+* PROGRAM TITLE        : Resaon code returned spart parts              *
+* AUTHOR               : Geert Rutten                                  *
+* DATE                 : 29/01/2009                                    *
+* DEVELOPMENT ID       : CR-0509                                       *
+* CHANGE REQUEST NUMBER: CD1K947263                                   *
+* PROGRAM DESCRIPTION  : Create report on reason code of the           *
+*                        returned parts                                *
+*----------------------------------------------------------------------*
+* Modification History                                                 *
+*                                                                      *
+*  Mod-0001   04-Jun-2009     Satyabrata Basu         CD1K948593       *
+*             Bugfix (SM#4584)  - Correct Authorization check          *
+*----------------------------------------------------------------------*
+*  MOD-0002   04-MAR-2011     Lakshmi Reddy           CD1K963480       *
+*                                                     CD1K963484       *
+*             CR1399    Part numbers for which movement type 262 or 502*
+*                       is done only should be displayed in the report *
+*----------------------------------------------------------------------*
+
+REPORT yam_sparepart_return  NO STANDARD PAGE HEADING
+                             LINE-SIZE 100.
+
+*----------------------------------------------------------------------*
+* type-pool ALV                                                        *
+*----------------------------------------------------------------------*
+TYPE-POOLS: slis.
+
+*----------------------------------------------------------------------*
+* DB tables                                                            *
+*----------------------------------------------------------------------*
+TABLES: aufk,                          " Order master data
+        afvgd,                         " Order: Dialog table for Table AFVG (order operation)
+        viqmfe,                        " PM Notification - Item
+        viaufkst.                      " PM Order Selection by Status
+
+*----------------------------------------------------------------------*
+* global data                                                          *
+*----------------------------------------------------------------------*
+
+*Begin of insert MOD-0001
+TYPES:BEGIN OF ty_mseg,
+        bwart TYPE bwart,
+        matnr TYPE matnr,
+        aufnr TYPE aufnr,
+      END OF ty_mseg.
+DATA: gt_mseg TYPE STANDARD TABLE OF ty_mseg,
+      wa_mseg TYPE ty_mseg.
+*End   of insert MOD-0001
+
+* selected order
+DATA: BEGIN OF gt_ord OCCURS 0,
+        aufnr  LIKE aufk-aufnr,
+        werks LIKE aufk-werks,
+        qmnum  LIKE afih-qmnum,
+      END OF gt_ord.
+
+DATA: BEGIN OF gt_result OCCURS 0,
+        aufnr  LIKE afih-aufnr,
+        qmnum  LIKE afih-qmnum,
+        arbpl  LIKE crhd-arbpl,
+        ernam  LIKE viqmfe-ernam,
+        erdat  LIKE viqmfe-erdat,
+        fecod  TYPE qcodegrp,
+        fedam  TYPE kurztext,
+        fetxt  LIKE viqmfe-fetxt,
+        werks  LIKE aufk-werks,
+        selected,
+      END OF gt_result.
+
+DATA: gt_tline_tmp TYPE STANDARD TABLE OF tline INITIAL SIZE 0
+                                          WITH HEADER LINE,
+      ld_tdname        TYPE tdobname,
+      g_off1          TYPE i,
+      g_off2          TYPE i,
+      g_len1         TYPE i,
+      g_len2         TYPE i,
+      g_len3         TYPE i.
+
+
+
+DATA:  number LIKE  bapi2080_nothdre-notif_no,
+       wa_viqmel        TYPE viqmel,
+       wa_riwo03        TYPE riwo03.
+DATA: i_wiqmfe LIKE wqmfe   OCCURS 0 WITH HEADER LINE.
+*--- Causes table
+DATA: i_wiqmur LIKE wqmur   OCCURS 0 WITH HEADER LINE.
+DATA: gv_aufpl TYPE co_aufpl,
+      lv_arbid TYPE afvc-arbid.
+
+* not used, needed for includes miolxtop, miolxf14, mioxf16
+DATA: sel_tab LIKE object_tab OCCURS 0 WITH HEADER LINE.
+
+DATA: go_on           VALUE '1',                            " 0 or 1
+      gv_repid        TYPE sy-repid,
+      gv_ic1          LIKE sy-ucomm VALUE '&IC1',
+      gv_index        TYPE sy-tabix,
+      gt_fieldcat     TYPE slis_t_fieldcat_alv,
+      gt_events_tab   TYPE slis_t_event,
+      gv_form_user_command TYPE slis_formname VALUE 'USER_COMMAND_L',
+      gv_pf_status_set TYPE slis_formname VALUE 'PF_STATUS_SET_RETURN',
+      gt_sort          TYPE slis_t_sortinfo_alv,
+      gv_index1        TYPE sytabix.
+*----------------------------------------------------------------------*
+* constants                                                            *
+*----------------------------------------------------------------------*
+CONSTANTS: c_fegrp       TYPE fegrp   VALUE 'ZACD-099',
+           c_10          TYPE vornr   VALUE '0010',
+           c_s           TYPE c        VALUE 'S',
+           c_x           TYPE c        VALUE 'X'.
+
+*- SELECTION SCREEN---------------------------------------------------
+* input selection
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE text-001.
+SELECT-OPTIONS:     s_werks  FOR aufk-werks OBLIGATORY MEMORY ID wrk.
+SELECT-OPTIONS:     s_aufnr  FOR aufk-aufnr.
+SELECT-OPTIONS:     s_date   FOR aufk-idat3.
+SELECT-OPTIONS: s_arbpl  FOR afvgd-arbpl MATCHCODE OBJECT cram.
+SELECTION-SCREEN END OF BLOCK b1.
+
+
+PARAMETERS:
+  dy_selm DEFAULT '0' NO-DISPLAY,      " selection mode
+  dy_tcode LIKE sy-tcode NO-DISPLAY,   " transaction
+  p_ocall NO-DISPLAY.                  " 'X' => prog called from
+" pm order
+
+*----------------------------------------------------------------------*
+* initialization                                                       *
+*----------------------------------------------------------------------*
+INITIALIZATION.
+
+*  PERFORM date.
+
+*----------------------------------------------------------------------*
+* at selection-screen on plant                                         *
+*----------------------------------------------------------------------*
+AT SELECTION-SCREEN ON s_werks.
+
+** Begin of Mod-0001  - Satya
+  LOOP AT s_werks.
+
+    IF   s_werks-low NE space.
+      AUTHORITY-CHECK OBJECT 'I_IWERK'
+               ID 'TCD'   FIELD sy-tcode
+               ID 'IWERK' FIELD s_werks-low.
+
+      IF sy-subrc NE 0.
+*.. No authorization for plant
+        MESSAGE e001(00) WITH text-e03 s_werks-low.
+      ENDIF.
+    ENDIF.
+
+    IF   s_werks-high NE space.
+      AUTHORITY-CHECK OBJECT 'I_IWERK'
+               ID 'TCD'   FIELD sy-tcode
+               ID 'IWERK' FIELD s_werks-high.
+
+      IF sy-subrc NE 0.
+*.. No authorization for plant
+        MESSAGE e001(00) WITH text-e03 s_werks-high.
+      ENDIF.
+    ENDIF.
+
+  ENDLOOP.
+** End of Mod-0001  - Satya
+
+*-START OF SELECTION----------------------------------------------------
+START-OF-SELECTION.
+
+
+* select orders
+  PERFORM select_order.
+
+  IF NOT gt_ord[] IS INITIAL.
+* select notification linked to the orders and fill the data for ALV
+    PERFORM select_notification.
+    PERFORM check_movement_type_for_parts.    "insert MOD-0002
+  ENDIF.
+*-----------------------------------------------------------------------
+END-OF-SELECTION.
+
+* create ALV-GRID
+  PERFORM build_field_catlog CHANGING gt_fieldcat.
+  PERFORM fill_events_f14.
+  PERFORM alv_display.
+
+
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_SPAREP_RETURN
+*&---------------------------------------------------------------------*
+*       select data from the db
+*----------------------------------------------------------------------*
+FORM select_order.
+
+  SELECT a~aufnr a~werks b~qmnum
+    INTO CORRESPONDING FIELDS OF TABLE gt_ord
+    FROM aufk AS a INNER JOIN afih AS b
+    ON a~aufnr = b~aufnr
+    WHERE
+          b~aufnr IN s_aufnr
+      AND a~werks IN s_werks
+*      AND a~IDAT3 <> 0
+      AND a~idat3 IN s_date.
+
+ENDFORM.                               " SELECT_ORD
+
+
+*&---------------------------------------------------------------------*
+*&      Form  select_notification
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM select_notification.
+
+  LOOP AT gt_ord.
+*     get notification information
+    number = gt_ord-qmnum.
+
+    CALL FUNCTION 'IQS4_GET_NOTIFICATION'
+      EXPORTING
+        i_qmnum     = number
+      IMPORTING
+        e_viqmel    = wa_viqmel
+        e_riwo03    = wa_riwo03
+      TABLES
+        e_iviqmfe_t = i_wiqmfe[]
+        e_iviqmur_t = i_wiqmur[].
+
+    IF sy-subrc EQ 0.
+      IF NOT i_wiqmfe[] IS INITIAL.
+        MOVE gt_ord-aufnr TO gt_result-aufnr.
+        MOVE gt_ord-qmnum TO gt_result-qmnum.
+        MOVE gt_ord-werks TO gt_result-werks.
+* Pick up the workcenter in CRHD
+
+        SELECT SINGLE aufpl
+                INTO gv_aufpl
+                FROM afko
+                WHERE aufnr = gt_ord-aufnr.
+
+        IF sy-subrc EQ 0.
+          SELECT  SINGLE arbid
+                  INTO  lv_arbid
+                  FROM  afvc
+                  WHERE aufpl = gv_aufpl
+                    AND vornr = c_10.                                             .
+
+          IF sy-subrc EQ 0.
+            SELECT SINGLE arbpl
+                   INTO gt_result-arbpl
+                   FROM crhd
+                   WHERE objid = lv_arbid.
+          ENDIF.
+        ENDIF.
+
+* If Workcenter selected
+        IF  gt_result-arbpl IN s_arbpl.
+          LOOP AT i_wiqmfe.
+            IF i_wiqmfe-fegrp = c_fegrp.
+* Pick up the damage text in QPCT
+              SELECT SINGLE  kurztext
+                      INTO gt_result-fedam
+                        FROM qpct
+                        WHERE codegruppe  EQ  i_wiqmfe-fegrp
+                        AND code  EQ  i_wiqmfe-fecod
+                        AND sprache = sy-langu.
+
+              MOVE gt_result-qmnum TO ld_tdname.
+              CALL FUNCTION 'READ_TEXT'
+                EXPORTING
+                  id                      = 'LTXT'
+                  language                = sy-langu
+                  name                    = ld_tdname
+                  object                  = 'QMEL'
+                TABLES
+                  lines                   = gt_tline_tmp
+                EXCEPTIONS
+                  id                      = 1
+                  language                = 2
+                  name                    = 3
+                  not_found               = 4
+                  object                  = 5
+                  reference_check         = 6
+                  wrong_access_to_archive = 7
+                  OTHERS                  = 8.
+              IF sy-subrc = 0.
+                READ TABLE gt_tline_tmp INDEX 1.
+                g_off1 = 0.
+                g_off2 = 0.
+                FIND '(' IN gt_tline_tmp-tdline MATCH OFFSET g_off1.
+                IF sy-subrc = '0'.
+                  g_off2 = g_off1 + 1.
+                  g_len1 = g_off1.
+                  FIND ')' IN gt_tline_tmp-tdline MATCH OFFSET g_off2.
+                  IF sy-subrc = '0'.
+                    g_len2 = g_off2.
+                    g_len3 = g_len2 - g_len1.
+                    g_off1 = g_off1 + 1.
+                    g_len3 = g_len3 - 1.
+                    WRITE gt_tline_tmp-tdline+g_off1(g_len3) TO gt_result-ernam.
+                  ENDIF.
+                ENDIF.
+              ENDIF.
+
+              IF gt_result-ernam = ' '.
+                MOVE i_wiqmfe-ernam TO gt_result-ernam.
+              ENDIF.
+
+
+              MOVE i_wiqmfe-erdat TO gt_result-erdat.
+              MOVE i_wiqmfe-fecod TO gt_result-fecod.
+              MOVE i_wiqmfe-fetxt TO gt_result-fetxt.
+              APPEND gt_result.
+              CLEAR gt_result-erdat.
+              CLEAR gt_result-fecod.
+              CLEAR gt_result-fetxt.
+              CLEAR gt_result-erdat.
+              CLEAR gt_result-ernam.
+
+
+            ENDIF.
+          ENDLOOP.
+        ENDIF. " ARBPL existing in selection?
+
+      ENDIF.
+    ENDIF.
+    CLEAR gt_result.
+  ENDLOOP.
+ENDFORM.                    "select_notification
+
+
+*&---------------------------------------------------------------------*
+*&      Form  build_field_catlog
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_GT_FIELDCAT  text
+*----------------------------------------------------------------------*
+FORM build_field_catlog  CHANGING pt_fieldcat TYPE slis_t_fieldcat_alv.
+
+  DATA : ls_fcat TYPE slis_fieldcat_alv.
+
+*--------------------------Order number----------------------*
+  ls_fcat-fieldname = 'AUFNR'.
+  ls_fcat-rollname = 'AUFNR'.
+  ls_fcat-no_convext = 'X'.
+  ls_fcat-no_zero = 'X'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+*--------------------------Notification Number-------------------*
+  ls_fcat-fieldname = 'QMNUM'.
+  ls_fcat-rollname = 'QMNUM'.
+  ls_fcat-no_zero = 'X'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+*--------------------------Workcenter-----------------------------*
+  ls_fcat-fieldname = 'ARBPL'.
+  ls_fcat-rollname = 'ARBPL'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+*--------------------------Created By-----------------------------*
+  ls_fcat-fieldname = 'ERNAM'.
+  ls_fcat-rollname = 'AUFERFNAM'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+
+*--------------------------Created Date-------------------------*
+  ls_fcat-fieldname = 'ERDAT'.
+  ls_fcat-rollname = 'ERDAT'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+
+*--------------------------Damage Code------------------------*
+  ls_fcat-fieldname = 'FECOD'.
+  ls_fcat-rollname = 'FECOD'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+
+*--------------------------Damage (reason for return)-----------------------*
+  ls_fcat-fieldname = 'FEDAM'.
+  ls_fcat-rollname = 'KURZTEXT'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+*--------------------------Text-----------------------*
+  ls_fcat-fieldname = 'FETXT'.
+  ls_fcat-rollname = 'PIN_PART_NUMBER'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+*--------------------------Plant-----------------------*
+  ls_fcat-fieldname = 'WERKS'.
+  ls_fcat-rollname = 'WERKS_D'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+ENDFORM.                    " build_field_catlog
+
+*&---------------------------------------------------------------------*
+*&      Form  USER_COMMAND_L
+*&---------------------------------------------------------------------*
+*       event user_command, called from ALV
+*----------------------------------------------------------------------*
+FORM user_command_l USING p_ucomm LIKE sy-ucomm
+                          p_selfield TYPE slis_selfield.
+
+  p_selfield-refresh = c_s.
+
+  PERFORM check_pf2_with_object_f16 USING p_ucomm.
+  PERFORM set_p_selfield_general_f16 USING p_selfield.
+
+  CASE p_ucomm.
+    WHEN 'ISEL'.
+      p_ucomm = 'DISP'.
+      PERFORM fcodes_with_mark_f16 USING p_ucomm p_selfield.
+    WHEN 'ORDE'.
+      PERFORM fcodes_with_mark_f16 USING p_ucomm p_selfield.
+    WHEN 'NOTI'.
+      PERFORM fcodes_with_mark_f16 USING p_ucomm p_selfield.
+  ENDCASE.
+
+ENDFORM.                               " USER_COMMAND_L
+
+*&---------------------------------------------------------------------*
+*&      Form  fcodes_with_mark_l
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_F_UCOMM  text
+*      -->P_F_SELFIELD  text
+*----------------------------------------------------------------------*
+FORM fcodes_with_mark_l  USING   p_ucomm LIKE sy-ucomm
+                              p_selfield TYPE slis_selfield.
+
+  CASE p_ucomm.
+*   Display order document
+    WHEN 'DISP' OR 'ORDE'.
+      SET PARAMETER ID 'ANR' FIELD gt_result-aufnr.
+      CALL TRANSACTION 'IW33' AND SKIP FIRST SCREEN.
+    WHEN 'NOTI'.
+      SET PARAMETER ID 'IQM' FIELD gt_result-qmnum.
+      CALL TRANSACTION 'IW53' AND SKIP FIRST SCREEN.
+  ENDCASE.
+
+ENDFORM.                    " fcodes_with_mark_l
+
+*&---------------------------------------------------------------------*
+*&      Form  alv_display
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM alv_display .
+
+  gv_repid = sy-repid.
+
+
+  PERFORM build_alv_sort
+      CHANGING gt_sort.
+
+
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+     EXPORTING
+       i_callback_program                =  gv_repid
+       i_save                            = 'A'
+       it_events                         =  gt_events_tab[]
+*      I_GRID_TITLE                      =  g_title
+*      I_GRID_SETTINGS                   =
+*      is_layout                         =  g_layout
+       it_fieldcat                       =  gt_fieldcat[]
+
+       it_sort                           =  gt_sort
+
+*      is_variant                        =  g_variant
+     TABLES
+        t_outtab                         =  gt_result.
+
+ENDFORM.                    " alv_display
+
+*&---------------------------------------------------------------------*
+*&      Form  check_pf2_with_object_f16
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_P_UCOMM  text
+*----------------------------------------------------------------------*
+FORM check_pf2_with_object_f16  USING    p_ucomm.
+
+  CHECK p_ucomm = gv_ic1.
+  p_ucomm = 'ISEL'.
+
+ENDFORM.                    " check_pf2_with_object_f16
+
+*&---------------------------------------------------------------------*
+*&      Form  set_p_selfield_general_f16
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_P_SELFIELD  text
+*----------------------------------------------------------------------*
+FORM set_p_selfield_general_f16  USING f_selfield TYPE slis_selfield.
+
+  f_selfield-col_stable = c_x.
+  f_selfield-row_stable = c_x.
+
+ENDFORM.                    " set_p_selfield_general_f16
+
+*&---------------------------------------------------------------------*
+*&      Form  fcodes_with_mark_f16
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_P_UCOMM  text
+*      -->P_P_SELFIELD  text
+*      -->P_ENDCASE  text
+*----------------------------------------------------------------------*
+FORM fcodes_with_mark_f16  USING p_ucomm LIKE sy-ucomm
+                                p_selfield TYPE slis_selfield.
+
+  PERFORM check_object_tab_marked_f14 USING p_ucomm p_selfield.
+
+  LOOP AT gt_result WHERE selected = c_x .
+    gv_index = sy-tabix.
+    PERFORM fcodes_with_mark_l USING p_ucomm p_selfield.
+    gt_result-selected = ' '.
+    MODIFY gt_result INDEX gv_index.
+  ENDLOOP.
+
+  CLEAR p_ucomm.
+
+ENDFORM.                    " fcodes_with_mark_f16
+
+*&---------------------------------------------------------------------*
+*&      Form  check_object_tab_marked_f14
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_P_UCOMM  text
+*      -->P_P_SELFIELD  text
+*----------------------------------------------------------------------*
+FORM check_object_tab_marked_f14  USING    p_ucomm LIKE sy-ucomm
+                                        p_selfield TYPE slis_selfield.
+
+  READ TABLE gt_result WITH KEY selected = c_x.
+
+  IF NOT sy-subrc IS INITIAL.
+    IF NOT p_selfield-tabindex IS INITIAL.
+      READ TABLE gt_result INDEX p_selfield-tabindex.
+      gt_result-selected = c_x.
+      MODIFY gt_result INDEX p_selfield-tabindex.
+    ENDIF.
+  ELSE.
+*--- Checkbox markiert -----------------------------------------------*
+    p_selfield-sel_tab_field = 'G_MARK'.
+  ENDIF.
+
+ENDFORM.                    " check_object_tab_marked_f14
+
+*&---------------------------------------------------------------------*
+*&      Form  fill_events_f14
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM fill_events_f14 .
+
+  DATA lv_event       TYPE slis_alv_event.
+
+  CALL FUNCTION 'REUSE_ALV_EVENTS_GET'
+    EXPORTING
+      i_list_type = 0
+    IMPORTING
+      et_events   = gt_events_tab.
+
+*--- allocate form for user-command ---------------------------------*
+  READ TABLE gt_events_tab WITH KEY name = slis_ev_user_command
+                        INTO lv_event.
+  IF sy-subrc = 0.
+    MOVE gv_form_user_command TO lv_event-form.
+    MODIFY gt_events_tab FROM lv_event INDEX sy-tabix.
+  ENDIF.
+
+
+  READ TABLE gt_events_tab WITH KEY name = slis_ev_pf_status_set
+                        INTO lv_event.
+  IF sy-subrc = 0.
+    MOVE gv_pf_status_set TO lv_event-form.
+    MODIFY gt_events_tab FROM lv_event INDEX sy-tabix.
+  ENDIF.
+
+
+ENDFORM.                    " fill_events_f14
+*&---------------------------------------------------------------------*
+*&      Form  BUILD_ALV_SORT
+*&---------------------------------------------------------------------*
+*       Build Sort Table.
+*----------------------------------------------------------------------*
+FORM build_alv_sort
+     CHANGING ct_sort TYPE slis_t_sortinfo_alv.
+
+*Local Variables.
+  DATA: counter TYPE i,
+        ls_sort TYPE slis_sortinfo_alv.
+
+  ADD 1 TO counter.
+  CLEAR ls_sort.
+  ls_sort-spos      = counter.
+  ls_sort-fieldname = 'AUFNR'.
+  ls_sort-up        = space.
+  ls_sort-down      = /isdfps/cl_const=>force_true.
+  APPEND ls_sort TO ct_sort.
+  CLEAR: counter.
+
+ENDFORM.                    " BUILD_ALV_SORT
+
+*&---------------------------------------------------------------------*
+*&      Form  pf_status_set_serv
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->RT_EXTAB   text
+*----------------------------------------------------------------------*
+FORM pf_status_set_return USING rt_extab TYPE slis_t_extab.
+
+  SET PF-STATUS 'YAM_RETURN'.
+
+ENDFORM.                    "pf_status_set_serv
+
+*Begin of insert MOD-0002
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_MOVEMENT_TYPE_FOR_PARTS
+*&---------------------------------------------------------------------*
+*       Consider part numbers which have movement type 262 or 502
+*----------------------------------------------------------------------*
+FORM check_movement_type_for_parts .
+
+  DATA: lt_parts TYPE STANDARD TABLE OF ty_mseg,
+        wa_matnr TYPE matnr.
+
+  DATA: BEGIN OF lt_result OCCURS 0,
+          aufnr  LIKE afih-aufnr,
+          qmnum  LIKE afih-qmnum,
+          arbpl  LIKE crhd-arbpl,
+          ernam  LIKE viqmfe-ernam,
+          erdat  LIKE viqmfe-erdat,
+          fecod  TYPE qcodegrp,
+          fedam  TYPE kurztext,
+          fetxt  LIKE viqmfe-fetxt,
+          werks  LIKE aufk-werks,
+          selected,
+        END OF lt_result.
+
+  REFRESH:lt_parts.
+  LOOP AT gt_result.
+    CLEAR: wa_mseg.
+    wa_mseg-matnr = gt_result-fetxt.
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+      EXPORTING
+        input  = wa_mseg-matnr
+      IMPORTING
+        output = wa_mseg-matnr.
+    wa_mseg-aufnr = gt_result-aufnr.
+    APPEND wa_mseg TO lt_parts.
+  ENDLOOP.
+
+  REFRESH: gt_mseg.
+  IF NOT lt_parts IS INITIAL.
+    SELECT bwart
+           matnr
+           aufnr
+    FROM   mseg
+    INTO   TABLE gt_mseg
+    FOR    ALL ENTRIES IN lt_parts
+    WHERE  ( bwart = '262' OR bwart = '502' )
+    AND    matnr EQ lt_parts-matnr
+    AND    aufnr EQ lt_parts-aufnr.
+  ENDIF.
+
+  APPEND LINES OF gt_result[] TO lt_result[].
+  REFRESH: gt_result[].
+*Consider part numbers which have movement type 262 or 502
+  LOOP AT lt_result.
+    CLEAR: wa_mseg,
+           wa_matnr.
+    wa_matnr = lt_result-fetxt.
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+      EXPORTING
+        input  = wa_matnr
+      IMPORTING
+        output = wa_matnr.
+    READ TABLE gt_mseg INTO wa_mseg WITH KEY matnr = wa_matnr
+                                             aufnr = lt_result-aufnr.
+    IF sy-subrc EQ 0.
+      APPEND lt_result TO gt_result.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    " CHECK_MOVEMENT_TYPE_FOR_PARTS
+
+*End of insert MOD-0002
+*Text symbol text£º
+*001:Selection screen input
+
+*E03:No authorisation for plant
+*Selection text£º
+*S_ARBPL:D       .
+*S_AUFNR:D       .
+*S_DATE:        Order Close Date
+*S_WERKS:D       .

@@ -1,0 +1,401 @@
+**********************************************************************
+* Program ID        : YSE_CUSTOMER_SALES_EXTEND                      *
+* Program title     : Aut. creation of customer in distr.channel 11  *
+* Author            : Luc Mertens USG Innotiv                        *
+* Date              : 06/10/2009                                     *
+* Functional spec   : CR0867                                         *
+* CHANGE REQUEST NR : CD1K950266                                     *
+* Description       : The purpose of this program is to create the   *
+*      customer also in distr.channel 11 when this one exists in 01. *
+*      In batchrun on daily basis ! (changed into trans. on 13/04/10 *
+*--------------------------------------------------------------------*
+* CHANGE HISTORY LOG
+*--------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME                  |CORR.NR.  |CHANGE REF. *
+*--------------------------------------------------------------------*
+* MOD-001 |13.04.2010|L. Mertens  USG Innotiv|CD1K956013|CR0867 V2   *
+**********************************************************************
+report yse_customer_sales_extend.
+
+*
+tables: knvv,
+        kna1.
+
+*
+data:
+  begin of gt_knvv_sel occurs 0,
+    kunnr type kunnr,
+    vkorg type vkorg,
+    vtweg type vtweg,
+    spart type spart,
+  end of gt_knvv_sel.
+
+data:
+  begin of gt_knvv_cre occurs 0,
+    kunnr type kunnr,
+    vkorg type vkorg,
+    vtweg type vtweg,
+    spart type spart,
+  end of gt_knvv_cre.
+
+data:
+  gv_mode    type c             value 'N',
+  gv_mestx   LIKE t100-text,
+  gv_msgnr   LIKE t100-msgnr,
+  gv_retcd   like sy-subrc.
+
+* begin of insert MOD-001
+types: begin of ty_range_vkorg,
+         vkorg type vkorg,
+       end of ty_range_vkorg.
+
+DATA: lt_range_vkorg type standard table of ty_range_vkorg.
+
+field-symbols: <fs_range_vkorg> type ty_range_vkorg.
+* end of insert MOD-001
+
+DATA: i_bdcdata LIKE bdcdata OCCURS 0 WITH HEADER LINE,
+      struct_bdcdata TYPE bdcdata,
+      gt_err    LIKE bdcmsgcoll OCCURS 0 WITH HEADER LINE.
+
+
+*selection screen layout:
+selection-screen begin of block b1 with frame title text-001.
+parameters:
+       p_vtwegt type knvv-vtweg obligatory.
+selection-screen end of block b1.
+
+selection-screen begin of block b2 with frame title text-002.
+select-options:
+       s_erdat  for knvv-erdat obligatory,
+       s_ktokd  for kna1-ktokd obligatory,
+       s_kdgrp  for knvv-kdgrp obligatory,
+* begin of change MOD-001
+*       s_vkorgf for knvv-vkorg.
+       s_vkorgf for knvv-vkorg OBLIGATORY.
+* end of change MOD-001
+parameters:
+       p_vtwegf type knvv-vtweg obligatory,
+       p_spartf type knvv-spart obligatory.
+selection-screen end of block b2.
+
+* begin of insert MOD-001
+ranges: r_vkorg FOR s_vkorgf.
+
+*--------------------------------------------------------------------------
+*check sales organisation
+AT SELECTION-SCREEN ON s_vkorgf.
+
+* If range is used select all to filter out later
+  LOOP at s_vkorgf.
+    if not s_vkorgf-high is initial.
+      select vkorg from tvko into table lt_range_vkorg
+        where vkorg between s_vkorgf-low and s_vkorgf-high.
+
+      refresh r_vkorg.
+      loop at lt_range_vkorg assigning <fs_range_vkorg>.
+        r_vkorg-low    = <fs_range_vkorg>-vkorg.
+        r_vkorg-sign   = 'I'.
+        r_vkorg-option = 'EQ'.
+        clear r_vkorg-high.
+        append r_vkorg.
+      endloop.
+    endif.
+  endloop.
+
+*.. authority check
+  loop at r_vkorg.
+    AUTHORITY-CHECK OBJECT 'V_VBAK_VKO'
+           ID 'VKORG' FIELD r_vkorg-low
+           ID 'VTWEG' FIELD p_vtwegf
+           ID 'SPART' FIELD p_spartf
+           ID 'ACTVT' FIELD '01'.
+
+    IF sy-subrc <> 0.
+      MESSAGE e001(00) WITH text-e01 r_vkorg-low.
+    ENDIF.
+  endloop.
+
+*...................Transaction counter...................................*
+  CALL METHOD ycl_statistics=>record_transaction.
+* end of insert MOD-001
+
+*--------------------------------------------------------------------------
+START-OF-SELECTION.
+
+* Select customers with distr.channel = p_vtwegf
+  PERFORM select_knvv_from.
+
+  if gt_knvv_sel[] is initial.
+    MESSAGE s047(ih).
+    exit.
+  ENDIF.
+
+* For selected customers, select distr.channel = p_vtwegt
+  perform select_knvv_to.
+
+  sort: gt_knvv_sel,
+        gt_knvv_cre.
+
+*--------------------------------------------------------------------------
+END-OF-SELECTION.
+
+* If customer does not exist for distr.channel = p_vtwegt,
+* create for this customer/distr.channel the appropriate sales data
+  loop at gt_knvv_sel.
+    read table gt_knvv_cre with key kunnr = gt_knvv_sel-kunnr
+       binary search.
+
+    if sy-subrc <> 0.
+      perform sub_extend_customer.
+      call transaction 'VD01' using i_bdcdata
+        update 'S' mode gv_mode messages into gt_err.
+
+      IF NOT sy-subrc IS INITIAL.
+        WRITE: / gt_knvv_sel-kunnr, 15 text-e06.
+        perform sub_write_message.
+* begin of insert MOD-001
+      else.
+        WRITE: / gt_knvv_sel-kunnr, 15 text-e05, p_vtwegt.
+* end of insert MOD-001
+      endif.
+    endif.
+  endloop.
+
+  skip 2.
+  write: 'End of program'.
+
+*--------------------------------------------------------------------------
+* S U B R O U T I N E S
+*--------------------------------------------------------------------------
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_KNVV_FROM
+*&---------------------------------------------------------------------*
+*       Select customers with sales area FROM
+*----------------------------------------------------------------------*
+FORM SELECT_KNVV_FROM.
+
+  if s_vkorgf[] is initial.
+    SELECT kunnr vkorg vtweg spart
+      FROM kna1vv INTO corresponding fields of TABLE gt_knvv_sel
+        WHERE vtweg eq p_vtwegf
+          and spart eq p_spartf
+          and erdat in s_erdat
+          and kdgrp in s_kdgrp
+          and ktokd in s_ktokd.
+  else.
+    SELECT kunnr vkorg vtweg spart
+      FROM kna1vv INTO corresponding fields of TABLE gt_knvv_sel
+        WHERE vkorg in s_vkorgf
+          and vtweg eq p_vtwegf
+          and spart eq p_spartf
+          and erdat in s_erdat
+          and kdgrp in s_kdgrp
+          and ktokd in s_ktokd.
+  endif.
+
+ENDFORM.                    " SELECT_KNVV_FROM
+
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_KNVV_TO
+*&---------------------------------------------------------------------*
+*       Select customers with sales area TO
+*----------------------------------------------------------------------*
+FORM SELECT_KNVV_TO.
+
+  SELECT kunnr vkorg vtweg spart
+    INTO corresponding fields of TABLE gt_knvv_cre
+    from knvv
+    for all entries in gt_knvv_sel
+      WHERE kunnr eq gt_knvv_sel-kunnr
+        and vkorg eq gt_knvv_sel-vkorg
+        and vtweg eq p_vtwegt
+        and spart eq gt_knvv_sel-spart.
+
+ENDFORM.                    " SELECT_KNVV_TO
+
+*&---------------------------------------------------------------------*
+*&      Form  SUB_EXTEND_CUSTOMER
+*&---------------------------------------------------------------------*
+*       Replace quotation number by sales order number
+*----------------------------------------------------------------------*
+FORM SUB_EXTEND_CUSTOMER.
+
+  refresh: i_bdcdata,
+           gt_err.
+
+* Initial screen
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    'SAPMF02D'  '0107'  'X'  ''   ''
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    ''  ''  ''  'RF02D-KUNNR'  gt_knvv_sel-kunnr
+          CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    ''  ''  ''  'RF02D-VKORG'  gt_knvv_sel-vkorg
+          CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    ''  ''  ''  'RF02D-VTWEG'  p_vtwegt
+          CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    ''  ''  ''  'RF02D-SPART'  gt_knvv_sel-spart
+          CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    ''  ''  ''  'RF02D-REF_KUNNR'  gt_knvv_sel-kunnr
+          CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    ''  ''  ''  'RF02D-REF_VKORG'  gt_knvv_sel-vkorg
+          CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    ''  ''  ''  'RF02D-REF_VTWEG'  p_vtwegf
+          CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    ''  ''  ''  'RF02D-REF_SPART'  gt_knvv_sel-spart
+          CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    ''  ''  ''  'BDC_OKCODE'  '/00'
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+* Sales tab
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    'SAPMF02D'  '0310'  'X'  ''   ''
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    ''  ''  ''  'BDC_OKCODE'  '/00'
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+* Shipping tab
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    'SAPMF02D'  '0315'  'X'  ''   ''
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    ''  ''  ''  'BDC_OKCODE'  '/00'
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+* Billing tab
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    'SAPMF02D'  '0320'  'X'  ''   ''
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    ''  ''  ''  'BDC_OKCODE'  '/00'
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+* Taxes
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    'SAPMF02D'  '1350'  'X'  ''   ''
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    ''  ''  ''  'BDC_OKCODE'  '=ENTR'
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+* Partner Functions tab
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    'SAPMF02D'  '0324'  'X'  ''   ''
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    ''  ''  ''  'BDC_OKCODE'  '=UPDA'
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+ENDFORM.                    " SUB_EXTEND_CUSTOMER
+
+*&---------------------------------------------------------------------*
+*&      Form  SUB_WRITE_MESSAGE
+*&---------------------------------------------------------------------*
+*       Write error messages from B-I sessions
+*----------------------------------------------------------------------*
+FORM SUB_WRITE_MESSAGE .
+
+  LOOP AT gt_err.
+    gv_msgnr = gt_err-msgnr.
+    CALL FUNCTION 'RH_MESSAGE_GET'
+      EXPORTING
+*        SPRSL                   = SY-LANGU
+        arbgb                   = sy-msgid
+        msgnr                   = gv_msgnr
+        msgv1                   = sy-msgv1
+        msgv2                   = sy-msgv2
+        msgv3                   = sy-msgv3
+        msgv4                   = sy-msgv4
+      IMPORTING
+        msgtext                 = gv_mestx
+      EXCEPTIONS
+        message_not_found       = 1
+        OTHERS                  = 2.
+
+    IF sy-subrc = 0.
+      WRITE: / gv_mestx.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    " SUB_WRITE_MESSAGE
+
+*Text symbol text£º
+*001:Data to be created
+*002:Reference data
+*E01:You are not authorized for sales organisation :
+*E03:Invalid sales organisation :
+*E05:customer extended with
+
+*E06:Transaction VD01 failed !
+*Selection text£º
+*P_SPARTF:D       .
+*P_VTWEGF:D       .
+*P_VTWEGT:D       .
+*S_ERDAT:D       .
+*S_KDGRP:D       .
+*S_KTOKD:D       .
+*S_VKORGF:D       .

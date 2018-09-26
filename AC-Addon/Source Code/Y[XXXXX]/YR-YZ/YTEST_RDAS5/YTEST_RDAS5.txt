@@ -1,0 +1,536 @@
+*&---------------------------------------------------------------------*
+*& Report  YTEST_RDAS5
+*&
+*&---------------------------------------------------------------------*
+*&
+*&
+*&---------------------------------------------------------------------*
+
+REPORT  ytest_rdas5.
+
+*&---------------------------------------------------------------------*
+*& Report  ZVK_DYN_REPORT
+*&---------------------------------------------------------------------*
+*& Report to Display Pricing condition Master Records
+*&---------------------------------------------------------------------*
+
+*REPORT  zvk_dyn_report.
+
+** Text Elements
+* p_kappl : Application Area
+* p_kschl : Condition Type
+**
+
+TYPE-POOLS : rsds,abap.
+TABLES : t685,dd02l,t681a.
+
+** Type definition for KONP & KONH Table
+TYPES : BEGIN OF ty_konp,
+           knumh TYPE knumh,
+           kbetr TYPE kbetr_kond,
+           krech TYPE krech,
+           loevm_ko TYPE loevm_ko,
+        END OF ty_konp.
+
+TYPES : BEGIN OF ty_konh,
+           knumh TYPE knumh,
+        END OF ty_konh.
+
+DATA : lt_konp TYPE STANDARD TABLE OF ty_konp,
+       lt_konh TYPE STANDARD TABLE OF ty_konh,
+       ls_konp TYPE ty_konp,
+       ls_konh TYPE ty_konh.
+
+DATA : key_index TYPE sy-tabix,
+       val_index TYPE sy-tabix.
+
+** Definitions for Pricing tables determination **
+DATA : ls_t685 TYPE t685,
+       ls_t681 TYPE t681,
+       ls_tmc1t TYPE tmc1t.
+
+** Definition for ALV Grid **
+DATA : gr_table TYPE REF TO cl_salv_table.
+
+DATA : gr_columns TYPE REF TO cl_salv_columns_table,
+       gr_column  TYPE REF TO cl_salv_column_table,
+       lt_columns TYPE salv_t_column_ref,
+       ls_columns TYPE salv_s_column_ref,
+       lv_domname TYPE domname.
+
+DATA : gr_functions TYPE REF TO cl_salv_functions_list.
+
+DATA : gr_layout    TYPE REF TO cl_salv_layout,
+       gr_layout_key TYPE salv_s_layout_key.
+
+DATA : gr_content TYPE REF TO cl_salv_form_element.
+
+** Defintions for Dynamic Structures **
+DATA : lt_tab TYPE REF TO cl_abap_tabledescr,
+       ls_row TYPE REF TO cl_abap_structdescr,
+       ls_frow TYPE REF TO cl_abap_structdescr,
+       lt_component TYPE cl_abap_structdescr=>component_table,
+       ls_component TYPE cl_abap_structdescr=>component.
+
+FIELD-SYMBOLS :  <gt_tab> TYPE STANDARD TABLE,
+                 <gs_row> TYPE ANY,
+                 <gd_fld> TYPE ANY.
+
+DATA : gt_tab TYPE REF TO data,
+       gs_row TYPE REF TO data.
+
+DATA : p_table TYPE dd02l-tabname.
+
+** Declarations for Free Selections
+DATA : lt_tables TYPE STANDARD TABLE OF rsdstabs,
+       ls_tables TYPE rsdstabs,
+       lt_fields TYPE STANDARD TABLE OF rsdsfields,
+       ls_fields TYPE rsdsfields,
+       lt_fields_n TYPE STANDARD TABLE OF rsdsfields,
+       ls_fields_n TYPE rsdsfields.
+
+DATA : selection_id TYPE dynselid,
+       fs_dyns      TYPE rsds_type,
+       fs_num       TYPE sy-tfill,
+       lv_kind      TYPE char01.
+
+** Declarations for Table Properties **
+DATA : lt_field_list TYPE ddfields,
+       ls_field_list TYPE dfies.
+
+** Declaration for Dynamic Where Clause **
+DATA : lt_clause TYPE STANDARD TABLE OF rsds_where,
+       ls_clause TYPE rsds_where.
+
+DATA : lt_where TYPE STANDARD TABLE OF rsdswhere,
+       lt_where_add TYPE STANDARD TABLE OF rsdswhere,
+       ls_where TYPE rsdswhere.
+
+DATA : lv_kappl  TYPE char04,
+       lv_kschl  TYPE char6.
+
+** Selection Screen
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME.
+PARAMETERS : p_kappl TYPE t681a-kappl.
+PARAMETERS : p_kschl TYPE t685-kschl.
+SELECTION-SCREEN END OF BLOCK b1.
+
+
+START-OF-SELECTION.
+  PERFORM get_table_det.
+  PERFORM create_structures.
+  PERFORM free_selections.
+  PERFORM report_display.
+
+*&---------------------------------------------------------------------*
+*&      Form  get_table_det
+*&---------------------------------------------------------------------*
+* To Get Details of Pricing condition Tables
+*----------------------------------------------------------------------*
+FORM get_table_det.
+  CLEAR : ls_t685, ls_t681, ls_tmc1t.
+** Get Pricing condition Access Sequence Key
+  CALL FUNCTION 'SD_COND_T685_SELECT'
+    EXPORTING
+      cts_kappl = p_kappl
+      cts_kschl = p_kschl
+      cts_kvewe = 'A'
+    IMPORTING
+      cts_t685  = ls_t685.
+** Get condition table based on access sequence selection
+
+  IF ls_t685-kozgf IS NOT INITIAL.
+    CALL FUNCTION 'RV_GET_CONDITION_TABLES'
+      EXPORTING
+        access_sequence        = ls_t685-kozgf
+        application            = p_kappl
+        condition_type         = p_kschl
+        condition_use          = 'A'
+        get_text               = 'X'
+        like_pf4               = ' '
+      IMPORTING
+        table_t681             = ls_t681
+        table_tmc1t            = ls_tmc1t
+      EXCEPTIONS
+        invalid_condition_type = 1
+        missing_parameter      = 2
+        no_selection_done      = 3
+        no_table_found         = 4
+        table_not_valid        = 5
+        OTHERS                 = 6.
+
+    IF sy-subrc <> 0 OR ls_t681-kotab IS INITIAL.
+      MESSAGE 'Error in Determining Condition Table..' TYPE 'I' DISPLAY LIKE 'E'.
+      STOP.
+    ELSE.
+      MOVE ls_t681-kotab TO p_table.
+    ENDIF.
+
+  ENDIF.
+
+ENDFORM.                    "get_table_det
+
+*&---------------------------------------------------------------------*
+*&      Form  create_structures
+*&---------------------------------------------------------------------*
+* To Create Dynamic Structures for Display
+*----------------------------------------------------------------------*
+FORM create_structures.
+* define local data
+  DATA: lo_typedescr  TYPE REF TO cl_abap_typedescr.
+
+** Get Structure of the table
+**  ls_row ?= cl_abap_typedescr=&gtdescribe_by_name( p_name = p_table ).
+  ls_row ?= cl_abap_typedescr=>describe_by_name( p_name = p_table ).
+
+** Get the components in the extracted structrue
+** And add one more field for Pricing condition value
+  IF ls_row IS NOT INITIAL.
+    lt_component = ls_row->get_components( ).
+    CLEAR ls_component.
+    MOVE 'KBETR' TO ls_component-name.
+    ls_component-type ?= cl_abap_datadescr=>describe_by_name( 'KBETR_KOND' ).
+    lo_typedescr ?= cl_abap_datadescr=>describe_by_name( 'KBETR_KOND' ).
+**        ls_component-type = lo_typedescr->type_kind.
+    APPEND ls_component TO lt_component.
+  ENDIF.
+  DESCRIBE TABLE lt_component LINES val_index.
+
+** Find the Index for the Key field KNUMH
+  LOOP AT lt_component INTO ls_component.
+    IF ls_component-name = 'KNUMH'.
+      MOVE sy-tabix TO key_index.
+    ENDIF.
+  ENDLOOP.
+** Create new line type with added field
+  CLEAR : ls_frow.
+  TRY.
+      ls_frow = cl_abap_structdescr=>create( p_components = lt_component ).
+    CATCH cx_sy_struct_creation .
+  ENDTRY.
+
+** Create the Internal Table structure
+  IF ls_frow IS NOT INITIAL.
+    CLEAR : lt_tab.
+    TRY.
+**        lt_tab = cl_abap_tabledescr=&gtcreate( p_line_type  = ls_frow ).
+        lt_tab = cl_abap_tabledescr=>create( p_line_type  = ls_frow ).
+      CATCH cx_sy_table_creation .
+    ENDTRY.
+  ENDIF.
+
+  IF lt_tab IS NOT INITIAL.
+    CREATE DATA gt_tab TYPE HANDLE lt_tab.
+  ENDIF.
+
+  IF ls_row IS NOT INITIAL.
+    CREATE DATA gs_row TYPE HANDLE ls_row.
+  ENDIF.
+
+  ASSIGN gt_tab->* TO <gt_tab>.
+  ASSIGN gs_row->* TO <gs_row>.
+
+
+ENDFORM.                    "create_structures
+
+*&---------------------------------------------------------------------*
+*&      Form  free_selections
+*&---------------------------------------------------------------------*
+* To Display Free Selections & extraction of data
+*----------------------------------------------------------------------*
+FORM free_selections.
+  REFRESH : lt_tables, lt_fields, lt_fields_n.
+  CLEAR   : ls_tables, ls_fields, ls_fields_n.
+  CLEAR   : selection_id.
+  CLEAR   : fs_dyns, fs_num.
+  REFRESH : lt_where, lt_where_add.
+
+** Extract Primary Key fields
+  REFRESH : lt_field_list.
+  CLEAR : ls_field_list.
+  CALL METHOD cl_reca_ddic_tabl=>get_field_list
+    EXPORTING
+      id_name            = p_table
+      if_suppress_mandt  = abap_true
+      if_suppress_key    = abap_false
+      if_suppress_nonkey = abap_true
+    IMPORTING
+      et_field_list      = lt_field_list
+    EXCEPTIONS
+      not_found          = 1
+      OTHERS             = 2.
+
+  IF lt_field_list IS NOT INITIAL.
+** Delete the Mandatory fields available in Selection screen so that
+** these fields will not show in Free Selection
+    DELETE lt_field_list WHERE fieldname EQ 'KAPPL'.
+    IF sy-subrc EQ 0.
+      CLEAR : ls_where.
+      CONCATENATE '''' p_kappl '''' INTO lv_kappl.
+      CONCATENATE '(' 'KAPPL EQ ' lv_kappl ')' INTO ls_where-line SEPARATED BY space.
+      APPEND ls_where TO lt_where.
+    ENDIF.
+    DELETE lt_field_list WHERE fieldname EQ 'KSCHL'.
+    IF sy-subrc EQ 0.
+      IF lt_where[] IS NOT INITIAL.
+        CLEAR : ls_where.
+        MOVE 'AND' TO ls_where-line.
+        APPEND ls_where TO lt_where.
+      ENDIF.
+      CONCATENATE '''' p_kschl '''' INTO lv_kschl.
+      CONCATENATE '(' 'KSCHL EQ' lv_kschl ')' INTO ls_where-line SEPARATED BY space.
+      APPEND ls_where TO lt_where.
+    ENDIF.
+
+    MOVE 'F' TO lv_kind.                "Activate only Key fields in Free Selection.
+    LOOP AT lt_field_list INTO ls_field_list.
+      CLEAR : ls_fields.
+      MOVE p_table TO ls_fields-tablename.
+      MOVE ls_field_list-fieldname TO ls_fields-fieldname.
+      APPEND ls_fields TO lt_fields.
+    ENDLOOP.
+  ELSE.
+    MOVE 'T' TO lv_kind.                "Activate all fields in Free- Selections
+  ENDIF.
+
+** Call Free-Selections Init **
+
+  MOVE p_table TO ls_tables-prim_tab.
+  APPEND ls_tables TO lt_tables.
+
+  CALL FUNCTION 'FREE_SELECTIONS_INIT'
+    EXPORTING
+      kind                     = lv_kind
+      expressions              = fs_dyns-texpr
+    IMPORTING
+      selection_id             = selection_id
+      where_clauses            = fs_dyns-clauses
+      expressions              = fs_dyns-texpr
+      field_ranges             = fs_dyns-trange
+      number_of_active_fields  = fs_num
+    TABLES
+      tables_tab               = lt_tables
+      fields_tab               = lt_fields
+      fields_not_selected      = lt_fields_n
+    EXCEPTIONS
+      fields_incomplete        = 1
+      fields_no_join           = 2
+      field_not_found          = 3
+      no_tables                = 4
+      table_not_found          = 5
+      expression_not_supported = 6
+      incorrect_expression     = 7
+      illegal_kind             = 8
+      area_not_found           = 9
+      inconsistent_area        = 10
+      kind_f_no_fields_left    = 11
+      kind_f_no_fields         = 12
+      too_many_fields          = 13
+      dup_field                = 14
+      field_no_type            = 15
+      field_ill_type           = 16
+      dup_event_field          = 17
+      node_not_in_ldb          = 18
+      area_no_field            = 19
+      OTHERS                   = 20.
+  IF sy-subrc EQ 0.
+** Call Free Selection Dialog Screen **
+    CALL FUNCTION 'FREE_SELECTIONS_DIALOG'
+      EXPORTING
+        selection_id            = selection_id
+        title                   = 'Free Selection for Pricing Conditions'
+        as_window               = ' '
+        alv                     = 'X'
+        tree_visible            = 'X'
+      IMPORTING
+        where_clauses           = fs_dyns-clauses
+        expressions             = fs_dyns-texpr
+        field_ranges            = fs_dyns-trange
+        number_of_active_fields = fs_num
+      TABLES
+        fields_tab              = lt_fields
+        fields_not_selected     = lt_fields_n
+      EXCEPTIONS
+        internal_error          = 1
+        no_action               = 2
+        selid_not_found         = 3
+        illegal_status          = 4
+        OTHERS                  = 5.
+    IF sy-subrc <> 0.
+      MESSAGE 'Invalid Selection' TYPE 'I' DISPLAY LIKE 'E'.
+      STOP.
+    ELSE.
+** Create Dynamic Where Clause
+
+      CLEAR : ls_clause, ls_where.
+      READ TABLE fs_dyns-clauses INTO ls_clause INDEX 1.
+      IF sy-subrc EQ 0.
+        lt_where_add[] = ls_clause-where_tab.
+      ENDIF.
+
+      IF lt_where[] IS NOT INITIAL.
+        IF lt_where_add[] IS NOT INITIAL.
+          CLEAR : ls_where.
+          MOVE 'AND' TO ls_where-line.
+          APPEND ls_where TO lt_where.
+        ENDIF.
+      ENDIF.
+      APPEND LINES OF lt_where_add TO lt_where.
+
+** Select Records From dynamic Pricing condition table using Dynamic Where clause
+      IF lt_where[] IS NOT INITIAL.
+        SELECT * FROM (p_table)
+        INTO CORRESPONDING FIELDS OF TABLE <gt_tab>
+        WHERE (lt_where).
+
+** Update Pricing condition record number in LT_KONH Table
+        IF sy-subrc EQ 0 AND  <gt_tab> IS NOT INITIAL.
+          LOOP AT  <gt_tab> ASSIGNING <gs_row>.
+            ASSIGN COMPONENT key_index OF STRUCTURE <gs_row> TO <gd_fld>.
+            IF sy-subrc EQ 0.
+              CLEAR : ls_konh.
+              MOVE <gd_fld> TO ls_konh-knumh.
+              APPEND ls_konh TO lt_konh.
+            ENDIF.
+          ENDLOOP.
+
+** Extract Pricing Condition Value from KONP
+          IF lt_konh[] IS NOT INITIAL.
+            REFRESH : lt_konp.
+            SELECT knumh kbetr krech loevm_ko FROM konp
+            INTO TABLE lt_konp
+              FOR ALL ENTRIES IN lt_konh
+              WHERE knumh = lt_konh-knumh.
+
+            IF lt_konp[] IS NOT INITIAL.
+              DELETE lt_konp WHERE loevm_ko EQ 'X'.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+      IF <gt_tab> IS NOT INITIAL.
+        LOOP AT <gt_tab> ASSIGNING <gs_row>.
+*          CLEAR .
+          ASSIGN COMPONENT key_index OF STRUCTURE <gs_row> TO <gd_fld>.
+          IF sy-subrc EQ 0.
+            CLEAR : ls_konp.
+            READ TABLE lt_konp INTO ls_konp WITH KEY knumh = <gd_fld>.
+            IF sy-subrc EQ 0.
+              IF ls_konp-krech EQ 'A'.         "Calculation type is % then divide by 10
+                COMPUTE ls_konp-kbetr = ls_konp-kbetr / 10.
+              ENDIF.
+              ASSIGN COMPONENT val_index OF STRUCTURE <gs_row> TO <gd_fld>.
+              MOVE ls_konp-kbetr TO <gd_fld>.
+            ENDIF.
+          ENDIF.
+        ENDLOOP.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+ENDFORM.                    "free_selections
+*&---------------------------------------------------------------------*
+*&      Form  report_display
+*&---------------------------------------------------------------------*
+* For Displaying ALV Grid
+*----------------------------------------------------------------------*
+FORM report_display.
+  CLEAR : gr_table.
+  TRY.
+      CALL METHOD cl_salv_table=>factory
+        EXPORTING
+          list_display = if_salv_c_bool_sap=>false
+        IMPORTING
+          r_salv_table = gr_table
+        CHANGING
+          t_table      = <gt_tab>.
+    CATCH cx_salv_msg .
+  ENDTRY.
+
+  IF gr_table IS NOT INITIAL.
+** Activate standard Functions of ALV **
+    gr_functions = gr_table->get_functions( ).
+    gr_functions->set_all( if_salv_c_bool_sap=>true ).
+** Activate Standard Layout Options **
+    MOVE sy-repid TO gr_layout_key-report.
+    gr_layout = gr_table->get_layout( ).
+    gr_layout->set_key( gr_layout_key ).
+    gr_layout->set_save_restriction( if_salv_c_layout=>restrict_none ).
+** Column Settings **
+    gr_columns = gr_table->get_columns( ).
+    IF gr_columns IS NOT INITIAL.
+      PERFORM column_settings.
+    ENDIF.
+    gr_columns->set_optimize( if_salv_c_bool_sap=>true ).
+** Top of List **
+    PERFORM top_of_page CHANGING gr_content.
+    gr_table->set_top_of_list( gr_content ).
+    CALL METHOD gr_table->display.
+  ENDIF.
+ENDFORM.                    "report_display
+
+*&---------------------------------------------------------------------*
+*&      Form  column_settings
+*&---------------------------------------------------------------------*
+* For Column settings for ALV Grid
+*----------------------------------------------------------------------*
+FORM column_settings.
+  REFRESH : lt_columns.
+  CLEAR : ls_columns.
+  lt_columns = gr_columns->get( ).
+  IF lt_columns[] IS NOT INITIAL.
+    LOOP AT lt_columns INTO ls_columns.
+      TRY.
+          gr_column ?= gr_columns->get_column( columnname = ls_columns-columnname ).
+        CATCH cx_salv_not_found .
+      ENDTRY.
+      IF gr_column IS NOT INITIAL.
+        lv_domname = gr_column->get_ddic_domain( ).
+**      Hide Client and condition number columns in ALV Grid
+        IF lv_domname EQ 'MANDT' OR lv_domname EQ 'KNUMB'.
+          gr_column->set_technical( if_salv_c_bool_sap=>true ).
+        ENDIF.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+
+ENDFORM.                    "column_settings
+
+*&---------------------------------------------------------------------*
+*&      Form  top_of_page
+*&---------------------------------------------------------------------*
+* To setting Top of Page in ALV Grid
+*----------------------------------------------------------------------*
+*      --&gtLR_CONTENT text
+*---------------------------------------------------------------------*
+FORM top_of_page CHANGING lr_content TYPE REF TO cl_salv_form_element.
+  DATA : lr_grid TYPE REF TO cl_salv_form_layout_grid,
+         lr_text TYPE REF TO cl_salv_form_text,
+         lr_label TYPE REF TO cl_salv_form_label,
+         lr_head TYPE string,
+         lr_row  TYPE string.
+  MOVE 'Pricing Conditions Report' TO lr_head.
+  CONCATENATE 'Condition Type : ' p_kschl INTO lr_row SEPARATED BY space.
+  CREATE OBJECT lr_grid.
+
+  lr_grid->create_header_information(
+                        row     = 1
+                        column  = 1
+                        text    = lr_head
+                        tooltip = lr_head ).
+  lr_grid->add_row( ).
+  lr_label = lr_grid->create_label(
+                        row         = 2
+                        column      = 1
+                        text        = lr_row
+                        tooltip     = lr_row ).
+  CONCATENATE 'Table : ' ls_tmc1t-gstru
+              '/ Key Combination : ' ls_tmc1t-gstxt INTO lr_row SEPARATED BY space.
+  lr_grid->add_row( ).
+  lr_label = lr_grid->create_label(
+                        row         = 3
+                        column      = 1
+                        text        = lr_row
+                        tooltip     = lr_row ).
+  lr_content = lr_grid.
+
+ENDFORM.                    "top_of_page

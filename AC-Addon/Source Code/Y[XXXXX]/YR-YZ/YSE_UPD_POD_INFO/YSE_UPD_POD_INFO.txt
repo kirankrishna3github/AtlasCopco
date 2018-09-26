@@ -1,0 +1,423 @@
+*----------------------------------------------------------------------*
+* PROGRAM ID           : YSE_UPD_POD_INFO                              *
+* PROGRAM TITLE        : AM: Update POD info on Service Order          *
+* AUTHOR               : Luc Mertens                                   *
+* DATE                 : 16/06/2008                                    *
+* DEVELOPMENT ID       :                                               *
+*                                                                      *
+* CHANGE REQUEST NUMBER: CD1K941286                                    *
+*                                                                      *
+* Program Description: This program updates POD info on the SO.        *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME                    |CORR.NR   | CHANGE REF.*
+*----------------------------------------------------------------------*
+* mod-001 |28.01.2010|L. Mertens   USG Innotiv |CD1K954122| CR1107     *
+*  - frequency jobexecution changes from once per day into once        *
+*    per hour                                                          *
+*----------------------------------------------------------------------*
+* mod-002 |01.07.2010|J. Smets   USG Innotiv   |CD1K957806| CR1162     *
+*  - Process mode for batch input modifiable                           *
+*----------------------------------------------------------------------*
+* mod-003 |05.07.2010|J. Smets   USG Innotiv   |CD1K957837| CR1162     *
+*  - Options for batch input (for processing after 'COMMIT WORK')      *
+* mod-004 |03.12.2010|Lakshmi R  USG Innotiv   |CD1K961609| CR1758     *
+*  - Check if order is open, then only update the record               *
+************************************************************************
+REPORT yse_upd_pod_info MESSAGE-ID yam_re.
+
+
+************************************************************************
+*       V A R I A B L E S                                              *
+************************************************************************
+DATA: lt_pod_content LIKE yse_pod_content OCCURS 0,
+      ls_pod_content LIKE yse_pod_content,
+      is_pod_content LIKE yse_pod_content.
+
+DATA: BEGIN OF lt_pod_content2 OCCURS 0.
+        INCLUDE STRUCTURE yse_pod_content.
+DATA:   tot_del_qty(4) TYPE n,
+        stat(1)        TYPE c,
+        vindex(3)      TYPE c.
+DATA: END OF lt_pod_content2.
+DATA: ls_pod_content2 LIKE LINE OF lt_pod_content2.
+
+DATA: gv_tot_del_qty(4)    TYPE n,
+      l_count(3),
+      gv_index(3),
+      gv_serv_ord          TYPE aufnr,
+      gv_text(40)          TYPE c,
+      gv_bdmng             LIKE resb-bdmng.
+
+DATA: i_bdcdata LIKE bdcdata OCCURS 0 WITH HEADER LINE,
+      struct_bdcdata TYPE bdcdata.
+
+DATA: gv_mode        TYPE bdcmode   VALUE 'N'.              "mod-002
+
+DATA: gv_options     TYPE ctu_params.                       "mod-003
+
+DATA : BEGIN OF gt_err OCCURS 0.
+        INCLUDE STRUCTURE bdcmsgcoll.
+DATA : END OF gt_err.
+
+DATA : BEGIN OF gt_resb OCCURS 0,
+         aufnr LIKE resb-aufnr,
+         sortf LIKE resb-sortf,
+         bdmng LIKE resb-bdmng,
+       END OF gt_resb.
+
+*Begin of insert MOD-004
+TYPES: BEGIN OF ty_orderstat,
+         aufnr TYPE aufnr,
+         objnr TYPE j_objnr,
+         stat  TYPE j_status,
+         inact TYPE j_inact,
+      END OF ty_orderstat.
+
+DATA: lt_aufnr TYPE STANDARD TABLE OF ty_orderstat,
+      lt_objnr TYPE STANDARD TABLE OF ty_orderstat,
+      lt_orderstat TYPE STANDARD TABLE OF ty_orderstat,
+      is_orderstat TYPE ty_orderstat,
+      is_objnr     TYPE ty_orderstat,
+      lv_servord   TYPE yserv_ord.
+*End of insert MOD-004
+
+************************************************************************
+*       S E L E C T - O P T I O N S / P A R A M E T E R S              *
+************************************************************************
+SELECT-OPTIONS: s_credat FOR sy-datum OBLIGATORY DEFAULT sy-datum.
+PARAMETERS:     p_test AS CHECKBOX DEFAULT 'X'.
+
+
+************************************************************************
+*       S T A R T - O F - S E L E C T I O N    E V E N T               *
+************************************************************************
+START-OF-SELECTION.
+
+* Select entries from custom table YSE_POD_CONTENT
+  SELECT * INTO TABLE lt_pod_content
+* begin of change MOD-001
+*    from YSE_POD_CONTENT where update_date in s_credat.
+    FROM yse_pod_content WHERE update_date IN s_credat
+                           AND processed   NE 'X'.
+* end of change MOD-001
+
+  IF lt_pod_content[] IS INITIAL.
+    WRITE: text-003.
+    EXIT.
+  ENDIF.
+
+  SORT lt_pod_content BY connot serv_ord component.
+
+*Begin of insert MOD-004
+
+*Prepare Service order numbers
+  REFRESH: lt_aufnr.
+  CLEAR  : is_pod_content,
+           is_orderstat.
+  LOOP AT lt_pod_content INTO is_pod_content.
+    MOVE is_pod_content-serv_ord TO is_orderstat-aufnr.
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+      EXPORTING
+        input  = is_orderstat-aufnr
+      IMPORTING
+        output = is_orderstat-aufnr.
+    APPEND is_orderstat TO lt_aufnr.
+    CLEAR: is_pod_content,
+           is_orderstat.
+  ENDLOOP.
+
+  REFRESH: lt_objnr,
+           lt_orderstat.
+*Get Object numbers of service orders
+  SELECT aufnr
+         objnr
+  FROM   aufk
+  INTO   CORRESPONDING FIELDS OF TABLE lt_objnr
+  FOR    ALL ENTRIES IN lt_aufnr
+  WHERE  aufnr EQ lt_aufnr-aufnr.
+  IF sy-subrc EQ 0.
+*Select Status of service orders using JEST and TJ02T tables
+    SELECT objnr
+           stat
+           inact
+    FROM   jest
+    INTO   CORRESPONDING FIELDS OF TABLE lt_orderstat
+    FOR    ALL ENTRIES IN lt_objnr
+    WHERE  objnr EQ lt_objnr-objnr
+    AND    ( stat EQ 'I0046' OR stat EQ 'I0045' OR stat EQ 'I0076' )
+    AND    inact EQ ' '.
+  ENDIF.
+
+  CLEAR: is_orderstat,
+         is_objnr.
+  LOOP AT lt_orderstat INTO is_orderstat.
+*Update Service order number in the itab with corresponding object number
+    READ TABLE lt_objnr INTO is_objnr WITH KEY objnr = is_orderstat-objnr.
+    IF sy-subrc EQ 0.
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+        EXPORTING
+          input  = is_objnr-aufnr
+        IMPORTING
+          output = lv_servord.
+      DELETE lt_pod_content WHERE serv_ord = lv_servord.
+    ENDIF.
+    CLEAR: is_orderstat,
+           is_objnr.
+  ENDLOOP.
+
+  IF lt_pod_content[] IS INITIAL.
+    WRITE: text-004.
+    EXIT.
+  ENDIF.
+
+*End of insert MOD-004
+
+* Calculation of the cumulated delivered quantities and set status
+  LOOP AT lt_pod_content INTO is_pod_content.
+    ls_pod_content = is_pod_content.
+
+    AT NEW component.
+      CLEAR gv_tot_del_qty.
+    ENDAT.
+
+    gv_tot_del_qty = gv_tot_del_qty +
+                                ls_pod_content-del_qty.
+
+    AT END OF component.
+      MOVE-CORRESPONDING ls_pod_content TO lt_pod_content2.
+      MOVE gv_tot_del_qty TO lt_pod_content2-tot_del_qty.
+
+*.... Get required qty and position of component in table RESB
+      PERFORM read_resb CHANGING gv_bdmng gv_index.
+      IF gv_bdmng IS INITIAL OR
+         gv_index IS INITIAL.
+*...... Error !!! Component not found
+        lt_pod_content2-stat = 'E'.
+        APPEND lt_pod_content2.
+        CLEAR lt_pod_content2.
+        CONTINUE.
+      ENDIF.
+
+      MOVE gv_index TO lt_pod_content2-vindex.
+      IF gv_tot_del_qty < gv_bdmng.
+        lt_pod_content2-stat = 'P'.
+      ELSE.
+        lt_pod_content2-stat = 'F'.
+      ENDIF.
+      APPEND lt_pod_content2.
+      CLEAR lt_pod_content2.
+    ENDAT.
+  ENDLOOP.
+
+  CHECK NOT lt_pod_content2[] IS INITIAL.
+
+* Test or update ?
+  IF p_test = 'X'.
+    WRITE: / text-002.
+  ELSE.
+*** mod-003 * begin ***
+*   Fill options for batch input processing
+    CLEAR gv_options.
+    gv_options-dismode  = gv_mode.
+    gv_options-updmode  = 'S'.
+    gv_options-racommit = 'X'.
+*** mod-003 * end ***
+*.. Update Service Order
+    WRITE: / text-001.
+    LOOP AT lt_pod_content2 INTO ls_pod_content2
+         WHERE stat NE 'E'.
+
+      REFRESH i_bdcdata.
+      PERFORM update_so.
+      CALL TRANSACTION 'IW32' USING i_bdcdata
+*                              mode 'N'                     "mod-002
+*                              MODE gv_mode                  "mod-002/3
+*                              UPDATE 'S'                   "mod-003
+                              OPTIONS FROM gv_options       "mod-003
+                              MESSAGES INTO gt_err.
+* begin of insert MOD-001
+      IF sy-subrc = 0.
+        UPDATE yse_pod_content SET processed = 'X'
+        WHERE connot    = ls_pod_content2-connot
+          AND serv_ord  = ls_pod_content2-serv_ord
+          AND component = ls_pod_content2-component
+          AND shipment  = ls_pod_content2-shipment
+          AND casenr    = ls_pod_content2-casenr.
+      ENDIF.
+* end of insert MOD-001
+    ENDLOOP.
+*
+    LOOP AT gt_err WHERE msgtyp = 'E' OR
+                         msgtyp = 'A'.
+      ULINE.
+      SKIP.
+      WRITE: / gt_err-msgtyp,
+               gt_err-msgid,
+               gt_err-msgnr,
+               gt_err-msgv1.
+    ENDLOOP.
+  ENDIF.
+
+* write entries (to be) updated
+  ULINE.
+  SKIP.
+  LOOP AT lt_pod_content2 INTO ls_pod_content2.
+    WRITE: / ls_pod_content2-serv_ord,
+             ls_pod_content2-component,
+             ls_pod_content2-del_date,
+             ls_pod_content2-signname,
+             ls_pod_content2-tot_del_qty,
+             ls_pod_content2-stat.
+  ENDLOOP.
+
+
+************************************************************************
+*       S U B R O U T I N E S                                          *
+************************************************************************
+FORM read_resb CHANGING r_bdmng r_index.
+
+  CLEAR: r_bdmng, r_index.
+
+* CALL THE CONVERSION FM to get leading ZERO'S
+  CALL FUNCTION 'CONVERSION_EXIT_AUFNR_INPUT'
+    EXPORTING
+      input  = ls_pod_content-serv_ord
+    IMPORTING
+      output = gv_serv_ord.
+
+  SELECT aufnr sortf bdmng
+    INTO CORRESPONDING FIELDS OF TABLE gt_resb
+    FROM resb WHERE aufnr EQ gv_serv_ord.
+*               and xloek ne 'X'.
+
+  IF gt_resb[] IS INITIAL.
+    RETURN.
+  ENDIF.
+
+  SORT gt_resb BY aufnr sortf.
+
+  READ TABLE gt_resb WITH KEY aufnr = gv_serv_ord
+                              sortf = ls_pod_content-component
+          BINARY SEARCH.
+
+  r_bdmng = gt_resb-bdmng.
+  r_index = sy-tabix.
+
+ENDFORM.                    "read_resb
+
+*----------------------------------------------------------------------*
+FORM update_so.
+
+* Initial screen
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                 USING    'SAPLCOIH'  '0101'  'X' ' ' ' '
+                 CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+     USING    ''  '' ' ' 'CAUFVD-AUFNR' ls_pod_content2-serv_ord
+     CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+     USING    ''  '' ' ' 'BDC_OKCODE'  '/00'
+     CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+*
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+               USING    'SAPLCOIH'  '3000'  'X' ''  ''
+               CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+               USING    ''  ''  '' 'BDC_OKCODE'  '=MUEB'
+               CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+* SELECT ALL COMPONENTS
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    'SAPLCOIH'  '3000'  'X' ''  ''
+       CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+      USING    ''  ''  '' 'BDC_OKCODE' '=AMAK'
+      CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+* GO TO GENERAL DATA SCREEN
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    'SAPLCOIH'  '3000'  'X' ''  ''
+       CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+      USING    ''  ''  '' 'BDC_OKCODE' '=MKAG'
+      CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+* HIT THE NEXT COMPONENT BUTTON AS MANY TIMES AS NECESSARY TO FIND
+* THE APPROPRIATE COMPONENT
+  IF ls_pod_content2-vindex > 1.
+    l_count = ls_pod_content2-vindex - 1.
+    DO l_count TIMES.
+      PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    'SAPLCOMD'  '3000'  'X' ''  ''
+           CHANGING struct_bdcdata.
+      APPEND struct_bdcdata  TO i_bdcdata.
+      CLEAR  struct_bdcdata.
+
+      PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  '' 'BDC_OKCODE' '=MD+'
+          CHANGING struct_bdcdata.
+      APPEND struct_bdcdata  TO i_bdcdata.
+      CLEAR  struct_bdcdata.
+    ENDDO.
+  ENDIF.
+
+* Update the BOM item text (line1)
+  CONCATENATE ls_pod_content2-del_date '-' ls_pod_content2-signname '-'
+              ls_pod_content2-tot_del_qty '-' ls_pod_content2-stat
+         INTO gv_text RESPECTING BLANKS.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    'SAPLCOMD'  '3000'  'X' ''  ''
+       CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+     USING    ''  ''  '' 'RESBD-POTX1' gv_text
+     CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+      USING    ''  ''  '' 'BDC_OKCODE' '=BU'
+      CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+ENDFORM.                    "update_so
+
+*Text symbol text£º
+*001:Updated
+*002:Test mode
+*003:No entries selected
+
+*004:No entries with Service Order with status OPEN
+*Selection text£º
+*P_TEST:        Test mode
+*S_CREDAT:        Creation date

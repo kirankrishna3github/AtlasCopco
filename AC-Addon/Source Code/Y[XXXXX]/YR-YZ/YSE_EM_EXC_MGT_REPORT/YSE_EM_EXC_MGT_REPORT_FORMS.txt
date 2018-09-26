@@ -1,0 +1,369 @@
+*----------------------------------------------------------------------*
+***INCLUDE YSE_EM_EXC_MGT_REPORT_FORMS .
+*----------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_AUTHORIZATION
+*&---------------------------------------------------------------------*
+FORM CHECK_AUTHORIZATION.
+
+
+
+ENDFORM.                    " CHECK_AUTHORIZATION
+
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_DATA
+*&---------------------------------------------------------------------*
+FORM SELECT_DATA.
+
+* Get mapping VKORG (SOrg) to EKORG (POrg)
+  SELECT      *
+         INTO TABLE IT_PO_SORG_PORG
+         FROM YSE_PO_SORG_PORG
+        WHERE VKORG IN SO_VKORG.
+
+* Get entries from log table which correspond to selection criteria
+  SELECT      *
+         INTO TABLE IT_EM_LOG
+         FROM YSE_EM_LOG
+        WHERE VKORG IN SO_VKORG
+          AND WERKS IN SO_WERKS.
+
+* Don't proceed collecting extra data if no result
+  CHECK SY-SUBRC EQ 0.
+
+* Build range with material numbers
+  SORT IT_EM_LOG BY MATNR.
+  GR_MATNR-SIGN   = 'I'.
+  GR_MATNR-OPTION = 'EQ'.
+  LOOP AT IT_EM_LOG.
+    IF GR_MATNR-LOW NE IT_EM_LOG-MATNR.
+      GR_MATNR-LOW = IT_EM_LOG-MATNR.
+      APPEND GR_MATNR.
+    ENDIF.
+  ENDLOOP.
+
+* Get standard cost from MBEW
+* begin of insert air21099 03.12.09 CR1151
+* SELECT      MATNR BWKEY BWTAR STPRS
+  SELECT      MATNR BWKEY BWTAR STPRS verpr
+* end of insert air21099 03.12.09 CR1151
+         INTO TABLE IT_MBEW
+         FROM MBEW
+        WHERE MATNR IN GR_MATNR
+          AND BWKEY IN SO_WERKS.
+
+* Get details from MARA
+  SELECT      MATNR MATKL PRDHA
+         INTO TABLE IT_MARA
+         FROM MARA
+        WHERE MATNR IN GR_MATNR.
+
+* Get details from MARC
+  SELECT      MATNR WERKS LGRAD MAXLZ MMSTA MMSTD PLIFZ SERNP
+         INTO TABLE IT_MARC
+         FROM MARC
+        WHERE MATNR IN GR_MATNR
+          AND WERKS IN SO_WERKS.
+
+* Get details from MARD
+  SELECT      MATNR WERKS LGORT LABST LGPBE
+         INTO TABLE IT_MARD
+         FROM MARD
+        WHERE MATNR IN GR_MATNR
+          AND WERKS IN SO_WERKS
+          AND LGORT EQ '1000'.
+
+ENDFORM.                    " SELECT_DATA
+
+*&---------------------------------------------------------------------*
+*&      Form  PROCESS_DATA
+*&---------------------------------------------------------------------*
+FORM PROCESS_DATA .
+
+  DATA:
+    LV_TDNAME LIKE THEAD-TDNAME,
+    IT_LINES  LIKE TLINE         OCCURS 0 WITH HEADER LINE,
+    V_PERIOD_BEGIN LIKE YSE_EM_SOHIST-PERIOD,
+    V_PERIOD_END   LIKE YSE_EM_SOHIST-PERIOD.
+
+  DATA: LV_SOHIST_SUM TYPE SBMENGE,
+        LV_SOHISTMIG_SUM TYPE SBMENGE.
+
+* begin of insert air21099 03.12.09 CR1151
+  data: lv_bukrs  type bukrs,
+        lv_bukrs2 type bukrs.
+* end of insert air21099 03.12.09 CR1151
+
+* Sort tables
+  SORT:
+    IT_EM_LOG     BY MATNR VKORG WERKS,
+    IT_MARA       BY MATNR,
+    IT_MBEW       BY MATNR BWKEY,
+    IT_MARC       BY MATNR WERKS,
+    IT_MARD       BY MATNR WERKS.
+
+
+
+*Period logic for selections
+  V_PERIOD_BEGIN = SY-DATUM.
+  V_PERIOD_BEGIN(4) = V_PERIOD_BEGIN(4) - 1.
+
+  V_PERIOD_END = SY-DATUM.
+  IF V_PERIOD_END+4(2) EQ '01'.
+    V_PERIOD_END(4)   = V_PERIOD_END(4) - 1.
+    V_PERIOD_END+4(2) = '12'.
+  ELSE.
+    V_PERIOD_END+4(2) = V_PERIOD_END+4(2) - 1.
+  ENDIF.
+
+
+
+
+
+* Start processing the log lines
+  LOOP AT IT_EM_LOG.
+
+*   Initialize out structure
+    CLEAR IT_OUT.
+
+*   Move corresponding fields to the out table
+    MOVE-CORRESPONDING IT_EM_LOG TO IT_OUT.
+
+*   Get MARA data
+    IF IT_MARA-MATNR EQ IT_EM_LOG-MATNR.
+      CLEAR SY-SUBRC.
+    ELSE.
+      READ TABLE IT_MARA WITH KEY MATNR = IT_EM_LOG-MATNR BINARY SEARCH.
+    ENDIF.
+    IF SY-SUBRC IS INITIAL.
+      IT_OUT-MATKL = IT_MARA-MATKL.
+      IT_OUT-PGC   = IT_MARA-PRDHA+4(4).
+    ENDIF.
+
+*   Get MARC data
+    IF       IT_MARC-MATNR EQ IT_EM_LOG-MATNR
+         AND IT_MARC-WERKS EQ IT_EM_LOG-WERKS.
+      CLEAR SY-SUBRC.
+    ELSE.
+      READ TABLE IT_MARC
+              WITH KEY MATNR = IT_EM_LOG-MATNR
+                       WERKS = IT_EM_LOG-WERKS
+              BINARY SEARCH.
+    ENDIF.
+    IF SY-SUBRC IS INITIAL.
+      IT_OUT-LGRAD = IT_MARC-LGRAD.
+      IT_OUT-MAXLZ = IT_MARC-MAXLZ.
+      IT_OUT-MMSTA = IT_MARC-MMSTA.
+      IT_OUT-MMSTD = IT_MARC-MMSTD.
+      IT_OUT-PLIFZ = IT_MARC-PLIFZ.
+      IT_OUT-SERNP = IT_MARC-SERNP.
+    ENDIF.
+
+*   Get MBEW data (standard cost)
+    IF       IT_MBEW-MATNR EQ IT_EM_LOG-MATNR
+         AND IT_MBEW-BWKEY EQ IT_EM_LOG-WERKS.
+      CLEAR SY-SUBRC.
+    ELSE.
+      READ TABLE IT_MBEW
+              WITH KEY MATNR = IT_EM_LOG-MATNR
+                       BWKEY = IT_EM_LOG-WERKS
+              BINARY SEARCH.
+    ENDIF.
+    IF SY-SUBRC IS INITIAL.
+      IT_OUT-STPRS = IT_MBEW-STPRS.
+    ENDIF.
+
+* begin of insert air21099 03.12.09 CR1151
+* Get movering average price for companies activated for actual costing
+    clear: lv_bukrs,
+           lv_bukrs2.
+
+    select single bukrs into lv_bukrs
+      from t001k where bwkey = IT_EM_LOG-WERKS.
+
+    if sy-subrc = 0.
+      select single bukrs into lv_bukrs2
+        from yse_cc_act_cost where bukrs = lv_bukrs.
+
+      if sy-subrc = 0.
+        READ TABLE IT_MBEW
+            WITH KEY matnr = IT_EM_LOG-MATNR
+                     bwkey = IT_EM_LOG-WERKS
+                     bwtar = space
+            BINARY SEARCH.
+
+        IF sy-subrc EQ 0.
+          IT_OUT-STPRS = it_mbew-verpr.
+        ENDIF.
+      endif.
+    endif.
+* end of insert air21099 03.12.09 CR1151
+
+*   Get MARD data (DB selection was done with StLoc = 1000 hardcoded)
+    IF       IT_MARD-MATNR EQ IT_EM_LOG-MATNR
+         AND IT_MARD-WERKS EQ IT_EM_LOG-WERKS.
+      CLEAR SY-SUBRC.
+    ELSE.
+      READ TABLE IT_MARD
+              WITH KEY MATNR = IT_EM_LOG-MATNR
+                       WERKS = IT_EM_LOG-WERKS
+              BINARY SEARCH.
+    ENDIF.
+    IF SY-SUBRC IS INITIAL.
+      IT_OUT-LABST = IT_MARD-LABST.
+      IT_OUT-LGPBE = IT_MARD-LGPBE.
+    ENDIF.
+
+*   Get default vendor for material/plant/POrg, and depending on that, the EINE data
+    IF       WA_VENDORINFO-MATNR EQ IT_EM_LOG-MATNR
+         AND WA_VENDORINFO-VKORG EQ IT_EM_LOG-VKORG
+         AND WA_VENDORINFO-WERKS EQ IT_EM_LOG-WERKS.
+    ELSE.
+*     If any of the key fields for finding vendor and dependant data has changed
+      CLEAR WA_VENDORINFO.
+      WA_VENDORINFO-MATNR = IT_EM_LOG-MATNR.
+      WA_VENDORINFO-VKORG = IT_EM_LOG-VKORG.
+      WA_VENDORINFO-WERKS = IT_EM_LOG-WERKS.
+*     Map VKORG to EKORG
+      READ TABLE IT_PO_SORG_PORG WITH KEY VKORG = IT_EM_LOG-VKORG.
+      IF SY-SUBRC EQ 0.
+        WA_VENDORINFO-EKORG = IT_PO_SORG_PORG-EKORG.
+*       Get fixed vendor
+        SELECT        SINGLE LIFNR
+                 INTO WA_VENDORINFO-LIFNR
+                 FROM EORD
+                WHERE MATNR EQ WA_VENDORINFO-MATNR
+                  AND WERKS EQ WA_VENDORINFO-WERKS
+                  AND FLIFN NE SPACE
+                  AND EKORG EQ WA_VENDORINFO-EKORG.
+*       If vendor found
+        IF SY-SUBRC EQ 0 AND NOT WA_VENDORINFO-LIFNR IS INITIAL.
+*         Get Purch Inforecord for material/vendor
+          SELECT       SINGLE INFNR
+                  INTO WA_VENDORINFO-INFNR
+                  FROM EINA
+                 WHERE MATNR EQ WA_VENDORINFO-MATNR
+                   AND LIFNR EQ WA_VENDORINFO-LIFNR
+                   AND LOEKZ EQ SPACE.
+*         If inforecord found
+          IF SY-SUBRC EQ 0.
+*           Get lead time and CCC flag
+            SELECT       SINGLE APLFZ EVERS
+                    FROM EINE
+                    INTO CORRESPONDING FIELDS OF WA_VENDORINFO
+                   WHERE INFNR EQ WA_VENDORINFO-INFNR
+                     AND EKORG EQ WA_VENDORINFO-EKORG
+                     AND WERKS EQ WA_VENDORINFO-WERKS
+                     AND LOEKZ EQ SPACE.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+    IT_OUT-LIFNR = WA_VENDORINFO-LIFNR.
+    IT_OUT-APLFZ = WA_VENDORINFO-APLFZ.
+    IT_OUT-EVERS = WA_VENDORINFO-EVERS.
+
+*   Get memo (text from MRP 4 view on material master)
+    READ TABLE IT_MEMO WITH KEY MATNR = IT_OUT-MATNR
+                                WERKS = IT_OUT-WERKS.
+    IF SY-SUBRC EQ 0.
+      IT_OUT-TDLINE = IT_MEMO-TDLINE.
+    ELSE.
+*     Get material text
+      LV_TDNAME(18)   = IT_OUT-MATNR.
+      LV_TDNAME+19(4) = IT_OUT-WERKS.
+      CLEAR: IT_LINES, IT_LINES[].
+      CALL FUNCTION 'READ_TEXT'
+        EXPORTING
+          ID                      = 'LTXT'
+          LANGUAGE                = 'E'
+          NAME                    = LV_TDNAME
+          OBJECT                  = 'MDTXT'
+        TABLES
+          LINES                   = IT_LINES
+        EXCEPTIONS
+          ID                      = 1
+          LANGUAGE                = 2
+          NAME                    = 3
+          NOT_FOUND               = 4
+          OBJECT                  = 5
+          REFERENCE_CHECK         = 6
+          WRONG_ACCESS_TO_ARCHIVE = 7
+          OTHERS                  = 8.
+
+      READ TABLE IT_LINES INDEX 1.
+      IF SY-SUBRC EQ 0.
+        IT_OUT-TDLINE = IT_LINES-TDLINE.
+*       Add the text to the table of memo's for quicker retrieval later
+        CLEAR IT_MEMO.
+        IT_MEMO-MATNR  = IT_OUT-MATNR.
+        IT_MEMO-WERKS  = IT_OUT-WERKS.
+        IT_MEMO-TDLINE = IT_OUT-TDLINE.
+        APPEND IT_MEMO.
+      ENDIF.
+    ENDIF.
+
+*ZMENG
+    CLEAR:LV_SOHIST_SUM,
+          LV_SOHISTMIG_SUM.
+
+    SELECT SUM( ZMENG ) FROM YSE_EM_SOHIST INTO LV_SOHIST_SUM
+                                  WHERE PERIOD GE V_PERIOD_BEGIN
+                                    AND PERIOD LE V_PERIOD_END
+                                    AND MATNR  EQ IT_OUT-MATNR
+                                    AND VKORG  EQ IT_OUT-VKORG
+*                                  AND VTWEG  EQ IT_OUT-VTWEG
+                                    AND WERKS  EQ IT_OUT-WERKS.
+
+*-- select also all lines from yse_em_sohistmig (migration values)
+    SELECT SUM( ZMENG ) FROM YSE_EM_SOHISTMIG INTO LV_SOHISTMIG_SUM
+                                 WHERE PERIOD GE V_PERIOD_BEGIN
+                                     AND PERIOD LE V_PERIOD_END
+                                     AND MATNR  EQ IT_OUT-MATNR
+                                     AND VKORG  EQ IT_OUT-VKORG
+*                                     AND VTWEG  EQ IT_OUT-VTWEG
+                                     AND WERKS  EQ IT_OUT-WERKS.
+
+    IT_OUT-12_MNTH_HIS = LV_SOHIST_SUM + LV_SOHISTMIG_SUM.
+
+
+*   Append line to the out table
+    APPEND IT_OUT.
+
+  ENDLOOP.
+
+ENDFORM.                    " PROCESS_DATA
+
+*&---------------------------------------------------------------------*
+*&      Form  VARIANT_INPUTHELP
+*&---------------------------------------------------------------------*
+FORM VARIANT_INPUTHELP.
+
+  CLEAR:
+    GV_EXIT,
+    GS_VARIANT_NEW.
+
+  GS_VARIANT_OLD-VARIANT = P_VAR.
+  GS_VARIANT_OLD-REPORT  = SY-REPID.
+
+  CALL FUNCTION 'REUSE_ALV_VARIANT_F4'
+    EXPORTING
+      IS_VARIANT    = GS_VARIANT_OLD
+      I_SAVE        = 'U'
+    IMPORTING
+      E_EXIT        = GV_EXIT
+      ES_VARIANT    = GS_VARIANT_NEW
+    EXCEPTIONS
+      NOT_FOUND     = 1
+      PROGRAM_ERROR = 2
+      OTHERS        = 3.
+  IF SY-SUBRC <> 0.
+*   MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*           WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+  ENDIF.
+
+  IF SY-SUBRC IS INITIAL AND GV_EXIT IS INITIAL.
+    P_VAR         = GS_VARIANT_NEW-VARIANT.
+  ENDIF.
+
+ENDFORM.                    " VARIANT_INPUTHELP

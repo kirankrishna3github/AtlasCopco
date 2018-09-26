@@ -1,0 +1,334 @@
+*&---------------------------------------------------------------------*
+*&  Include           YSE_SL_EM_WHS_GNL_FRM                            *
+*&---------------------------------------------------------------------*
+
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_PLANT_WHTYP
+*&---------------------------------------------------------------------*
+FORM CHECK_PLANT_WHTYP .
+
+* Initialize the internal range of plants
+  CLEAR:
+    R_WERKS, R_WERKS[].
+  R_WERKS-SIGN   = 'I'.
+  R_WERKS-OPTION = 'EQ'.
+
+* Check that at least plant or whtype was selected
+  IF P_WERKS IS INITIAL AND P_WHTYPE IS INITIAL.
+    MESSAGE E040.
+  ENDIF.
+
+* If plant is provided
+  IF NOT P_WERKS IS INITIAL.
+*   Get the warehouse type for the given plant
+    SELECT SINGLE *
+             FROM YSE_EM_PLANT
+             INTO WA_EM_PLANT
+            WHERE WERKS EQ P_WERKS.
+*   If not found or provided whtype doesn't match, raise an error
+    IF SY-SUBRC NE 0
+         OR ( NOT P_WHTYPE IS INITIAL AND P_WHTYPE NE WA_EM_PLANT-WHTYPE ).
+      MESSAGE E041 WITH P_WERKS P_WHTYPE.
+*   If found and either no whtype was provided, or it matches, create line in R_WERKS
+    ELSE.
+      R_WERKS-LOW    = P_WERKS.
+      APPEND R_WERKS.
+*     Also set plant and description
+      SV_WERKS = P_WERKS.
+      SELECT SINGLE NAME1
+               INTO SV_NAME1
+               FROM T001W
+              WHERE WERKS EQ P_WERKS.
+*     And whstype
+      SV_WHTYPE = WA_EM_PLANT-WHTYPE.
+    ENDIF.
+
+* If only whtype is provided
+  ELSE.
+*   Select one by one the plants that have the correct whtype
+    SELECT      *
+           FROM YSE_EM_PLANT
+           INTO WA_EM_PLANT
+          WHERE WHTYPE EQ P_WHTYPE.
+*     Add line in R_WERKS
+      R_WERKS-LOW = WA_EM_PLANT-WERKS.
+      APPEND R_WERKS.
+    ENDSELECT.
+
+*   Set plant and description and whtype
+    SV_WERKS = '*'.
+    SV_NAME1 = SPACE.
+    SV_WHTYPE = P_WHTYPE.
+  ENDIF.
+
+* Check that at least one plant is defined in R_WERKS
+  IF R_WERKS[] IS INITIAL.
+    MESSAGE E042.
+  ENDIF.
+
+ENDFORM.                    " CHECK_PLANT_WHTYP
+
+*&---------------------------------------------------------------------*
+*&      FORM  CHECK_AUTHORIZATION
+*&---------------------------------------------------------------------*
+FORM CHECK_AUTHORIZATION .
+
+  LOOP AT R_WERKS.
+    AUTHORITY-CHECK OBJECT 'M_MATE_WRK'
+             ID 'ACTVT' DUMMY
+             ID 'WERKS' FIELD R_WERKS-LOW.
+
+    IF SY-SUBRC = 4.
+*     No authorisation to display data
+      MESSAGE ID 'YSE_GENERAL' TYPE 'E' NUMBER '008' WITH R_WERKS-LOW.
+    ELSEIF SY-SUBRC <> 0.
+*     Error checking authorization
+      MESSAGE ID 'YSE_GENERAL' TYPE 'E' NUMBER '004'.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    " CHECK_AUTHORIZATION
+
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_DATA
+*&---------------------------------------------------------------------*
+FORM SELECT_DATA .
+
+* Get selected material group descriptions
+  SELECT      MATKL WGBEZ
+         FROM T023T
+         INTO TABLE IT_T023T
+        WHERE MATKL IN S_MATKL
+          AND SPRAS EQ 'EN'.
+
+* Get plant views of materials maintained in the plant(s) from the selection screen
+  SELECT      MARC~MATNR WERKS DISMM UMLMC TRAME EISBE BSTFE MINBE
+         FROM MARC
+         JOIN MARA
+           ON MARC~MATNR EQ MARA~MATNR
+         INTO TABLE IT_MARC
+        WHERE WERKS IN R_WERKS
+          AND MATKL IN S_MATKL.
+  SORT IT_MARC BY MATNR WERKS.
+
+** Get the number of materials maintained in the plant(s) from the selscr which have
+** MRP type Z5
+*  SELECT COUNT( * )
+*         INTO SV_ISTOC
+*         FROM MARC
+*        WHERE WERKS IN R_WERKS
+*          AND DISMM EQ 'Z5'.
+
+* Get storage location information of mat's maintained in the plants/stloc from sel
+  SELECT      MATNR WERKS LGORT LABST INSME SPEME RETME UMLME
+         FROM MARD
+         INTO TABLE IT_MARD
+        WHERE WERKS IN R_WERKS
+          AND LGORT IN S_LGORT. "#EC CI_NOFIRST
+  SORT IT_MARD BY MATNR WERKS LGORT.
+
+* Get special stock with customer
+  SELECT      MATNR WERKS CHARG SOBKZ KUNNR KULAB
+         FROM MSKU
+         INTO TABLE IT_MSKU
+        WHERE WERKS IN R_WERKS
+          AND SOBKZ EQ 'W'.
+  SORT IT_MSKU BY MATNR WERKS.
+
+* Get standard prices
+  SELECT      MATNR BWKEY BWTAR STPRS
+         FROM MBEW
+         INTO TABLE IT_MBEW
+        WHERE BWKEY IN R_WERKS.
+  SORT IT_MBEW BY MATNR BWKEY.
+
+* Select data for open PO quantity
+  SELECT      EBELN EBELP MENGE MATNR NETPR PEINH ELIKZ EREKZ
+         INTO TABLE IT_EKPO
+         FROM EKPO
+          FOR ALL ENTRIES IN IT_MARC
+        WHERE MATNR EQ IT_MARC-MATNR
+          AND WERKS IN R_WERKS
+*         AND LGORT EQ '1000'
+          AND LOEKZ NE 'L'.
+  SELECT      EBELN EBELP ZEKKN VGABE GJAHR BELNR BUZEI MENGE SHKZG
+         FROM EKBE
+         INTO TABLE IT_EKBE
+          FOR ALL ENTRIES IN IT_EKPO
+        WHERE EBELN EQ IT_EKPO-EBELN
+          AND VGABE EQ '1'.
+
+ENDFORM.                    " SELECT_DATA
+
+*&---------------------------------------------------------------------*
+*&      Form  PROCESS_DATA
+*&---------------------------------------------------------------------*
+FORM PROCESS_DATA .
+
+  DATA:
+    LV_TOTST     TYPE ZTOTAL_STOCK,
+    LV_STLOC1000 TYPE C,
+    LV_GRCLSD    TYPE C,
+    LV_REC_QTY   LIKE IT_EKBE-MENGE,
+    LV_TEMP      LIKE IT_MARC-EISBE,
+    LV_TEMP2     LIKE IT_MARC-EISBE.
+
+* Loop over plant views
+  LOOP AT IT_MARC.
+
+    CLEAR:
+*     Clear StLoc1000 flag (which means plant stock should be added)
+      LV_STLOC1000,
+*     Clear STOCK accumulater field for the current material/plant
+      LV_TOTST.
+
+*   Add storage location stock, aggregated to material/plant level
+    LOOP AT IT_MARD WHERE MATNR EQ IT_MARC-MATNR AND WERKS EQ IT_MARC-WERKS.
+      LV_TOTST =   LV_TOTST
+                       + IT_MARD-LABST + IT_MARD-INSME + IT_MARD-SPEME
+                       + IT_MARD-RETME + IT_MARD-UMLME.
+*     If storage location = 1000, then also add stock from the plant
+      IF IT_MARD-LGORT EQ '1000'.
+        LV_STLOC1000 = 'X'.
+      ENDIF.
+    ENDLOOP.
+
+*   Add plant stock if there was a storage location view for this material on stloc 1000
+    IF LV_STLOC1000 NE SPACE.
+      LV_TOTST = LV_TOTST + IT_MARC-UMLMC + IT_MARC-TRAME.
+    ENDIF.
+
+*   Add special stock, aggregated to material/plant level
+    LOOP AT IT_MSKU WHERE MATNR EQ IT_MARC-MATNR AND WERKS EQ IT_MARC-WERKS.
+      LV_TOTST = LV_TOTST + IT_MSKU-KULAB.
+    ENDLOOP.
+
+*   Find standard cost of item
+    CLEAR IT_MBEW.
+    READ TABLE IT_MBEW WITH KEY MATNR = IT_MARC-MATNR
+                                BWKEY = IT_MARC-WERKS
+                       BINARY SEARCH.
+
+*   Outputfield 1: No of items with stock
+*   If stock > 0, add 1 to the counter of "Number of items with total stock > 0"
+    IF LV_TOTST > 0.
+      SV_IWSTK = SV_IWSTK + 1.
+    ENDIF.
+
+*   Depending on MRP type
+    CASE IT_MARC-DISMM.
+*     When stocked
+      WHEN 'Z5'.
+*       Outputfield 2: No of items "stocked"
+        SV_ISTOC = SV_ISTOC + 1.
+*       Outputfield 4: Stock value: stocked
+        SV_Z5VAL = SV_Z5VAL + ( IT_MBEW-STPRS * LV_TOTST ).
+*       Outputfield 8
+*       Calculate Safety Stock * Lotsize
+        LV_TEMP = IT_MARC-EISBE + IT_MARC-BSTFE.
+*       If Safety stock * Lotsize > Reorder point
+        IF LV_TEMP GT IT_MARC-MINBE.
+          SV_MSVAL = SV_MSVAL + ( IT_MBEW-STPRS * LV_TEMP ).
+        ELSE.
+          SV_MSVAL = SV_MSVAL + ( IT_MBEW-STPRS * IT_MARC-MINBE ).
+        ENDIF.
+*       Outputfield 9
+        SV_ASVAL = SV_ASVAL + ( IT_MBEW-STPRS * ( IT_MARC-EISBE + ( IT_MARC-BSTFE / 2 ) ) ).
+*       Output field 9
+*       Calculate Recorder point - Safety stock
+*        LV_TEMP2 = IT_MARC-MINBE - IT_MARC-EISBE.
+*       If Lotsize > Recorder point - Safety stock
+*        IF  IT_MARC-BSTFE GT LV_TEMP2.
+*          SV_ASVAL = SV_ASVAL + ( IT_MBEW-STPRS * ( IT_MARC-EISBE + ( IT_MARC-BSTFE / 2 ) ) ).
+*        ELSE.
+*          SV_ASVAL = SV_ASVAL + ( IT_MBEW-STPRS * ( IT_MARC-EISBE + ( LV_TEMP2 / 2 ) ) ).
+*        ENDIF.
+*     When not stocked
+      WHEN 'Z6' OR 'Z7'.
+*       Outputfield 5: Stock value: not-stocked
+        SV_Z6VAL = SV_Z6VAL + ( IT_MBEW-STPRS * LV_TOTST ).
+*     When ...
+      WHEN 'ND'.
+*       Outputfield 6: Stock value: other
+        SV_OTVAL = SV_OTVAL + ( IT_MBEW-STPRS * LV_TOTST ).
+    ENDCASE.
+
+  ENDLOOP.
+
+* Output field 3: total stock value
+  SV_TSVAL = SV_Z5VAL + SV_Z6VAL + SV_OTVAL.
+
+* Calculate "On order value"
+  LOOP AT IT_EKPO.
+
+*   Clear "closed" flags and quantity fields
+    CLEAR: LV_GRCLSD, LV_REC_QTY.
+
+*   Check if GR complete
+    IF IT_EKPO-ELIKZ NE SPACE.
+      LV_GRCLSD = 'X'.
+*   Check if GR complete due to delivered quant >= ordered quantity
+    ELSE.
+
+*     Loop over history
+      LOOP AT IT_EKBE WHERE EBELN EQ IT_EKPO-EBELN AND EBELP EQ IT_EKPO-EBELP.
+*       Add to total quantity if Debit/credit indicator is ...
+        IF IT_EKBE-SHKZG EQ 'S'.
+          LV_REC_QTY = LV_REC_QTY + IT_EKBE-MENGE.
+*       Subtract from total quantity if Debit/credit indicator is ...
+        ELSE.   " = 'H'
+          LV_REC_QTY = LV_REC_QTY - IT_EKBE-MENGE.
+        ENDIF.
+      ENDLOOP.
+
+*     If history exceeds ordered quantity, PO item is closed
+      IF LV_REC_QTY >= IT_EKPO-MENGE.
+        LV_GRCLSD = 'X'.
+      ENDIF.
+
+    ENDIF.
+
+*   If PO item is open
+    IF LV_GRCLSD EQ SPACE.
+*     Increment open order value
+      SV_OOVAL = SV_OOVAL + IT_EKPO-MENGE * IT_EKPO-NETPR / IT_EKPO-PEINH.
+
+    ENDIF.
+
+  ENDLOOP.
+
+ENDFORM.                    " PROCESS_DATA
+
+*&---------------------------------------------------------------------*
+*&      Form  F4HELP_WHTYPE
+*&---------------------------------------------------------------------*
+FORM F4HELP_WHTYPE .
+
+  DATA:
+    IT_WHTYPE    TYPE YSE_EM_WHSTYPE OCCURS 0,
+    I_DDSHRETVAL TYPE DDSHRETVAL     OCCURS 0 WITH HEADER LINE.
+
+  SELECT *
+         FROM YSE_EM_WHSTYPE
+         INTO TABLE IT_WHTYPE.
+
+* Call list with selected plants
+  CALL FUNCTION 'F4IF_INT_TABLE_VALUE_REQUEST'
+    EXPORTING
+      VALUE_ORG       = 'S'
+      RETFIELD        = 'WHTYPE'
+      WINDOW_TITLE    = 'WAREHOUSE TYPE'
+    TABLES
+      VALUE_TAB       = IT_WHTYPE
+      RETURN_TAB      = I_DDSHRETVAL
+    EXCEPTIONS
+      PARAMETER_ERROR = 1
+      NO_VALUES_FOUND = 2
+      OTHERS          = 3.
+
+  IF SY-SUBRC EQ 0.
+    READ TABLE I_DDSHRETVAL INDEX 1.
+    P_WHTYPE = I_DDSHRETVAL-FIELDVAL.
+  ENDIF.
+
+ENDFORM.                    " F4HELP_WHTYPE

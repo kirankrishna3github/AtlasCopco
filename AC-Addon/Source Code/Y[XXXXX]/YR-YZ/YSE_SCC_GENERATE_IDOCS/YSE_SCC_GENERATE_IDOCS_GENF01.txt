@@ -1,0 +1,3829 @@
+*&---------------------------------------------------------------------*
+*&      Form  CREATE_IDOCS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_MESSAGE_TYPE  text
+*      -->P_C_LS  text
+*      -->P_BUKRS  text
+*      <--P_RESULT  text
+*----------------------------------------------------------------------*
+*======================================================================*
+* Change History Log
+*----------------------------------------------------------------------*
+*Mod. no.|  Date    | Name                  | Corr. Nr   | Change
+*----------------------------------------------------------------------*
+*MOD-001 |12/04/2011| Lakshmi Reddy         | CD1K964361 | CR2005      *
+*----------------------------------------------------------------------*
+*MOD-002 |26/07/2011| Geert Rutten          | CD1K966809 | CR2096      *
+*----------------------------------------------------------------------*
+*MOD-003 |11/08/2011| Jules Smets           | CD1K967171 | CR2096      *
+*----------------------------------------------------------------------*
+*MOD-004 |14/08/2012| Johnny Wu             | CD1K972897 | CR2648      *
+*----------------------------------------------------------------------*
+
+form create_idocs.
+  data: lt_edidd_data_scc       type table of edidd,
+        lt_edidd_data           type table of edidd,
+        ls_edidd_data_scc       type edidd,
+        ls_edidd_data_scc_cdm   type edidd,
+        lv_lines                type i,
+        lv_lines_cud            type i,
+        lv_tabix                type sy-tabix.
+
+  "Get FAM Code
+  perform get_fam_code.
+  "Get Plant
+  perform get_werks.
+
+  if gt_werks is initial.
+    write: 'Cannot find the plant as per the selection criteria.'.
+    return.
+  endif.
+* Read Data
+*  clear i_edidd_data_scc[].
+  perform fill_data tables lt_edidd_data_scc.
+
+  describe table lt_edidd_data_scc lines lv_lines.
+
+  "Material/Stock/OPO
+  loop at lt_edidd_data_scc into ls_edidd_data_scc
+    where segnam = c_segment_scc_matmas
+       or segnam = c_segment_scc_stock
+       or segnam = c_segment_scc_opo.
+
+    append ls_edidd_data_scc to lt_edidd_data.
+    perform send_idoc using lt_edidd_data.
+    clear: lt_edidd_data.
+  endloop.
+
+  delete lt_edidd_data_scc where segnam = c_segment_scc_matmas
+                              or segnam = c_segment_scc_stock
+                              or segnam = c_segment_scc_opo.
+
+  "Customer Demand
+  describe table lt_edidd_data_scc lines lv_lines_cud.
+  loop at lt_edidd_data_scc into ls_edidd_data_scc.
+    lv_tabix = sy-tabix.
+    if lv_tabix = 1.
+      ls_edidd_data_scc_cdm = ls_edidd_data_scc.
+    endif.
+
+    if ls_edidd_data_scc_cdm-docnum <> ls_edidd_data_scc-docnum.
+      "New order
+      perform send_idoc using lt_edidd_data.
+      clear: lt_edidd_data.
+      ls_edidd_data_scc_cdm = ls_edidd_data_scc.
+    endif.
+    clear: ls_edidd_data_scc-docnum.
+    append ls_edidd_data_scc to lt_edidd_data.
+
+    if lv_tabix = lv_lines_cud."Last line
+      perform send_idoc using lt_edidd_data.
+    endif.
+  endloop.
+
+  if lv_lines = 0.
+    perform send_idoc using lt_edidd_data_scc.
+  endif.
+endform.                    "create_idocs
+
+
+*&---------------------------------------------------------------------*
+*&      Form  create_idocs2
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_MESSAGE_TYPE  text
+*      -->P_LS            text
+*----------------------------------------------------------------------*
+*form create_idocs2 using p_message_type type edidc-mestyp
+*                        p_ls type edidc-rcvprt.
+*
+** FIND RECEIVING PARTNER
+*  select single rcvprn idoctyp                              "#EC *
+*  into  (gs_edidc-rcvprn, gs_edidc-idoctp)
+*  from edp13
+*  where mestyp = p_message_type.
+*** Polulate Control Record
+*  gs_edidc-mestyp =  p_message_type.
+**  wa_edidc-idoctp =  p_idoc_type.
+*  gs_edidc-rcvprt =  p_ls.
+*
+** Read Data
+*  if sy-subrc eq 0.
+*
+*    clear i_edidd_data_scc[].
+*    perform fill_data tables i_edidd_data_scc
+*                      using p_message_type.
+*
+*  else.
+*    write : / 'Idoc type ',p_message_type, ' Check Partner Profiles '.
+*  endif.
+*
+*
+*endform.                    "create_idocs
+
+*&---------------------------------------------------------------------*
+*&      Form  FILL_DATA
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_I_EDIDD_DATA  text
+*      -->P_P_MESSAGE_TYPE  text
+*      -->P_P_BUKRS  text
+*----------------------------------------------------------------------*
+form fill_data  tables pt_data structure edidd.
+  clear: pt_data.
+
+************************************************************************
+* Material Information
+  if cb_mat eq 'X'.
+    perform fill_data_mat tables pt_data.
+  endif.
+
+************************************************************************
+* Stock Information
+  if cb_stck eq 'X'.
+    perform fill_data_stock tables pt_data.
+  endif.
+
+************************************************************************
+  if cb_opo eq 'X'.
+    perform fill_data_opo tables pt_data.
+  endif.
+
+************************************************************************
+  if cb_cdm eq 'X'.
+    perform fill_data_cud tables pt_data.
+  endif.
+endform.                      " FILL_DATA
+
+
+*&---------------------------------------------------------------------*
+*&      Form  UPDATE_TABLE
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+
+form  get_eine "using ps_scc_mat_prcs type yse_scc_mat_prcs
+               changing ps_matmas type t_scc_matmas.
+  data: lv_infnr type infnr,
+        lv_netpr type netpr,
+        lv_waers type waers,
+        lv_norbm type norbm.
+
+
+  clear: lv_waers, lv_norbm, lv_evers, lv_netpr, lv_aplfz.
+  select single infnr from eina into lv_infnr               "#EC *
+      where matnr = ps_matmas-matnr"ps_scc_mat_prcs-matnr and
+        and lifnr = ps_matmas-lifnr.
+
+*  select single waers norbm evers from EINE into (lv_waers, lv_norbm, lv_evers)
+*      where infnr = lv_infnr and
+*            ekorg = IT_YSE_SCC_MAT_PRCS-EKORG and
+*            werks = IT_YSE_SCC_MAT_PRCS-WERKS.
+  select single netpr aplfz waers norbm evers from eine into (lv_netpr, lv_aplfz, lv_waers, lv_norbm, lv_evers )
+      where infnr = lv_infnr and
+            ekorg = p_ekorg "ps_scc_mat_prcs-ekorg and
+        and werks = ps_matmas-werks"ps_scc_mat_prcs-werks and
+        and esokz = '0' and
+            prdat > sy-datum.
+
+  ps_matmas-netpr = lv_netpr.
+  ps_matmas-norbm = lv_norbm.
+  ps_matmas-waers = lv_waers.
+endform.                    "GET_EINE
+
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_MARA
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+form get_mara changing ps_matmas type t_scc_matmas.
+
+  data:   lv_pgc(4)   type c,
+          lv_bukrs type bukrs,
+          lv_plc_temp(10) type c,
+          lv_prctr type marc-prctr,
+          lv_gewei type gewei,
+          lv_ntgew type ntgew.
+
+  data: it_plc         type k9rcd11000010    occurs 0 with header line.
+
+
+  clear: lv_matkl, lv_gewei, lv_ntgew, lv_pgc, lv_prctr."lv_vkorg,
+
+  select single bismt gewei ntgew prdha matkl from mara
+    into (ps_matmas-bismt, lv_gewei, lv_ntgew, ps_matmas-prdha, lv_matkl)
+             where matnr =  ps_matmas-matnr.
+
+  ps_matmas-gewei = lv_gewei.
+  ps_matmas-ntgew = lv_ntgew.
+
+* Get PLC Data
+
+  lv_pgc = ps_matmas-prdha+4(4).
+
+  select single prctr into lv_prctr                         "#EC *
+                           from yse_prctr_deriv where pgc = lv_pgc
+                                                and vtweg = '01'.
+  if sy-subrc = 0.
+
+*.. Derive segment from profit center
+    clear lv_bukrs.
+    select single bukrs into lv_bukrs from t001k
+      where bwkey = ps_matmas-werks.
+
+    call function 'YSE_CONVERT_PRCTR_BL'
+      exporting
+        prctr_in    = lv_prctr
+        bukrs       = lv_bukrs
+      importing
+        segment_out = lv_plc_temp.
+
+    clear it_plc[].
+    select      *
+*         FROM K9RCD11000009
+           from k9rcd11000010                               "20080417
+           into table it_plc.
+
+    loop at it_plc where sour1_from le lv_plc_temp
+                     and sour1_to   ge lv_plc_temp
+                     and valid_from le sy-datum.
+      ps_matmas-plc = it_plc-target1.
+      exit.
+    endloop.
+  endif.
+endform.                    "GET_MARA
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_DMAKT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+form get_dmakt changing ps_matmas type t_scc_matmas.
+
+*  DATA:   lv_pgc(4)   TYPE c,
+*          lv_vkorg TYPE vkorg,
+*          lv_bukrs TYPE bukrs,
+*          lv_plc_temp(10) TYPE c,
+*          lv_prctr TYPE marc-prctr.
+  data: "it_plc         TYPE k9rcd11000010    OCCURS 0 WITH HEADER LINE,
+        lv_check type i,
+        lv_descr type text256.
+
+
+  select single maktx from makt into ps_matmas-maktx
+             where matnr =  ps_matmas-matnr and spras = 'E'.
+
+  clear lv_check.
+  clear lv_descr.
+  lv_descr = ps_matmas-maktx.
+  perform latin_check in program yam_common_routines
+                                  using   lv_descr
+                                  changing lv_check.
+  if not lv_check is initial.
+    clear ps_matmas-maktx.
+  endif.
+
+endform.                    "GET_DMAKT
+
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_MARC
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+form get_marc changing ps_matmas type t_scc_matmas.
+  data: lv_mmsta type mmsta,
+        lv_nfmat type nfmat,
+        lv_ersda type ersda.
+
+  clear: lv_mmsta, lv_nfmat.
+  select single mmsta nfmat from marc into (lv_mmsta, lv_nfmat)
+    where matnr = ps_matmas-matnr and
+          werks = ps_matmas-werks.
+  if lv_mmsta = 'A1'.
+    ps_matmas-nfmat = lv_nfmat.
+  endif.
+
+  if lv_mmsta is initial.
+    ps_matmas-repl = '0'.
+  elseif lv_mmsta = 'A1' and not lv_nfmat is initial.
+    ps_matmas-repl = '1'.
+  elseif lv_mmsta = 'A1' and  lv_nfmat is initial.
+    ps_matmas-repl = '2'.
+  elseif lv_mmsta = 'A2'.
+    ps_matmas-repl = '3'.
+  endif.
+
+  select single ersda from msta into lv_ersda               "#EC *
+    where matnr = ps_matmas-matnr  and
+          werks = ps_matmas-werks and
+          statm = 'E'.
+  if sy-subrc = 0.
+    ps_matmas-plant_credat = lv_ersda.
+  endif.
+
+endform.                    "GET_MARC
+
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_MBEW
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+form get_mbew changing ps_matmas type t_scc_matmas.
+  data: lv_verpr type verpr,
+        lv_stprs type stprs.
+
+  clear: lv_verpr, lv_stprs.
+  select single verpr stprs from mbew into (lv_verpr, lv_stprs) "#EC *
+    where matnr = ps_matmas-matnr and
+          bwkey = ps_matmas-werks.
+  if ps_matmas-werks(2) = 'CN'.
+    ps_matmas-verpr = lv_stprs.
+  else.
+    ps_matmas-verpr = lv_verpr.
+  endif.
+endform.                    "GET_MBEW
+
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_EORD
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+form get_eord changing ps_matmas type t_scc_matmas.
+
+  data: lv_lifnr type lifnr.
+
+  clear lv_lifnr.
+  select single lifnr from eord into lv_lifnr               "#EC *
+    where matnr = ps_matmas-matnr and
+          werks = ps_matmas-werks and
+          bdatu > sy-datum and
+          flifn = 'X'.
+  if sy-subrc = 0.
+    ps_matmas-lifnr = lv_lifnr.
+  endif.
+
+endform.                    "GET_EORD
+
+
+*&---------------------------------------------------------------------*
+*&      Form  get_allocated_stock
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+form get_allocated_stock using pt_material type tt_material.
+
+* Get Safety stock
+*  PERFORM get_safety_stock.
+
+* Get open sales orders
+  perform get_open_sales_orders." using pt_material.
+
+* Get returns (ZRE1) open sales orders
+  perform get_returns_zre." using pt_material.
+
+* Get open reservations
+*  PERFORM get_open_reservations.
+
+* Get open transport req
+  "  PERFORM get_open_transport_req.
+
+* Get open transport orders
+* Cf. Function get_allocated stock > perform find_open_transport_orders
+  perform get_open_transport_orders using pt_material.
+
+endform.                    " GET_ALLOCATED_STOCK
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_ALLOCATED_STOCK1
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*form GET_ALLOCATED_STOCK1 .
+*  DATA : BEGIN OF IT_VBBE OCCURS 0,
+*         VBELN LIKE VBBE-VBELN,
+*         POSNR LIKE VBBE-POSNR,
+*         MATNR LIKE VBBE-MATNR,
+*         WERKS LIKE VBBE-WERKS,
+*         VBTYP LIKE VBBE-VBTYP,
+*         VMENG LIKE VBBE-VMENG,
+*         END OF IT_VBBE.
+*  DATA : WA_VBBE LIKE IT_VBBE.
+*
+*  DATA : BEGIN OF IT_LIKP OCCURS 0,
+*         VBELN LIKE LIKP-VBELN,
+*         LFART LIKE LIKP-LFART,
+*         END OF IT_LIKP.
+*  DATA : WA_LIKP LIKE IT_LIKP.
+*
+*  DATA : BEGIN OF IT_LIPS OCCURS 0,
+*          VBELN LIKE LIPS-VBELN,
+*          POSNR LIKE LIPS-POSNR,
+*          PSTYV LIKE LIPS-PSTYV,
+*         END OF IT_LIPS.
+*  DATA : WA_LIPS LIKE IT_LIPS.
+*
+*
+*  SELECT VBELN POSNR MATNR WERKS VBTYP VMENG FROM VBBE
+*               INTO TABLE IT_VBBE
+*               FOR ALL ENTRIES IN it_material
+*                 WHERE MATNR = it_material-MATNR
+*                   AND WERKS = it_material-werks.
+*  IF SY-SUBRC = 0.
+*    SORT IT_VBBE BY MATNR WERKS.
+*  ENDIF.
+*
+*  CHECK NOT IT_VBBE[] IS INITIAL.
+*  SELECT VBELN LFART  FROM LIKP
+*               INTO TABLE IT_LIKP
+*                FOR ALL ENTRIES IN IT_VBBE
+*                 WHERE VBELN = IT_VBBE-VBELN.
+*  IF SY-SUBRC = 0.
+*    SORT IT_LIKP BY VBELN.
+*    DELETE ADJACENT DUPLICATES from it_likp COMPARING ALL FIELDS.
+*  ENDIF.
+*
+*  REFRESH IT_ALLOC.
+*  CLEAR IT_ALLOC.
+*  LOOP AT IT_VBBE INTO WA_VBBE.
+*    READ TABLE it_material WITH KEY matnr = WA_VBBE-matnr
+*                                      werks = WA_VBBE-werks
+*                             BINARY SEARCH.
+*    IF sy-subrc EQ 0.
+*      it_alloc-werks          = WA_VBBE-werks.
+*      it_alloc-matnr          = WA_VBBE-matnr.
+*      it_alloc-alloc_quantity = WA_VBBE-VMENG.
+*      COLLECT it_alloc.
+*    ENDIF.
+*  ENDLOOP.
+*
+*  LOOP AT IT_VBBE INTO WA_VBBE.
+*    CLEAR WA_LIKP.
+*    READ TABLE it_LIKP INTO WA_LIKP WITH KEY VBELN = WA_VBBE-VBELN
+*                            BINARY SEARCH.
+*    IF SY-SUBRC = 0 AND WA_LIKP-LFART = 'ZL03'.
+*      it_alloc-werks          = WA_VBBE-werks.
+*      it_alloc-matnr          = WA_VBBE-matnr.
+*      it_alloc-alloc_quantity = WA_VBBE-VMENG * -1.
+*      COLLECT it_alloc.
+*    ENDIF.
+*  ENDLOOP.
+*
+*  CHECK NOT IT_VBBE[] IS INITIAL.
+*  SELECT VBELN
+*          POSNR
+*          PSTYV
+*          FROM LIPS
+*               INTO TABLE IT_LIPS
+*                FOR ALL ENTRIES IN IT_VBBE
+*                 WHERE VBELN = IT_VBBE-VBELN
+*                   AND POSNR = IT_VBBE-POSNR.
+*  IF SY-SUBRC = 0.
+*    SORT IT_LIPS BY VBELN POSNR.
+*  ENDIF.
+*
+*  LOOP AT IT_VBBE INTO WA_VBBE.
+*    CLEAR WA_LIPS.
+*    READ TABLE it_LIPS INTO WA_LIPS WITH KEY VBELN = WA_VBBE-VBELN
+*                                             POSNR = WA_VBBE-POSNR
+*                                             BINARY SEARCH.
+*    IF SY-SUBRC = 0 AND WA_VBBE-VBTYP = 'J' AND WA_LIPS-PSTYV = 'ZDTC'.
+*      it_alloc-werks          = WA_VBBE-werks.
+*      it_alloc-matnr          = WA_VBBE-matnr.
+*      it_alloc-alloc_quantity = WA_VBBE-VMENG * -1.
+*      COLLECT it_alloc.
+*    ENDIF.
+*  ENDLOOP.
+*
+*endform.                    " GET_ALLOCATED_STOCK1
+
+*&---------------------------------------------------------------------*
+*&      Form  get_safety_stock
+*&---------------------------------------------------------------------*
+*FORM get_safety_stock .
+*
+** Only consider safety stock if "safety stock indicator" is flagged
+**  CHECK p_saf = 'X'.
+** Only consider safety stock if storage location = 1000
+**  CHECK P_LGORT = '1000'.
+*  IF '1000' IN s_lgorts.
+*
+** Safety stock has already been fetched from MARC, just copy it over into IT_ALLOC_EXT
+** Put material with it's safety stock in allocations table
+*    it_alloc-lgort          = '1000'.
+*    LOOP AT it_material.
+*      it_alloc-matnr          = it_material-matnr.
+*      it_alloc-werks          = it_material-werks.
+*      it_alloc-alloc_quantity = it_material-eisbe.
+*      COLLECT it_alloc.
+*    ENDLOOP.
+*  ENDIF.
+*ENDFORM.                    " get_safety_stock
+
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_open_sales_orders
+*&---------------------------------------------------------------------*
+form get_open_sales_orders." using pt_material type tt_material.
+  types: begin of ty_lips,
+        vbeln_so type vbap-vbeln,
+        posnr_so type vbap-posnr,
+        vbeln_del type lips-vbeln,
+        posnr_del type lips-posnr,
+        matnr     type lips-matnr,
+        werks     type lips-werks,
+        lgort     type lips-lgort,
+        lfimg     type lips-lfimg,
+      end of ty_lips.
+
+  data: lt_lips          type table of ty_lips,"lips,
+        ls_lips          type ty_lips,"lips,
+"        lv_spstg         type vbuk-spstg,
+        lv_flag          type char1, "Flag
+        lv_index         type sy-tabix value 1,
+        lv_cmgst         type vbuk-cmgst.
+*  data: lt_vbap type tt_vbap.
+
+* Salesorder items have been selected before
+  clear: it_alloc[].
+* Add order quantities to allocations table
+  sort it_vbap[] by vbeln ascending posnr ascending."matnr.
+*  loop at it_vbap.
+**   When the sales item's StLoc is initial, treat it is if it were
+**   StLoc 1000
+** Begin of insert MOD-001
+*    clear lv_spstg.
+*    select single spstg from vbuk into lv_spstg
+*     where vbeln = it_vbap-vbeln.
+*    if lv_spstg = ' ' or p_block <> 'X'.
+** End of insert MOD-001
+*      if it_vbap-lgort is initial.
+*        it_vbap-lgort = '1000'.
+*      endif.
+**      SORT it_material BY matnr werks lgort."MOD-004
+**      read table pt_material transporting no fields
+**                              with key matnr = it_vbap-matnr
+**                                       werks = it_vbap-werks
+**                                       lgort = it_vbap-lgort
+**                              binary search.
+**      if sy-subrc eq 0.
+*      it_alloc-lgort          = it_vbap-lgort."ls_material-lgort.
+*      it_alloc-werks          = it_vbap-werks.
+*      it_alloc-matnr          = it_vbap-matnr.
+*      it_alloc-alloc_quantity = it_vbap-kwmeng.
+*      collect it_alloc.
+**      endif.
+** Begin of insert MOD-001
+*    endif.
+** End of insert MOD-001
+*    append it_vbap to lt_vbap. "Get order that are not cancelled.
+*  endloop.
+
+* Get delivered quantities for the above selected order items
+  if not it_vbap[] is initial.
+    select a~vbelv a~posnv b~vbeln b~posnr b~matnr
+           b~werks b~lgort b~lfimg
+           into table lt_lips
+           from vbfa as a
+           join lips as b
+             on a~vbeln eq b~vbeln
+            and a~posnn eq b~posnr
+           join vbuk as c
+             on a~vbeln eq c~vbeln
+            for all entries in it_vbap
+          where a~vbelv = it_vbap-vbeln
+            and a~posnv = it_vbap-posnr
+            and a~vbtyp_n = 'J'  " Deliveries
+            and c~wbstk = 'C'.
+    sort lt_lips by vbeln_so ascending posnr_so ascending.
+  endif.
+
+  loop at it_vbap.
+*    clear lv_spstg.
+    clear: lv_cmgst.
+*    select single spstg from vbuk into lv_spstg
+    select single cmgst from vbuk into lv_cmgst
+     where vbeln = it_vbap-vbeln.
+*    if lv_spstg = ' ' or p_block <> 'X'.
+    if p_block <> 'X' or lv_cmgst = '' or lv_cmgst = 'A' or lv_cmgst = 'D'.
+* Subtract remaining delivered quantities from allocation table
+      loop at lt_lips into ls_lips from lv_index
+                                    where vbeln_so = it_vbap-vbeln
+                                      and posnr_so = it_vbap-posnr.
+        lv_index = sy-tabix + 1.
+        it_vbap-kwmeng = it_vbap-kwmeng - ls_lips-lfimg.
+      endloop.
+
+      if it_vbap-kwmeng <> 0.
+        "Check if the GI Date of SO is out of Lead time
+        perform flag_cal_as_stock using it_vbap"it_vbap-vbeln it_vbap-posnr
+                                  changing lv_flag.
+        if lv_flag = ''.
+          continue.
+        endif.
+      endif.
+
+      if it_vbap-lgort is initial.
+        it_vbap-lgort = '1000'.
+      endif.
+      it_alloc-lgort          = it_vbap-lgort."ls_material-lgort.
+      it_alloc-werks          = it_vbap-werks.
+      it_alloc-matnr          = it_vbap-matnr.
+      it_alloc-alloc_quantity = it_vbap-kwmeng.
+      collect it_alloc.
+    endif.
+  endloop.
+
+*  loop at lt_lips into ls_lips.
+*    read table gt_werks with key
+*                  werks = ls_lips-werks lgort = ls_lips-lgort
+*                  binary search transporting no fields.
+*    " Not the werks/storage in consignment table
+*    if sy-subrc <> 0 .
+*      continue.
+*    endif.
+*
+**   StLoc 1000
+*    if ls_lips-lgort is initial.
+*      ls_lips-lgort = '1000'.
+*    endif.
+*
+**    read table pt_material transporting no fields
+**                           with key matnr = ls_lips-matnr
+**                                    werks = ls_lips-werks
+**                                    lgort = ls_lips-lgort
+**                            binary search.
+**    if sy-subrc eq 0.
+*    it_alloc-lgort          = ls_lips-lgort.
+*    it_alloc-werks          = ls_lips-werks.
+*    it_alloc-matnr          = ls_lips-matnr.
+*    it_alloc-alloc_quantity = ls_lips-lfimg * ( -1 ).
+*    collect it_alloc.
+**     To collect the Open Qty for Stock Back Ordered
+**      COLLECT it_alloc INTO it_stbo_so.
+**    endif.
+*  endloop.
+
+endform.                    " GET_open_sales_orders
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_open_sales_orders
+*&---------------------------------------------------------------------*
+form get_returns_zre." using pt_material type tt_material.
+  data: lt_lips          type table of lips,
+        ls_lips          type lips,
+*        lv_spstg         type vbuk-spstg,
+        lv_cmgst         type vbuk-cmgst.
+
+* Salesorder items have been selected before
+* Add order quantities to allocations table
+  sort it_vbap_zre by matnr.
+  loop at it_vbap_zre.
+*   When the sales item's StLoc is initial, treat it is if it were
+*   StLoc 1000
+* Begin of insert MOD-001
+    clear lv_cmgst."lv_spstg.
+    select single cmgst from vbuk into lv_cmgst
+     where vbeln = it_vbap_zre-vbeln.
+*    if lv_spstg = ' ' or p_block <> 'X'.
+    if p_block <> 'X' or lv_cmgst = '' or lv_cmgst = 'A' or lv_cmgst = 'D'.
+* End of insert MOD-001
+      if it_vbap_zre-lgort is initial.
+        it_vbap_zre-lgort = '1000'.
+      endif.
+*      if sy-subrc eq 0.
+      it_alloc_zre-werks          = it_vbap_zre-werks.
+      it_alloc_zre-lgort          = it_vbap_zre-lgort.
+      it_alloc_zre-matnr          = it_vbap_zre-matnr.
+      it_alloc_zre-alloc_quantity = it_vbap_zre-kwmeng.
+      collect it_alloc_zre.
+*     To collect the Open Qty for Stock Back Ordered
+*      COLLECT it_alloc INTO it_stbo_so.
+*      endif.
+* Begin of insert MOD-001
+    endif.
+* End of insert MOD-001
+  endloop.
+
+* Get delivered quantities for the above selected order items
+  if not it_vbap_zre[] is initial.
+    select      b~vbeln b~posnr b~matnr b~lgort b~lfimg b~werks
+           into corresponding fields of table lt_lips
+           from vbfa as a
+           join lips as b
+             on a~vbeln eq b~vbeln
+            and a~posnn eq b~posnr
+           join vbuk as c
+             on a~vbeln eq c~vbeln
+            for all entries in it_vbap_zre
+          where a~vbelv = it_vbap_zre-vbeln
+            and a~posnv = it_vbap_zre-posnr
+            and a~vbtyp_n = 'T'  " Return Deliveries
+            and c~wbstk = 'C'.
+  endif.
+
+* Subtract remaining delivered quantities from allocation table
+  loop at lt_lips into ls_lips.
+*   StLoc 1000
+    if ls_lips-lgort is initial.
+      ls_lips-lgort = '1000'.
+    endif.
+
+*    read table pt_material transporting no fields
+*                           with key matnr = ls_lips-matnr
+*                                    werks = ls_lips-werks
+*                                    lgort = ls_lips-lgort
+*                           binary search.
+*    if sy-subrc eq 0.
+    it_alloc_zre-lgort          = ls_lips-lgort.
+    it_alloc_zre-werks          = ls_lips-werks.
+    it_alloc_zre-matnr          = ls_lips-matnr.
+    it_alloc_zre-alloc_quantity = ls_lips-lfimg * ( -1 ).
+    collect it_alloc_zre.
+*     To collect the Open Qty for Stock Back Ordered
+*      COLLECT it_alloc INTO it_stbo_so.
+*    endif.
+  endloop.
+
+endform.                    " GET_returns_ZRE
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_open_reservations
+*&---------------------------------------------------------------------*
+*FORM get_open_reservations .
+*
+** Service details selected before, but whithout condition >> XWAOK EQ 'X' <<
+*
+** Add open reservation quantities to allocations table
+*  SORT it_resb BY matnr werks lgort.
+*  LOOP AT it_resb WHERE xwaok EQ 'X'.
+*    READ TABLE it_material
+*               WITH KEY matnr = it_resb-matnr
+*                        werks = it_resb-werks
+*                        lgort = it_resb-lgort
+*               BINARY SEARCH.
+*    IF sy-subrc EQ 0.
+*      it_alloc-matnr          = it_resb-matnr.
+*      it_alloc-werks          = it_resb-werks.
+*      it_alloc-lgort          = it_resb-lgort.
+*      it_alloc-alloc_quantity = it_resb-bdmng - it_resb-enmng.
+*      COLLECT it_alloc.
+**     To collect the Open Qty for Stock Back Ordered
+**      COLLECT it_alloc INTO it_stbo_so.
+*    ENDIF.
+*  ENDLOOP.
+*
+*
+*ENDFORM.                    " GET_open_reservations
+
+*&---------------------------------------------------------------------*
+*&      Form  get_open_transport_req
+*&---------------------------------------------------------------------*
+*FORM get_open_transport_req .
+*
+** Only consider open transport req if storage location = 1000
+**  CHECK p_lgort = '1000'.
+*
+**  IF '1000' IN s_lgorts.
+**
+**    SELECT      matnr reswk menge
+**           INTO TABLE it_eban
+**           FROM eban
+**           FOR ALL ENTRIES IN it_material
+**           WHERE matnr = it_material-matnr AND
+**                 reswk = it_material-werks
+**            AND bsart EQ c_po_replenishment
+**            AND pstyp EQ c_pstyp_stock_tr      "STOCK TRANSFER
+**            AND statu EQ 'N'
+**            AND loekz EQ space
+**            AND ebakz EQ space
+***            AND reswk IN s_werkss " so_werks
+**            AND ( lgort EQ '1000'
+**                 or lgort eq ' ').
+**
+*** Add open transport req quant's to allocations table
+**    LOOP AT it_eban.
+**      READ TABLE it_material WITH KEY matnr = it_eban-matnr
+**                                      werks = it_eban-reswk
+**                             BINARY SEARCH.
+**      it_alloc-lgort = '1000'.
+**      IF sy-subrc EQ 0.
+**        it_alloc-matnr = it_eban-matnr.
+**        it_alloc-werks = it_eban-reswk.
+**        it_alloc-alloc_quantity = it_eban-menge.
+**        COLLECT it_alloc.
+**      ENDIF.
+**    ENDLOOP.
+**  ENDIF.
+*
+*ENDFORM.                    " GET_open_transport_req
+
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_OPEN_TRANSPORT_ORDERS
+*&---------------------------------------------------------------------*
+form get_open_transport_orders using pt_material type tt_material.
+  data: lv_index      like sy-tabix,
+        lv_whtype type yse_scc_planttyp-whtype.
+  data: begin of ls_ekpo,
+          ebeln like ekpo-ebeln,
+          ebelp like ekpo-ebelp,
+          matnr like vbap-matnr,
+          menge like ekpo-menge,
+          reswk like ekko-reswk,
+          lgort like ekpo-lgort,
+        end of ls_ekpo,
+        lt_ekpo like ls_ekpo occurs 0.
+
+  data: begin of ls_ekbe,
+    ebeln like ekpo-ebeln,
+    ebelp like ekpo-ebelp,
+    matnr like vbap-matnr,
+    menge like ekpo-menge,
+    belnr like ekbe-belnr,
+    buzei like ekbe-buzei,
+    bwart like ekbe-bwart,
+  end of ls_ekbe,
+  lt_ekbe like ls_ekbe occurs 0.
+
+* Only consider open transport orders if storage location = 1000
+*  CHECK p_lgort = '1000'.
+
+*  if '1000' in s_lgorts.
+
+* Select from ekpo/ekko
+  if pt_material[] is initial.
+    return.
+  endif.
+
+  select b~ebeln b~ebelp b~matnr b~menge a~reswk "b~lgort
+         into table lt_ekpo
+         from ekko as a
+        inner join ekpo as b
+           on a~ebeln = b~ebeln
+          for all entries in pt_material
+        where b~matnr eq pt_material-matnr and
+              a~reswk eq pt_material-werks
+          and (    a~bsart eq 'ZUB1'
+                or a~bsart eq 'ZNB4' )
+*              and a~reswk in s_werks
+          and b~loekz eq space.
+
+  loop at lt_ekpo into ls_ekpo.
+    lv_index = sy-tabix.
+    clear lv_whtype.
+
+    if p_ekorg = 'CN07'.
+      select single whtype from yse_scc_planttyp into lv_whtype
+        where ekorg = p_ekorg and werks = ls_ekpo-reswk.
+    elseif p_ekorg = 'RU02'.
+      select single sltype from yse_scc_sloctyp into lv_whtype
+        where werks = ls_ekpo-reswk and lgort = '1000'.
+    endif.
+
+    if lv_whtype <> c_cw.
+      delete lt_ekpo index lv_index.
+    else.
+      ls_ekpo-lgort = 1000."ZUB1/ZNB4, the default SLoc
+      modify lt_ekpo from ls_ekpo
+                    index lv_index transporting lgort.
+* Add transport orders to allocation table
+      it_alloc-matnr = ls_ekpo-matnr.
+      it_alloc-werks = ls_ekpo-reswk.
+      it_alloc-lgort = ls_ekpo-lgort.
+      it_alloc-alloc_quantity = ls_ekpo-menge.
+      collect it_alloc.
+    endif.
+  endloop.
+
+* Don't continue open transport orders if no rows returned
+  if lt_ekpo is not initial.
+* Select receipted quantities for the open transport order items
+    select  ebeln ebelp matnr menge belnr buzei bwart
+           into table lt_ekbe
+           from ekbe
+           for all entries in lt_ekpo
+          where ebeln eq lt_ekpo-ebeln
+            and ebelp eq lt_ekpo-ebelp
+            and vgabe = '6'.
+
+* Subtract receipted qty's from allocation table
+    loop at lt_ekbe into ls_ekbe.
+      it_alloc-matnr = ls_ekbe-matnr.
+      read table lt_ekpo into ls_ekpo
+                          with key ebeln = ls_ekbe-ebeln
+                                   ebelp = ls_ekbe-ebelp.
+      it_alloc-werks = ls_ekpo-reswk.
+      it_alloc-lgort = ls_ekpo-lgort.
+
+      if ls_ekbe-bwart eq '641'.
+        it_alloc-alloc_quantity = ls_ekbe-menge * ( -1 ).
+      elseif ls_ekbe-bwart eq '642'.
+        it_alloc-alloc_quantity = ls_ekbe-menge.
+      endif.
+      collect it_alloc.
+    endloop.
+  endif.
+endform.                    " GET_OPEN_TRANSPORT_ORDERS
+
+*&---------------------------------------------------------------------*
+*&      Form  get_order_data ZOR/ZO03
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+form get_order_data using pt_material type tt_material.
+  clear it_vbap[]."MOD-004
+
+  if  pt_material is initial.
+    return.
+  endif.
+
+* Get open order item quantities
+  select      vbap~vbeln vbap~posnr matnr kwmeng werks lgort abgru
+         into table it_vbap
+         from vbak
+        inner join vbap
+           on vbak~vbeln eq vbap~vbeln
+        for all entries in pt_material
+        where vbap~matnr eq pt_material-matnr
+          and vbap~werks eq pt_material-werks
+          and vbap~pstyv <> 'ZTXT'
+          and lgort eq pt_material-lgort
+          and vbak~auart in ('ZOR', 'ZO03', 'ZKB', 'ZKT' )
+          and vbtyp eq 'C'.
+
+  if it_vbap[] is not initial.
+    "Delete the SO lines which is rejected.
+    delete it_vbap[] where abgru <> ''.
+  endif.
+endform.                    " GET_ORDER_DATA
+
+
+*&---------------------------------------------------------------------*
+*&      Form  get_order_data returns ZRE1
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+form get_order_data_zre using pt_material type tt_material.
+* Get open order item quantities
+  "MOD-004 begin
+  clear it_vbap_zre[].
+
+  if  pt_material is initial.
+    return.
+  endif.
+
+  select      vbap~vbeln vbap~posnr matnr kwmeng werks lgort abgru
+         into table it_vbap_zre
+         from vbak
+        inner join vbap
+           on vbak~vbeln eq vbap~vbeln
+        for all entries in pt_material
+        where vbap~matnr eq pt_material-matnr
+          and vbap~werks eq pt_material-werks
+          and lgort      eq  pt_material-lgort
+          and vbak~auart in ('ZRE1', 'ZRE2')
+          and vbtyp eq 'H'.
+  "MOD-004 end
+endform.                    " GET_ORDER_DATA
+
+
+*&---------------------------------------------------------------------*
+*&      Form  get_sales_order_stock
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+form get_sales_order_stock using pt_material type tt_material
+                          changing pt_mska type  tt_mska.
+  data: ls_mska type ty_mska,
+        ls_material type ty_material.
+
+  "MOD-004 Begin
+  loop at pt_material into ls_material.
+    clear: ls_mska.
+    select sum( kalab )
+          into ls_mska-kalab from mska
+      where matnr = ls_material-matnr
+          and werks = ls_material-werks
+          and lgort eq ls_material-lgort
+          and sobkz eq 'E'
+          and kalab <> 0.
+    if sy-subrc = 0.
+      ls_mska-matnr = ls_material-matnr.
+      ls_mska-werks = ls_material-werks.
+      ls_mska-lgort = ls_material-lgort.
+      append ls_mska to pt_mska.
+    endif.
+  endloop.
+  sort pt_mska by matnr werks lgort.
+  "MOD-004 end
+endform.                    "get_sales_order_stock
+
+**&---------------------------------------------------------------------*
+**&      Form  GET_SERVICE_DATA
+**&---------------------------------------------------------------------*
+*FORM get_service_data .
+*
+** Get reservation data
+*  SELECT      matnr werks lgort bdmng enmng vmeng umrez umren xwaok
+*         INTO TABLE it_resb
+*         FROM resb
+*        FOR ALL ENTRIES IN it_material
+*        WHERE matnr = it_material-matnr AND
+*              werks = it_material-werks
+**          AND lgort EQ p_lgort
+*          AND (    lgort IN s_lgorts
+*                OR lgort EQ ' ' )
+*          AND xloek EQ space
+*          AND (    xwaok EQ 'X'
+*           OR xwaok EQ space ).
+*
+*ENDFORM.                    " GET_SERVICE_DATA
+*&---------------------------------------------------------------------*
+*&      Form  F4_werks
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+form f4_werks .
+  data: begin of lt_werks occurs 0,
+        werks type werks_d,
+    end of lt_werks.
+
+  data : lt_return type table of ddshretval,
+         ls_return type ddshretval.
+
+  call function 'GET_DYNP_VALUE'
+    exporting
+      i_field = 'P_EKORG'
+      i_repid = gv_repid
+      i_dynnr = '1000'
+    changing
+      o_value = p_ekorg.
+
+  select t024w~werks into table lt_werks from t024w
+                     where
+                     ekorg eq p_ekorg.
+
+
+  call function 'F4IF_INT_TABLE_VALUE_REQUEST'
+    exporting
+      retfield        = 'WERKS'
+      dynprofield     = 'S_WERKS-LOW'
+      dynpprog        = gv_repid
+      dynpnr          = '1000'
+      value_org       = 'S'
+    tables
+      value_tab       = lt_werks
+      return_tab      = lt_return
+    exceptions                                              "#EC *
+      parameter_error = 1
+      no_values_found = 2
+      others          = 3.
+
+  if sy-subrc = 0.
+    read table lt_return into ls_return index 1.
+    s_werks-low = ls_return-fieldval.
+  endif.
+endform.                    " F4_werks
+*&---------------------------------------------------------------------*
+*&      Form  fill_IDOC_ctrl
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+form fill_idoc_ctrl .
+  clear: gs_edidc.
+  select single rcvprn idoctyp                              "#EC *
+    into  (gs_edidc-rcvprn, gs_edidc-idoctp)
+    from edp13
+    where mestyp = gv_message_type.
+
+*  if sy-subrc <> 0 .
+*    write : / 'Idoc type ',gv_message_type, ' Check Partner Profiles '.
+*  endif.
+** Polulate Control Record
+  gs_edidc-mestyp =  gv_message_type.
+*  wa_edidc-idoctp =  p_idoc_type.
+  gs_edidc-rcvprt =  'LS'.
+endform.                    " fill_IDOC_ctrl
+*&---------------------------------------------------------------------*
+*&      Form  Send_IDOC
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+form send_idoc using pt_idoc_data type edidd_tt.
+  data: ls_idoc_data type edidd,
+        lt_edidc_control type table of edidc,
+        ls_edidc_control type edidc.
+
+  if pt_idoc_data is not initial.
+    read table pt_idoc_data into ls_idoc_data index 1.
+
+    case ls_idoc_data-segnam.
+      when c_segment_scc_matmas.
+        gv_message_type = c_mestyp_scc_matmas.
+      when c_segment_scc_opo.
+        gv_message_type = c_mestyp_scc_opo.
+      when c_segment_scc_cud or c_segment_scc_cudl.
+        gv_message_type = c_mestyp_scc_cud.
+      when c_segment_scc_stock.
+        gv_message_type = c_mestyp_scc_stock.
+      when others.
+    endcase.
+
+* FIND RECEIVING PARTNER
+    if gs_edidc-mestyp <> gv_message_type.
+      perform fill_idoc_ctrl.
+    endif.
+
+    call function 'MASTER_IDOC_DISTRIBUTE'
+      exporting
+        master_idoc_control            = gs_edidc
+      tables
+        communication_idoc_control     = lt_edidc_control
+        master_idoc_data               = pt_idoc_data
+      exceptions
+        error_in_idoc_control          = 1
+        error_writing_idoc_status      = 2
+        error_in_idoc_data             = 3
+        sending_logical_system_unknown = 4
+        others                         = 5.
+    if sy-subrc eq 0.
+      read table lt_edidc_control into ls_edidc_control
+                        index 1.
+      call function 'BAPI_TRANSACTION_COMMIT'.
+      call function 'EDI_DOCUMENT_DEQUEUE_LATER'
+        exporting
+          docnum                 = ls_edidc_control-docnum
+        exceptions
+          idoc_is_not_to_dequeue = 1
+          others                 = 2.
+      if sy-subrc <> 0 .
+        sy-subrc = 0.
+      endif.
+      loop at pt_idoc_data into ls_idoc_data.
+        write : / 'Idoc type ',gv_message_type,
+                  'generated ', ls_idoc_data-sdata.
+      endloop.
+    else.
+      loop at pt_idoc_data into ls_idoc_data.
+        write : / 'Idoc type ',gv_message_type,
+                  ' in Error ', ls_idoc_data-sdata.
+      endloop.
+    endif.
+  else.
+    append ls_idoc_data to pt_idoc_data.
+    call function 'MASTER_IDOC_DISTRIBUTE'
+      exporting
+        master_idoc_control            = gs_edidc
+      tables
+        communication_idoc_control     = lt_edidc_control
+        master_idoc_data               = pt_idoc_data
+      exceptions
+        error_in_idoc_control          = 1
+        error_writing_idoc_status      = 2
+        error_in_idoc_data             = 3
+        sending_logical_system_unknown = 4
+        others                         = 5.
+    if sy-subrc eq 0.
+      read table lt_edidc_control into ls_edidc_control
+                        index 1.
+      call function 'BAPI_TRANSACTION_COMMIT'.
+      call function 'EDI_DOCUMENT_DEQUEUE_LATER'
+        exporting
+          docnum                 = ls_edidc_control-docnum
+        exceptions
+         idoc_is_not_to_dequeue = 1
+        others.
+      if sy-subrc <> 0 .
+        sy-subrc = 0.
+      endif.
+    endif.
+    write : / 'Idoc type ',gv_message_type, ' No data found '.
+  endif.
+endform.                    " Send_IDOC
+*&---------------------------------------------------------------------*
+*&      Form  get_werks
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+form get_werks.
+  data: ls_werks type ty_werks.
+
+  clear gt_werks.
+  select a~werks a~lgort from yse_scc_consign as a
+          inner join t024w as b on b~werks = a~werks   "#EC CI_BUFFJOIN
+          into table gt_werks
+          where b~werks in s_werks and b~ekorg = p_ekorg.
+
+  "For SLoc = 1000, should also consider SLoc = ' '
+  loop at gt_werks into ls_werks where lgort = '1000' or lgort = '0001'.
+    ls_werks-lgort = ' '.
+    append ls_werks to gt_werks.
+  endloop.
+  sort gt_werks by werks lgort.
+endform.                    "get_werks
+
+*&---------------------------------------------------------------------*
+*&      Form  fill_data_mat
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+form fill_data_mat tables pt_data type edidd_tt.
+*  data: lt_cdhdr type table of cdhdr,
+*        ls_cdhdr type cdhdr,
+*        lt_hdrpos type table of ty_hdrpos,
+*        ls_hdrpos type ty_hdrpos.
+
+  data: lt_scc_mat_prcs type table of yse_scc_mat_prcs,
+        ls_scc_mat_prcs type yse_scc_mat_prcs,
+        lv_ersda type ersda.
+
+  data: lv_tabix type sy-tabix,
+        lv_lifnr type lifnr,
+        lv_prdha type prodh_d,
+        lv_plifz type zsccplifz.
+
+  data: lt_mat type table of t_ini_mat,
+        ls_mat type t_ini_mat,
+        ls_matmas type t_scc_matmas,
+        lt_matmas type table of t_scc_matmas,
+        ls_data   type edidd.
+
+  ranges: lr_flag for yse_scc_used_mat-flag.
+
+** Begin of insert MOD-002
+** Select all change documents for Material (MARA MARC MBEW EINE EORD)
+*  select * into table lt_cdhdr from cdhdr
+*         where (  objectclas = 'MATERIAL'
+*               or objectclas = 'INFOSATZ'
+*               or objectclas = 'ORDERBUCH' )
+**             AND objectid   = dobject-objky
+*           and ( udate in s_ersda ).
+**             AND  objectid IN s_matnr.¡§
+*
+*  describe table lt_cdhdr lines sy-tfill.
+** End of insert MOD-002
+
+  lr_flag-sign = 'I'.
+  lr_flag-option = 'EQ'.
+  lr_flag-low = 'X'.
+  append lr_flag.
+
+* initial download ?
+* Begin of change MOD-002
+*    if p_ini = 'X'.
+*     if p_ini = 'X' or sy-tfill > 500.                     "MOD-003
+  if p_ini = 'X'." or sy-tfill > p_cdhdr.                   "MOD-003
+* End of change MOD-002
+    lr_flag-low = 'P'.
+    append lr_flag.
+  else.
+*    sort lt_cdhdr by udate utime.
+** Fill internal table with changed documents
+*    select changenr objectclas objectid tabname tabkey fname chngind value_new value_old
+*           from cdpos into corresponding fields of table lt_hdrpos
+*           for all entries in lt_cdhdr
+*           where objectclas  = lt_cdhdr-objectclas
+*             and objectid    = lt_cdhdr-objectid
+*             and changenr    = lt_cdhdr-changenr
+*             and ( ( tabname = 'MARC' and ( fname = 'WERKS' or fname = 'KEY') )
+*                or ( tabname = 'MARC' and ( fname = 'MATNR' or fname = 'KEY') )
+*                or ( tabname = 'MBEW' and ( fname = 'VERPR' or fname = 'KEY') )
+*                or ( tabname = 'MBEW' and ( fname = 'STPRS' or fname = 'KEY') )
+*                or ( tabname = 'MARC' and ( fname = 'MMSTA' or fname = 'KEY') )
+*                or ( tabname = 'MARC' and ( fname = 'NFMAT' or fname = 'KEY') )
+*                or ( tabname = 'EINE' and ( fname = 'NETPR' or fname = 'KEY') )
+*                or ( tabname = 'EINE' and ( fname = 'WAERS' or fname = 'KEY') )
+*                or ( tabname = 'EINE' and ( fname = 'NORBM' or fname = 'KEY') )
+*                or ( tabname = 'EORD' and ( fname = 'LIFNR' or fname = 'KEY') )
+*                or ( tabname = 'MARA' and ( fname = 'BISMT' or fname = 'KEY') )
+*                or ( tabname = 'MARA' and ( fname = 'NTGEW' or fname = 'KEY') )
+*                or ( tabname = 'MARA' and ( fname = 'GEWEI' or fname = 'KEY') )
+*                or ( tabname = 'MARA' and ( fname = 'PRDHA' or fname = 'KEY') )
+*                or ( tabname = 'DMAKT' and ( fname = 'MAKTX'  or fname = 'KEY') and tabkey = 'E' ) ).
+*
+*    loop at lt_hdrpos into ls_hdrpos.   " You can not join with cluster tables.
+*      read table lt_cdhdr into ls_cdhdr
+*          with key objectclas = ls_hdrpos-objectclas
+*                   objectid = ls_hdrpos-objectid
+*                   changenr = ls_hdrpos-changenr.
+*
+*      ls_hdrpos-udate = ls_cdhdr-udate.
+*      modify lt_hdrpos from ls_hdrpos transporting udate.
+*    endloop.
+*
+** Filling of table YSE_SCC_MAT_PRCS.
+**Per change Date/indicator/material/plant (and number of source List for EORD)
+**it will show which tables need to be inserted/modified
+*    sort lt_hdrpos by chngind udate tabname.
+*    loop at lt_hdrpos into ls_hdrpos.
+*      case ls_hdrpos-tabname.
+*        when 'MARA'.
+*          perform process_mat_mara using ls_hdrpos.
+*        when 'DMAKT'.
+*          perform process_mat_dmakt using ls_hdrpos.
+*        when 'MARC'.
+*          perform process_mat_marc using ls_hdrpos.
+*        when 'MBEW'.
+*          perform process_mat_mbew using ls_hdrpos.
+*        when 'EINE'.
+*          perform process_mat_eine using ls_hdrpos.
+*        when 'EORD'.
+*          perform process_mat_eord using ls_hdrpos.
+*        when others.
+*      endcase.
+*    endloop.
+    perform process_cdoc_mat.
+
+* fill internal table to be used to fill the IDOC
+    select * from yse_scc_mat_prcs
+        appending corresponding fields of table lt_scc_mat_prcs
+      for all entries in gt_werks
+        where chgind in ('U','I','E','D','J')
+          and udate in s_ersda
+          and matnr in s_matnr
+          and werks = gt_werks-werks
+          and lgort = gt_werks-lgort
+          and ekorg eq p_ekorg.                         "#EC CI_NOFIRST
+  endif.  " initial download ?
+
+* Check flag in YSE_SCC_USED_MAT.  If 'X'...it means the material was never send to SCC...
+* materials with flag 'X' won't be processed with the change docs.
+* Afterwards we put a 'P' from processed...
+  select c~matnr c~werks c~lgort into corresponding fields of table lt_mat
+      from mara as a
+       inner join marc as b on b~matnr = a~matnr
+       inner join yse_scc_used_mat as c on c~matnr = b~matnr
+                                       and c~werks = b~werks
+      for all entries in gt_werks
+      where a~matnr in s_matnr
+        and a~matkl in s_matkl
+        and a~mtart in s_mtart
+        and c~werks = gt_werks-werks
+        and c~lgort = gt_werks-lgort
+        and c~flag  in lr_flag.
+
+  loop at lt_mat into ls_mat.
+    clear: ls_scc_mat_prcs, lv_ersda.
+    ls_scc_mat_prcs-chgind = 'A'.
+    ls_scc_mat_prcs-werks  = ls_mat-werks.
+    ls_scc_mat_prcs-lgort  = ls_mat-lgort.
+    ls_scc_mat_prcs-matnr  = ls_mat-matnr.
+    ls_scc_mat_prcs-ekorg  = p_ekorg.
+
+    select single ersda from msta into lv_ersda             "#EC *
+     where matnr = ls_scc_mat_prcs-matnr  and
+          werks = ls_scc_mat_prcs-werks and
+          statm = 'E'.
+    if sy-subrc = 0.
+      ls_scc_mat_prcs-udate = lv_ersda.
+    endif.
+    append ls_scc_mat_prcs to lt_scc_mat_prcs.
+  endloop.
+
+************************************ Further processing for initial download materials and changed materials **********************************************************
+* Refine the table depending on the selections on the selection screen
+  sort lt_scc_mat_prcs by chgind matnr werks lgort zeord ekorg infnr.
+  delete adjacent duplicates from lt_scc_mat_prcs comparing chgind matnr werks lgort zeord ekorg infnr.
+
+  loop at lt_scc_mat_prcs into ls_scc_mat_prcs.
+    clear lv_prdha.
+    lv_tabix = sy-tabix.
+* Only Materials with Material Type/Material Group of selection screen
+    select single prdha from mara into lv_prdha
+      where matnr = ls_scc_mat_prcs-matnr
+        and mtart in s_mtart
+        and matkl in s_matkl.
+
+    if sy-subrc <> 0.
+      delete lt_scc_mat_prcs index lv_tabix.
+      continue.
+    elseif lv_prdha(4) not in s_gac.
+      delete lt_scc_mat_prcs index lv_tabix.
+      continue.
+    elseif lv_prdha+4(4) not in s_pgc.
+      delete lt_scc_mat_prcs index lv_tabix.
+      continue.
+    endif.
+
+* Vendors which are not selected on selection screen-> exclude  otherwise allways send IDOC with or without vendor
+    select single lifnr from eord into lv_lifnr             "#EC *
+      where matnr = ls_scc_mat_prcs-matnr and
+            werks = ls_scc_mat_prcs-werks and
+            lifnr in s_ven and
+            bdatu > sy-datum and
+            flifn = 'X'.
+    if sy-subrc <> 0.
+      delete lt_scc_mat_prcs index lv_tabix.
+      continue.
+    endif.
+  endloop.
+
+* Retrieve all material info
+  loop at lt_scc_mat_prcs into ls_scc_mat_prcs.
+    clear: lv_evers, ls_matmas.
+
+    ls_matmas-matnr = ls_scc_mat_prcs-matnr.
+    if ls_scc_mat_prcs-chgind = 'I' or ls_scc_mat_prcs-chgind = 'A'.
+      ls_matmas-trtype = 'A'.
+    else.
+      ls_matmas-trtype = 'C'.
+    endif.
+
+    ls_matmas-werks = ls_scc_mat_prcs-werks.
+    ls_matmas-lgort = ls_scc_mat_prcs-lgort.
+    ls_matmas-fam   = gv_fam.
+
+    perform get_mara changing ls_matmas.
+    perform get_dmakt changing ls_matmas.
+    perform get_marc changing ls_matmas.
+    perform get_mbew changing ls_matmas.
+    perform get_eord changing ls_matmas.
+    perform get_eine changing ls_matmas.
+
+* Find Lead Time
+    select single lead from yse_scc_used_mat into lv_plifz
+      where matnr = ls_matmas-matnr
+        and werks = ls_matmas-werks
+        and lgort = ls_scc_mat_prcs-lgort.
+
+    ls_matmas-lead_time = lv_plifz.
+* Fill Updated/Insert tables
+    ls_matmas-eine = ls_scc_mat_prcs-eine.
+    ls_matmas-marc = ls_scc_mat_prcs-marc.
+    ls_matmas-mara = ls_scc_mat_prcs-mara.
+    ls_matmas-mbew = ls_scc_mat_prcs-mbew.
+    ls_matmas-eord = ls_scc_mat_prcs-eord.
+    ls_matmas-makt = ls_scc_mat_prcs-makt.
+    append ls_matmas to lt_matmas.
+  endloop.
+
+  loop at lt_matmas into ls_matmas.
+* Fill Idoc Material Information
+    clear ls_data.
+    ls_data-segnam  = c_segment_scc_matmas.
+    ls_data-sdata   = ls_matmas.
+    append ls_data to pt_data.
+
+*  change all 'X' (new created) into 'P' (Processed) in YSE_SCC_USED_MAT
+*  for the once we will create and IDOC(entries in it_matmas)
+    update yse_scc_used_mat set flag = 'P'
+      where matnr = ls_matmas-matnr
+        and werks = ls_matmas-werks
+        and lgort = ls_matmas-lgort.
+  endloop.
+
+  if sy-subrc <> 0.
+    clear: ls_data, ls_matmas.
+
+    ls_matmas-fam = gv_fam.
+    ls_matmas-werks = c_9999.
+    ls_matmas-plant_credat = sy-datum.
+    ls_matmas-verpr = '0'.
+    ls_matmas-netpr = '0'.
+    ls_matmas-ntgew = '0'.
+    ls_matmas-lead_time = '0'.
+    ls_data-segnam  = c_segment_scc_matmas.
+    ls_data-sdata   = ls_matmas.
+    append ls_data to pt_data.
+  endif.
+endform.                    "fill_data_mat
+*&---------------------------------------------------------------------*
+*&      Form  fill_data_stock
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->L_DATA     text
+*----------------------------------------------------------------------*
+form fill_data_stock tables pt_data type edidd_tt.
+  data: ls_stock type ty_stock,
+        lt_stock type table of ty_stock.
+
+  data: lv_index type sy-tabix,
+        lv_kalab type labst.
+
+  data: lv_available_stck type labst,
+        lv_zre           type labst,
+        lv_labst          type mard-labst.
+
+  data: lt_mska           type table of ty_mska,
+        ls_mska           type ty_mska.
+
+  data: lt_material       type table of ty_material,
+        ls_material       type ty_material.
+
+  perform get_mat_stock tables lt_material.
+
+
+* Get allocated stock
+* Get order data for "stock back order" and "open sales orders" (allocated stock) ZOR/ZO03
+  perform get_order_data using lt_material.
+* Get Sales Order Stock
+  perform get_sales_order_stock using lt_material changing lt_mska.
+
+* Get order data for ZRE1
+  perform get_order_data_zre using lt_material.
+* Get service reservation data for "stock back order" and "open reservations" (allocated stock)
+*    PERFORM get_service_data.
+
+* Get Allocated Stock
+  perform get_allocated_stock using lt_material.
+*    PERFORM get_allocated_stock1.
+
+  loop at lt_material into ls_material.
+    clear: lv_kalab, lv_labst, ls_mska.
+    select single labst into lv_labst from mard
+                              where matnr = ls_material-matnr
+                                and werks = ls_material-werks
+                                and lgort = ls_material-lgort.
+
+* Add Sales order stock
+    read table lt_mska into ls_mska
+                       with key matnr = ls_material-matnr
+                                werks = ls_material-werks
+                                lgort = ls_material-lgort
+                   binary search.
+    if sy-subrc eq 0.
+      lv_kalab = ls_mska-kalab.
+    endif.
+
+    read table it_alloc with key matnr = ls_material-matnr
+                                 werks = ls_material-werks
+                                 lgort = ls_material-lgort.
+    if sy-subrc eq 0.
+      lv_index = sy-tabix.
+      it_alloc-unrestr_quantity = lv_labst + lv_kalab.
+      modify it_alloc index lv_index transporting unrestr_quantity.
+    else."if ls_material-lgort = '1000'.
+      clear it_alloc.
+      it_alloc-matnr = ls_material-matnr.
+      it_alloc-werks = ls_material-werks.
+      it_alloc-lgort = ls_material-lgort.
+      it_alloc-unrestr_quantity = lv_labst + lv_kalab.
+      append it_alloc.
+    endif.
+  endloop.
+
+  sort it_alloc_zre by matnr werks lgort."MOD-004
+  loop at it_alloc.
+    clear: lv_zre, ls_stock, lv_available_stck.
+    "MOD-004 begin
+    read table it_alloc_zre with key matnr = it_alloc-matnr
+                                   werks = it_alloc-werks
+                                   lgort = it_alloc-lgort
+                                   binary search.
+    "MOD-004 end
+    if sy-subrc eq 0.
+      lv_zre = it_alloc_zre-alloc_quantity.
+    endif.
+
+    ls_stock-fam = gv_fam.
+
+    ls_stock-matnr = it_alloc-matnr.
+    ls_stock-werks = it_alloc-werks.
+    ls_stock-lgort = it_alloc-lgort.
+    lv_available_stck = it_alloc-unrestr_quantity - it_alloc-alloc_quantity + lv_zre.
+*    lv_unrestr_stck = it_alloc-unrestr_quantity.
+    ls_stock-unrestr_stck = it_alloc-unrestr_quantity."lv_unrestr_stck.
+    ls_stock-available_stck = lv_available_stck.
+    if not lv_available_stck is initial.
+      append ls_stock to lt_stock.
+    endif.
+  endloop.
+
+* Fill IDOC Stock
+  perform prepare_idocdata_stock using lt_stock changing pt_data[].
+endform.                    "fill_data_stock
+
+*&---------------------------------------------------------------------*
+*&      Form  fill_data_cud
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->L_DATA     text
+*----------------------------------------------------------------------*
+form fill_data_cud tables l_data structure edidd.
+
+  if s_matnrc is initial.
+    s_matnrc-sign = 'I'.
+    s_matnrc-option = 'NE'.
+    s_matnrc-low = ''.
+    append s_matnrc.
+  endif.
+
+* Fill internal table it_vbakcud with the Sales documents which are created
+  perform process_cud_so tables l_data.
+
+* Fill internal table it_ekkocud with the Purchase Documents which are created
+  perform process_cud_po tables l_data.
+endform.                    "fill_data_cud
+*&---------------------------------------------------------------------*
+*&      Form  fill_data_opo
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->L_DATA     text
+*----------------------------------------------------------------------*
+form fill_data_opo tables pt_data type edidd_tt.
+  data: lt_scc_opo_prcs type table of yse_scc_opo_prcs.
+
+  data: lt_opo type table of ty_scc_opo,
+        lt_opo_c type table of t_scc_opo_c.
+
+  if p_inio = 'X'. " intial load?
+* Purchase Orders
+    select ekko~lifnr as lifnr
+           ekko~reswk as reswk
+           ekko~bsart as bsart
+           ekpo~menge as qo_menge
+           ekpo~ebeln as ebeln
+           ekpo~ebelp as ebelp
+           ekpo~matnr as matnr
+           ekpo~werks as werks
+           ekpo~lgort as lgort
+           ekpo~loekz as loekz
+    from ekpo
+    inner join  ekko  on ekpo~ebeln =  ekko~ebeln
+    inner join  eket  on ekpo~ebeln =  eket~ebeln
+                    and  ekpo~ebelp =  eket~ebelp
+       into corresponding fields of table lt_opo
+             for all entries in gt_werks
+    where ekpo~werks = gt_werks-werks
+      and ekpo~lgort = gt_werks-lgort
+      and ekpo~matnr in s_matnro
+*          ekpo~werks in s_werks and
+      and ekko~lifnr in s_lifnro
+      and ekko~bsart in s_bsarto
+      and ekko~bsart in ('ZNB1', 'ZNB2', 'ZUB1' )
+      and ekko~ebeln in s_ebelno
+      and ekko~ekorg eq p_ekorg and
+          eket~etenr = '0001'.
+  else.
+    perform process_cdoc_opo." tables lt_hdrpos.
+
+* Received quantity
+* Select all relevant goods receipts
+    perform process_opo_mkpf.
+
+* fill internal table to be used to fill the IDOC
+    select * from yse_scc_opo_prcs into corresponding fields of table lt_scc_opo_prcs
+      where udate in s_credao.
+
+    if lt_scc_opo_prcs is not initial.
+* Refine the table depending on the selections on the selection screen
+      select ekko~lifnr as lifnr
+             ekko~reswk as reswk
+             ekko~bsart as bsart
+             ekpo~menge as qo_menge
+             ekpo~ebeln as ebeln
+             ekpo~ebelp as ebelp
+             ekpo~matnr as matnr
+             ekpo~werks as werks
+             ekpo~lgort as lgort
+             ekpo~loekz as loekz
+      from ekpo
+      inner join  ekko  on ekpo~ebeln =  ekko~ebeln
+      inner join  eket  on ekpo~ebeln =  eket~ebeln
+                      and  ekpo~ebelp =  eket~ebelp
+         appending corresponding fields of table lt_opo
+      for all entries in  lt_scc_opo_prcs
+      where ekpo~ebeln =  lt_scc_opo_prcs-ebeln
+        and ekpo~ebelp =  lt_scc_opo_prcs-ebelp
+        and ekpo~matnr in s_matnro
+        and ekpo~werks in s_werks
+        and ekko~lifnr in s_lifnro
+        and ekko~bsart in s_bsarto
+        and ekko~ebeln in s_ebelno
+        and ekko~bsart in ('ZNB1', 'ZNB2', 'ZUB1' )
+        and ekko~ekorg eq p_ekorg
+        and eket~etenr = '0001'.
+    endif.
+  endif. " initial load or not
+
+*****************************************FURTHER PROCESSING*************
+* Further Processing Purchase Order
+  perform process_opo_po using lt_opo changing lt_opo_c.
+
+* Further Processing Purchase Requisition
+  perform process_opo_pr using lt_scc_opo_prcs changing lt_opo_c .
+
+* Fill IDOC Open Purchase Order
+  perform prepare_idocdata_opo using lt_opo_c[] changing pt_data[].
+endform.                    "fill_data_opo
+*&---------------------------------------------------------------------*
+*&      Form  process_mat_marc
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+form process_mat_marc using ps_hdrpos type ty_hdrpos.
+  data: lv_matnr        type matnr,
+        lv_werks        type werks_d,
+        lv_subrc        type sy-subrc,
+        lt_scc_used_mat type table of yse_scc_used_mat,
+        ls_scc_used_mat type yse_scc_used_mat,
+        ls_scc_mat_prcs type yse_scc_mat_prcs.
+
+  "  if i_hdrpos-tabname = 'MARC'.
+  lv_matnr = ps_hdrpos-objectid(18).
+  lv_werks = ps_hdrpos-tabkey+21(10).
+
+  "Check material number
+  perform check_mat_matnr using lv_matnr
+                          changing lv_subrc.
+  if lv_subrc <> 0.
+    return.
+  endif.
+
+  read table gt_werks transporting no fields with key werks = lv_werks.
+  if sy-subrc <> 0.
+    return.
+  endif.
+
+  select * from yse_scc_used_mat into table lt_scc_used_mat
+    where matnr = lv_matnr
+      and werks = lv_werks
+      and flag <> 'X'.
+
+  loop at lt_scc_used_mat into ls_scc_used_mat.
+    clear: ls_scc_mat_prcs.
+    select single * from yse_scc_mat_prcs
+     into ls_scc_mat_prcs
+     where chgind = ps_hdrpos-chngind
+       and udate = ps_hdrpos-udate
+       and matnr = lv_matnr
+       and werks = ls_scc_used_mat-werks
+       and lgort = ls_scc_used_mat-lgort
+       and zeord = 0
+       and ekorg = p_ekorg.
+
+    if sy-subrc <> 0 .
+      ls_scc_mat_prcs-chgind = ps_hdrpos-chngind.
+      ls_scc_mat_prcs-udate = ps_hdrpos-udate.
+      ls_scc_mat_prcs-matnr = lv_matnr.
+      ls_scc_mat_prcs-werks = lv_werks.
+      ls_scc_mat_prcs-lgort = ls_scc_used_mat-lgort.
+      ls_scc_mat_prcs-ekorg = p_ekorg.
+    endif.
+
+    ls_scc_mat_prcs-marc = 'X'.
+    modify yse_scc_mat_prcs from ls_scc_mat_prcs.
+  endloop.. "in yse_scc_used_mat
+  "  endif.
+endform.                    " process_mat_marc
+*&---------------------------------------------------------------------*
+*&      Form  PROCESS_MAT_MBEW
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+form process_mat_mbew using ps_hdrpos type ty_hdrpos.
+  data: lv_matnr        type matnr,
+        lv_werks        type werks_d,
+        lv_subrc        type sy-subrc,
+        lt_scc_used_mat type table of yse_scc_used_mat,
+        ls_scc_used_mat type yse_scc_used_mat,
+        ls_scc_mat_prcs type yse_scc_mat_prcs.
+*if i_hdrpos-tabname = 'MBEW'.
+
+  if ( ps_hdrpos-fname = 'VERPR' and ps_hdrpos-tabkey+21(2) = 'RU' ) or
+     ( ps_hdrpos-fname = 'STPRS' and ps_hdrpos-tabkey+21(2) = 'CN' ).
+
+    lv_matnr = ps_hdrpos-objectid(18).
+    lv_werks = ps_hdrpos-tabkey+21(10).
+
+    "Check material number
+    perform check_mat_matnr using lv_matnr
+                            changing lv_subrc.
+    if lv_subrc <> 0.
+      return.
+    endif.
+
+    read table gt_werks transporting no fields with key werks = lv_werks.
+    if sy-subrc <> 0.
+      return.
+    endif.
+
+    select * from yse_scc_used_mat into table lt_scc_used_mat
+       where matnr = lv_matnr and
+             werks = lv_werks and
+             flag <> 'X'.
+
+    loop at lt_scc_used_mat into ls_scc_used_mat.
+      clear: ls_scc_mat_prcs.
+      select single * from yse_scc_mat_prcs
+       into ls_scc_mat_prcs
+       where chgind = ps_hdrpos-chngind
+         and udate = ps_hdrpos-udate
+         and matnr = lv_matnr
+         and werks = ls_scc_used_mat-werks
+         and lgort = ls_scc_used_mat-lgort
+         and zeord = 0
+         and ekorg = p_ekorg.
+
+      if sy-subrc <> 0 .
+        ls_scc_mat_prcs-chgind = ps_hdrpos-chngind.
+        ls_scc_mat_prcs-udate = ps_hdrpos-udate.
+        ls_scc_mat_prcs-matnr = lv_matnr.
+        ls_scc_mat_prcs-werks = lv_werks.
+        ls_scc_mat_prcs-lgort = ls_scc_used_mat-lgort.
+        ls_scc_mat_prcs-ekorg = p_ekorg.
+      endif.
+      ls_scc_mat_prcs-mbew = 'X'.
+      modify yse_scc_mat_prcs from ls_scc_mat_prcs.
+    endloop..  "in yse_scc_used_mat
+  endif. " VERPR or STPRS
+*      endif.
+endform.                    " PROCESS_MAT_MBEW
+*&---------------------------------------------------------------------*
+*&      Form  PROCESS_MAT_EINE
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_I_HDRPOS  text
+*----------------------------------------------------------------------*
+form process_mat_eine using ps_hdrpos type ty_hdrpos.
+  data: lv_matnr        type matnr,
+        lv_werks        type werks_d,
+        lv_infnr        type infnr,
+        lv_subrc        type sy-subrc,
+        lt_scc_used_mat type table of yse_scc_used_mat,
+        ls_scc_used_mat type yse_scc_used_mat,
+        ls_scc_mat_prcs type yse_scc_mat_prcs.
+
+*if i_hdrpos-tabname = 'EINE'.
+  lv_infnr = ps_hdrpos-objectid.
+  lv_werks = ps_hdrpos-tabkey+18(4).
+
+  select single matnr from eina into lv_matnr
+      where infnr = lv_infnr.
+
+  "Check material number
+  perform check_mat_matnr using lv_matnr
+                          changing lv_subrc.
+  if lv_subrc <> 0.
+    return.
+  endif.
+
+  read table gt_werks transporting no fields with key werks = lv_werks.
+  if sy-subrc <> 0.
+    return.
+  endif.
+
+  select * from yse_scc_used_mat into table lt_scc_used_mat
+     where matnr = lv_matnr and
+           werks = lv_werks and
+           flag <> 'X'.
+  loop at lt_scc_used_mat into ls_scc_used_mat.
+    clear: ls_scc_mat_prcs.
+    select single * from yse_scc_mat_prcs
+     into ls_scc_mat_prcs
+     where chgind = ps_hdrpos-chngind
+       and udate = ps_hdrpos-udate
+       and matnr = lv_matnr
+       and werks = ls_scc_used_mat-werks
+       and lgort = ls_scc_used_mat-lgort
+       and zeord = 0
+       and ekorg = p_ekorg.
+
+    if sy-subrc <> 0 .
+      ls_scc_mat_prcs-chgind = ps_hdrpos-chngind.
+      ls_scc_mat_prcs-udate = ps_hdrpos-udate.
+      ls_scc_mat_prcs-matnr = lv_matnr.
+      ls_scc_mat_prcs-werks = lv_werks.
+      ls_scc_mat_prcs-lgort = ls_scc_used_mat-lgort.
+      ls_scc_mat_prcs-ekorg = p_ekorg.
+      ls_scc_mat_prcs-infnr = lv_infnr.
+    endif.
+    ls_scc_mat_prcs-eine = 'X'.
+    modify yse_scc_mat_prcs from ls_scc_mat_prcs.
+  endloop. " in yse_scc_used_mat
+*      endif.
+endform.                    " PROCESS_MAT_EINE
+*&---------------------------------------------------------------------*
+*&      Form  PROCESS_MAT_EORD
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_I_HDRPOS  text
+*----------------------------------------------------------------------*
+form process_mat_eord using ps_hdrpos type ty_hdrpos.
+  data: lv_matnr        type matnr,
+        lv_werks        type werks_d,
+        lv_zeord        type dzeord,
+        lv_subrc        type sy-subrc,
+        lt_scc_used_mat type table of yse_scc_used_mat,
+        ls_scc_used_mat type yse_scc_used_mat,
+        ls_scc_mat_prcs type yse_scc_mat_prcs.
+
+*if i_hdrpos-tabname = 'EORD'.
+
+  lv_matnr = ps_hdrpos-objectid(18).
+  lv_werks = ps_hdrpos-objectid+18(4).
+  lv_zeord = ps_hdrpos-tabkey+25(5).
+
+  "Check material number
+  perform check_mat_matnr using lv_matnr
+                          changing lv_subrc.
+  if lv_subrc <> 0.
+    return.
+  endif.
+
+  "Make sure the plant is in the plant list.
+  read table gt_werks transporting no fields with key werks = lv_werks.
+  if sy-subrc <> 0 .
+    return.
+  endif.
+
+*  select single lifnr from eord into lv_lifnr
+*        where matnr = lv_matnr and
+*              werks = lv_werks and
+*              zeord = lv_zeord and
+*              flifn = 'X'.
+
+  select * from yse_scc_used_mat into table lt_scc_used_mat
+     where matnr = lv_matnr and
+           werks = lv_werks and
+           flag <> 'X'.
+
+  loop at lt_scc_used_mat into ls_scc_used_mat.
+    clear: ls_scc_mat_prcs.
+    select single * from yse_scc_mat_prcs
+     into ls_scc_mat_prcs
+     where chgind = ps_hdrpos-chngind
+       and udate = ps_hdrpos-udate
+       and matnr = lv_matnr
+       and werks = ls_scc_used_mat-werks
+       and lgort = ls_scc_used_mat-lgort
+       and zeord = lv_zeord
+       and ekorg = p_ekorg.
+
+    if sy-subrc <> 0 .
+      ls_scc_mat_prcs-chgind = ps_hdrpos-chngind.
+      ls_scc_mat_prcs-udate = ps_hdrpos-udate.
+      ls_scc_mat_prcs-matnr = lv_matnr.
+      ls_scc_mat_prcs-werks = lv_werks.
+      ls_scc_mat_prcs-lgort = ls_scc_used_mat-lgort.
+      ls_scc_mat_prcs-zeord = lv_zeord.
+      ls_scc_mat_prcs-ekorg = p_ekorg.
+    endif.
+    ls_scc_mat_prcs-eord = 'X'.
+    modify yse_scc_mat_prcs from ls_scc_mat_prcs.
+  endloop. " in yse_scc_used_mat
+*      endif.
+endform.                    " PROCESS_MAT_EORD
+*&---------------------------------------------------------------------*
+*&      Form  PROCESS_MAT_MARA
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_I_HDRPOS  text
+*----------------------------------------------------------------------*
+form process_mat_mara using ps_hdrpos type ty_hdrpos.
+  data: lv_matnr        type matnr,
+        lv_subrc        type sy-subrc,
+        lt_scc_used_mat type table of yse_scc_used_mat,
+        ls_scc_used_mat type yse_scc_used_mat,
+        ls_scc_mat_prcs type yse_scc_mat_prcs.
+
+*if i_hdrpos2-tabname = 'MARA'.
+  lv_matnr = ps_hdrpos-objectid(18).
+
+  "Check material number
+  perform check_mat_matnr using lv_matnr
+                          changing lv_subrc.
+  if lv_subrc <> 0.
+    return.
+  endif.
+
+  select * from yse_scc_used_mat inner join marc
+    on marc~matnr = yse_scc_used_mat~matnr
+    and marc~werks = yse_scc_used_mat~werks
+    into corresponding fields of table lt_scc_used_mat
+    for all entries in gt_werks
+    where yse_scc_used_mat~matnr = lv_matnr
+      and yse_scc_used_mat~werks = gt_werks-werks
+      and yse_scc_used_mat~lgort = gt_werks-lgort
+      and yse_scc_used_mat~flag <> 'X'.
+
+  loop at lt_scc_used_mat into ls_scc_used_mat.
+    clear: ls_scc_mat_prcs.
+    select single * from yse_scc_mat_prcs
+        into ls_scc_mat_prcs
+        where chgind = ps_hdrpos-chngind
+          and udate = ps_hdrpos-udate
+          and matnr = lv_matnr
+          and werks = ls_scc_used_mat-werks
+          and lgort = ls_scc_used_mat-lgort
+          and zeord = 0
+          and ekorg = p_ekorg.
+    if sy-subrc <> 0 .
+      ls_scc_mat_prcs-chgind = ps_hdrpos-chngind.
+      ls_scc_mat_prcs-udate = ps_hdrpos-udate.
+      ls_scc_mat_prcs-matnr = lv_matnr.
+      ls_scc_mat_prcs-werks = ls_scc_used_mat-werks.
+      ls_scc_mat_prcs-lgort = ls_scc_used_mat-lgort.
+      ls_scc_mat_prcs-ekorg = p_ekorg.
+    endif.
+    ls_scc_mat_prcs-mara = 'X'.
+    modify yse_scc_mat_prcs from ls_scc_mat_prcs.
+  endloop.
+endform.                    " PROCESS_MAT_MARA
+*&---------------------------------------------------------------------*
+*&      Form  PROCESS_MAT_DMAKT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->PS_HDRPOS  text
+*----------------------------------------------------------------------*
+form process_mat_dmakt using ps_hdrpos type ty_hdrpos.
+  data: lv_matnr type matnr,
+        lv_subrc        type sy-subrc,
+        lt_scc_used_mat type table of yse_scc_used_mat,
+        ls_scc_used_mat type yse_scc_used_mat,
+        ls_scc_mat_prcs type yse_scc_mat_prcs.
+
+*if i_hdrpos2-tabname = 'DMAKT'.
+  lv_matnr = ps_hdrpos-objectid(18).
+
+  "Check material number
+  perform check_mat_matnr using lv_matnr
+                          changing lv_subrc.
+  if lv_subrc <> 0.
+    return.
+  endif.
+
+  select * from yse_scc_used_mat inner join marc
+    on marc~matnr = yse_scc_used_mat~matnr
+    and marc~werks = yse_scc_used_mat~werks
+    into corresponding fields of table lt_scc_used_mat
+    for all entries in gt_werks
+    where yse_scc_used_mat~matnr = lv_matnr
+      and yse_scc_used_mat~werks = gt_werks-werks
+      and yse_scc_used_mat~lgort = gt_werks-lgort
+      and yse_scc_used_mat~flag <> 'X'.
+
+  loop at lt_scc_used_mat into ls_scc_used_mat.
+    clear: ls_scc_mat_prcs.
+    select single * from yse_scc_mat_prcs
+        into ls_scc_mat_prcs
+        where chgind = ps_hdrpos-chngind
+          and udate = ps_hdrpos-udate
+          and matnr = lv_matnr
+          and werks = ls_scc_used_mat-werks
+          and lgort = ls_scc_used_mat-lgort
+          and zeord = 0
+          and ekorg = p_ekorg.
+    if sy-subrc <> 0 .
+      ls_scc_mat_prcs-chgind = ps_hdrpos-chngind.
+      ls_scc_mat_prcs-udate = ps_hdrpos-udate.
+      ls_scc_mat_prcs-matnr = lv_matnr.
+      ls_scc_mat_prcs-werks = ls_scc_used_mat-werks.
+      ls_scc_mat_prcs-lgort = ls_scc_used_mat-lgort.
+      ls_scc_mat_prcs-ekorg = p_ekorg.
+    endif.
+    ls_scc_mat_prcs-makt = 'X'.
+    modify yse_scc_mat_prcs from ls_scc_mat_prcs.
+  endloop.
+endform.                    " PROCESS_MAT_DMAKT
+*&---------------------------------------------------------------------*
+*&      Form  PROCESS_OPO_EBAN
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_I_HDRPOS  text
+*----------------------------------------------------------------------*
+form process_opo_eban using ps_hdrpos type ty_hdrpos.
+  data: lv_banfn type banfn,
+        lv_bnfpo type bnfpo,
+        ls_scc_opo_prcs type yse_scc_opo_prcs.
+
+  lv_banfn = ps_hdrpos-objectid.
+  lv_bnfpo = ps_hdrpos-tabkey+13(5).
+
+  select single * from yse_scc_opo_prcs into ls_scc_opo_prcs
+    where udate  = ps_hdrpos-udate
+      and ebeln = lv_banfn
+      and ebelp = lv_bnfpo.
+
+  if sy-subrc <> 0.   " INSERT new Entry in YSE_SCC_OPO_PRCS
+    clear: ls_scc_opo_prcs.
+    ls_scc_opo_prcs-udate = ps_hdrpos-udate.
+    ls_scc_opo_prcs-ebeln = lv_banfn.
+    ls_scc_opo_prcs-ebelp = lv_bnfpo.
+  endif.
+  wa_yse_scc_opo_prcs-eban = 'X'.
+  modify yse_scc_opo_prcs from wa_yse_scc_opo_prcs.
+endform.                    " PROCESS_OPO_EBAN
+*&---------------------------------------------------------------------*
+*&      Form  PROCESS_OPO_EKKO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_I_HDRPOS  text
+*----------------------------------------------------------------------*
+form process_opo_ekko using ps_hdrpos type ty_hdrpos.
+  data: lv_ebeln type ebeln,
+        lt_scc_opo_prcs type table of yse_scc_opo_prcs,
+        ls_scc_opo_prcs type yse_scc_opo_prcs.
+
+  data: lt_ekpo type table of ekpo,
+        ls_ekpo type ekpo.
+
+  lv_ebeln = ps_hdrpos-objectid.
+  select * from ekpo into table lt_ekpo where ebeln = lv_ebeln.
+
+  select * from yse_scc_opo_prcs into table lt_scc_opo_prcs "#EC *
+    where udate = ps_hdrpos-udate
+      and ebeln = lv_ebeln.
+
+  loop at lt_ekpo into ls_ekpo.
+    clear: ls_scc_opo_prcs.
+    read table lt_scc_opo_prcs into ls_scc_opo_prcs with key ebeln = ls_ekpo-ebeln ebelp = ls_ekpo-ebelp.
+    if sy-subrc <> 0.
+      ls_scc_opo_prcs-udate = ps_hdrpos-udate.
+      ls_scc_opo_prcs-ebeln = ls_ekpo-ebeln.
+      ls_scc_opo_prcs-ebelp = ls_ekpo-ebelp.
+    endif.
+    ls_scc_opo_prcs-ekko = 'X'.
+    modify yse_scc_opo_prcs from ls_scc_opo_prcs.
+
+  endloop.
+endform.                    " PROCESS_OPO_EKKO
+*&---------------------------------------------------------------------*
+*&      Form  PROCESS_OPO_EKPO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_I_HDRPOS  text
+*----------------------------------------------------------------------*
+form process_opo_ekpo using ps_hdrpos type ty_hdrpos.
+  data: lv_ebeln type ebeln,
+        lv_ebelp type ebelp,
+        ls_scc_opo_prcs type yse_scc_opo_prcs.
+
+*  if i_hdrpos-tabname = 'EKPO'.
+  lv_ebeln = ps_hdrpos-objectid.
+  lv_ebelp = ps_hdrpos-tabkey+13(5).
+
+  select single * from yse_scc_opo_prcs into ls_scc_opo_prcs
+    where udate  = ps_hdrpos-udate
+      and ebeln = lv_ebeln
+      and ebelp = lv_ebelp.
+
+  if sy-subrc <> 0.
+    ls_scc_opo_prcs-udate = ps_hdrpos-udate.
+    ls_scc_opo_prcs-ebeln = lv_ebeln.
+    ls_scc_opo_prcs-ebelp = lv_ebelp.
+  endif.
+  ls_scc_opo_prcs-ekpo = 'X'.
+  modify yse_scc_opo_prcs from ls_scc_opo_prcs.
+endform.                    " PROCESS_OPO_EKPO
+*&---------------------------------------------------------------------*
+*&      Form  PROCESS_OPO_EKET
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_I_HDRPOS  text
+*----------------------------------------------------------------------*
+form process_opo_eket using ps_hdrpos type ty_hdrpos.
+  data: lv_ebeln type ebeln,
+        lv_ebelp type ebelp,
+        ls_scc_opo_prcs type yse_scc_opo_prcs.
+
+* if i_hdrpos-tabname = 'EKET'.
+  lv_ebeln = ps_hdrpos-objectid.
+  lv_ebelp = ps_hdrpos-tabkey+13(5).
+
+  select single * from yse_scc_opo_prcs into ls_scc_opo_prcs
+    where udate  = ps_hdrpos-udate
+      and ebeln = lv_ebeln
+      and ebelp = lv_ebelp.
+
+  if sy-subrc <> 0.
+    ls_scc_opo_prcs-udate = ps_hdrpos-udate.
+    ls_scc_opo_prcs-ebeln = lv_ebeln.
+    ls_scc_opo_prcs-ebelp = lv_ebelp.
+  endif.
+
+  ls_scc_opo_prcs-eket = 'X'.
+  modify yse_scc_opo_prcs from ls_scc_opo_prcs.
+endform.                    " PROCESS_OPO_EKET
+*&---------------------------------------------------------------------*
+*&      Form  PROCESS_OPO_MKPF
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+form process_opo_mkpf.
+  data: lv_cpudt type cddatum,
+        lv_ebeln type mseg-ebeln,
+        lv_ebelp type mseg-ebelp,
+        lt_mkpf type table of mkpf,
+        ls_mkpf type mkpf,
+        lt_mseg type table of mseg,
+        ls_mseg type mseg,
+        ls_scc_opo_prcs type yse_scc_opo_prcs.
+
+  select * into table lt_mkpf from mkpf
+         where ( cpudt in s_credao )
+         and blart eq 'WE'.                             "#EC CI_NOFIELD
+
+  if sy-subrc = 0.
+    select * into table lt_mseg from mseg
+    for all entries in lt_mkpf
+     where mblnr = lt_mkpf-mblnr
+       and mjahr = lt_mkpf-mjahr
+       and ( bwart = '101' or bwart = '102').
+
+    loop at lt_mseg into ls_mseg.
+      clear: lv_cpudt, ls_scc_opo_prcs.
+
+      read table lt_mkpf into ls_mkpf with key mblnr = ls_mseg-mblnr
+                                               mjahr = ls_mseg-mjahr.
+      lv_cpudt = ls_mkpf-cpudt.
+      lv_ebeln = ls_mseg-ebeln.
+      lv_ebelp = ls_mseg-ebelp.
+
+      select single * from yse_scc_opo_prcs into ls_scc_opo_prcs
+       where udate = lv_cpudt
+         and ebeln = lv_ebeln
+         and ebelp = lv_ebelp.
+
+      if sy-subrc <> 0.
+        ls_scc_opo_prcs-udate = lv_cpudt.
+        ls_scc_opo_prcs-ebeln = lv_ebeln.
+        ls_scc_opo_prcs-ebelp = lv_ebelp.
+      endif.
+      ls_scc_opo_prcs-mseg = 'X'.
+      modify yse_scc_opo_prcs from ls_scc_opo_prcs.
+    endloop.
+  endif. " mkpf is filled
+endform.                    " PROCESS_OPO_MKPF
+*&---------------------------------------------------------------------*
+*&      Form  PROCESS_CDOC_OPO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_I_HDRPOS[]  text
+*----------------------------------------------------------------------*
+form process_cdoc_opo."  tables pt_hdrpos type tt_hdrpos.
+  data: lt_cdhdr  type table of cdhdr,
+        ls_cdhdr  type cdhdr,
+        lt_hdrpos type table of ty_hdrpos,
+        ls_hdrpos type ty_hdrpos.
+
+* Select all change documents for Open Purchase Order (EKKO EKPO EKET)
+* Select all change documents for Open Purchase requistion (EBAN)
+  select * into table lt_cdhdr from cdhdr
+         where objectclas in ('EINKBELEG', 'BANF' )
+           and udate in s_credao.
+
+  if lt_cdhdr is initial.
+    return.
+  endif.
+* Fill internal table with changed documents
+  select  changenr objectclas objectid tabname tabkey fname chngind value_new value_old
+            from cdpos into corresponding fields of table lt_hdrpos
+    for all entries in lt_cdhdr
+         where objectclas  = lt_cdhdr-objectclas
+           and objectid    = lt_cdhdr-objectid
+           and changenr    = lt_cdhdr-changenr
+           and ( ( tabname = 'EKPO' and ( fname = 'WERKS' or fname = 'KEY') )
+              or ( tabname = 'EKPO' and ( fname = 'MATNR' or fname = 'KEY') )
+              or ( tabname = 'EKPO' and ( fname = 'MENGE' or fname = 'KEY') )
+              or ( tabname = 'EKPO' and ( fname = 'LOEKZ' or fname = 'KEY') )
+              or ( tabname = 'EKKO' and ( fname = 'LIFNR' or fname = 'KEY') )
+              or ( tabname = 'EKET' and ( fname = 'EINDT' or fname = 'KEY') )
+              or ( tabname = 'EBAN' and ( fname = 'LOEKZ' or fname = 'KEY') )
+              or ( tabname = 'EBAN' and ( fname = 'MENGE' or fname = 'KEY') )
+              or ( tabname = 'EBAN' and ( fname = 'BADAT' or fname = 'KEY') )
+              or ( tabname = 'EBAN' and ( fname = 'ERDAT' or fname = 'KEY') ) ).
+
+  loop at lt_hdrpos into ls_hdrpos.   " You can not join with cluster tables.
+    read table lt_cdhdr into ls_cdhdr with key changenr = ls_hdrpos-changenr
+                                objectclas = ls_hdrpos-objectclas
+                                objectid = ls_hdrpos-objectid.
+    ls_hdrpos-udate = ls_cdhdr-udate.
+    modify lt_hdrpos from ls_hdrpos transporting udate.
+  endloop.
+  sort lt_hdrpos by chngind udate tabname.
+
+  loop at lt_hdrpos into ls_hdrpos.
+    case ls_hdrpos-tabname.
+      when 'EBAN'.
+        perform process_opo_eban using ls_hdrpos.
+      when 'EKKO'.
+        perform process_opo_ekko using ls_hdrpos.
+      when 'EKPO'.
+        perform process_opo_ekpo using ls_hdrpos.
+      when 'EKET'.
+        perform process_opo_eket using ls_hdrpos.
+      when others.
+    endcase.
+  endloop.
+endform.                    " PROCESS_CDOC_OPO
+*&---------------------------------------------------------------------*
+*&      Form  PROCESS_OPO_PO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_IT_OPO  text
+*----------------------------------------------------------------------*
+form process_opo_po using pt_opo type tt_scc_opo
+                    changing pt_opo_c type tt_scc_opo_c.
+  data: lv_menge_d type menge_d,
+        lv_menge_c type menge_d,
+        lv_eeind type eindt,
+        ls_opo type ty_scc_opo,
+        lt_opo type tt_scc_opo,
+        ls_opo_c type t_scc_opo_c,
+        ls_scc_used_mat type yse_scc_used_mat.
+
+  lt_opo = pt_opo.
+  sort lt_opo by ebeln ebelp.
+
+  loop at lt_opo into ls_opo.
+    clear: lv_menge_d, lv_menge_c.
+* FAM
+    ls_opo-fam = gv_fam.
+* Received Quantity
+    select sum( menge ) from mseg into lv_menge_d
+      where matnr = ls_opo-matnr and
+            ebeln = ls_opo-ebeln and
+            ebelp = ls_opo-ebelp and
+            bwart eq '101'.
+
+    select sum( menge ) from mseg into lv_menge_c
+      where matnr = ls_opo-matnr and
+            ebeln = ls_opo-ebeln and
+            ebelp = ls_opo-ebelp and
+            bwart eq '102'.
+
+    ls_opo-gr_menge = lv_menge_d - lv_menge_c.
+    modify lt_opo from ls_opo.
+  endloop.
+
+  loop at lt_opo into ls_opo.
+    select single * from  yse_scc_used_mat into ls_scc_used_mat
+     where matnr = ls_opo-matnr
+       and werks = ls_opo-werks
+       and lgort = ls_opo-lgort
+       and flag = 'P'.
+    if sy-subrc = 0.
+      clear lv_eeind.
+      select single firstd from yse_scc_firstopo into lv_eeind "#EC *
+        where ebeln = ls_opo-ebeln and
+              ebelp = ls_opo-ebelp and
+              firstd in s_rqdato.
+      if sy-subrc = 0 or ( sy-subrc <> 0 and s_rqdato is initial ).
+        ls_opo_c-eeind = lv_eeind.
+        ls_opo_c-fam  = ls_opo-fam.
+*             it_opo_c-trtype = wa_opo-trtype.
+        if ls_opo-bsart = 'ZNB1' or  ls_opo-bsart = 'ZNB2'.
+          ls_opo_c-lifnr = ls_opo-lifnr.
+        else.
+          ls_opo_c-lifnr = ls_opo-reswk.
+        endif.
+        ls_opo_c-bsart = ls_opo-bsart.
+        ls_opo_c-ebeln = ls_opo-ebeln.
+        ls_opo_c-ebelp =  ls_opo-ebelp.
+* Deleted po lines ordered qty = 0
+        ls_opo_c-qo_menge = ls_opo-qo_menge.
+        ls_opo_c-gr_menge = ls_opo-gr_menge.
+        ls_opo_c-matnr = ls_opo-matnr.
+        if ls_opo-werks <> 'CN91' and ls_opo-werks <> 'CN93'.
+          ls_opo_c-werks = ls_opo-werks.
+          ls_opo_c-lgort = ls_opo-lgort.
+        else.
+          perform get_real_plant_po using ls_opo-ebeln ls_opo-ebelp
+                                    changing ls_opo_c-werks.
+          ls_opo_c-lgort = '1000'.
+        endif.
+
+        if p_inio = 'X'.
+          " intial load? -> PO's that are closed QO = GR should not be send
+          if  ls_opo-loekz <> 'L' and ls_opo-qo_menge <> ls_opo-gr_menge.
+            append ls_opo_c to pt_opo_c.
+          endif.
+        else.
+          if ls_opo-loekz = 'L'.
+            ls_opo_c-qo_menge = 0.
+          endif.
+          append ls_opo_c to pt_opo_c.
+        endif.
+      endif.
+    endif.
+  endloop.
+endform.                    " PROCESS_OPO_PO
+*&---------------------------------------------------------------------*
+*&      Form  process_opo_pr
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->PT_OPR     text
+*----------------------------------------------------------------------*
+form process_opo_pr using pt_scc_opo_prcs type tt_scc_opo_prcs
+                    changing pt_opo_c type tt_scc_opo_c.
+
+  data: ls_opr      type ty_scc_opo,
+        lt_opr      type table of ty_scc_opo,
+        ls_pr_c     type t_scc_opo_c,
+        lv_index    type sy-tabix.
+
+  data: lv_ebeln_pr type ebeln,
+        lv_loekz_pr type loekz,
+        lv_firstd   type lfdat.
+
+  data: ls_scc_used_mat type yse_scc_used_mat.
+
+* Select the created Purchase Requistions
+  select   eban~flief as lifnr
+*               ekko~reswk as reswk
+           eban~bsart as bsart
+           eban~menge as qo_menge
+           eban~banfn as ebeln
+           eban~bnfpo as ebelp
+           eban~matnr as matnr
+           eban~werks as werks
+           eban~lgort as lgort
+           eban~loekz as loekz
+       into corresponding fields of table lt_opr
+   from eban
+    for all entries in gt_werks
+     where eban~werks = gt_werks-werks
+      and eban~lgort = gt_werks-lgort
+      and eban~badat in s_credao
+*          and eban~werks in s_werks
+      and eban~banfn in s_banfno
+      and eban~matnr in s_matnro
+      and eban~ekorg = p_ekorg
+      and eban~bsart in ('ZNB1', 'ZNB2', 'ZNB3').
+
+  "Remove ZNB1 PR for MR China.
+  if p_ekorg = 'CN07'.
+    delete lt_opr where bsart = 'ZNB1'.
+  endif.
+  if pt_scc_opo_prcs is not initial.
+    select eban~flief as lifnr
+               eban~menge as qo_menge
+               eban~bsart as bsart
+               eban~banfn as ebeln
+               eban~bnfpo as ebelp
+               eban~matnr as matnr
+               eban~werks as werks
+               eban~lgort as lgort
+               eban~loekz as loekz
+          from eban
+          appending corresponding fields of table lt_opr
+           for all entries in  pt_scc_opo_prcs
+           where eban~banfn =  pt_scc_opo_prcs-ebeln
+             and eban~bnfpo =  pt_scc_opo_prcs-ebelp
+*             and eban~werks = it_werks-werks
+*             and eban~lgort = it_werks-lgort
+             and eban~flief in s_lifnro
+             and eban~banfn in s_banfno
+             and eban~ekorg = p_ekorg
+             and eban~bsart in ('ZNB1', 'ZNB2', 'ZNB3').
+  endif.
+
+  sort lt_opr by ebeln ebelp.
+  delete adjacent duplicates from lt_opr comparing ebeln ebelp.
+
+  loop at lt_opr into ls_opr.
+    lv_index = sy-tabix.
+* FAM
+    ls_opr-fam = gv_fam.
+
+* Received Quantity
+    clear: lv_ebeln_pr, lv_loekz_pr.
+    select single ebeln loekz from eban into (lv_ebeln_pr, lv_loekz_pr)
+      where banfn = ls_opr-ebeln and
+            bnfpo = ls_opr-ebelp.
+    if not lv_ebeln_pr is initial or not lv_loekz_pr is initial.
+      ls_opr-gr_menge = 0.
+      ls_opr-qo_menge = 0.
+    else.
+      ls_opr-gr_menge = 0.
+    endif.
+    modify lt_opr from ls_opr index lv_index.
+  endloop.
+
+  loop at lt_opr into ls_opr.
+
+    select single * from  yse_scc_used_mat into ls_scc_used_mat
+      where matnr = ls_opr-matnr
+        and werks = ls_opr-werks
+        and lgort = ls_opr-lgort
+        and flag = 'P'.
+    if sy-subrc = 0.
+      clear lv_firstd.
+      select single lfdat from eban into lv_firstd
+        where banfn = ls_opr-ebeln and
+              bnfpo = ls_opr-ebelp and
+              lfdat in s_rqdato.
+
+      if sy-subrc = 0 or ( sy-subrc <> 0 and s_rqdato is initial ).
+        ls_pr_c-eeind = lv_firstd.
+        ls_pr_c-fam  = ls_opr-fam.
+        ls_pr_c-lifnr = ls_opr-lifnr.
+        ls_pr_c-bsart = ls_opr-bsart.
+        ls_pr_c-ebeln = ls_opr-ebeln.
+        ls_pr_c-ebelp = ls_opr-ebelp.
+        ls_pr_c-qo_menge = ls_opr-qo_menge.
+        ls_pr_c-gr_menge = ls_opr-gr_menge.
+        ls_pr_c-matnr = ls_opr-matnr.
+        if ls_opr-werks <> 'CN91' and ls_opr-werks <> 'CN93'.
+          ls_pr_c-werks = ls_opr-werks.
+          ls_pr_c-lgort = ls_opr-lgort.
+        else.
+          perform get_real_plant_pr using ls_opr-ebeln ls_opr-ebelp
+                                    changing ls_pr_c-werks.
+          ls_pr_c-lgort = '1000'.
+        endif.
+
+        if p_inio = 'X'. " intial load? -> PO's that are closed QO = GR should not be send
+          if ls_pr_c-qo_menge <> 0.
+            append ls_pr_c to pt_opo_c.
+          endif.
+        else.
+          append ls_pr_c to pt_opo_c.
+        endif.
+      endif.
+    endif.
+  endloop.
+endform.                    "process_opo_pr
+*&---------------------------------------------------------------------*
+*&      Form  PREPARE_IDOCDATA_OPO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_IT_OPO_C  text
+*----------------------------------------------------------------------*
+form prepare_idocdata_opo using pt_opo_c type tt_scc_opo_c
+                          changing pt_data type  edidd_tt.
+  data: ls_opo_c type t_scc_opo_c,
+        ls_edidd type edidd.
+
+  loop at pt_opo_c into ls_opo_c.
+    ls_edidd-segnam  = c_segment_scc_opo.
+    ls_edidd-sdata   = ls_opo_c.
+    append ls_edidd to pt_data.
+  endloop.
+
+** Fill IDOC Purchase Requisition
+*  loop at it_opo2_c into wa_opo2_c.
+*    clear l_data.
+*    l_data-segnam  = c_segment_scc_opo.
+*    l_data-sdata   = wa_opo2_c.
+*    append l_data.
+*  endloop.
+
+  if pt_data[] is initial.
+    ls_opo_c-fam = gv_fam.
+    ls_opo_c-ebeln = c_9999999999.
+    ls_opo_c-eeind = sy-datum.
+    ls_opo_c-qo_menge = '0'.
+    ls_opo_c-gr_menge = '0'.
+    ls_edidd-segnam  = c_segment_scc_opo.
+    ls_edidd-sdata   = ls_opo_c.
+    append ls_edidd to pt_data.
+  endif.
+endform.                    " PREPARE_IDOCDATA_OPO
+*&---------------------------------------------------------------------*
+*&      Form  prepare_idocdata_stock
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->PT_STOCK   text
+*      -->PT_DATA    text
+*----------------------------------------------------------------------*
+form prepare_idocdata_stock using pt_stock type tt_stock
+                          changing pt_data type  edidd_tt.
+  data: ls_stock type ty_stock,
+        ls_edidd type edidd.
+
+  loop at pt_stock into ls_stock.
+    ls_edidd-segnam  = c_segment_scc_stock.
+    ls_edidd-sdata   = ls_stock.
+    append ls_edidd to pt_data.
+  endloop.
+
+  if sy-subrc <> 0 .
+    ls_stock-fam  = gv_fam.
+    ls_stock-werks = c_9999.
+    ls_stock-available_stck = '0'.
+    ls_stock-unrestr_stck = '0'.
+    ls_edidd-segnam  = c_segment_scc_stock.
+    ls_edidd-sdata   = ls_stock.
+    append ls_edidd to pt_data.
+  endif.
+endform.                    "prepare_idocdata_stock
+*&---------------------------------------------------------------------*
+*&      Form  process_cdoc_cud
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->PT_HDRPOS  text
+*----------------------------------------------------------------------*
+form process_cdoc_cud_so using pt_mat type tt_material
+                         changing pt_vbak type tab_vbak.
+  data: lt_cdhdr type table of cdhdr,
+        lt_cdhdr_tmp type table of cdhdr,
+        lt_objectid type table of cdhdr-objectid,
+        lv_objectid type cdhdr-objectid,
+        ls_cdhdr type cdhdr,
+        lt_hdrpos type tt_hdrpos,
+        ls_hdrpos type ty_hdrpos,
+        ls_vbak type vbak,
+        lt_vbak type table of vbak,
+        lt_vbap type table of vbap,
+        ls_vbap type vbap,
+        lt_posnr type table of vbap-posnr,
+        lv_index type sy-index,
+        lv_delete type boolean.
+
+  select * into table lt_cdhdr from cdhdr
+    where objectclas = 'VERKBELEG'
+           and ( udate in s_credac ).
+
+  sort lt_cdhdr by objectid ascending.
+  loop at lt_cdhdr into ls_cdhdr.
+    at new objectid.
+      ls_vbak-vbeln = ls_cdhdr-objectid.
+      if ls_vbak-vbeln in s_vbelnc.
+        append ls_vbak to lt_vbak.
+      endif.
+    endat.
+  endloop.
+
+  if lt_vbak is not initial.
+    clear: lt_posnr.
+    select vbap~vbeln vbap~posnr vbap~matnr vbap~werks vbap~lgort
+      into corresponding fields of table lt_vbap
+      from vbak inner join vbap on vbap~vbeln eq vbak~vbeln
+        for all entries in lt_vbak
+        where vbak~vbeln = lt_vbak-vbeln
+        and vbak~vkorg = p_ekorg
+        and vbak~auart in ('ZOR', 'ZO03', 'ZKE', 'ZKT' )
+        and vbak~kunnr in s_kunnrc
+        and vbap~pstyv <> 'ZTXT'.
+  endif.
+
+  loop at lt_vbap into ls_vbap.
+    lv_index = sy-tabix.
+    read table pt_mat with key matnr = ls_vbap-matnr
+                               werks = ls_vbap-werks
+                               lgort = ls_vbap-lgort
+                               transporting no fields binary search.
+    if sy-subrc <> 0 .
+      delete lt_vbap index lv_index.
+    endif.
+  endloop.
+
+  sort lt_vbap by vbeln.
+
+  loop at lt_cdhdr into ls_cdhdr.
+    ls_vbak-vbeln = ls_cdhdr-objectid.
+
+    read table lt_vbap transporting no fields
+                with key vbeln = ls_vbak-vbeln.
+
+    if sy-subrc <> 0.
+      delete lt_cdhdr where objectid = ls_cdhdr-objectid.
+    endif.
+  endloop.
+
+  if lt_cdhdr is not initial.
+    sort lt_cdhdr by udate utime.
+* Fill internal table it_vbakcud with changed Sales Documents concerning WERK MENGE and MATNR
+    select changenr objectclas objectid tabname tabkey fname chngind value_new value_old
+           from cdpos into corresponding fields of table lt_hdrpos
+           for all entries in lt_cdhdr
+           where objectclas  = lt_cdhdr-objectclas
+             and objectid    = lt_cdhdr-objectid
+             and changenr    = lt_cdhdr-changenr
+             and ( ( tabname = 'VBAP' and ( fname = 'WERKS' ) )
+                or ( tabname = 'VBEP' and ( fname = 'WMENG' ) )
+                or ( tabname = 'VBAP' and ( fname = 'MATNR' ) )
+* Begin of insert MOD-001
+                or ( tabname = 'VBUK' and ( fname = 'CMGST' ) )
+                or ( tabname = 'VBAK' and ( fname = 'FAKSK' ) )
+                or ( tabname = 'VBAK' and ( fname = 'LIFSK' ) )
+                ).
+  endif.
+
+  loop at lt_hdrpos into ls_hdrpos.
+    ls_vbak-vbeln = ls_hdrpos-objectid.
+    append ls_vbak to pt_vbak.
+  endloop.
+endform.                    "process_cdoc_cud_so
+*&---------------------------------------------------------------------*
+*&      Form  process_cdoc_mat
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+form process_cdoc_mat.
+  constants: lc_batch type i value 500.
+  data: lt_cdhdr type table of cdhdr,
+        lt_cdhdr_tmp type table of cdhdr,
+        ls_cdhdr type cdhdr,
+        lt_hdrpos type table of ty_hdrpos,
+        ls_hdrpos type ty_hdrpos.
+
+  data: lv_lines type i,
+        lv_start type i,
+        lv_end type i,
+        lv_exit type char1.
+
+  select * into table lt_cdhdr from cdhdr
+         where (  objectclas = 'MATERIAL'
+               or objectclas = 'INFOSATZ'
+               or objectclas = 'ORDERBUCH' )
+           and ( udate in s_ersda ).
+
+  if sy-subrc <> 0 .
+    return.
+  endif.
+
+  describe table lt_cdhdr lines lv_lines.
+  lv_start = 1 - lc_batch.
+  lv_end = 0.
+
+  while lv_exit <> 'X'.
+    clear: lt_cdhdr_tmp, lt_hdrpos.
+    lv_start = lv_start + lc_batch.
+    lv_end   = lv_end + lc_batch.
+
+    if lv_end >= lv_lines.
+      lv_end = lv_lines.
+      lv_exit = 'X'.
+    endif.
+
+    append lines of lt_cdhdr from  lv_start to lv_end to lt_cdhdr_tmp.
+
+    select changenr objectclas objectid tabname tabkey fname
+           chngind value_new value_old
+           from cdpos into corresponding fields of table lt_hdrpos
+           for all entries in lt_cdhdr_tmp
+           where objectclas  = lt_cdhdr_tmp-objectclas
+             and objectid    = lt_cdhdr_tmp-objectid
+             and changenr    = lt_cdhdr_tmp-changenr
+             and ( ( tabname = 'MARC' and ( fname = 'WERKS' or fname = 'KEY') )
+                or ( tabname = 'MARC' and ( fname = 'MATNR' or fname = 'KEY') )
+                or ( tabname = 'MBEW' and ( fname = 'VERPR' or fname = 'KEY') )
+                or ( tabname = 'MBEW' and ( fname = 'STPRS' or fname = 'KEY') )
+                or ( tabname = 'MARC' and ( fname = 'MMSTA' or fname = 'KEY') )
+                or ( tabname = 'MARC' and ( fname = 'NFMAT' or fname = 'KEY') )
+                or ( tabname = 'EINE' and ( fname = 'NETPR' or fname = 'KEY') )
+                or ( tabname = 'EINE' and ( fname = 'WAERS' or fname = 'KEY') )
+                or ( tabname = 'EINE' and ( fname = 'NORBM' or fname = 'KEY') )
+                or ( tabname = 'EORD' and ( fname = 'LIFNR' or fname = 'KEY') )
+                or ( tabname = 'MARA' and ( fname = 'BISMT' or fname = 'KEY') )
+                or ( tabname = 'MARA' and ( fname = 'NTGEW' or fname = 'KEY') )
+                or ( tabname = 'MARA' and ( fname = 'GEWEI' or fname = 'KEY') )
+                or ( tabname = 'MARA' and ( fname = 'PRDHA' or fname = 'KEY') )
+                or ( tabname = 'DMAKT' and ( fname = 'MAKTX'  or fname = 'KEY') and tabkey = 'E' ) ).
+
+    loop at lt_hdrpos into ls_hdrpos.   " You can not join with cluster tables.
+      read table lt_cdhdr into ls_cdhdr
+          with key objectclas = ls_hdrpos-objectclas
+                   objectid = ls_hdrpos-objectid
+                   changenr = ls_hdrpos-changenr.
+
+      ls_hdrpos-udate = ls_cdhdr-udate.
+*      modify lt_hdrpos from ls_hdrpos transporting udate.
+
+* Filling of table YSE_SCC_MAT_PRCS.
+*Per change Date/indicator/material/plant (and number of source List for EORD)
+*it will show which tables need to be inserted/modified
+      case ls_hdrpos-tabname.
+        when 'MARA'.
+          perform process_mat_mara using ls_hdrpos.
+        when 'DMAKT'.
+          perform process_mat_dmakt using ls_hdrpos.
+        when 'MARC'.
+          perform process_mat_marc using ls_hdrpos.
+        when 'MBEW'.
+          perform process_mat_mbew using ls_hdrpos.
+        when 'EINE'.
+          perform process_mat_eine using ls_hdrpos.
+        when 'EORD'.
+          perform process_mat_eord using ls_hdrpos.
+        when others.
+      endcase.
+    endloop.
+  endwhile.
+endform.                    "process_cdoc_mat
+*&---------------------------------------------------------------------*
+*&      Form  check_mat_matnr
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->PV_MATNR   text
+*      -->CV_SUBRC   text
+*----------------------------------------------------------------------*
+form check_mat_matnr using pv_matnr type mara-matnr
+                      changing cv_subrc like sy-subrc.
+
+  cv_subrc = 0.
+  if pv_matnr not in s_matnr.
+    cv_subrc = 1.
+  else.
+    select single * from mara where matnr = pv_matnr
+                         and mtart in s_mtart
+                         and matkl in s_matkl.
+    if sy-subrc <> 0.
+      cv_subrc = 1.
+    endif.
+  endif.
+endform.                    "check_mat_matnr
+*&---------------------------------------------------------------------*
+*&      Form  PROCESS_CUD_SO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+form process_cud_so tables l_data structure edidd.
+  data: lt_vbak      type table of vbak."wtysc_vbeln_tab.
+
+  data: lv_index      type sy-tabix,
+*        lv_spstg      type vbuk-spstg,
+        lv_cmgst      type vbuk-cmgst.
+
+  data: lt_mat        type table of ty_material.
+
+  data: lt_cud_scc       type tt_cud_scc,
+        ls_cud_scc       type ty_cud_scc,
+        lt_cud_scc2      type tt_cud_scc,
+        ls_cud_scc2      type ty_cud_scc.
+
+  data: lt_cud_scc_hd    type tt_cud_scc_hd,
+        ls_cud_scc_hd    type ty_cud_scc_hd,
+        lt_data   type table of edidd,
+        ls_data  type edidd.
+* Detail
+  data: ls_cud_scc_c_d type t_scc_cud_c_d.
+* Header
+  data: ls_cud_scc_c_h type t_scc_cud_c_h.
+
+  perform get_mat_cud tables lt_mat.
+
+  select vbak~vbeln vbak~auart into corresponding fields of table lt_vbak
+    from vbak inner join vbap on vbap~vbeln eq vbak~vbeln
+    for all entries in lt_mat
+     where vbak~vbeln in s_vbelnc
+      and vbak~vkorg = p_ekorg
+      and vbak~auart in ('ZOR', 'ZO03', 'ZKE', 'ZKT')
+      and vbak~kunnr in s_kunnrc
+      and vbap~matnr = lt_mat-matnr
+      and vbap~werks = lt_mat-werks
+      and vbap~lgort = lt_mat-lgort
+      and vbap~pstyv <> 'ZTXT'
+      and vbap~erdat in s_credac.
+
+  if p_inic <> 'X'. " process if not intial load
+    perform process_cdoc_cud_so using lt_mat changing lt_vbak.
+
+* Fill internal table with the sales order wich have movements 261, 601, 602 and 651 on it
+    perform process_cud_vbfa changing lt_vbak.
+
+    perform process_cud_so_mkpf changing lt_vbak.
+  endif. " not initial load
+
+  sort lt_vbak by vbeln.
+  delete adjacent duplicates from lt_vbak.
+
+* Retrieve all the Sales data for all the sales documents which have been changed or created
+  if lt_vbak is not initial.
+    select  vbak~vbeln vbap~posnr vbap~werks vbap~lgort vbak~auart vbak~kunnr vbak~erdat
+              vbap~matnr vbap~kwmeng vbap~abgru vbap~aufnr vbap~route
+       into corresponding fields of table lt_cud_scc
+       from vbak inner join vbap on vbap~vbeln eq vbak~vbeln
+        for all entries in lt_vbak
+         where vbak~vbeln = lt_vbak-vbeln
+          and vbak~auart in ('ZOR', 'ZO03', 'ZKE', 'ZKT')
+          and vbak~vkorg = p_ekorg
+          and vbak~kunnr in s_kunnrc
+          and vbap~pstyv <> 'ZTXT'.
+
+    loop at lt_cud_scc into ls_cud_scc.
+      lv_index = sy-tabix.
+      read table lt_mat transporting no fields binary search
+                with key matnr = ls_cud_scc-matnr
+                         werks = ls_cud_scc-werks
+                         lgort = ls_cud_scc-lgort.
+      if sy-subrc <> 0.
+        delete lt_cud_scc index lv_index.
+      endif.
+    endloop.
+  endif.
+
+  loop at lt_cud_scc into ls_cud_scc.
+    lv_index = sy-tabix.
+    perform process_cud_so_qty changing ls_cud_scc.
+
+* Calculate the GI date
+    perform get_scc_firstd using ls_cud_scc-vbeln ls_cud_scc-posnr
+                           changing ls_cud_scc-gidate.
+
+    if ls_cud_scc-gidate is not initial.
+* FAM
+      ls_cud_scc-fam = gv_fam.
+
+      modify lt_cud_scc index lv_index from ls_cud_scc transporting kwmeng gimeng gidate fam.
+    else.
+      delete lt_cud_scc index lv_index.
+    endif.
+  endloop.
+
+* Only one line to be send when sales order lines with same material
+  sort lt_cud_scc by fam vbeln posnr werks matnr gidate.
+  loop at lt_cud_scc into ls_cud_scc.
+    if ls_cud_scc-lgort = ''.
+      if ls_cud_scc-werks = 'CN91' or ls_cud_scc-werks = 'CN93'.
+        ls_cud_scc-lgort = '0001'.
+      else.
+        ls_cud_scc-lgort = '1000'.
+      endif.
+    endif.
+
+    read table lt_cud_scc2 into ls_cud_scc2
+             with key vbeln = ls_cud_scc-vbeln
+                      werks = ls_cud_scc-werks
+                      lgort = ls_cud_scc-lgort
+                      matnr = ls_cud_scc-matnr
+                      gidate = ls_cud_scc-gidate.
+    if sy-subrc = 0.
+      lv_index = sy-tabix.
+      ls_cud_scc2-kwmeng = ls_cud_scc2-kwmeng + ls_cud_scc-kwmeng.
+      ls_cud_scc2-gimeng = ls_cud_scc2-gimeng + ls_cud_scc-gimeng.
+      modify lt_cud_scc2 index lv_index from ls_cud_scc2 transporting kwmeng gimeng.
+    else.
+      append ls_cud_scc to lt_cud_scc2.
+    endif.
+  endloop.
+
+* Fill IDOC Customer Demand Sales
+* First fill header
+  loop at lt_cud_scc2 into ls_cud_scc2.
+    ls_cud_scc_hd-fam = ls_cud_scc2-fam.
+    ls_cud_scc_hd-kunnr = ls_cud_scc2-kunnr.
+    ls_cud_scc_hd-vbeln = ls_cud_scc2-vbeln.
+    ls_cud_scc_hd-auart = ls_cud_scc2-auart.
+    ls_cud_scc_hd-erdat = ls_cud_scc2-erdat.
+    append ls_cud_scc_hd to lt_cud_scc_hd.
+  endloop.
+
+  sort lt_cud_scc_hd by vbeln.
+  delete adjacent duplicates from lt_cud_scc_hd.
+
+  loop at lt_cud_scc_hd into ls_cud_scc_hd.
+* Begin of insert MOD-001
+    clear lv_cmgst."lv_spstg.
+    select single cmgst from vbuk into lv_cmgst
+      where vbeln = ls_cud_scc_hd-vbeln.
+*    if lv_spstg = ' ' or p_block = ' '.
+    if p_block = ' ' or lv_cmgst = '' or lv_cmgst = 'A' or lv_cmgst = 'D'.
+* End of insert MOD-001
+      ls_cud_scc_c_h-fam = ls_cud_scc_hd-fam.
+      ls_cud_scc_c_h-kunnr = ls_cud_scc_hd-kunnr.
+      ls_cud_scc_c_h-vbeln = ls_cud_scc_hd-vbeln.
+      ls_cud_scc_c_h-auart = ls_cud_scc_hd-auart.
+      ls_cud_scc_c_h-erdat = ls_cud_scc_hd-erdat.
+      ls_data-segnam  = c_segment_scc_cud.
+      ls_data-docnum = ls_cud_scc_hd-vbeln.
+      ls_data-sdata = ls_cud_scc_c_h.
+      append ls_data to lt_data.
+      loop at lt_cud_scc2 into ls_cud_scc2 where vbeln = ls_cud_scc_hd-vbeln.
+*            IF sy-subrc EQ 0.
+        ls_cud_scc_c_d-vbeln      = ls_cud_scc2-vbeln.
+        ls_cud_scc_c_d-posnr       = ls_cud_scc2-posnr.
+        ls_cud_scc_c_d-matnr       = ls_cud_scc2-matnr.
+        if ls_cud_scc2-werks <> 'CN91' and ls_cud_scc2-werks <> 'CN93'.
+          ls_cud_scc_c_d-werks       = ls_cud_scc2-werks.
+          ls_cud_scc_c_d-lgort       = ls_cud_scc2-lgort.
+        else.
+          perform get_real_plant using ls_cud_scc_c_d-vbeln
+                                       ls_cud_scc_c_d-posnr
+                                 changing ls_cud_scc_c_d-werks.
+          ls_cud_scc_c_d-lgort = '1000'.
+        endif.
+        ls_cud_scc_c_d-kwmeng      = ls_cud_scc2-kwmeng.
+        ls_cud_scc_c_d-gimeng      = ls_cud_scc2-gimeng.
+        ls_cud_scc_c_d-gidate      = ls_cud_scc2-gidate.
+        ls_data-segnam              = c_segment_scc_cudl.
+        ls_data-docnum              = ls_cud_scc_hd-vbeln.
+        ls_data-sdata               = ls_cud_scc_c_d.
+        append ls_data to lt_data.
+*            ENDIF.
+      endloop.
+    endif.
+  endloop.
+
+  if lt_data is initial.
+    clear gv_empty.
+    gv_empty = gv_empty + 1.
+  else.
+    append lines of lt_data to l_data.
+  endif.
+endform.                    " PROCESS_CUD_SO
+*&---------------------------------------------------------------------*
+*&      Form  PROCESS_CUD_PO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+form process_cud_po tables l_data structure edidd.
+  data: lt_ebeln      type wrf_pbas_ebeln_tty,
+        lv_ebeln      type ekko-ebeln.
+  data: lv_index      type sy-tabix,
+        lv_flag       type char1.
+
+  data: lt_mat type tt_material.
+
+  data: lt_cud_scc_mm type tt_cud_scc_mm,
+        ls_cud_scc_mm type ty_cud_scc_mm,
+        lt_cud_scc2_mm type tt_cud_scc_mm,
+        ls_cud_scc2_mm type ty_cud_scc_mm.
+
+  data: lt_cud_scc_hd    type tt_cud_scc_hd,
+        ls_cud_scc_hd    type ty_cud_scc_hd.
+* Detail
+  data: ls_cud_scc_c_d type t_scc_cud_c_d.
+* Header
+  data: ls_cud_scc_c_h type t_scc_cud_c_h.
+
+  perform get_mat_cud tables lt_mat.
+
+  select ekpo~ebeln into table lt_ebeln
+    from ekko
+   inner join ekpo on ekko~ebeln eq ekpo~ebeln
+    for all entries in lt_mat
+     where ekko~reswk = lt_mat-werks
+      and ekpo~matnr  = lt_mat-matnr
+      and ekpo~aedat in s_credac
+      and ekko~bsart = 'ZUB1'
+      and ekko~ebeln in s_ebelnc.
+
+  if p_inic <> 'X'. " process if not intial load?
+    perform process_cdoc_cud_po changing lt_ebeln.
+
+* Fill internal table with the sales order which have movement 262 on it
+    perform process_cud_po_mkpf changing lt_ebeln.
+  endif. " not initial load
+
+  sort lt_ebeln.
+  delete adjacent duplicates from lt_ebeln.
+
+* Retrieve all the Sales data for all the sales documents which have been changed or created
+  loop at lt_ebeln into lv_ebeln.
+
+    select  ekko~reswk ekko~ebeln ekko~bsart ekpo~aedat ekpo~ebelp
+            ekpo~werks ekpo~matnr ekpo~menge
+     appending corresponding fields of table lt_cud_scc_mm
+     from ekko
+     inner join ekpo on ekpo~ebeln eq ekko~ebeln
+      for all entries in lt_mat
+       where ekko~ebeln = lv_ebeln
+        and  ekko~reswk = lt_mat-werks
+        and ( ekko~bsart = 'ZUB1')
+*            and ( ekpo~lgort  = '1000' or ekpo~lgort = ' ' )
+        and ekpo~matnr = lt_mat-matnr
+        and ekpo~aedat in s_credac
+        and ekpo~werks in s_kunnrc
+        and ekpo~loekz <> 'L'.
+  endloop.
+
+  loop at lt_cud_scc_mm into ls_cud_scc_mm.
+    lv_index = sy-tabix.
+    if p_ekorg = 'CN07'.
+      perform cud_po_cn changing ls_cud_scc_mm lv_flag.
+    elseif p_ekorg = 'RU02'.
+      perform cud_po_ru changing ls_cud_scc_mm lv_flag.
+    endif.
+    if lv_flag = c_delete.
+      delete lt_cud_scc_mm index lv_index.
+    elseif lv_flag = c_modify.
+      ls_cud_scc_mm-fam = gv_fam.
+      modify lt_cud_scc_mm from ls_cud_scc_mm index lv_index
+                           transporting fam lgort menge gimeng gidate.
+    endif.
+  endloop.
+
+
+* Only one line to be send when sales order lines with same material
+  sort lt_cud_scc_mm by ebeln reswk matnr gidate.
+  loop at lt_cud_scc_mm into ls_cud_scc_mm.
+    read table lt_cud_scc2_mm into ls_cud_scc2_mm
+             with key ebeln = ls_cud_scc_mm-ebeln
+                      reswk = ls_cud_scc_mm-reswk
+                      matnr = ls_cud_scc_mm-matnr
+                      gidate = ls_cud_scc_mm-gidate.
+
+    lv_index = sy-tabix.
+
+    if sy-subrc = 0.
+      ls_cud_scc2_mm-menge = ls_cud_scc2_mm-menge + ls_cud_scc_mm-menge.
+      ls_cud_scc2_mm-gimeng = ls_cud_scc2_mm-gimeng + ls_cud_scc_mm-gimeng.
+      modify lt_cud_scc2_mm from ls_cud_scc2_mm index lv_index transporting menge gimeng.
+    else.
+      ls_cud_scc2_mm = ls_cud_scc_mm.
+      append ls_cud_scc2_mm to lt_cud_scc2_mm.
+    endif.
+  endloop.
+
+* Fill IDOC Customer Demand Stock Transfer
+* First fill header
+  loop at lt_cud_scc2_mm into ls_cud_scc2_mm.
+    ls_cud_scc_hd-fam = ls_cud_scc2_mm-fam.
+    ls_cud_scc_hd-kunnr = ls_cud_scc2_mm-werks.
+    ls_cud_scc_hd-vbeln = ls_cud_scc2_mm-ebeln.
+    ls_cud_scc_hd-auart = ls_cud_scc2_mm-bsart.
+    ls_cud_scc_hd-erdat = ls_cud_scc2_mm-aedat.
+    append ls_cud_scc_hd to lt_cud_scc_hd.
+  endloop.
+
+  sort lt_cud_scc_hd by vbeln.
+  delete adjacent duplicates from lt_cud_scc_hd comparing vbeln.
+
+  if lt_cud_scc_hd is initial.
+    gv_empty = gv_empty + 1.
+  else.
+    loop at lt_cud_scc_hd into ls_cud_scc_hd.
+      ls_cud_scc_c_h-fam   = ls_cud_scc_hd-fam.
+      ls_cud_scc_c_h-kunnr = ls_cud_scc_hd-kunnr.
+      ls_cud_scc_c_h-vbeln = ls_cud_scc_hd-vbeln.
+      ls_cud_scc_c_h-auart = ls_cud_scc_hd-auart.
+      ls_cud_scc_c_h-erdat = ls_cud_scc_hd-erdat.
+      l_data-segnam        = c_segment_scc_cud.
+      l_data-docnum        = ls_cud_scc_hd-vbeln.
+      l_data-sdata = ls_cud_scc_c_h.
+      append l_data.
+      loop at lt_cud_scc2_mm into ls_cud_scc2_mm
+                              where ebeln = ls_cud_scc_hd-vbeln.
+        ls_cud_scc_c_d-vbeln       = ls_cud_scc2_mm-ebeln.
+        ls_cud_scc_c_d-posnr       = ls_cud_scc2_mm-ebelp.
+        ls_cud_scc_c_d-matnr       = ls_cud_scc2_mm-matnr.
+        if ls_cud_scc2_mm-reswk <> 'CN91'
+          and ls_cud_scc2_mm-reswk <> 'CN93'.
+          ls_cud_scc_c_d-werks       = ls_cud_scc2_mm-reswk.
+          ls_cud_scc_c_d-lgort       = ls_cud_scc2_mm-lgort.
+        else.
+          perform get_real_plant using ls_cud_scc_c_d-vbeln
+                                       ls_cud_scc_c_d-posnr
+                                 changing ls_cud_scc_c_d-werks.
+          ls_cud_scc_c_d-lgort       = '1000'.
+        endif.
+
+        ls_cud_scc_c_d-kwmeng      = ls_cud_scc2_mm-menge.
+        ls_cud_scc_c_d-gimeng      = ls_cud_scc2_mm-gimeng.
+        ls_cud_scc_c_d-gidate      = ls_cud_scc2_mm-gidate.
+        l_data-segnam              = c_segment_scc_cudl.
+        l_data-docnum              = ls_cud_scc_hd-vbeln.
+        l_data-sdata               = ls_cud_scc_c_d.
+        append l_data.
+      endloop.
+    endloop.
+  endif.
+
+  if gv_empty = 2.
+    clear: l_data, ls_cud_scc_c_h, ls_cud_scc_c_d.
+
+    ls_cud_scc_c_h-fam = gv_fam.
+    ls_cud_scc_c_h-vbeln = c_9999999999.
+    ls_cud_scc_c_h-erdat = sy-datum.
+    l_data-segnam  = c_segment_scc_cud.
+    l_data-sdata = ls_cud_scc_c_h.
+    append l_data.
+    ls_cud_scc_c_d-posnr = '000010'.
+    ls_cud_scc_c_d-gidate      = sy-datum.
+    ls_cud_scc_c_d-kwmeng = '0'.
+    ls_cud_scc_c_d-gimeng = '0'.
+    l_data-segnam              = c_segment_scc_cudl.
+    l_data-sdata               = ls_cud_scc_c_d.
+    append l_data.
+  endif.
+endform.                    " PROCESS_CUD_PO
+*&---------------------------------------------------------------------*
+*&      Form  process_cdoc_cud_po
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+form process_cdoc_cud_po changing pt_ebeln type wrf_pbas_ebeln_tty.
+  data: lt_cdhdr type table of cdhdr,
+        ls_cdhdr type cdhdr,
+        lt_hdrpos type tt_hdrpos,
+        ls_hdrpos type ty_hdrpos,
+
+        lv_ebeln type ekpo-ebeln,
+        lt_ebelp type table of ekpo-ebelp,
+        lv_index type sy-index.
+
+  select * into table lt_cdhdr from cdhdr
+    where objectclas = 'EINKBELEG'
+           and ( udate in s_credac ).
+
+  loop at lt_cdhdr into ls_cdhdr.
+    lv_index = sy-tabix.
+    clear: lt_ebelp.
+    lv_ebeln = ls_cdhdr-objectid.
+
+    if lv_ebeln not in s_ebelnc.
+      delete lt_cdhdr index lv_index.
+      continue.
+    endif.
+
+    select ebelp from v_ekko_ekpo into table lt_ebelp
+      for all entries in gt_werks
+           where ebeln = lv_ebeln
+             and ekorg = p_ekorg
+             and werks = gt_werks-werks
+             and lgort = gt_werks-lgort.
+    if sy-subrc <> 0 .
+      delete lt_cdhdr index lv_index.
+    endif.
+  endloop.
+
+  if lt_cdhdr is not initial.
+    sort lt_cdhdr by udate utime.
+* Fill internal table it_vbakcud with changed Sales Documents concerning WERK MENGE and MATNR
+    select changenr objectclas objectid tabname tabkey fname chngind value_new value_old
+           from cdpos into corresponding fields of table lt_hdrpos
+           for all entries in lt_cdhdr
+           where objectclas  = lt_cdhdr-objectclas
+             and objectid    = lt_cdhdr-objectid
+             and changenr    = lt_cdhdr-changenr
+             and ( ( tabname = 'EKPO' and ( fname = 'WERKS' ) )
+                or ( tabname = 'EKPO' and ( fname = 'MENGE' ) )
+                or ( tabname = 'EKPO' and ( fname = 'MATNR' ) )
+                ).
+  endif.
+
+  loop at lt_hdrpos into ls_hdrpos.
+    lv_ebeln = ls_hdrpos-objectid.
+    if lv_ebeln in s_ebelnc.
+      append lv_ebeln to pt_ebeln.
+    endif.
+  endloop.
+endform.                    "process_cdoc_cud_po
+*&---------------------------------------------------------------------*
+*&      Form  PROCESS_CUD_MKPF
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_LT_VBELN  text
+*----------------------------------------------------------------------*
+form process_cud_so_mkpf  changing pt_vbak type tab_vbak.
+  data: lt_mkpf type table of mkpf,
+"        ls_mkpf type mkpf,
+        lt_mseg type table of mseg,
+        ls_mseg type mseg.
+
+  select * from mkpf into table lt_mkpf
+   where budat in s_credac.
+
+  if lt_mkpf is not initial.
+* Fill internal table with the sales order which have movement 262/261 on it
+    select * from mseg into corresponding fields of table lt_mseg
+      for all entries in lt_mkpf
+      where mblnr = lt_mkpf-mblnr
+      and   mjahr = lt_mkpf-mjahr
+*                ( lgort = '1000' or lgort = ' ' ) and
+      and   matnr in s_matnrc
+      and   bwart in ('262', '261' )
+      and   kzbew = ' '.                           "insert MOD-001
+
+    loop at lt_mseg into ls_mseg.
+      read table gt_werks transporting no fields
+                  with key werks = ls_mseg-werks lgort = ls_mseg-lgort.
+      if sy-subrc = 0 and ls_mseg-aufnr is not initial.
+        select vbeln from vbak into corresponding fields of table pt_vbak
+          where aufnr = ls_mseg-aufnr.
+      endif.
+    endloop.
+  endif.
+endform.                    " PROCESS_CUD_MKPF
+*&---------------------------------------------------------------------*
+*&      Form  PROCESS_CUD_VBFA
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_LT_VBELN  text
+*----------------------------------------------------------------------*
+form process_cud_vbfa  changing pt_vbak type tab_vbak.
+  data: lt_vbeln type table of vbak-vbeln,
+        lv_vbeln type vbak-vbeln,
+        ls_vbak  type vbak.
+
+  select vbelv from vbfa into table lt_vbeln
+        where vbelv in s_vbelnc
+          and bwart in ('261 ', '601', '602', '651')
+          and erdat in s_credac
+          and matnr in s_matnr.
+
+  loop at lt_vbeln into lv_vbeln.
+    ls_vbak-vbeln = lv_vbeln.
+    append ls_vbak to pt_vbak.
+  endloop.
+endform.                    " PROCESS_CUD_VBFA
+*&---------------------------------------------------------------------*
+*&      Form  GET_SCC_FIRSTD
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_IT_CUD_SCC_GIDATE  text
+*----------------------------------------------------------------------*
+form get_scc_firstd  using pv_vbeln type vbap-vbeln
+                           pv_posnr type vbap-posnr
+                    changing p_gidate type sy-datum.
+
+  select single firstd from yse_scc_firstd into p_gidate    "#EC *
+       where vbeln = pv_vbeln
+         and posnr = pv_posnr.
+
+  if sy-subrc <> 0.
+    submit yse_scc_ini_firstdate
+       with s_vbelnc = pv_vbeln
+       with p_ekorg = p_ekorg
+       and return.
+
+    select single firstd from yse_scc_firstd into p_gidate  "#EC *
+     where vbeln = pv_vbeln
+       and posnr = pv_posnr.
+  endif.
+
+  if p_gidate not in s_rqdatc.
+    clear: s_rqdatc.
+  endif.
+endform.                    " GET_SCC_FIRSTD
+*&---------------------------------------------------------------------*
+*&      Form  PROCESS_CUD_SO_QTY
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_IT_CUD_SCC  text
+*----------------------------------------------------------------------*
+form process_cud_so_qty  changing ps_cud_scc type ty_cud_scc.
+  data: lv_rfmng_min     type rfmng,
+        lv_rfmng_plus    type rfmng,
+        lv_rfmng_262     type rfmng,
+        lv_rfmng_261     type rfmng.
+
+  clear: lv_rfmng_min, lv_rfmng_plus, lv_rfmng_262, lv_rfmng_261.
+
+* Qty delivered.
+  if not ps_cud_scc-abgru is initial.
+    ps_cud_scc-gimeng = 0.
+  else.
+    select sum( rfmng ) from vbfa into lv_rfmng_min
+    where vbelv = ps_cud_scc-vbeln and
+          posnv = ps_cud_scc-posnr and
+          bwart in ('602 ', '651') and
+          matnr = ps_cud_scc-matnr.
+
+    select sum( rfmng ) from vbfa into lv_rfmng_plus
+    where vbelv = ps_cud_scc-vbeln and
+          posnv = ps_cud_scc-posnr and
+          bwart in ('601 ', '261') and
+          matnr = ps_cud_scc-matnr.
+
+    if ps_cud_scc-aufnr is not initial.
+      select sum( menge ) from mseg into lv_rfmng_262
+        where aufnr = ps_cud_scc-aufnr and
+*                 ( lgort = '1000' or lgort = ' ' ) and
+             matnr = ps_cud_scc-matnr and
+*           posnv = it_cud_SCC-posnr and
+             bwart = '262' and
+             kzbew = ' '.                            "insert MOD-001
+
+      select sum( menge ) from mseg into lv_rfmng_261
+        where aufnr = ps_cud_scc-aufnr and
+*                 ( lgort = '1000' or lgort = ' ' ) and
+             matnr = ps_cud_scc-matnr and
+*           posnv = it_cud_SCC-posnr and
+             bwart = '261' and
+             kzbew = ' '. " 261 entered on SEO itself( not via GI on outbound delivery = KZBEW = 'L')
+    endif.
+    ps_cud_scc-gimeng = ps_cud_scc-gimeng  + lv_rfmng_plus - lv_rfmng_min - lv_rfmng_262 + lv_rfmng_261.
+  endif.
+
+* Qty Ordered
+  clear lv_rfmng_min.
+  if not ps_cud_scc-abgru is initial.
+    ps_cud_scc-kwmeng = 0.
+  else.
+    select sum( rfmng ) from vbfa into lv_rfmng_min
+     where vbelv = ps_cud_scc-vbeln and
+           posnv = ps_cud_scc-posnr and
+           bwart in ('651') and
+           matnr = ps_cud_scc-matnr.
+    if sy-subrc = 0.
+      ps_cud_scc-kwmeng = ps_cud_scc-kwmeng - lv_rfmng_min - lv_rfmng_262 + lv_rfmng_261.
+    endif.
+  endif.
+endform.                    " PROCESS_CUD_SO_QTY
+*&---------------------------------------------------------------------*
+*&      Form  PROCESS_CUD_PO_MKPF
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_LT_EBELN  text
+*----------------------------------------------------------------------*
+form process_cud_po_mkpf  changing pt_ebeln type wrf_pbas_ebeln_tty.
+  data: lt_mkpf type table of mkpf,
+        lt_mseg type table of mseg,
+        ls_mseg type mseg.
+
+  select * from mkpf into table lt_mkpf
+   where budat in s_credac.
+
+  if lt_mkpf is not initial.
+    clear lt_mseg[].
+    select * from mseg into corresponding fields of table lt_mseg
+      for all entries in lt_mkpf
+      where mblnr = lt_mkpf-mblnr
+        and mjahr = lt_mkpf-mjahr
+        and matnr in s_matnrc
+        and ebeln in s_ebelnc
+        and shkzg = 'H'
+        and bwart = '641'.
+
+    loop at lt_mseg into ls_mseg.
+      read table gt_werks transporting no fields
+                  with key werks = ls_mseg-werks lgort = ls_mseg-lgort.
+      if sy-subrc = 0.
+        select ebeln from ekpo appending table pt_ebeln
+          where ebeln = ls_mseg-ebeln.
+      endif.
+    endloop.
+  endif.
+endform.                    " PROCESS_CUD_PO_MKPF
+*&---------------------------------------------------------------------*
+*&      Form  get_scc_firstdpo
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->PV_EBELN   text
+*      -->PV_EBELP   text
+*      -->P_GIDATE   text
+*----------------------------------------------------------------------*
+form get_scc_firstdpo  using pv_ebeln type ekpo-ebeln
+                           pv_ebelp type ekpo-ebelp
+                    changing p_gidate type sy-datum.
+
+  select single firstd from yse_scc_firstdpo into p_gidate  "#EC *
+        where ebeln = pv_ebeln
+          and ebelp = pv_ebelp.
+
+  if p_gidate not in s_rqdatc.
+    clear: s_rqdatc.
+  endif.
+endform.                    "get_scc_firstdpo
+*&---------------------------------------------------------------------*
+*&      Form  GET_FAM_CODE
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_LS_CUD_SCC_WERKS  text
+*      <--P_LS_CUD_FAM  text
+*----------------------------------------------------------------------*
+form get_fam_code.
+  data: lv_werks type yse_scc_fam-werks.
+
+  lv_werks = p_ekorg(2).
+  select single fam from yse_scc_fam into gv_fam
+   where werks = lv_werks.
+
+  if p_ekorg = 'CN07'. "Special Handling
+    gv_fam = 'CJB'.
+  endif.
+endform.                    " GET_FAM_CODE
+*&---------------------------------------------------------------------*
+*&      Form  GET_MAT_CUD
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_LT_MAT  text
+*----------------------------------------------------------------------*
+form get_mat_cud  tables pt_mat type tt_material.
+  data: ls_mat   type ty_material,
+        lt_mat   type table of ty_material.
+
+  select matnr werks lgort from yse_scc_used_mat into table pt_mat
+    for all entries in gt_werks where matnr in s_matnrc
+                                  and werks = gt_werks-werks
+                                  and lgort = gt_werks-lgort
+                                  and flag = 'P'.
+
+  loop at pt_mat into ls_mat.
+    if ls_mat-lgort = '1000' or ls_mat-lgort = '0001'.
+      ls_mat-lgort = ''.
+      append ls_mat to lt_mat.
+    endif.
+  endloop.
+  append lines of lt_mat to pt_mat.
+  sort pt_mat by matnr werks lgort.
+endform.                    " GET_MAT_CUD
+*&---------------------------------------------------------------------*
+*&      Form  GET_MAT_STOCK
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_LT_MATERIAL  text
+*----------------------------------------------------------------------*
+form get_mat_stock  tables pt_mat type tt_material.
+  data: ls_mat   type ty_material,
+        lt_mat   type table of ty_material.
+
+  select b~matnr b~werks b~lgort a~mtart a~matkl c~mmsta a~meins a~prdha
+        c~plifz "c~maxlz c~mmstd c~nfmat c~prctr d~lgpbe
+  into corresponding fields of table pt_mat
+    from yse_scc_used_mat as b
+  inner join mara as a
+  on a~matnr = b~matnr
+  inner join marc as c
+        on c~matnr = b~matnr
+       and c~werks = b~werks
+  for all entries in gt_werks
+  where b~matnr in s_matnrs
+    and b~werks = gt_werks-werks
+    and b~lgort = gt_werks-lgort
+    and b~flag = 'P'
+    and a~matkl in s_matkls
+    and a~mtart in s_mtarts
+    and a~lvorm eq space.
+  "MOD-004 end
+
+  loop at pt_mat into ls_mat.
+    if ls_mat-lgort = '1000'.
+      ls_mat-lgort = ''.
+      append ls_mat to lt_mat.
+    endif.
+  endloop.
+  append lines of lt_mat to pt_mat.
+
+  sort pt_mat by matnr werks lgort. "MOD-004
+
+endform.                    " GET_MAT_STOCK
+*&---------------------------------------------------------------------*
+*&      Form  get_real_plant
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_VBELN    text
+*      -->P_POSNR    text
+*      -->P_WERKS    text
+*      -->VBAP-WERKS text
+*----------------------------------------------------------------------*
+form get_real_plant using p_vbeln type vbap-vbeln p_posnr type vbap-posnr
+                                 changing p_werks type vbap-werks.
+  data: lv_kunnr type vbpa-kunnr,
+        lv_regio type yse_scc_regplnt-regio.
+
+  clear: p_werks.
+  select single kunnr from vbpa into lv_kunnr
+              where vbeln = p_vbeln and posnr = p_posnr and parvw = 'WE'.
+  if sy-subrc <> 0 .
+    select single kunnr from vbpa into lv_kunnr
+              where vbeln = p_vbeln and parvw = 'WE'.
+  endif.
+
+  if sy-subrc = 0.
+    select single regio from kna1 into lv_regio where kunnr = lv_kunnr.
+    if sy-subrc = 0.
+      select single werks from yse_scc_regplnt
+        into p_werks where regio = lv_regio.            "#EC CI_GENBUFF
+    endif.
+  endif.
+
+  if p_werks is initial.
+    write : / 'Cannot find the real plant for SO ',p_vbeln, '/', p_posnr.
+  endif.
+endform.                    "get_real_plant
+*&---------------------------------------------------------------------*
+*&      Form  get_real_plant_po
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_EBELN    text
+*      -->P_EBELP    text
+*      -->P_WERKS    text
+*----------------------------------------------------------------------*
+form get_real_plant_po using p_ebeln type ekpo-ebeln p_ebelp type ekpo-ebelp
+                                 changing p_werks type vbap-werks.
+  data: lv_vbeln type vbap-vbeln,
+        lv_posnr type vbap-posnr.
+
+  clear: p_werks.
+
+  select single vbeln vbelp into (lv_vbeln, lv_posnr) from ekkn
+      where  ebeln = p_ebeln and ebelp = p_ebelp.
+
+  if sy-subrc = 0.
+    perform get_real_plant using lv_vbeln lv_posnr
+                           changing p_werks.
+  endif.
+endform.                    "get_real_plant_PO
+*&---------------------------------------------------------------------*
+*&      Form  get_real_plant_pr
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_BANFN    text
+*      -->P_BNFPO    text
+*      -->P_WERKS    text
+*----------------------------------------------------------------------*
+form get_real_plant_pr using p_banfn type ebkn-banfn p_bnfpo type ebkn-bnfpo
+                                 changing p_werks type vbap-werks.
+  data: lv_vbeln type vbap-vbeln,
+        lv_posnr type vbap-posnr.
+
+  clear: p_werks.
+
+  select single vbeln vbelp into (lv_vbeln, lv_posnr) from ebkn
+      where  banfn = p_banfn and bnfpo = p_bnfpo.
+
+  if sy-subrc = 0.
+    perform get_real_plant using lv_vbeln lv_posnr
+                           changing p_werks.
+  endif.
+endform.                    "get_real_plant_PO
+*&---------------------------------------------------------------------*
+*&      Form  FLAG_CAL_AS_STOCK
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_IT_VBAP_VBELN  text
+*      -->P_IT_VBAP_POSNR  text
+*      <--P_LV_FLAG  text
+*----------------------------------------------------------------------*
+form flag_cal_as_stock  using  ps_vbap  type ty_vbap
+                        changing pv_flag  type char1.
+  constants: lc_yes  type char1 value 'X',"Counted as allocated stock
+             lc_no   type char1 value ''."Not counted as allocated stock
+
+  data:lv_gi_date       type vbep-wadat,"Good issue date
+       lv_plan_del_time type marc-plifz,"Planned delivery time
+       lv_process_time  type marc-webaz,"Processing time
+       lv_date          type sy-datum.
+
+  "Only when following condition was met, the Order Qty is counted as
+  "Allocated stock
+  "Current Date + Planned Delivery Time + GR Processing Time >= GI Date
+  select single wadat into lv_gi_date
+      from vbep where vbeln = ps_vbap-vbeln
+                  and posnr = ps_vbap-posnr
+                  and etenr = '1'.
+
+  select single plifz webaz into (lv_plan_del_time, lv_process_time )
+              from marc where matnr = ps_vbap-matnr
+                          and werks = ps_vbap-werks.
+
+  lv_date = sy-datum + lv_plan_del_time + lv_process_time.
+  if lv_date >= lv_gi_date.
+    pv_flag = lc_yes.
+  else.
+    pv_flag = lc_no.
+  endif.
+endform.                    " FLAG_CAL_AS_STOCK
+*&---------------------------------------------------------------------*
+*&      Form  CUD_PO_CN
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_LS_CUD_SCC_MM  text
+*      <--P_LV_FLAG  text
+*----------------------------------------------------------------------*
+form cud_po_cn  changing ps_cud_scc_mm  type ty_cud_scc_mm
+                         pv_flag        type char1.
+  data: lv_whtype     type char2,
+        lv_rfmng_641  type rfmng.
+
+  if ps_cud_scc_mm-reswk = 'CN91'
+  or ps_cud_scc_mm-reswk = 'CN93'.
+    ps_cud_scc_mm-lgort = '0001'.
+  else.
+    ps_cud_scc_mm-lgort = '1000'.
+  endif.
+* Only process if the Supplying Plant is a Central Warehouse
+  select single whtype from yse_scc_planttyp into lv_whtype
+    where ekorg = p_ekorg and werks = ps_cud_scc_mm-reswk.
+
+  if lv_whtype = c_cw.
+    perform get_scc_firstdpo using ps_cud_scc_mm-ebeln ps_cud_scc_mm-ebelp
+                             changing ps_cud_scc_mm-gidate.
+    if ps_cud_scc_mm-gidate is not initial.
+* Qty delivered.
+      select sum( menge ) from mseg into lv_rfmng_641
+        where ebeln = ps_cud_scc_mm-ebeln and
+              ebelp = ps_cud_scc_mm-ebelp and
+*                 ( lgort = '1000' or lgort = ' ' ) and
+             matnr = ps_cud_scc_mm-matnr and
+             shkzg = 'H' and
+             bwart = '641'.
+
+*      ps_cud_scc_mm-fam = gv_fam.
+      ps_cud_scc_mm-gimeng = lv_rfmng_641.
+      pv_flag = c_modify.
+    else.
+      pv_flag = c_delete.
+    endif.
+  else.
+    pv_flag = c_delete.
+  endif.
+endform.                    " CUD_PO_CN
+*&---------------------------------------------------------------------*
+*&      Form  cud_po_ru
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--PS_CUD_SCC_MM  text
+*      <--PV_FLAG        text
+*----------------------------------------------------------------------*
+form cud_po_ru  changing ps_cud_scc_mm  type ty_cud_scc_mm
+                         pv_flag        type char1.
+  data: "lt_mseg       type table of mseg,
+        "ls_mseg       type mseg,
+        "lv_rwerks     type mseg-werks,"Receiving plant
+        lv_lgort     type mseg-lgort,"Receiving SLoc
+        lv_sltype    type yse_scc_sloctyp-sltype,"SLoc type
+        "lv_sflag      type char1, "Flag for supplying Sloc
+        "lv_rflag      type char1, "Flag for receiver Sloc
+        lv_rfmng_641  type rfmng.
+
+  "exclude both cases:
+  " - STO between 2 different plants and two different stor. locations
+  " - STO between 2 different plants and same stor. locations
+  if ps_cud_scc_mm-reswk <> ps_cud_scc_mm-werks.
+    pv_flag = c_delete.
+    return.
+  endif.
+
+  "Check supply location
+  select single sltype from yse_scc_sloctyp into lv_sltype
+      where werks = ps_cud_scc_mm-reswk
+        and lgort = '1000'.
+  if lv_sltype = c_cw.
+    ps_cud_scc_mm-lgort = '1000'.
+  else.
+    pv_flag = c_delete.
+    return.
+  endif.
+
+  "Check Receiving location
+  clear lv_sltype.
+  select single lgort from ekpo into lv_lgort where ebeln = ps_cud_scc_mm-ebeln
+                                                 and ebelp = ps_cud_scc_mm-ebelp.
+  select single sltype from yse_scc_sloctyp into lv_sltype
+      where werks = ps_cud_scc_mm-werks
+        and lgort = lv_lgort.
+  if lv_sltype <> c_bw.
+    pv_flag = c_delete.
+    return.
+  endif.
+
+  perform get_scc_firstdpo using ps_cud_scc_mm-ebeln ps_cud_scc_mm-ebelp
+                             changing ps_cud_scc_mm-gidate.
+  if ps_cud_scc_mm-gidate is not initial.
+    select sum( menge ) from mseg into lv_rfmng_641
+            where ebeln = ps_cud_scc_mm-ebeln and
+                  ebelp = ps_cud_scc_mm-ebelp and
+                 matnr = ps_cud_scc_mm-matnr and
+                 shkzg = 'H' and
+                 bwart = '641'.
+    ps_cud_scc_mm-gimeng = lv_rfmng_641.
+    pv_flag = c_modify.
+  else.
+    pv_flag = c_delete.
+  endif.
+endform.                    "cud_po_ru

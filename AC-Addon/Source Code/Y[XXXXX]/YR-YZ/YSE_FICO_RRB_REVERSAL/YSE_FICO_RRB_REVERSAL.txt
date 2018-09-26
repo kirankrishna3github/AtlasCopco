@@ -1,0 +1,493 @@
+*&---------------------------------------------------------------------*
+*& Report  YSE_FICO_RRB_REVERSAL
+*&
+*& Author:   Johnny Wu
+*& Date:  30/08/2012
+*&---------------------------------------------------------------------*
+*&
+*& Description:
+*& WO#: CR2667 New program to solve RRB History data reversal
+*& Transaction Code:
+*&
+*&---------------------------------------------------------------------*
+*& Request No  Date    Programmer  Revision
+*&---------------------------------------------------------------------*
+*& CD1K973056 30/08/2012 Johnny Wu Initial transport                   *
+*&
+*&---------------------------------------------------------------------*
+
+report  yse_fico_rrb_reversal
+       line-size 220.
+*       line-count 220.
+
+*----------------------------------------------------------------------*
+*                            TABLES                                    *
+*----------------------------------------------------------------------*
+tables: bkpf, bseg.
+
+*----------------------------------------------------------------------*
+*                            TYPES                                     *
+*----------------------------------------------------------------------*
+
+*----------------------------------------------------------------------*
+*                            VARIABLES                                 *
+*----------------------------------------------------------------------*
+data: gt_bkpf type table of bkpf,
+      gt_bseg type table of bseg,
+      gs_documentheader type bapiache09,
+      gt_accountgl type standard table of bapiacgl09,
+      gt_currencyamount type standard table of bapiaccr09,
+      gt_criteria type standard table of bapiackec9,
+      gt_valuefield type standard table of bapiackev9,
+      gv_lastday type sy-datum,
+      gv_perio type ce11000-perio.
+
+*----------------------------------------------------------------------*
+*                          SELECTION SCREEN VARIABLES                  *
+*----------------------------------------------------------------------*
+selection-screen begin of block bk1 with frame title text-bk1.
+parameters:     p_bukrs like bkpf-bukrs obligatory.
+select-options: s_belnr for  bkpf-belnr obligatory.
+parameters:     p_gjahr like bkpf-gjahr obligatory,
+                p_poper like t009b-poper obligatory.
+selection-screen end of block bk1.
+*----------------------------------------------------------------------*
+*                          Include programs                            *
+*----------------------------------------------------------------------*
+
+
+*----------------------------------------------------------------------*
+*                          Initialization                              *
+*----------------------------------------------------------------------*
+initialization.
+
+*----------------------------------------------------------------------*
+*                          Selection screen validations                *
+*----------------------------------------------------------------------*
+at selection-screen.
+
+*----------------------------------------------------------------------*
+*                          Top of Page for basic list
+*----------------------------------------------------------------------*
+top-of-page.
+
+*----------------------------------------------------------------------*
+*                          main program                                *
+*----------------------------------------------------------------------*
+start-of-selection.
+  perform get_data.
+
+end-of-selection.
+  perform process_data.
+
+*&---------------------------------------------------------------------*
+*&      Form  get_data
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+form get_data.
+  data: ls_bkpf type bkpf,
+        ls_bseg type bseg.
+
+  perform get_last_day.
+
+  select * into table gt_bkpf from bkpf where bukrs = p_bukrs
+                                        and belnr in s_belnr
+                                        and gjahr = p_gjahr.
+
+  if sy-subrc = 0.
+    select * into table gt_bseg from bseg for all entries in gt_bkpf
+                        where bukrs = gt_bkpf-bukrs
+                          and belnr = gt_bkpf-belnr
+                          and gjahr = gt_bkpf-gjahr
+                          and ( hkont = '0003210901' or hkont = '0003010901').
+  endif.
+
+*  "Step 1: Change gt_bkpf
+** Doc.Header Text:BKPF-BKTXT = RRB Historical data reversal
+*  ls_bkpf-bktxt = 'RRB Historical data reversal'.
+*
+**Reversed.dco for:BKPF-STBLG =blank
+*  ls_bkpf-stblg = ''.
+*
+**Reversed.doc fiscal year:BKPF-STJAH = blank
+*  ls_bkpf-stjah = ''.
+*
+*  modify gt_bkpf from ls_bkpf transporting bktxt stblg stjah.
+  sort gt_bkpf by bukrs belnr gjahr.
+
+*  "Step 2: Change gt_bseg
+*  loop at gt_bseg into ls_bseg.
+**Posting Key:BSEG-BSCHL is  the opposite with the original posting
+*  endloop.
+
+  sort gt_bseg by bukrs belnr gjahr buzei.
+
+endform.                    "get_data
+*&---------------------------------------------------------------------*
+*&      Form  process_data
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+form process_data.
+  data: ls_bkpf type bkpf,
+        ls_bseg type bseg,
+        lt_accountgl type standard table of bapiacgl09,
+        lt_currencyamount type standard table of bapiaccr09,
+        lt_criteria type standard table of bapiackec9.
+
+  data: lt_return type standard table of bapiret2,
+        ls_return type bapiret2.
+
+  loop at gt_bkpf into ls_bkpf.
+    clear: gs_documentheader, gt_accountgl,
+           gt_currencyamount,gt_criteria, gt_valuefield, lt_return.
+
+    perform get_documentheader using ls_bkpf.
+    perform get_accountgl using ls_bkpf.
+    perform get_currencyamount using ls_bkpf.
+    perform get_criteria using ls_bkpf.
+
+    call function 'BAPI_ACC_DOCUMENT_POST'
+    exporting
+      documentheader          = gs_documentheader
+*     CUSTOMERCPD             =
+*     CONTRACTHEADER          =
+*   IMPORTING
+*     OBJ_TYPE                =
+*     OBJ_KEY                 =
+*     OBJ_SYS                 =
+    tables
+     accountgl               = gt_accountgl "acct_key
+*     ACCOUNTRECEIVABLE       =
+*     ACCOUNTPAYABLE          =
+*     ACCOUNTTAX              =
+     currencyamount          = gt_currencyamount
+     criteria                = gt_criteria
+     valuefield              = gt_valuefield
+*     EXTENSION1              =
+      return                  = lt_return
+*     PAYMENTCARD             =
+*     CONTRACTITEM            =
+*     EXTENSION2              =
+*     REALESTATE              =
+*     ACCOUNTWT               =
+            .
+
+    loop at lt_return into ls_return.
+      "Show error messages
+      write: /, 1  ls_bkpf-belnr,
+                12  ls_return-type,
+                14  ls_return-id,
+                26 ls_return-number,
+                31 ls_return-message.
+    endloop.
+
+    read table lt_return transporting no fields with key type = 'E'.
+    if sy-subrc <> 0 .
+      call function 'BAPI_TRANSACTION_COMMIT'
+       exporting
+         wait          = 'X'
+*       IMPORTING
+*         RETURN        =
+                .
+    endif.
+  endloop.
+
+endform.                    "process_data
+*&---------------------------------------------------------------------*
+*&      Form  get_last_day
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+form get_last_day.
+  data: lv_firstday type sy-datum.
+*  CONCATENATE p_gjahr p_monat '01' INTO lv_lastday.
+
+
+  call function 'LAST_DAY_IN_PERIOD_GET'
+      exporting
+        i_gjahr              = p_gjahr
+*     I_MONMIT             = 00
+        i_periv              = 'K4'
+        i_poper              =  p_poper
+      importing
+        e_date               = gv_lastday
+      exceptions
+        input_false          = 1
+        t009_notfound        = 2
+        t009b_notfound       = 3
+        others               = 4
+              .
+
+  concatenate p_gjahr p_poper into gv_perio .
+*  call function 'RP_LAST_DAY_OF_MONTHS'
+*    exporting
+*      day_in                  = lv_firstday
+*   importing
+*     last_day_of_month       = gv_lastday
+**   EXCEPTIONS
+**     DAY_IN_NO_DATE          = 1
+**     OTHERS                  = 2
+*            .
+*  if sy-subrc <> 0.
+** MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+**         WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+*  endif.
+
+
+endform.                    "get_last_day
+*&---------------------------------------------------------------------*
+*&      Form  get_documentheader
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+form get_documentheader using p_bkpf type bkpf.
+  gs_documentheader-header_txt =  'RRB Historical data reversal'. "#EC *
+  gs_documentheader-comp_code  =  p_bukrs.
+  gs_documentheader-username   =  sy-uname.
+  gs_documentheader-bus_act    =  'RFBU'.
+  gs_documentheader-doc_date   =  p_bkpf-bldat.
+  gs_documentheader-pstng_date = sy-datum."gv_lastday.
+  gs_documentheader-fisc_year  =  p_gjahr.
+  gs_documentheader-fis_period =  sy-datum+4(2)."'08'.
+  gs_documentheader-doc_type   =  'SA'.
+  gs_documentheader-ref_doc_no =  p_bkpf-xblnr.
+endform.                    "get_documentheader
+*&---------------------------------------------------------------------*
+*&      Form  get_accountgl
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_BKPF     text
+*----------------------------------------------------------------------*
+form get_accountgl using ps_bkpf type bkpf.
+  data: ls_bseg type bseg,
+        ls_accountgl type bapiacgl09.
+
+  clear: gt_accountgl.
+  loop at gt_bseg into ls_bseg where bukrs = ps_bkpf-bukrs
+                                   and belnr = ps_bkpf-belnr
+                                   and gjahr = ps_bkpf-gjahr.
+    clear: ls_accountgl.
+    ls_accountgl-itemno_acc = ls_bseg-buzei."'10'.
+    ls_accountgl-gl_account = ls_bseg-hkont."p_re_rev.
+    ls_accountgl-tax_code   = ls_bseg-mwskz."gv_tax_code.
+    ls_accountgl-item_text  = 'RRB Historical data reversal'."'RRB reposting'.                "#EC *
+    ls_accountgl-comp_code  = ps_bkpf-bukrs."p_bukrs.
+* ls_accountgl-FUNC_AREA  = '2051'.          "20100122 EXTUVE CR1223
+    ls_accountgl-func_area  = ls_bseg-fkber."'3111'.          "20100122 EXTUVE CR1223
+    ls_accountgl-plant      = ls_bseg-werks."gs_ce41000-werks.
+    ls_accountgl-fis_period = sy-datum+4(2)."ps_bkpf-monat."gv_period.
+    ls_accountgl-fisc_year  = ps_bkpf-gjahr."p_letja.
+    ls_accountgl-pstng_date = sy-datum."gv_lastday."gv_doc_date.
+    ls_accountgl-value_date = ls_bseg-valut."Valuation Date
+
+    ls_accountgl-alloc_nmbr = ls_bseg-zuonr.
+*  CONCATENATE gs_dmr-vgbel gs_dmr-vgpos INTO ls_accountgl-alloc_nmbr SEPARATED BY space.
+    ls_accountgl-profit_ctr = ls_bseg-prctr."gs_ce41000-ww006.
+    append ls_accountgl to gt_accountgl.
+
+  endloop.
+endform.                    "get_accountgl
+*&---------------------------------------------------------------------*
+*&      Form  get_currencyamount
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_BKPF     text
+*----------------------------------------------------------------------*
+form get_currencyamount using ps_bkpf type bkpf.
+  data: ls_bseg type bseg,
+        ls_currencyamount type bapiaccr09.
+  clear: gt_currencyamount.
+  loop at gt_bseg into ls_bseg where bukrs = ps_bkpf-bukrs
+                                   and belnr = ps_bkpf-belnr
+                                   and gjahr = ps_bkpf-gjahr.
+    ls_currencyamount-itemno_acc = ls_bseg-buzei."'10'.
+    ls_currencyamount-currency = ps_bkpf-waers."ls_bseg-pswsl."gv_waers.
+    if ls_bseg-bschl = '40'.
+      ls_currencyamount-amt_doccur = ls_bseg-dmbtr * -1."gs_dmr-netwr.
+    else.
+      ls_currencyamount-amt_doccur = ls_bseg-dmbtr.
+    endif.
+    append ls_currencyamount to gt_currencyamount.
+  endloop.
+endform.                    "get_currencyamount
+*&---------------------------------------------------------------------*
+*&      Form  get_criteria
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_BKPF     text
+*----------------------------------------------------------------------*
+form get_criteria using ps_bkpf type bkpf.
+  data: ls_bseg type bseg,
+        ls_criteria type bapiackec9,
+        ls_valuefield type  bapiackev9,
+        ls_ce11000 type ce11000,
+        lv_kaufn type ce11000-kaufn,
+        lv_kdpos type ce11000-kdpos,
+
+        lv_paledger type ce11000-paledger.
+*
+*  data: lo_structref      type ref to cl_abap_structdescr.
+*
+*  lo_structref ?= cl_abap_typedescr=>describe_by_name( 'CE11000' ).
+*  idetails[] = lo_structref->components[].
+
+  clear: gt_criteria.
+  lv_paledger = '02'.
+  loop at gt_bseg into ls_bseg where bukrs = ps_bkpf-bukrs
+                                     and belnr = ps_bkpf-belnr
+                                     and gjahr = ps_bkpf-gjahr.
+    clear: lv_kaufn, lv_kdpos.
+
+    split ls_bseg-zuonr at space into lv_kaufn lv_kdpos.
+
+    select single * into ls_ce11000 from ce11000
+              where paledger = lv_paledger"'02'
+                and vrgar = 'B'
+                and perio = gv_perio
+                and rbeln = ls_bseg-belnr
+                and kaufn = lv_kaufn
+                and kdpos = lv_kdpos
+                and bukrs = ls_bseg-bukrs
+                and kstar = ls_bseg-hkont.
+
+    ls_criteria-itemno_acc = ls_bseg-buzei.
+
+    ls_criteria-fieldname = 'ARTNR'.
+    ls_criteria-character = ls_ce11000-artnr .
+    append ls_criteria to gt_criteria.
+
+    ls_criteria-fieldname = 'VTWEG'.
+    ls_criteria-character = ls_ce11000-vtweg.
+    append ls_criteria to gt_criteria.
+
+    ls_criteria-fieldname = 'SPART'.
+    ls_criteria-character = ls_ce11000-spart.
+    append ls_criteria to gt_criteria.
+
+    ls_criteria-fieldname = 'KNDNR'.
+    ls_criteria-character = ls_ce11000-kndnr.
+    append ls_criteria to gt_criteria.
+
+    ls_criteria-fieldname = 'PRCTR'.
+    ls_criteria-character = ls_ce11000-prctr.
+    append ls_criteria to gt_criteria.
+
+    ls_criteria-fieldname = 'EQUNR'.
+    ls_criteria-character = ls_ce11000-equnr.
+    append ls_criteria to gt_criteria.
+
+    ls_criteria-fieldname = 'WW002'.
+    ls_criteria-character = ls_ce11000-ww002.
+    append ls_criteria to gt_criteria.
+
+    ls_criteria-fieldname = 'WW003'.
+    ls_criteria-character = ls_ce11000-ww003.
+    append ls_criteria to gt_criteria.
+
+    ls_criteria-fieldname = 'WW006'.
+    ls_criteria-character = ls_ce11000-ww006.
+    append ls_criteria to gt_criteria.
+
+    ls_criteria-fieldname = 'WW007'.
+    ls_criteria-character = ls_ce11000-ww007.
+    append ls_criteria to gt_criteria.
+
+    ls_criteria-fieldname = 'KTGRD'.
+    ls_criteria-character = ls_ce11000-ktgrd.
+    append ls_criteria to gt_criteria.
+
+    ls_criteria-fieldname = 'WW009'.
+    ls_criteria-character = ls_ce11000-ww009.
+    append ls_criteria to gt_criteria.
+
+    ls_criteria-fieldname = 'VKORG'.
+    ls_criteria-character = ls_ce11000-vkorg.
+    append ls_criteria to gt_criteria.
+
+    ls_criteria-fieldname = 'VKBUR'.
+    ls_criteria-character = ls_ce11000-vkbur.
+    append ls_criteria to gt_criteria.
+
+    ls_criteria-fieldname = 'WW004'.
+    ls_criteria-character = ls_ce11000-ww004.
+    append ls_criteria to gt_criteria.
+
+    ls_criteria-fieldname = 'KUNWE'.
+    ls_criteria-character = ls_ce11000-kunwe.
+    append ls_criteria to gt_criteria.
+
+    ls_criteria-fieldname = 'BEMOT'.
+    ls_criteria-character = ls_ce11000-bemot.
+    append ls_criteria to gt_criteria.
+
+    ls_criteria-fieldname = 'PRODH'.
+    ls_criteria-character = ls_ce11000-prodh.
+    append ls_criteria to gt_criteria.
+
+    ls_criteria-fieldname = 'WW005'.
+    ls_criteria-character = ls_ce11000-ww005.
+    append ls_criteria to gt_criteria.
+
+    ls_criteria-fieldname = 'KAUFN'.
+    ls_criteria-character = ls_ce11000-kaufn.
+    append ls_criteria to gt_criteria.
+
+    ls_criteria-fieldname = 'KDPOS'.
+    ls_criteria-character = ls_ce11000-kdpos.
+    append ls_criteria to gt_criteria.
+
+    ls_criteria-fieldname = 'WW008'.
+    ls_criteria-character = ls_ce11000-ww008.
+    append ls_criteria to gt_criteria.
+
+    "gt_valuefield
+    ls_valuefield-itemno_acc = ls_bseg-buzei.
+
+    if ls_bseg-hkont = '0004210901' or ls_bseg-hkont = '0004010901'.
+      ls_valuefield-fieldname = 'VV200'.
+    endif.
+
+    if ls_bseg-hkont = '0003210901' or ls_bseg-hkont = '0003010901'.
+      ls_valuefield-fieldname = 'VV100'.
+    endif.
+
+    if ls_bseg-bschl = '40'.
+      ls_valuefield-amt_valcom = ls_bseg-dmbtr.
+    else.
+      ls_valuefield-amt_valcom = ls_bseg-dmbtr * -1.
+    endif.
+
+    ls_valuefield-currency = ps_bkpf-waers."ls_bseg-pswsl."gs_dmr-waerk.
+    append ls_valuefield to gt_valuefield.
+  endloop.
+
+  sort gt_valuefield by itemno_acc ascending fieldname ascending.
+  delete adjacent duplicates from gt_valuefield.
+
+endform.                    "get_criteria
+*&---------------------------------------------------------------------*
+*&      Form  get_valuefield
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->PS_BKPF    text
+*----------------------------------------------------------------------*
+form get_valuefield using ps_bkpf type bkpf.
+  data: ls_valuefield type  bapiackev9.
+
+
+endform.                    "get_valuefield
+
+*Text symbol text£º
+
+*BK1:Selection Criteria
+*Selection text£º
+*P_BUKRS:D       .
+*P_GJAHR:D       .
+*P_POPER:D       .
+*S_BELNR:D       .

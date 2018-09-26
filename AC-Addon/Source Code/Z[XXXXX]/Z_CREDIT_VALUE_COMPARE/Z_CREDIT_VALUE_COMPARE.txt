@@ -1,0 +1,268 @@
+*&---------------------------------------------------------------------*
+*& Report  Z_CREDIT_VALUE_COMPARE
+*&
+*&---------------------------------------------------------------------*
+*&
+*&
+*&---------------------------------------------------------------------*
+
+REPORT z_credit_value_compare.
+
+*--- Global Data Declarations -----------------------------------------*
+TYPE-POOLS slis.
+
+DATA: BEGIN OF ls_results,
+        kkber LIKE vbak-kkber,
+        knkli LIKE vbak-knkli,
+        cmwae LIKE vbak-cmwae,
+        oeikw LIKE s066-oeikw,
+        olikw LIKE s067-olikw,
+        ofakw LIKE s067-ofakw,
+      END OF ls_results,
+      lt_results LIKE TABLE OF ls_results.
+
+DATA: BEGIN OF ls_s066_67,
+        kkber LIKE s066-kkber,
+        knkli LIKE s066-knkli,
+        cmwae LIKE s066-cmwae,
+      END OF ls_s066_67,
+      lt_s066_67 LIKE TABLE OF ls_s066_67.
+
+DATA: BEGIN OF ls_values.
+        INCLUDE STRUCTURE ls_results.
+DATA:   oeikw_db LIKE s066-oeikw,
+        olikw_db LIKE s067-olikw,
+        ofakw_db LIKE s067-ofakw,
+        color TYPE slis_t_specialcol_alv,
+       END OF ls_values,
+       lt_wrong_values LIKE TABLE OF ls_values.
+
+DATA: counter_all TYPE i,
+      counter_inc TYPE i.
+
+SELECT-OPTIONS: knkli FOR ls_results-knkli MATCHCODE OBJECT debi,
+                kkber FOR ls_results-kkber MATCHCODE OBJECT h_t014.
+
+PARAMETERS: protb   DEFAULT 'Y' NO-DISPLAY,
+            tracs   DEFAULT 'X' NO-DISPLAY,
+            noblock DEFAULT 'X' NO-DISPLAY.
+
+
+
+*--- Start of selection -----------------------------------------------*
+START-OF-SELECTION.
+* simulate re-creation of open credit values
+  SUBMIT rvkred07 AND RETURN EXPORTING LIST TO MEMORY
+         WITH knkli   IN knkli
+         WITH kkber   IN kkber
+         WITH protb   EQ protb
+         WITH tracs   EQ tracs
+         WITH noblock EQ noblock.
+
+* import the results from RVKRED07
+  IMPORT lt_results FROM MEMORY ID 'CREDIT_RESULTS_RVKRED07'.
+
+* check for S066 and S067 entries ...
+  SELECT * FROM s066 INTO CORRESPONDING FIELDS OF TABLE lt_s066_67
+                     WHERE kkber IN kkber AND
+                           knkli IN knkli AND
+                           oeikw NE 0.
+  SELECT * FROM s067 APPENDING CORRESPONDING FIELDS OF TABLE lt_s066_67
+                     WHERE kkber IN kkber AND
+                           knkli IN knkli AND
+                           ( olikw NE 0 OR
+                             ofakw NE 0 ).
+  SORT lt_s066_67.
+  DELETE ADJACENT DUPLICATES FROM lt_s066_67 COMPARING kkber knkli.
+  SORT lt_results.
+* ... and add missing entries to lt_results
+  LOOP AT lt_s066_67 INTO ls_s066_67.
+    READ TABLE lt_results WITH KEY kkber = ls_s066_67-kkber
+                                   knkli = ls_s066_67-knkli
+                          TRANSPORTING NO FIELDS
+                          BINARY SEARCH.
+    IF sy-subrc NE 0.
+      MOVE-CORRESPONDING ls_s066_67 TO ls_results.
+      INSERT ls_results INTO lt_results INDEX sy-tabix.
+    ENDIF.
+  ENDLOOP.
+
+* compare simulated credit values with database values
+  LOOP AT lt_results INTO ls_results.
+    MOVE-CORRESPONDING ls_results TO ls_values.
+    ADD 1 TO counter_all.
+    CALL FUNCTION 'SD_CREDIT_EXPOSURE'
+      EXPORTING
+        kkber         = ls_values-kkber
+        knkli         = ls_values-knkli
+      IMPORTING
+        open_delivery = ls_values-olikw_db
+        open_invoice  = ls_values-ofakw_db
+        open_order    = ls_values-oeikw_db.
+*   collect wrong values in internal table
+    IF ls_values-oeikw NE ls_values-oeikw_db OR
+       ls_values-olikw NE ls_values-olikw_db OR
+       ls_values-ofakw NE ls_values-ofakw_db.
+      APPEND ls_values TO lt_wrong_values.
+      ADD 1 TO counter_inc.
+    ENDIF.
+    CLEAR ls_values.
+  ENDLOOP.
+
+
+*--- End of selection -------------------------------------------------*
+END-OF-SELECTION.
+
+* Prepare fieldcatalog for SAP List Viewer
+  DATA: lt_fieldcat TYPE slis_t_fieldcat_alv,
+        ls_fieldcat LIKE LINE OF lt_fieldcat.
+
+  CALL FUNCTION 'REUSE_ALV_FIELDCATALOG_MERGE'
+    EXPORTING
+      i_structure_name = 'ZCRED_VALUES'
+    CHANGING
+      ct_fieldcat      = lt_fieldcat.
+
+  LOOP AT lt_fieldcat INTO ls_fieldcat.
+    IF ls_fieldcat-fieldname = 'KKBER' OR
+       ls_fieldcat-fieldname = 'KNKLI' OR
+       ls_fieldcat-fieldname = 'CMWAE'.
+      ls_fieldcat-fix_column = 'X'.
+      ls_fieldcat-key = 'X'.
+    ENDIF.
+    IF ls_fieldcat-fieldname(1) = 'O'.
+      ls_fieldcat-outputlen = 15.
+    ENDIF.
+    IF ls_fieldcat-fieldname = 'KNKLI'.
+      ls_fieldcat-hotspot = 'X'.
+    ENDIF.
+    MODIFY lt_fieldcat FROM ls_fieldcat.
+  ENDLOOP.
+
+* prepare list header
+  DATA: lt_events TYPE slis_t_event,
+        ls_events LIKE LINE OF lt_events.
+  ls_events-name = 'TOP_OF_PAGE'.
+  ls_events-form = 'TOP_OF_PAGE'.
+  APPEND ls_events TO lt_events.
+
+* prepare call transaction FD33 via hotspot or double-click
+  ls_events-name = 'USER_COMMAND'.
+  ls_events-form = 'USER_COMMAND'.
+  APPEND ls_events TO lt_events.
+
+* prepare coloring of fields
+  DATA: ls_layout TYPE slis_layout_alv.
+  ls_layout-coltab_fieldname = 'COLOR'.
+
+* check for incorrect open values and color them
+  DATA: lt_color TYPE slis_t_specialcol_alv,
+        ls_color LIKE LINE OF lt_color.
+  LOOP AT lt_wrong_values INTO ls_values.
+    IF ls_values-oeikw NE ls_values-oeikw_db.
+      ls_color-fieldname = 'OEIKW_DB'.
+      ls_color-color-col = 6.
+      APPEND ls_color TO lt_color.
+    ENDIF.
+    IF ls_values-olikw NE ls_values-olikw_db.
+      ls_color-fieldname = 'OLIKW_DB'.
+      ls_color-color-col = 6.
+      APPEND ls_color TO lt_color.
+    ENDIF.
+    IF ls_values-ofakw NE ls_values-ofakw_db.
+      ls_color-fieldname = 'OFAKW_DB'.
+      ls_color-color-col = 6.
+      APPEND ls_color TO lt_color.
+    ENDIF.
+    ls_values-color = lt_color.
+    CLEAR ls_color. REFRESH lt_color.
+    MODIFY lt_wrong_values FROM ls_values.
+  ENDLOOP.
+
+* call SAP List Viewer
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+    EXPORTING
+      i_callback_program = sy-repid
+      is_layout          = ls_layout
+      it_fieldcat        = lt_fieldcat
+      it_events          = lt_events
+    TABLES
+      t_outtab           = lt_wrong_values.
+
+
+*--- End of program ---------------------------------------------------*
+
+
+
+
+
+*--- Forms ------------------------------------------------------------*
+
+*&---------------------------------------------------------------------*
+*&      Form  TOP_OF_PAGE
+*&---------------------------------------------------------------------*
+*       prepare list header for SAP List Viewer
+*----------------------------------------------------------------------*
+
+FORM top_of_page.
+
+  DATA: lt_listhead TYPE slis_t_listheader,
+        ls_listhead LIKE LINE OF lt_listhead.
+
+  ls_listhead-typ  = 'H'.
+  ls_listhead-key  = ' '.
+  ls_listhead-info = text-001.
+  APPEND ls_listhead TO lt_listhead.
+  ls_listhead-typ  = 'S'.
+  ls_listhead-key  = counter_all.
+  ls_listhead-info = text-002.
+  APPEND ls_listhead TO lt_listhead.
+  ls_listhead-typ  = 'S'.
+  ls_listhead-key  = counter_inc.
+  ls_listhead-info = text-003.
+  APPEND ls_listhead TO lt_listhead.
+
+  CALL FUNCTION 'REUSE_ALV_COMMENTARY_WRITE'
+    EXPORTING
+      it_list_commentary = lt_listhead.
+
+ENDFORM.                    "top_of_page
+
+
+*&---------------------------------------------------------------------*
+*&      Form  user_command
+*&---------------------------------------------------------------------*
+*       call transaction FD33
+*----------------------------------------------------------------------*
+FORM user_command USING us_ucomm LIKE sy-ucomm
+                        us_selfield TYPE slis_selfield.
+
+  READ TABLE lt_wrong_values INTO ls_values INDEX us_selfield-tabindex.
+
+  SET PARAMETER ID 'KUN' FIELD ls_values-knkli.
+  SET PARAMETER ID 'KKB' FIELD ls_values-kkber.
+
+  CALL FUNCTION 'AUTHORITY_CHECK_TCODE'
+    EXPORTING
+      tcode  = 'FD33'
+    EXCEPTIONS
+      ok     = 1
+      not_ok = 2
+      OTHERS = 3.
+
+  IF sy-subrc GT 1.
+    MESSAGE i077(s#) WITH 'FD33'.
+  ELSE.
+    CALL TRANSACTION 'FD33'.
+  ENDIF.
+
+ENDFORM.                    "user_command
+
+*Text symbol text£º
+*001:List credit customers with incorrect credit values
+*002:Checked credit customers / credit control areas
+
+*003:Credit customers / credit control areas with incorrect
+*Selection text£º
+*KKBER:D       .
+*KNKLI:D       .

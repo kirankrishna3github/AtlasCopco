@@ -1,0 +1,588 @@
+************************************************************************
+* Program ID           : YSE_UPDATE_CONTRACT_STATUS                    *
+* Program Title        : Update Contract Line User Status              *
+* Author               : Lakshmi Reddy                                 *
+* Date                 : 03/02/2011                                    *
+* Change Request Number: CD1K962726                                    *
+* Description          : At creation of a contract,a User Status       *
+*                        ZAM00002 gets automatically linked to the     *
+*                        contract on Header level.This program sets the*
+*                        user status as ZAM00005 on line item level    *
+*======================================================================*
+* Copied From          : N/A                                           *
+* Title                : N/A                                           *
+* Other Related obj    : N/A                                           *
+*======================================================================*
+* Change History Log                                                   *
+*----------------------------------------------------------------------*
+* Mod. no.|Date      |Name        |Correction Number|Change Reference  *
+*----------------------------------------------------------------------*
+* MOD-001 |03/02/2011|LakshmiReddy|CD1K962726       |CR1918            *
+* Description: Initial Development                                     *
+*----------------------------------------------------------------------*
+
+REPORT  yse_update_contract_status MESSAGE-ID yam_re.
+
+TYPE-POOLS: slis.
+
+************************************************************************
+*                  T Y P E S  S T R U C T U R E S
+************************************************************************
+TYPES: BEGIN OF ty_inputdata,
+        vbeln   TYPE vbeln_va,
+        vposn   TYPE posnr_va,
+        objnr   TYPE j_objnr,
+       END OF ty_inputdata.
+
+TYPES: BEGIN OF ty_report,
+        vbeln   TYPE vbeln_va,
+        vposn   TYPE posnr_va,
+        errtyp  TYPE char1,
+        errdes  TYPE string,
+       END OF ty_report.
+
+************************************************************************
+*                 I N T E R N A L  T A B L E S
+************************************************************************
+DATA:i_files TYPE filetable,
+     i_inputdata TYPE STANDARD TABLE OF ty_inputdata,
+     i_validdata TYPE STANDARD TABLE OF ty_inputdata,
+     i_report    TYPE STANDARD TABLE OF ty_report,
+     i_fieldcatalog TYPE slis_t_fieldcat_alv,
+     i_events       TYPE slis_t_event,
+     i_header       TYPE slis_t_listheader.
+
+
+*----------------------------------------------------------------------*
+*                 V A R I A B L E S                                    *
+*----------------------------------------------------------------------*
+DATA:wa_file    TYPE file_table,
+     v_title    TYPE string,
+     v_subrc    TYPE i,
+     v_usract   TYPE i,
+     v_deffile  TYPE string,
+     wa_inputdata TYPE ty_inputdata,
+     wa_report    TYPE ty_report.
+
+*----------------------------------------------------------------------*
+*                 S E L E C T I O N  S C R E E N                       *
+*----------------------------------------------------------------------*
+SELECTION-SCREEN BEGIN OF BLOCK s1 WITH FRAME TITLE text-001.
+PARAMETERS: p_file LIKE rlgrap-filename OBLIGATORY.
+SELECTION-SCREEN END OF BLOCK s1.
+
+*----------------------------------------------------------------------*
+*                 A T  S E L E C T I O N  S C R E E N                  *
+*----------------------------------------------------------------------*
+
+*F4-Help for filename
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_file.
+  PERFORM f100_f4_help_for_input_file CHANGING p_file.
+
+************************************************************************
+*                 S T A R T - O F - S E L E C T I O N
+************************************************************************
+START-OF-SELECTION.
+
+  PERFORM f200_prepare_input_data.
+
+  IF NOT i_inputdata IS INITIAL.
+    PERFORM f300_prep_valid_and_err_record.
+
+    PERFORM f400_update_jsto_table.
+
+    PERFORM f500_display_report.
+  ELSE.
+    MESSAGE s320 WITH
+           'The file does not contain any records'(008).
+  ENDIF.
+*----------------------------------------------------------------------*
+*                            F O R M S                                 *
+*----------------------------------------------------------------------*
+
+*&---------------------------------------------------------------------*
+*&      Form  F100_F4_HELP_FOR_INPUT_FILE
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM f100_f4_help_for_input_file CHANGING f_c_file.
+
+  v_title = 'Select Input File'.
+  MOVE f_c_file TO v_deffile.
+  CALL METHOD cl_gui_frontend_services=>file_open_dialog
+    EXPORTING
+      window_title            = v_title
+      default_filename        = v_deffile
+      file_filter             = '*.*|*.*'
+    CHANGING
+      file_table              = i_files
+      rc                      = v_subrc
+      user_action             = v_usract
+    EXCEPTIONS
+      file_open_dialog_failed = 1
+      cntl_error              = 2
+      error_no_gui            = 3
+      not_supported_by_gui    = 4
+      OTHERS                  = 5.
+  IF sy-subrc = 0 AND v_usract <> cl_gui_frontend_services=>action_cancel.
+    LOOP AT  i_files INTO wa_file.
+      MOVE wa_file-filename TO f_c_file.
+      EXIT.
+    ENDLOOP.
+  ELSEIF v_usract EQ cl_gui_frontend_services=>action_cancel.
+    MOVE v_deffile TO f_c_file.
+  ENDIF.
+
+ENDFORM.                    " F100_F4_HELP_FOR_INPUT_FILE
+*&---------------------------------------------------------------------*
+*&      Form  F200_PREPARE_INPUT_DATA
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM f200_prepare_input_data .
+
+  DATA: lv_file TYPE string,
+        v_index TYPE sy-tabix.
+  REFRESH: i_inputdata.
+  MOVE p_file TO lv_file.
+
+  CALL FUNCTION 'GUI_UPLOAD'
+    EXPORTING
+      filename                = lv_file
+      filetype                = 'DAT'
+    TABLES
+      data_tab                = i_inputdata
+    EXCEPTIONS
+      file_open_error         = 1
+      file_read_error         = 2
+      no_batch                = 3
+      gui_refuse_filetransfer = 4
+      invalid_type            = 5
+      no_authority            = 6
+      unknown_error           = 7
+      bad_data_format         = 8
+      header_not_allowed      = 9
+      separator_not_allowed   = 10
+      header_too_long         = 11
+      unknown_dp_error        = 12
+      access_denied           = 13
+      dp_out_of_memory        = 14
+      disk_full               = 15
+      dp_timeout              = 16
+      OTHERS                  = 17.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+  CLEAR: wa_inputdata,
+         v_index.
+  LOOP AT i_inputdata INTO wa_inputdata.
+    v_index = sy-tabix.
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+      EXPORTING
+        input  = wa_inputdata-vbeln
+      IMPORTING
+        output = wa_inputdata-vbeln.
+
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+      EXPORTING
+        input  = wa_inputdata-vposn
+      IMPORTING
+        output = wa_inputdata-vposn.
+    MODIFY i_inputdata
+    INDEX  v_index
+    FROM   wa_inputdata.
+    CLEAR: wa_inputdata,
+           v_index.
+  ENDLOOP.
+
+ENDFORM.                    " F200_PREPARE_INPUT_DATA
+*&---------------------------------------------------------------------*
+*&      Form  F300_PREP_VALID_AND_ERR_RECORD
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM f300_prep_valid_and_err_record .
+
+  TYPES: BEGIN OF ty_vbap,
+          vbeln TYPE vbeln_va,
+          posnr TYPE posnr_va,
+         END OF ty_vbap.
+
+  TYPES: BEGIN OF ty_veda,
+          vbeln TYPE vbeln_va,
+          vposn TYPE posnr_va,
+          venddat TYPE vndat_veda,
+         END   OF ty_veda.
+
+  TYPES: BEGIN OF ty_vbup,
+          vbeln TYPE vbeln,
+          posnr TYPE posnr,
+          absta TYPE absta_vb,
+         END   OF ty_vbup.
+
+  DATA: i_vbap  TYPE STANDARD TABLE OF ty_vbap,
+        i_veda  TYPE STANDARD TABLE OF ty_veda,
+        i_vbup  TYPE STANDARD TABLE OF ty_vbup,
+        i_temp  TYPE STANDARD TABLE OF ty_inputdata,
+        wa_vbap TYPE ty_vbap,
+        wa_veda TYPE ty_veda,
+        wa_vbup TYPE ty_vbup.
+
+  DELETE ADJACENT DUPLICATES FROM i_inputdata COMPARING vbeln
+                                                        vposn.
+  REFRESH:i_vbap.
+  IF NOT i_inputdata IS INITIAL.
+    SELECT vbeln
+           posnr
+    FROM   vbap
+    INTO   TABLE i_vbap
+    FOR    ALL ENTRIES IN i_inputdata
+    WHERE  vbeln EQ i_inputdata-vbeln
+    AND    posnr EQ i_inputdata-vposn.
+  ENDIF.
+
+*Consider input file records if exists in VBAP table
+  REFRESH: i_validdata,
+           i_report.
+  CLEAR: wa_inputdata.
+  LOOP AT i_inputdata INTO wa_inputdata.
+    CLEAR: wa_vbap.
+    READ TABLE i_vbap INTO wa_vbap WITH KEY vbeln = wa_inputdata-vbeln
+                                            posnr = wa_inputdata-vposn.
+    IF sy-subrc EQ 0.
+      APPEND wa_inputdata TO i_validdata.
+    ELSE.
+*If Record does not exist in VBAP table
+      CLEAR: wa_report.
+      wa_report-vbeln = wa_inputdata-vbeln.
+      wa_report-vposn = wa_inputdata-vposn.
+      wa_report-errtyp = 'E'.
+      wa_report-errdes = 'The record does not exist in SAP'(002).
+      APPEND wa_report TO i_report.
+    ENDIF.
+    CLEAR: wa_inputdata.
+  ENDLOOP.
+
+*Consider contract lines which are still valid contracts
+  REFRESH: i_veda.
+  IF NOT i_validdata IS INITIAL.
+    SELECT vbeln
+           vposn
+           venddat
+    FROM   veda
+    INTO   CORRESPONDING FIELDS OF TABLE i_veda
+    FOR    ALL ENTRIES IN i_validdata
+    WHERE  vbeln EQ i_validdata-vbeln
+    AND    ( vposn EQ i_validdata-vposn OR vposn EQ '000000' ).
+  ENDIF.
+
+*Consider contract lines with no cancellation on that lins
+  REFRESH: i_vbup.
+  IF NOT i_validdata IS INITIAL.
+    SELECT vbeln
+           posnr
+           absta
+    FROM   vbup
+    INTO   CORRESPONDING FIELDS OF TABLE i_vbup
+    FOR    ALL ENTRIES IN i_validdata
+    WHERE  vbeln EQ i_validdata-vbeln
+    AND    posnr EQ i_validdata-vposn
+    AND    absta EQ 'A'.
+  ENDIF.
+
+*Prepare final valid contract line items for updating the User Status
+  REFRESH: i_temp.
+  APPEND LINES OF i_validdata TO i_temp.
+  REFRESH: i_validdata.
+  LOOP AT i_temp INTO wa_inputdata.
+    CLEAR: wa_veda.
+    READ TABLE i_veda INTO wa_veda WITH KEY vbeln = wa_inputdata-vbeln
+                                            vposn = wa_inputdata-vposn.
+    IF sy-subrc EQ 0.
+*Check contract line end date greater than current date
+      IF wa_veda-venddat GT sy-datum.
+        CLEAR: wa_veda.
+        READ TABLE i_vbup INTO wa_vbup WITH KEY vbeln = wa_inputdata-vbeln
+                                                posnr = wa_inputdata-vposn.
+        IF sy-subrc EQ 0.
+          APPEND wa_inputdata TO i_validdata.
+        ELSE.
+*If check on Rejection status of contract item fails
+          CLEAR: wa_report.
+          wa_report-vbeln = wa_inputdata-vbeln.
+          wa_report-vposn = wa_inputdata-vposn.
+          wa_report-errtyp = 'E'.
+          wa_report-errdes = 'Contract line item has already processed Partially or Completely'(010).
+          APPEND wa_report TO i_report.
+        ENDIF.
+      ELSE.
+*If check on Contract line end date fails
+        CLEAR: wa_report.
+        wa_report-vbeln = wa_inputdata-vbeln.
+        wa_report-vposn = wa_inputdata-vposn.
+        wa_report-errtyp = 'E'.
+        wa_report-errdes = 'Contract Line End Date is not greater than Current Date'(014).
+        APPEND wa_report TO i_report.
+      ENDIF.
+    ELSE.
+      CLEAR: wa_veda.
+      READ TABLE i_veda INTO wa_veda WITH KEY vbeln = wa_inputdata-vbeln
+                                              vposn = '000000'.
+      IF sy-subrc EQ 0.
+        IF wa_veda-venddat GT sy-datum.
+          CLEAR: wa_veda.
+          READ TABLE i_vbup INTO wa_vbup WITH KEY vbeln = wa_inputdata-vbeln
+                                                  posnr = wa_inputdata-vposn.
+          IF sy-subrc EQ 0.
+            APPEND wa_inputdata TO i_validdata.
+          ELSE.
+*If check on Rejection status of contract item fails
+            CLEAR: wa_report.
+            wa_report-vbeln = wa_inputdata-vbeln.
+            wa_report-vposn = wa_inputdata-vposn.
+            wa_report-errtyp = 'E'.
+            wa_report-errdes = 'Contract line item has already processed Partially or Completely'(010).
+            APPEND wa_report TO i_report.
+          ENDIF.
+        ELSE.
+*If check on Contract line end date fails
+          CLEAR: wa_report.
+          wa_report-vbeln = wa_inputdata-vbeln.
+          wa_report-vposn = wa_inputdata-vposn.
+          wa_report-errtyp = 'E'.
+          wa_report-errdes = 'Contract Line End Date is not greater than Current Date'(014).
+          APPEND wa_report TO i_report.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+    CLEAR: wa_inputdata.
+  ENDLOOP.
+ENDFORM.                    " F300_PREP_VALID_AND_ERR_RECORD
+*&---------------------------------------------------------------------*
+*&      Form  F400_UPDATE_JSTO_TABLE
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM f400_update_jsto_table .
+
+  DATA: i_jsto  TYPE STANDARD TABLE OF jsto,
+        wa_jsto TYPE jsto,
+        v_index TYPE sy-tabix.
+
+*Prepare OBJNR value for each contract line item in the internal table
+  CLEAR: wa_inputdata,
+         v_index.
+  LOOP AT i_validdata INTO wa_inputdata.
+    v_index = sy-tabix.
+    CONCATENATE 'VB'
+                wa_inputdata-vbeln
+                wa_inputdata-vposn
+                INTO
+                wa_inputdata-objnr.
+    MODIFY i_validdata
+    INDEX  v_index
+    FROM   wa_inputdata.
+    CLEAR: wa_inputdata,
+           v_index.
+  ENDLOOP.
+
+*Get records from JSTO table
+  REFRESH: i_jsto.
+  IF NOT i_validdata IS INITIAL.
+    SELECT *
+    FROM   jsto
+    INTO   TABLE i_jsto
+    FOR    ALL ENTRIES IN i_validdata
+    WHERE  objnr EQ i_validdata-objnr
+    AND    obtyp EQ 'VBP'.
+  ENDIF.
+
+  CLEAR: wa_jsto.
+  LOOP AT i_jsto INTO wa_jsto.
+    wa_jsto-stsma = 'ZAM00005'.
+    MODIFY i_jsto
+    INDEX  sy-tabix
+    FROM   wa_jsto.
+    CLEAR: wa_jsto.
+  ENDLOOP.
+
+  IF NOT i_jsto IS INITIAL.
+    MODIFY jsto FROM TABLE i_jsto.
+    IF sy-subrc EQ 0.
+      COMMIT WORK.
+      CLEAR wa_jsto.
+      LOOP AT i_jsto INTO wa_jsto.
+        CLEAR: wa_report.
+        wa_report-vbeln = wa_jsto-objnr+2(10).
+        wa_report-vposn = wa_jsto-objnr+12(6).
+        wa_report-errtyp = 'S'.
+        wa_report-errdes = 'The contract line item status has been updated successfully'(011).
+        APPEND wa_report TO i_report.
+        CLEAR: wa_jsto.
+      ENDLOOP.
+    ELSE.
+      LOOP AT i_jsto INTO wa_jsto.
+        CLEAR: wa_report.
+        wa_report-vbeln = wa_jsto-objnr+2(10).
+        wa_report-vposn = wa_jsto-objnr+12(6).
+        wa_report-errtyp = 'E'.
+        wa_report-errdes = 'The contract line item status not updated due to an error while updating database table'(012).
+        APPEND wa_report TO i_report.
+        CLEAR: wa_jsto.
+      ENDLOOP.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    " F400_UPDATE_JSTO_TABLE
+
+*&---------------------------------------------------------------------*
+*&      Form  F500_DISPLAY_REPORT
+*&---------------------------------------------------------------------*
+*       Display ALV report
+*----------------------------------------------------------------------*
+FORM f500_display_report .
+
+  PERFORM f510_build_field_catalog.
+
+  PERFORM f520_build_events.
+
+  PERFORM f530_display_alv_report.
+
+ENDFORM.                    " F500_DISPLAY_REPORT
+*&---------------------------------------------------------------------*
+*&      Form  F510_BUILD_FIELD_CATALOG
+*&---------------------------------------------------------------------*
+*       Build field catalog
+*----------------------------------------------------------------------*
+FORM f510_build_field_catalog .
+
+  PERFORM f511_field_catalog USING 'VBELN'
+                                   'Contract Document'(003).
+
+  PERFORM f511_field_catalog USING 'VPOSN'
+                                   'Item Number'(004).
+
+  PERFORM f511_field_catalog USING 'ERRTYP'
+                                   'Message Type'(005).
+
+  PERFORM f511_field_catalog USING 'ERRDES'
+                                   'Message Description'(006).
+
+ENDFORM.                    " F510_BUILD_FIELD_CATALOG
+
+*&---------------------------------------------------------------------*
+*&      Form  F511_FIELD_CATALOG
+*&---------------------------------------------------------------------*
+*       Prepare field catalog with output fields
+*----------------------------------------------------------------------*
+FORM f511_field_catalog USING p_fname   TYPE any
+                              p_seltext TYPE any.
+
+  DATA: wa_fieldcatalog TYPE slis_fieldcat_alv.
+
+*appending parameters of a particular field of a fieldcatalog
+  wa_fieldcatalog-tabname   = 'I_REPORT'.
+  wa_fieldcatalog-fieldname = p_fname.
+  wa_fieldcatalog-seltext_m = p_seltext.
+
+*appending parameters of a particular field to fieldcatalog
+  APPEND wa_fieldcatalog TO i_fieldcatalog.
+
+ENDFORM.                    " f511_field_catalog
+
+*---------------------------------------------------------------------*
+*       FORM top_of_page                                              *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+FORM top_of_page.
+
+  DATA : wa_header TYPE slis_listheader.
+
+  CLEAR wa_header.
+  REFRESH i_header.
+
+  wa_header-typ = 'H'.
+  wa_header-info = 'List of Success and Error Records'(007).
+  APPEND wa_header TO i_header.
+
+  CALL FUNCTION 'REUSE_ALV_COMMENTARY_WRITE'
+    EXPORTING
+      it_list_commentary = i_header.
+
+ENDFORM.                    "top_of_page
+
+*&---------------------------------------------------------------------*
+*&      Form  f520_build_events
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM f520_build_events.
+
+  DATA : wa_events TYPE slis_alv_event.
+
+  CALL FUNCTION 'REUSE_ALV_EVENTS_GET'
+    EXPORTING
+      i_list_type = 0
+    IMPORTING
+      et_events   = i_events.
+
+  READ TABLE i_events WITH KEY name = 'TOP_OF_PAGE'
+                                      INTO wa_events.
+
+  wa_events-form = 'TOP_OF_PAGE'.
+
+  MODIFY i_events
+  FROM wa_events
+  TRANSPORTING form
+  WHERE name EQ wa_events-name.
+
+ENDFORM.                    " f520_build_events
+
+*&---------------------------------------------------------------------*
+*&      Form  f530_display_alv_report
+*&---------------------------------------------------------------------*
+*       Display ALV report
+*----------------------------------------------------------------------*
+FORM f530_display_alv_report .
+
+  DATA: l_repid TYPE sy-repid.
+
+  l_repid = sy-repid.
+  SORT i_report BY vbeln vposn.
+
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+    EXPORTING
+      i_callback_program = l_repid
+      it_fieldcat        = i_fieldcatalog
+      it_events          = i_events
+    TABLES
+      t_outtab           = i_report
+    EXCEPTIONS
+      program_error      = 1
+      OTHERS             = 2.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+ENDFORM.                    " f530_display_alv_report
+
+*Text symbol text£º
+*001:Input File Selection
+*002:The record does not exist in SAP
+*003:Contract Document
+*004:Item Number
+*005:Message Type
+*006:Message Description
+*008:The file does not contain any records
+*009:Check on Contract Line End Date failed in VEDA table
+*010:Contract line item has already been processed Partially or Completely
+*011:The contract line item status has been updated successfully
+*012:The contract line item status not updated due to an error while updating database table
+
+*014:Contract Line End Date is not greater than Current Date
+*Selection text£º
+*P_FILE:        File Name

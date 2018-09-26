@@ -1,0 +1,194 @@
+*&---------------------------------------------------------------------*
+*& Report  YSE_PO_RELCODE_FILL                                         *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+* This report should be run once in every system so that for all
+* existing PO's, the relation codes are being determined. See also issue
+* 2380 in the SEED issue DB
+
+REPORT  YSE_PO_RELCODE_FILL.
+
+  DATA:
+    LV_COMPL   TYPE C,
+    BEGIN OF IT_EKPO OCCURS 0,
+      EBELN    TYPE EBELN,
+      EBELP    TYPE EBELP,
+      BANFN    TYPE BANFN,
+      AFNAM    TYPE AFNAM,
+*      LOEKZ    TYPE ELOEK,
+    END OF IT_EKPO,
+    BEGIN OF IT_EKKO OCCURS 0,
+      EBELN    TYPE EBELN,
+    END OF IT_EKKO,
+    LV_RELATIONCODE(60),
+    LV_COUNT   TYPE I,
+    WA_EKPO    TYPE MEPOITEM,
+    IT_EKPOR   TYPE PURCHASE_ORDER_ITEMS,
+    WA_EKPOR   TYPE PURCHASE_ORDER_ITEM,
+    IT_RELCO_E TYPE TABLE OF YSE_PO_RELCODE, " Existing data
+    WA_RELCO_E TYPE YSE_PO_RELCODE,          " Existing data
+    IT_RELCO_N TYPE TABLE OF YSE_PO_RELCODE, " New data
+    WA_RELCO_N TYPE YSE_PO_RELCODE,          " New data
+    IT_RELCO_T TYPE TABLE OF YSE_PO_RELCODE, " Temp data (copy of new)
+    WA_RELCO_T TYPE YSE_PO_RELCODE,          " Temp data (copy of new)
+    BEGIN OF WA_TEMP,
+      BANFN TYPE BANFN,
+      AFNAM TYPE AFNAM,
+      RELCO TYPE ZRELCO,
+    END OF WA_TEMP.
+
+* Selection parameter
+  PARAMETER:
+    CB_DEL AS CHECKBOX.
+
+* If user chose to first empty the table, do so
+  IF NOT CB_DEL IS INITIAL.
+    DELETE FROM YSE_PO_RELCODE.
+  ENDIF.
+
+* Select all PO items of ZNB1 and ZNB2 PO's
+  SELECT      EKPO~EBELN EBELP BANFN AFNAM
+         FROM EKPO
+         JOIN EKKO
+           ON EKPO~EBELN EQ EKKO~EBELN
+         INTO TABLE IT_EKPO
+        WHERE ( BSART EQ 'ZNB1'
+             OR BSART EQ 'ZNB2' )
+          AND EKPO~LOEKZ EQ SPACE
+          AND EKKO~LOEKZ EQ SPACE.
+
+* Select all determined relation codes
+  SELECT     *
+        FROM YSE_PO_RELCODE
+        INTO TABLE IT_RELCO_E.
+
+* Get list of unique order numbers
+  SORT IT_EKPO BY EBELN AFNAM.
+  SORT IT_RELCO_E BY EBELN EBELP.
+  IT_EKKO[] = IT_EKPO[].
+  DELETE ADJACENT DUPLICATES FROM IT_EKKO.
+
+* Start processing order by order
+  LOOP AT IT_EKKO.
+
+*   Check if every item of current PO has a corresp. line in it_relco_e
+    LV_COMPL = 'X'.
+    LOOP AT IT_EKPO WHERE EBELN EQ IT_EKKO-EBELN.
+      READ TABLE IT_RELCO_E INTO WA_RELCO_E
+                            WITH KEY EBELN = IT_EKPO-EBELN
+                                     EBELP = IT_EKPO-EBELP
+                            BINARY SEARCH.
+      IF SY-SUBRC NE 0.
+        CLEAR LV_COMPL.
+        EXIT.
+      ENDIF.
+    ENDLOOP.
+
+*   If order not complete (there is at least 1 item w/o relco)
+    IF LV_COMPL IS INITIAL.
+
+      CLEAR: WA_RELCO_N,
+             IT_RELCO_N[],
+             WA_RELCO_T,
+             IT_RELCO_T[],
+             WA_TEMP.
+
+      LV_RELATIONCODE =
+              'AABBCCDDEEFFGGHHIIJJKKLLMMNNOOPPQQRRSSTTUUVVWW'.
+
+*     Prepare internal table with current PO item / requisitioner info
+      WA_RELCO_N-EBELN = IT_EKKO-EBELN.
+*     Loop over items of the PO
+      LOOP AT IT_EKPO WHERE EBELN EQ IT_EKKO-EBELN.
+**       If deletion indicator is set, skip item
+*        IF IT_EKPO-LOEKZ NE SPACE.
+*          CONTINUE.
+*        ENDIF.
+*       Copy relevant fields
+        WA_RELCO_N-EBELP = IT_EKPO-EBELP.
+        WA_RELCO_N-BANFN = IT_EKPO-BANFN.
+        WA_RELCO_N-AFNAM = IT_EKPO-AFNAM.
+*       Find previously set relation code for this item's requisitioner
+        READ TABLE IT_RELCO_E INTO WA_RELCO_E
+                              WITH KEY EBELN = IT_EKPO-EBELN
+                                       BANFN = IT_EKPO-BANFN
+                                       AFNAM = IT_EKPO-AFNAM
+                              BINARY SEARCH.
+*       If found, set it in the new relco table
+        IF SY-SUBRC EQ 0.
+          WA_RELCO_N-RELCO = WA_RELCO_E-RELCO.
+        ELSE.
+          WA_RELCO_N-RELCO = SPACE.
+        ENDIF.
+*       Save the relation
+        APPEND WA_RELCO_N TO IT_RELCO_N.
+
+      ENDLOOP.
+
+*     Copy new data to temp table (to perform count of AFNAM on)
+      IT_RELCO_T[] = IT_RELCO_N[].
+
+*     Complete the relco for items where it's blank, ie items which have
+*     now requisitioner that has never been derived a relco for before
+      SORT IT_RELCO_N BY BANFN AFNAM.
+      LOOP AT IT_RELCO_N INTO WA_RELCO_N WHERE RELCO EQ SPACE.
+
+        CHECK WA_RELCO_N-AFNAM NE SPACE.
+
+*       Check if requisitioner is the same as previous item
+        IF WA_RELCO_N-BANFN = WA_TEMP-BANFN AND
+           WA_RELCO_N-AFNAM = WA_TEMP-AFNAM.
+*         Reuse relco from last item (which had same requisitioner code)
+          WA_RELCO_N-RELCO = WA_TEMP-RELCO.
+        ELSE.
+*         If new requisit., count the nr of items with this requisit.
+          CLEAR LV_COUNT.
+          LOOP AT IT_RELCO_T INTO WA_RELCO_T
+                            WHERE EBELN EQ WA_RELCO_N-EBELN
+                              AND BANFN EQ WA_RELCO_N-BANFN
+                              AND AFNAM EQ WA_RELCO_N-AFNAM.
+            ADD 1 TO LV_COUNT.
+          ENDLOOP.
+*         If requis. code occurs more than once (1 time in this item)
+          IF LV_COUNT GT 1.
+*           Prepare new code based on the already used codes
+            DO.
+*             Check if code is used
+              READ TABLE IT_RELCO_N INTO WA_RELCO_T
+                     WITH KEY RELCO = LV_RELATIONCODE(2).
+*             If found
+              IF SY-SUBRC EQ 0.
+*               Go to next code
+                SHIFT LV_RELATIONCODE LEFT BY 2 PLACES.
+              ELSE.
+                EXIT.
+              ENDIF.
+            ENDDO.
+            WA_RELCO_N-RELCO = LV_RELATIONCODE(2).
+            SHIFT LV_RELATIONCODE LEFT BY 2 PLACES.
+          ENDIF.
+        ENDIF.
+
+*       Save last combination AFNAM - RELCO
+        WA_TEMP-BANFN = WA_RELCO_N-BANFN.
+        WA_TEMP-AFNAM = WA_RELCO_N-AFNAM.
+        WA_TEMP-RELCO = WA_RELCO_N-RELCO.
+
+        MODIFY IT_RELCO_N FROM WA_RELCO_N.
+
+      ENDLOOP.
+
+*     Sort table
+      SORT IT_RELCO_N BY EBELN EBELP.
+
+*     Update DB from IT_RELCO_N
+      MODIFY YSE_PO_RELCODE FROM TABLE IT_RELCO_N.
+
+    ENDIF.
+
+  ENDLOOP.
+
+  WRITE: 'UPDATE FINISHED'.
+
+*Selection text£º
+*CB_DEL:        First empty table

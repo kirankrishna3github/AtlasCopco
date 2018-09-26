@@ -1,0 +1,21 @@
+***INCLUDE LKKAGF88.
+
+*.Auftragstypen.........................................................
+DATA: BEGIN OF AUFTRAGSTYP,
+        INBT LIKE T003O-AUTYP VALUE '01',    " Innerbetrieblicher Auftr.
+        ABGR LIKE T003O-AUTYP VALUE '02',    " Abgrenzungsauftrag
+        MUST LIKE T003O-AUTYP VALUE '03',    " Musterauftrag
+        EINZ LIKE T003O-AUTYP VALUE '04',    " Einzelfertigungsauftrag,
+                                             " CO-Fertigungsauftrag
+        PROD LIKE T003O-AUTYP VALUE '05',    " Produktkostensammler fuer
+                                             " Serienplanung
+        QMAU LIKE T003O-AUTYP VALUE '06',    " QM-AUftrag      "P30F.INS
+        FERT LIKE T003O-AUTYP VALUE '10',    " PPS-Fertigungsauftraege
+        NETW LIKE T003O-AUTYP VALUE '20',    " Netzplan
+        INST LIKE T003O-AUTYP VALUE '30',    " Instandhaltungsauftrag
+                                             "CB und Serviceauftrag
+        BATC LIKE T003O-AUTYP VALUE '40',    " Prozessauftrag
+        PRUF LIKE T003O-AUTYP VALUE '50',    " Prueflos
+        PERS LIKE T003O-AUTYP VALUE '60',    " Personalauftrag "P30F.INS
+        VETE LIKE T003O-AUTYP VALUE '70',    " Versandtermine  "P30F.INS
+      END OF AUFTRAGSTYP.

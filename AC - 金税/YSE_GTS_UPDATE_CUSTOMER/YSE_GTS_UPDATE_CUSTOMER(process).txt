@@ -1,0 +1,162 @@
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE text-002.
+PARAMETERS: p_file1  TYPE  rlgrap-filename OBLIGATORY MODIF ID one
+  DEFAULT 'C:\SAP\CR3982-Customer_tax_nos.xls'. "#EC NOTEXT
+SELECTION-SCREEN END OF BLOCK b1.
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_file1.
+  PERFORM frm_get_filename.
+INITIALIZATION.
+  PERFORM do_init.
+AT SELECTION-SCREEN.
+START-OF-SELECTION.
+  PERFORM upload_files.
+  PERFORM UPDATE_CUSTOMER.
+end-OF-SELECTION.
+  PERFORM show_log.
+FORM frm_get_filename .
+  CALL FUNCTION 'WS_FILENAME_GET'
+    EXPORTING
+      def_filename           = p_file1
+      mask                   = text-t50
+      mode                   = 'O'
+      title                  = text-t51
+    IMPORTING
+      filename               = p_file1
+    EXCEPTIONS
+      inv_winsys             = 01
+      no_batch               = 02
+      selection_cancel       = 03
+      selection_error        = 04
+      OTHERS                 = 05
+             .
+  IF sy-subrc <> 0.
+    MESSAGE ID 'YSE_GENERAL' TYPE 'S' NUMBER '000' WITH text-022.
+    EXIT.
+  ENDIF.
+ENDFORM.                    " FRM_GET_FILENAME
+FORM do_init .
+  gv_suc = 0.
+  gv_tot = 0.
+  REFRESH:
+    i_tab_raw_data     ,
+    gt_upload_customer .
+ENDFORM.                    " DO_INIT
+FORM upload_files .
+  IF sy-batch <> gc_x.
+    CALL FUNCTION 'SAPGUI_PROGRESS_INDICATOR'
+      EXPORTING
+        percentage = '25'
+        text       = text-011.
+  ENDIF.
+  CALL FUNCTION 'TEXT_CONVERT_XLS_TO_SAP'
+     EXPORTING
+       i_tab_raw_data             = i_tab_raw_data
+       i_filename                 = p_file1
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+           WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+  IF gt_upload_customer[] IS INITIAL.
+    MESSAGE text-005 TYPE 'S' DISPLAY LIKE 'E'.
+    LEAVE LIST-PROCESSING.
+  ENDIF.
+  DESCRIBE TABLE gt_upload_customer LINES lv_lines.
+  IF lv_lines > gc_max_line.
+    MESSAGE s000(yse_general)
+      WITH text-030 gc_max_line text-031
+      DISPLAY LIKE 'E'.
+    LEAVE LIST-PROCESSING.
+  ENDIF.
+ENDFORM.                    " UPLOAD_FILE
+FORM UPDATE_CUSTOMER .
+  IF sy-batch <> gc_x.
+    CALL FUNCTION 'SAPGUI_PROGRESS_INDICATOR'
+      EXPORTING
+        percentage = '40'
+        text       = text-012.
+  ENDIF.
+  LOOP AT gt_upload_customer ASSIGNING <lfs_customer>.
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+      EXPORTING
+        input         = <lfs_customer>-kunnr
+      IMPORTING
+        OUTPUT        = <lfs_customer>-kunnr.
+    <lfs_customer>-index    = sy-tabix.
+    lv_len = STRLEN( <lfs_customer>-taxtxt ).
+    IF lv_len > 19.
+      <lfs_customer>-eflag = gc_x.
+      <lfs_customer>-msgtxt = 'The VAT number is more then 19'(t91).
+      CONTINUE.
+    ENDIF.
+    <lfs_customer>-stcd1   = <lfs_customer>-taxtxt+1(16).
+    <lfs_customer>-stcd5   = <lfs_customer>-taxtxt+17(2).
+  ENDLOOP.
+  UNASSIGN <lfs_customer>.
+  APPEND LINES OF gt_upload_customer TO gt_temp.
+  DELETE gt_temp WHERE eflag = gc_x.
+  SELECT *
+    FROM kna1
+    INTO TABLE lt_kna1
+    FOR ALL ENTRIES IN gt_temp
+    WHERE kunnr = gt_temp-kunnr.
+  LOOP AT gt_upload_customer ASSIGNING <lfs_customer>
+    WHERE eflag IS INITIAL.
+    READ TABLE lt_kna1 INTO ls_kna1
+      WITH KEY kunnr = <lfs_customer>-kunnr.
+    IF sy-subrc <> 0.
+      <lfs_customer>-eflag = gc_x.
+      <lfs_customer>-msgtxt = 'The customer number is valid'(t92).
+      CONTINUE.
+    ENDIF.
+    ls_kna1-stcd1 = <lfs_customer>-stcd1.
+    ls_kna1-stcd5 = <lfs_customer>-stcd5.
+    CALL FUNCTION 'SD_CUSTOMER_MAINTAIN_ALL'
+      EXPORTING
+        i_kna1                  = ls_kna1
+        PI_POSTFLAG             = gc_x
+      EXCEPTIONS
+        client_error            = 1
+        kna1_incomplete         = 2
+        knb1_incomplete         = 3
+        knb5_incomplete         = 4
+        knvv_incomplete         = 5
+        kunnr_not_unique        = 6
+        sales_area_not_unique   = 7
+        sales_area_not_valid    = 8
+        insert_update_conflict  = 9
+        number_assignment_error = 10
+        number_not_in_range     = 11
+        number_range_not_extern = 12
+        number_range_not_intern = 13
+        account_group_not_valid = 14
+        parnr_invalid           = 15
+        bank_address_invalid    = 16
+        tax_data_not_valid      = 17
+        no_authority            = 18
+        company_code_not_unique = 19
+        dunning_data_not_valid  = 20
+        knb1_reference_invalid  = 21
+        cam_error               = 22
+        OTHERS                  = 23.
+    IF sy-subrc <> 0.
+      <lfs_customer>-eflag = gc_x.
+       MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+               WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4
+               INTO <lfs_customer>-msgtxt.
+       CONTINUE.
+    ENDIF.
+    gv_suc = gv_suc + 1.
+  ENDLOOP.
+ENDFORM.                    " UPDATE_CUSTOMER
+FORM SHOW_LOG .
+  DESCRIBE TABLE gt_upload_customer LINES gv_tot.
+  WRITE: 'Totally'(t80), gv_tot , 'entries are processed,'(t81).
+  WRITE: gv_suc ,'customers are successfully updated.'(t82), /.
+  WRITE: 'Failed entries as below:'(t83).
+  ULINE.
+  WRITE: 'Line No'(t84), 12 'Customer No'(t85), 28 'Error message'(t86).
+  LOOP AT gt_upload_customer INTO ls_upload_customer
+    WHERE eflag = 'X'.
+    WRITE: / ls_upload_customer-index, 12 ls_upload_customer-kunnr,
+           28 ls_upload_customer-msgtxt.
+  ENDLOOP.
+ENDFORM.                    " SHOW_LOG

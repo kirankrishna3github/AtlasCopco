@@ -1,0 +1,772 @@
+*********************************************************************
+* Report  : YSE_MM_VISA_FOLLOW                                      *
+*-------------------------------------------------------------------*
+* Author  : Peter Dud¨¢s, Sarah Vangertruijden                       *
+* Company : Atlas Copco                                             *
+* Created : 2008.04.14                                              *
+* Dev.nbr : D412                                                    *
+*-------------------------------------------------------------------*
+* Get data on reservations to check if ok                           *
+* The purpose of this report is to follow up Purchase Orders for    *
+* interfaced vendors. It should five a clear view on following      *
+* errors that occur in the system:                                  *
+*                                                                   *
+* 1. The delivered qty is larger than the ordered qty               *
+* 2. The invoiced qty is larger than the ordered qty                *
+* 3. The delivered qty differs from the invoiced qty                *
+* 4. Open PO items without an AB confirmation line                  *
+* ( 5. The PO Item is deleted, but still invoiced and/or goods      *
+*   receipt => still looking for solution to prevent this error)    *
+*                                                                   *
+*********************************************************************
+
+REPORT  YSE_MM_VISA_FOLLOW.
+
+
+TABLES: ekko, ekpo, ekes, ekbe, lips.
+*-------------------------------------------------------------------*
+* Type declarations                                                 *
+*-------------------------------------------------------------------*
+
+
+
+TYPES: BEGIN OF xtyp_out.
+        include structure YSE_MM_VISA_FOLLOW.
+*         ebeln       LIKE ekko-ebeln,   " PO
+*         ebelp       LIKE ekpo-ebelp,   " PO item nr
+*         vbeln       LIKE ekes-vbeln,    "delivery
+*         vbelp       LIKE ekes-vbeln,    "delivery item
+*         bukrs       LIKE ekko-bukrs,
+*         ekorg       LIKE ekko-ekorg,
+*         bsart       LIKE ekko-bsart,
+*         lifnr       LIKE ekko-lifnr,
+*         aedat       LIKE ekko-aedat,
+*         loekz       LIKE ekpo-loekz,
+*         menge      LIKE ekpo-menge,    " Ordered quantity
+*         meins      LIKE ekpo-meins,
+*         inv_mng     LIKE ekbe-menge,    " Invoiced quantity per invoice item
+*         inv_mng_sum LIKE ekbe-menge,    " Invoiced quantity per PO Item
+*         inv_xblnr       LIKE rbkp-xblnr,
+*         inv_ernam   LIKE ekbe-ernam,
+*         inv_budat   LIKE ekbe-budat,
+*         del_mng     LIKE ekes-menge,    "Delivered quantity per delivery item
+*         del_mng_sum LIKE ekes-menge,    "Delivered quantity per PO Item
+*         del_ernam   LIKE lips-ernam,
+*         del_erdat   LIKE lips-erdat,
+*         abline      LIKE ekes-xblnr,
+TYPES:  END OF xtyp_out,
+
+
+     BEGIN OF xtyp_ekpo,
+       table(4)    TYPE c,
+       ebeln       LIKE ekko-ebeln,   " PO
+       ebelp       LIKE ekpo-ebelp,   " PO item nr
+       bukrs       LIKE ekko-bukrs,
+       ekorg       LIKE ekko-ekorg,
+       bsart       LIKE ekko-bsart,
+       lifnr       LIKE ekko-lifnr,
+       aedat       LIKE ekko-aedat,
+       loekz       LIKE ekpo-loekz,
+       menge      LIKE ekpo-menge,    " Ordered quantity
+       meins      LIKE ekpo-meins,
+       inv_mng_sum LIKE ekbe-menge,    " Invoiced quantity per PO Item
+       del_mng_sum LIKE ekes-menge,    "Delivered quantity per PO Item
+       abline      LIKE ekes-xblnr,
+     END OF xtyp_ekpo,
+
+
+    BEGIN OF xtyp_mm_visa_skip,
+          ebeln LIKE ekpo-ebeln,
+          ebelp LIKE ekpo-ebelp,
+       END OF xtyp_mm_visa_skip,
+
+
+
+  BEGIN OF xtyp_ebeln,
+      ebeln LIKE ekko-ebeln,
+  END OF xtyp_ebeln,
+
+  BEGIN OF xtyp_vbeln,
+      vbeln LIKE lips-vbeln,
+  END OF xtyp_vbeln,
+
+  BEGIN OF xtyp_ekbe,
+      ebeln   LIKE ekes-ebeln,
+      ebelp   LIKE ekes-ebelp,
+      bewtp   LIKE ekbe-bewtp,
+      bwart   LIKE ekbe-bwart,
+      ernam   LIKE ekbe-ernam,
+      budat   LIKE ekbe-budat,
+      menge   LIKE ekbe-menge,
+      shkzg   LIKE ekbe-shkzg,
+      xblnr   LIKE rbkp-xblnr,
+      belnr   LIKE rbkp-belnr,
+  END OF xtyp_ekbe,
+
+  BEGIN OF xtyp_ekes,
+      ebeln LIKE ekes-ebeln,
+      ebelp LIKE ekes-ebelp,
+      etens LIKE ekes-etens,
+      ebtyp LIKE ekes-ebtyp,
+      menge LIKE ekes-menge,
+      vbeln LIKE ekes-vbeln,    "delivery
+      vbelp LIKE ekes-vbeln,    "delivery item
+      xblnr LIKE ekes-xblnr,
+      del_ernam   LIKE lips-ernam,
+      del_erdat   LIKE lips-erdat,
+  END OF xtyp_ekes.
+
+
+
+
+*-------------------------------------------------------------------*
+*   CLASS STUFF                                                     *
+*-------------------------------------------------------------------*
+
+CLASS lcl_event_handler DEFINITION .
+  PUBLIC SECTION.
+    METHODS:
+      handle_double_click FOR EVENT double_click OF cl_gui_alv_grid
+                  IMPORTING e_row e_column es_row_no.
+  PRIVATE SECTION.
+ENDCLASS.                    "lcl_event_handler DEFINITION
+
+*-------------------------------------------------------------------*
+CLASS lcl_event_handler IMPLEMENTATION .
+
+  METHOD handle_double_click .
+*    PERFORM handle_double_click USING e_row e_column es_row_no .
+  ENDMETHOD .                    "handle_double_click
+ENDCLASS.                    "lcl_event_handler IMPLEMENTATION
+
+
+
+*-------------------------------------------------------------------*
+* Data declarations                                                 *
+*-------------------------------------------------------------------*
+
+DATA:
+*DATA: xt_data TYPE SORTED TABLE OF xtyp_data
+*                  WITH NON-UNIQUE KEY rsnum rspos rsart,
+
+      xt_ekes TYPE TABLE OF xtyp_ekes,
+      xt_ekbe TYPE TABLE OF xtyp_ekbe,
+      xt_ekpo TYPE HASHED TABLE OF xtyp_ekpo
+                WITH UNIQUE KEY ebeln ebelp,
+      xt_out TYPE TABLE OF xtyp_out.
+
+* ----- ALV GRID ---------------------------------------------------*
+TYPE-POOLS: SLIS.
+
+DATA:
+      xv_variant         LIKE disvariant,
+      xv_variant_flag    TYPE c,
+      xv_sd_alv_variant  LIKE disvariant,
+      xt_fcat            TYPE slis_t_fieldcat_alv,   " lvc_t_fcat,
+      xt_alv_sort        TYPE slis_t_sortinfo_alv,
+      xv_user_command    TYPE slis_formname  VALUE 'USER_COMMAND',
+      xv_variant_save    TYPE c              VALUE 'U',
+      xv_layout          TYPE SLIS_LAYOUT_ALV.    "lvc_s_layo.
+* DATA: xref_event_handler TYPE REF TO lcl_event_handler .
+
+
+FIELD-SYMBOLS:
+                <x_any> TYPE any.
+
+
+DATA:  xv_chars(10) TYPE c,
+      xv_i TYPE i,
+      xv_set(1) TYPE c.
+
+
+*-------------------------------------------------------------------*
+* Selection screen                                                  *
+*-------------------------------------------------------------------*
+SELECTION-SCREEN BEGIN OF BLOCK b01 WITH FRAME TITLE text-t01.
+SELECT-OPTIONS:
+    s_aedat FOR ekko-aedat OBLIGATORY,  " bedat?
+    s_LIFNR FOR ekko-lifnr OBLIGATORY,
+    s_ebeln FOR ekko-ebeln,
+    s_ebelp FOR ekpo-ebelp,
+    s_bsart FOR ekko-bsart,
+    s_bukrs FOR ekko-bukrs,
+    s_ekorg FOR ekko-ekorg.
+
+PARAMETERS:   xr_err TYPE xfeld RADIOBUTTON GROUP g1 DEFAULT 'X',
+              xr_noab TYPE xfeld RADIOBUTTON GROUP g1.
+
+SELECTION-SCREEN END OF BLOCK b01.
+
+*-------------------------------------------------------------------*
+* Initialization of the selection screen                            *
+*-------------------------------------------------------------------*
+INITIALIZATION.
+
+
+AT SELECTION-SCREEN.
+
+  clear xv_set.
+  LOOP AT SCREEN.
+    CASE SCREEN-GROUP3.
+      WHEN 'LOW'.
+        xv_i = strlen( SCREEN-NAME ) - 4.
+        xv_chars = SCREEN-NAME+0(xv_i).
+        ASSIGN  (xv_chars) TO <x_any>.
+        IF NOT <x_any> IS INITIAL.
+          xv_set = 'X'.
+          EXIT.
+        ENDIF.
+      WHEN 'HGH'.
+    ENDCASE.
+  ENDLOOP.
+
+  IF xv_set NE 'X'.
+    MESSAGE e000(yse_sales_log)
+        WITH 'At least one select criteria must be set'.
+  ENDIF.
+
+*&---------------------------------------------------------------------*
+*&   Event top-of-page
+*&---------------------------------------------------------------------*
+TOP-OF-PAGE.
+
+************************************************************************
+* START MAIN PROGRAM                                                   *
+************************************************************************
+START-OF-SELECTION.
+  PERFORM select_data.
+  PERFORM process_data.
+  PERFORM alv_fcat.
+  PERFORM alv_layout.
+  PERFORM alv_display.
+
+END-OF-SELECTION.
+*&---------------------------------------------------------------------*
+*&      Form  select_data
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM select_data .
+  DATA:  lt_ebeln TYPE TABLE OF xtyp_ebeln,
+         lv_ebeln TYPE xtyp_ebeln,
+         lt_vbeln TYPE TABLE OF xtyp_vbeln,
+         lv_vbeln TYPE xtyp_vbeln.
+
+  FIELD-SYMBOLS: <l_ekpo> TYPE xtyp_ekpo.
+
+  SELECT ekko~ebeln ekpo~ebelp ekko~bukrs ekko~ekorg bsart lifnr
+         ekko~aedat
+         ekpo~loekz ekpo~menge  ekpo~meins
+      FROM ekko
+      JOIN ekpo ON ekko~ebeln = ekpo~ebeln
+      INTO CORRESPONDING FIELDS OF TABLE xt_ekpo
+      WHERE ekko~aedat IN s_aedat
+         AND ekko~lifnr IN s_lifnr
+         AND ekko~ebeln IN s_ebeln
+         AND ekpo~ebelp IN s_ebelp
+         AND ekko~bsart IN s_bsart
+         AND ekko~bukrs IN s_bukrs
+         AND ekko~ekorg IN s_ekorg.
+
+  SORT xt_out BY ebeln ebelp.
+  LOOP AT xt_ekpo ASSIGNING <l_ekpo>.
+    IF xr_err = 'X' AND <l_ekpo>-loekz = 'L'.
+      DELETE TABLE xt_ekpo WITH TABLE KEY ebeln = <l_ekpo>-ebeln ebelp = <l_ekpo>-ebelp .
+      CONTINUE.
+    ENDIF.
+
+
+    AT NEW ebeln.
+      lv_ebeln = <l_ekpo>-ebeln.
+      APPEND lv_ebeln TO lt_ebeln.
+    ENDAT.
+  ENDLOOP.
+
+  check NOT lt_ebeln[] IS INITIAL.
+  SELECT ebeln ebelp ekbe~bewtp ekbe~bwart ekbe~ernam ekbe~budat ekbe~menge ekbe~shkzg
+         rbkp~xblnr rbkp~belnr
+       FROM ekbe
+       LEFT JOIN rbkp ON ekbe~belnr = rbkp~belnr
+                     AND ekbe~gjahr = rbkp~gjahr
+       INTO TABLE xt_ekbe
+       FOR ALL ENTRIES IN lt_ebeln
+     WHERE  ebeln = lt_ebeln-ebeln
+       AND  ( bewtp = 'Q' OR bewtp = 'E' ).
+
+
+  SELECT ekes~ebeln ekes~ebelp ekes~etens ekes~ebtyp ekes~menge
+         ekes~vbeln ekes~vbelp ekes~xblnr
+         lips~ernam as del_ernam lips~erdat as del~erdat
+      FROM ekes
+      LEFT JOIN lips ON lips~vbeln = ekes~vbeln      " the vbeln is sometimes empty
+               AND lips~posnr = ekes~vbelp
+      INTO TABLE xt_ekes
+      FOR ALL ENTRIES IN lt_ebeln
+      WHERE ebeln = lt_ebeln-ebeln
+        AND ( ebtyp = 'LA' OR ebtyp = 'AB' ).
+
+ENDFORM.                    " select_data
+
+*&---------------------------------------------------------------------*
+*&      Form  process_data
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+
+FORM process_data.
+  DATA:    lv_out          TYPE xtyp_out,
+           lv_ekbe         TYPE xtyp_ekbe,
+           lv_ekes         TYPE xtyp_ekes,
+           lt_mm_visa_skip TYPE TABLE OF xtyp_mm_visa_skip,
+           lv_mm_visa_skip TYPE xtyp_mm_visa_skip,
+           lv_tabix        LIKE sy-tabix.
+
+  FIELD-SYMBOLS: <l_ekpo> TYPE xtyp_ekpo,
+                 <l_out> TYPE xtyp_out.
+
+
+  SORT xt_ekes BY ebeln ebelp.
+* Process ekbe data
+  LOOP AT xt_ekbe INTO lv_ekbe.
+    lv_tabix = sy-tabix.
+    READ TABLE xt_ekpo ASSIGNING <l_ekpo>
+          WITH KEY ebeln = lv_ekbe-ebeln
+                   ebelp = lv_ekbe-ebelp.
+    IF sy-subrc <> 0.
+      DELETE xt_ekbe INDEX lv_tabix.
+    ELSE.
+      clear lv_out.
+      MOVE-CORRESPONDING <l_ekpo> TO lv_out.
+      clear lv_out-del_mng_sum.
+      clear lv_out-inv_mng_sum.
+
+      CASE lv_ekbe-bewtp.
+* Invoiced qty per PO Item
+        WHEN 'Q'.      " invoice receips
+          IF lv_ekbe-shkzg = 'H'.
+            lv_out-inv_mng = lv_ekbe-menge * -1.   " ekbe-menge
+          ELSE.
+            lv_out-inv_mng = lv_ekbe-menge.
+          ENDIF.
+          .
+          <l_ekpo>-inv_mng_sum = <l_ekpo>-inv_mng_sum + lv_out-inv_mng.
+        WHEN 'E'.       " good receips
+          IF lv_ekbe-bwart = '102'.      " GR for PO reversal
+            lv_out-del_mng = lv_ekbe-menge * -1.
+          <l_ekpo>-del_mng_sum = <l_ekpo>-del_mng_sum + lv_out-del_mng.
+          ELSE.
+            CONTINUE.
+          ENDIF.
+        WHEN OTHERS.
+          MESSAGE E000(yse_sales_log) WITH 'Program error XT_ekbe'.
+      ENDCASE.
+    ENDIF.
+
+    move lv_ekbe-ernam TO lv_out-inv_ernam.
+    move lv_ekbe-budat TO lv_out-inv_budat.
+    move lv_ekbe-xblnr TO lv_out-inv_xblnr.
+    APPEND lv_out TO xt_out.
+  ENDLOOP.
+
+* Process ekes data
+  LOOP AT xt_ekes INTO lv_ekes.
+    lv_tabix = sy-tabix.
+    READ TABLE xt_ekpo ASSIGNING <l_ekpo>
+          WITH KEY ebeln = lv_ekes-ebeln
+                   ebelp = lv_ekes-ebelp.
+    IF sy-subrc <> 0.
+      DELETE xt_ekes INDEX lv_tabix.
+    ELSE.
+      clear lv_out.
+      MOVE-CORRESPONDING <l_ekpo> TO lv_out.
+      clear lv_out-del_mng_sum.
+      clear lv_out-inv_mng_sum.
+      CASE lv_ekes-ebtyp.
+* Invoiced qty per PO Item
+        WHEN 'LA'.      " invoice receips
+          lv_out-del_mng = lv_ekes-menge.
+          <l_ekpo>-del_mng_sum = <l_ekpo>-del_mng_sum + lv_out-del_mng.
+        WHEN 'AB'.      " invoice receips
+          <l_ekpo>-abline = lv_ekes-xblnr.
+          DELETE xt_ekes INDEX lv_tabix.    " we just need to copy abline, no display
+          CONTINUE.
+        WHEN OTHERS.
+          MESSAGE E000(yse_sales_log) WITH 'Program error OTHERS xt_ekes'.
+      ENDCASE.
+    ENDIF.
+
+    move lv_ekes-del_ernam TO lv_out-del_ernam.
+    move lv_ekes-del_erdat TO lv_out-del_erdat.
+    move lv_ekes-vbeln TO lv_out-vbeln.    " delivery doc
+    move lv_ekes-vbelp TO lv_out-vbelp.    " delivery doc item
+    APPEND lv_out TO xt_out.
+  ENDLOOP.
+
+
+
+
+
+* Delete unnecessary lines from xt_ekpo
+  LOOP AT xt_ekpo ASSIGNING <l_ekpo>.
+    IF xr_err = 'X'.
+      IF NOT (
+             <l_ekpo>-del_mng_sum > <l_ekpo>-menge        " Delivered quantity is larger than ordered
+          OR <l_ekpo>-inv_mng_sum > <l_ekpo>-menge        " Invoiced quantity is larger than ordered
+          OR <l_ekpo>-inv_mng_sum <> <l_ekpo>-del_mng_sum " Delivered quantity differs from invoiced
+             ).
+        DELETE TABLE xt_ekpo WITH TABLE KEY ebeln = <l_ekpo>-ebeln ebelp = <l_ekpo>-ebelp .
+      ENDIF.
+    ELSEIF xr_noab = 'X'.
+      IF  NOT ( <l_ekpo>-menge > 0
+*              AND  <l_ekpo>-inv_mng_sum = 0
+*              AND  <l_ekpo>-del_mng_sum = 0
+              AND  <l_ekpo>-abline = ''
+              ).
+        DELETE TABLE xt_ekpo WITH TABLE KEY ebeln = <l_ekpo>-ebeln ebelp = <l_ekpo>-ebelp .
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+ IF NOT xt_ekpo[] IS INITIAL.
+   SELECT ebeln ebelp FROM YSE_MM_VISA_SKIP
+         INTO TABLE lt_mm_visa_skip
+         FOR ALL ENTRIES IN xt_ekpo
+         WHERE ebeln = xt_ekpo-ebeln
+           AND ebelp = xt_ekpo-ebelp.
+   LOOP AT lt_mm_visa_skip INTO lv_mm_visa_skip.
+        DELETE TABLE xt_ekpo WITH TABLE KEY ebeln = lv_mm_visa_skip-ebeln
+                                            ebelp = lv_mm_visa_skip-ebelp .
+   ENDLOOP.
+ ENDIF.
+
+
+
+
+* Delete all from xt_out, that has no pair in xt_ekpo .
+  LOOP AT xt_out ASSIGNING <l_out>.
+    lv_tabix = sy-tabix.
+    READ TABLE xt_ekpo ASSIGNING <l_ekpo>
+          WITH KEY ebeln = <l_out>-ebeln
+                   ebelp = <l_out>-ebelp.
+    IF sy-subrc <> 0.
+      DELETE xt_out INDEX lv_tabix.
+    ENDIF.
+  ENDLOOP.
+
+
+* Add EKPO data to ekes
+  LOOP AT xt_ekpo ASSIGNING <l_ekpo>.
+    clear lv_out.
+    READ TABLE xt_out ASSIGNING <l_out>
+          WITH key ebeln = <l_ekpo>-ebeln ebelp = <l_ekpo>-ebelp.
+    IF sy-subrc = 0.
+      <l_out>-inv_mng_sum  = <l_ekpo>-inv_mng_sum .
+      <l_out>-del_mng_sum  = <l_ekpo>-del_mng_sum.
+      <l_out>-abline       = <l_ekpo>-abline.
+    ELSE.
+      clear lv_out.
+      MOVE-CORRESPONDING <l_ekpo> TO lv_out.
+      APPEND lv_out TO xt_out.
+    ENDIF.
+  ENDLOOP.
+  SORT xt_out BY ebeln ebelp del_mng_sum DESCENDING inv_mng_sum DESCENDING.
+
+ENDFORM.                    "process_data
+
+*----------------------------------------------------------------------*
+*       Form  ALV_OUTPUT                                               *
+*----------------------------------------------------------------------*
+*       text                                                           *
+*----------------------------------------------------------------------*
+FORM alv_display.
+  DATA: lv_repid LIKE sy-repid.
+
+
+* variant-report    = 'YSE_SD_SALES'.
+* variant-variant   = variant.
+  xv_sd_alv_variant = xv_variant.
+  lv_repid = sy-repid.
+
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+    EXPORTING
+      i_callback_program      = lv_repid
+      i_callback_user_command = xv_user_command " 'USER_COMMAND'
+
+*      i_callback_top_of_page  = 'ALV_TOP'
+      i_grid_title            = 'Sales reporting'
+      is_layout               = xv_layout
+      it_fieldcat             = xt_fcat
+      it_sort                 = xt_alv_sort
+      i_default               = 'X'
+      i_save                  = 'A'
+      is_variant              = xv_sd_alv_variant
+      i_screen_start_column   = 0
+      i_screen_start_line     = 0
+      i_screen_end_column     = 0
+      i_screen_end_line       = 0
+    TABLES
+      t_outtab                = xt_out
+    EXCEPTIONS
+      program_error           = 1
+      OTHERS                  = 2.
+  IF sy-subrc NE 0.
+*   message id sy-msgid type sy-msgty number sy-msgno
+*           with sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+ENDFORM.                    " ALV_OUTPUT
+
+
+*------------------------------------------------------------------*
+*   Form  VARIANT_INPUTHELP                                        *
+*------------------------------------------------------------------*
+*   F4 - help for variants                                         *
+* AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_var.                  *
+*    PERFORM variant_inputhelp USING p_var.                        *
+*------------------------------------------------------------------*
+FORM alv_variant_inputhelp USING var.
+
+*  --- Variables
+  DATA: h_exit            TYPE c.
+
+  CLEAR h_exit.
+  CLEAR xv_variant.
+
+  CALL FUNCTION 'REUSE_ALV_VARIANT_F4'
+    EXPORTING
+      is_variant    = xv_variant
+      i_save        = xv_variant_save
+    IMPORTING
+      e_exit        = h_exit
+      es_variant    = xv_variant
+    EXCEPTIONS
+      not_found     = 1
+      program_error = 2
+      OTHERS        = 3.
+
+  IF sy-subrc IS INITIAL AND h_exit IS INITIAL.
+    xv_variant-variant = xv_variant-variant.
+    var               = xv_variant-variant.
+  ENDIF.
+
+ENDFORM.                    " VARIANT_INPUTHELP
+*&---------------------------------------------------------------------*
+*&      Form  alv_fcat
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM alv_fcat .
+  DATA:
+        lv_repid LIKE sy-repid.
+
+  FIELD-SYMBOLS: <l_fcat> TYPE slis_fieldcat_alv.  "lvc_s_fcat.
+
+  clear: xt_fcat.
+  refresh: xt_fcat.
+
+  lv_repid = sy-repid.
+
+* Create Fieldcatalogue from internal table
+  CALL FUNCTION 'REUSE_ALV_FIELDCATALOG_MERGE'
+       EXPORTING
+            I_PROGRAM_NAME         = lv_repid
+*            I_INTERNAL_TABNAME     = 'XT_DATA'
+            I_STRUCTURE_NAME       = 'YSE_MM_VISA_FOLLOW'
+            I_INCLNAME             = lv_repid
+       CHANGING
+            CT_FIELDCAT            = xt_fcat
+       EXCEPTIONS
+            INCONSISTENT_INTERFACE = 1
+            PROGRAM_ERROR          = 2
+            OTHERS                 = 3.
+
+* Modify it according our needs
+  LOOP at xt_fcat ASSIGNING <l_fcat>.
+    CASE <l_fcat>-fieldname.
+
+      WHEN 'INV_MNG'.
+        PERFORM alv_fcat_title USING 'Invoiced item Qty'(001)
+                                CHANGING <l_fcat>.
+      WHEN 'INV_MNG_SUM'.
+        PERFORM alv_fcat_title USING 'Total invoiced Qty'(002)
+                                CHANGING <l_fcat>.
+      WHEN 'INV_XBLNR'.
+        PERFORM alv_fcat_title USING 'Invoice reference'(003)
+                                CHANGING <l_fcat>.
+      WHEN 'INV_ERNAM'.
+        PERFORM alv_fcat_title USING 'Invoice Creator'(004)
+                                CHANGING <l_fcat>.
+      WHEN 'INV_BUDAT'.
+        PERFORM alv_fcat_title USING 'Inv.Posting dat'(005)
+                                CHANGING <l_fcat>.
+      WHEN 'DEL_MNG'.
+        PERFORM alv_fcat_title USING 'Delivered Qty.'(010)
+                                CHANGING <l_fcat>.
+      WHEN 'DEL_MNG_SUM'.
+        PERFORM alv_fcat_title USING 'Total qty vendor confirmation'(006)
+                                CHANGING <l_fcat>.
+      WHEN 'DEL_ERNAM'.
+        PERFORM alv_fcat_title USING 'Creator of Delivery Note'(007)
+                                CHANGING <l_fcat>.
+      WHEN 'DEL_ERDAT'.
+        PERFORM alv_fcat_title USING 'Delivery Note Creation Date'(008)
+                                CHANGING <l_fcat>.
+      WHEN 'ABLINE1'.
+        PERFORM alv_fcat_title USING 'Abline'(009)
+                                CHANGING <l_fcat>.
+
+*      WHEN 'XX'.
+*          PERFORM alv_fcat_title USING 'nev'
+*                                  CHANGING <l_fcat>.
+*          <l_fcat>-no_OUT = 'X'.
+*          <l_fcat>-currency = 'HUF'.
+*          <l_fcat>-do_sum = 'X'.
+*          <l_fcat>-emphasize = 'X'.
+    ENDCASE.
+  ENDLOOP.
+
+ENDFORM.                    " alv_fcat
+
+
+*----------------------------------------------------------------------*
+*   Form  ALV_FCAT_CHANGE                                              *
+*----------------------------------------------------------------------*
+*   .....                                                              *
+*----------------------------------------------------------------------*
+
+FORM alv_fcat_title USING p_title TYPE string
+                     CHANGING p_fieldcat TYPE slis_fieldcat_alv
+                      .
+  p_fieldcat-seltext_s    = p_title.
+  p_fieldcat-seltext_m    = p_title.
+  p_fieldcat-seltext_l    = p_title.
+  p_fieldcat-reptext_ddic = p_title.
+ENDFORM.                    " alv_fcat_change
+
+*----------------------------------------------------------------------*
+*   Form  ALV_LAYOUT                                                   *
+*----------------------------------------------------------------------*
+*   .....                                                              *
+*----------------------------------------------------------------------*
+
+FORM alv_layout.
+
+  xv_layout-colwidth_optimize = 'X'.
+*  xv_layout-zebra = ''.
+*  xv_layout-smalltitle = 'X'.
+*  xv_layout-grid_title = 'title'.
+
+ENDFORM.                    "alv_layout
+
+
+*----------------------------------------------------------------------*
+*       Form  PREPARE_SORT                                             *
+*----------------------------------------------------------------------*
+*       text                                                           *
+*----------------------------------------------------------------------*
+FORM alv_prepare_sort.
+  DATA:  lv_sort          TYPE slis_sortinfo_alv.
+* lv_sort-spos      = '1'.
+* lv_sort-fieldname = 'PRCTR'.
+* lv_sort-up        = 'X'.
+* append lv_sort to xt_alv_sort.
+
+ENDFORM.                    " PREPARE_SORT
+
+*&---------------------------------------------------------------------*
+*&      Form  ALV_TOP
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM alv_top.
+
+*
+** ALV header declarations
+*  DATA: lt_header      TYPE slis_t_listheader,
+*        lv_header     TYPE slis_listheader,
+**       T_LINE        LIKE WA_HEADER-INFO,
+*        lv_lines      TYPE i,
+*        lv_linesc(10) TYPE c.
+*
+** Nr of records
+*  DESCRIBE TABLE xt_data LINES lv_lines.
+*  lv_linesc = lv_lines.
+*
+*  lv_header-typ  = 'S'.
+*  lv_header-key  = 'Nr of lines:'(101).
+*  lv_header-info = lv_linesc.
+*  APPEND lv_header TO lt_header.
+*  CLEAR: lv_header. ", T_LINE.
+*
+*  CALL FUNCTION 'REUSE_ALV_COMMENTARY_WRITE'
+*    EXPORTING
+*      it_list_commentary = lt_header
+*      i_logo             = 'GANESH_LOGO'.
+
+ENDFORM.                    "ALV_TOP
+
+
+
+*------------------------------------------------------------------*
+*   Form  USER_COMMAND                                             *
+*------------------------------------------------------------------*
+*   --> R_UCOMM                                                    *
+*   --> RS_SELFIELD                                                *
+*------------------------------------------------------------------*
+FORM user_command USING ucomm    LIKE sy-ucomm
+                        selfield TYPE slis_selfield.
+
+*-- Check function code
+  CASE ucomm.
+    WHEN '&IC1'.
+      CASE selfield-fieldname.
+        WHEN 'MATNR'.
+          SET PARAMETER ID 'MAT' FIELD selfield-value.
+          CALL TRANSACTION 'MM03' AND SKIP FIRST SCREEN.
+        WHEN 'EBELN'.
+          SET PARAMETER ID 'BSA' FIELD selfield-value.
+          SET PARAMETER ID 'BES' FIELD selfield-value.
+          CALL TRANSACTION 'ME23N' AND SKIP FIRST SCREEN.
+        WHEN 'RSNUM'.
+          SET PARAMETER ID 'RES' FIELD selfield-value.
+          CALL TRANSACTION 'MB23' AND SKIP FIRST SCREEN.
+      ENDCASE.
+  ENDCASE.
+ENDFORM.                    " USER_COMMAND
+
+*Text symbol text£º
+*001:Invoiced item Qty
+*002:Total invoiced Qty
+*003:Invoice reference
+*004:Invoice Creator
+*005:Inv.Posting dat
+*006:Total qty vendor confirmation
+*007:Creator of Delivery Note
+*008:Delivery Note Creation Date
+*009:Abline
+*010:Delivered Qty.
+*011:Type
+*T01:General Selection
+*T02:AB line or Errors
+
+*T03:Include deleted PO-lines
+*Selection text£º
+*S_AEDAT:D       .
+*S_BSART:D       .
+*S_BUKRS:D       .
+*S_EBELN:D       .
+*S_EBELP:D       .
+*S_EKORG:D       .
+*S_LIFNR:D       .
+*XR_ERR:        Errors
+*XR_LOEKZ:        Deleted Lines
+*XR_NOAB:        No AB Line

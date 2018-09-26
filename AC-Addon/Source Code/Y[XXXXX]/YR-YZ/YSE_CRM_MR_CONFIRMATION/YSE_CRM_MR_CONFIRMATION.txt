@@ -1,0 +1,723 @@
+*----------------------------------------------------------------------*
+* PROGRAM ID    : YSE_CRM_MR_CSORDER                                   *
+* PROGRAM TITLE : MR CS Order Mass upload labour hour confirmation     *
+* AUTHOR        : Anda Wu                                              *
+* DATE          : 14/07/2014                                           *
+* DEVELOPMENT ID:                                                      *
+*                                                                      *
+* CHANGE REQUEST NUMBER:                                               *
+*                                                                      *
+* Program Description: MR CS Order Mass upload labour hour confirmation*
+*                                                                      *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+*  DATE    | NAME     |TRANSPORT  | CR# and short Description          *
+*----------------------------------------------------------------------*
+*14/07/2014|Anda Wu   |CD1K982284 |CR3297: Initial version             *
+*----------------------------------------------------------------------*
+REPORT  yse_crm_mr_confirmation NO STANDARD PAGE HEADING LINE-SIZE 255.
+
+************************************************************************
+* TYPES                                                                *
+************************************************************************
+TYPES:
+  BEGIN OF ty_input_file,
+    downtime      TYPE char40,        "CRM Entry download time
+    aufnr         TYPE qmel-aufnr,    "Sevice Order No
+    arbpl         TYPE ru_arbpli,     "Work center
+    ac_work       TYPE ru_ismng,      "Actual work ZAM001
+    ac_exps       TYPE ru_ismng,      "Actual Expense  ZAM063
+    cfm_txt       TYPE afrud-ltxa1,   "Confirm Text
+    ac_allw       TYPE ru_ismng,      "Actual Expense  ZAM051
+  END OF ty_input_file.
+
+************************************************************************
+* WORKAREAS                                                            *
+************************************************************************
+DATA:
+  gs_update       TYPE ty_input_file.
+
+************************************************************************
+* INTERNAL TABLES                                                      *
+************************************************************************
+DATA:
+  gt_lfile        TYPE yse_t_lfile,                 "Local file name
+  gt_aufk         TYPE STANDARD TABLE OF aufk,
+  gt_vbak         TYPE STANDARD TABLE OF vbak,
+  gt_list         TYPE STANDARD TABLE OF bapi_conf_key,
+  gt_update       TYPE STANDARD TABLE OF ty_input_file,"Update filedata
+  gt_update_suc   TYPE STANDARD TABLE OF string,    "update process log
+  gt_update_log   TYPE STANDARD TABLE OF string.    "update process log
+
+************************************************************************
+* VARIABLES                                                            *
+************************************************************************
+DATA:
+  gv_tot_lines    TYPE i,                           "Process lines
+  gv_suc_lines    TYPE i,                           "Success Lines
+  gv_fai_lines    TYPE i.                           "Failed lines
+
+************************************************************************
+* CONSTANTS                                                            *
+************************************************************************
+CONSTANTS:
+  gc_tab          TYPE c VALUE cl_abap_char_utilities=>horizontal_tab,
+  gc_type_e       TYPE c VALUE 'E',
+  gc_hifi         TYPE c VALUE '-',
+  gc_colon        TYPE c VALUE ':'.
+
+************************************************************************
+* SELECTION-SCREEN                                                     *
+************************************************************************
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE text-t01.
+PARAMETERS:
+          p_file(1024) TYPE c LOWER CASE OBLIGATORY.  "Local File Path
+
+SELECTION-SCREEN BEGIN OF LINE.
+PARAMETERS: cb_hflg    AS CHECKBOX                    "Header text flag
+              DEFAULT 'X' MODIF ID m1.
+SELECTION-SCREEN END OF LINE.
+SELECTION-SCREEN END OF BLOCK b1.
+
+*&---------------------------------------------------------------------*
+*& INITIALIZATION                                                      *
+*&---------------------------------------------------------------------*
+INITIALIZATION.
+* Do initialization
+  PERFORM frm_do_init.
+
+*&---------------------------------------------------------------------*
+*& AT SELECTION-SCREEN OUTPUT                                          *
+*&---------------------------------------------------------------------*
+AT SELECTION-SCREEN OUTPUT.
+* Set selection screen
+  PERFORM set_screen.
+
+*&---------------------------------------------------------------------*
+*& AT SELECTION-SCREEN                                                 *
+*&---------------------------------------------------------------------*
+AT SELECTION-SCREEN.
+* Check if the file path and name exist
+  PERFORM check_filename.
+
+*&---------------------------------------------------------------------*
+*& AT SELECTION-SCREEN  ON VALUE-REQUEST                               *
+*&---------------------------------------------------------------------*
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_file.
+* Get local file path
+  PERFORM select_file.
+
+*&---------------------------------------------------------------------*
+*& START-OF-SELECTION                                                  *
+*&---------------------------------------------------------------------*
+START-OF-SELECTION.
+* Read local file into a internal table
+  PERFORM read_file.
+* Write entry to datebase table
+  PERFORM write_db.
+
+*&---------------------------------------------------------------------*
+*& END-OF-SELECTION                                                    *
+*&---------------------------------------------------------------------*
+END-OF-SELECTION.
+  IF gv_tot_lines > 0.
+*   WRITE process result message
+    PERFORM write_log.
+  ENDIF.
+
+*&---------------------------------------------------------------------*
+*&      Form  select_file
+*&---------------------------------------------------------------------*
+*       Get local file path
+*----------------------------------------------------------------------*
+FORM select_file .
+
+  DATA:
+    lv_title  TYPE string,     "Referrence title
+    lt_file   TYPE filetable,  "Internal table of dialog filenames
+    ls_file   TYPE file_table, "Working area for IT_FILE,
+    lv_rc     TYPE i.          "Return Code
+
+  lv_title = text-001.
+  CLEAR: lt_file[],
+         ls_file.
+
+* Open local file dialog
+  CALL METHOD cl_gui_frontend_services=>file_open_dialog
+    EXPORTING
+      window_title            = lv_title
+      with_encoding           = 'X'
+    CHANGING
+      file_table              = lt_file
+*      FILE_ENCODING           = lv_ENCODING
+      rc                      = lv_rc
+    EXCEPTIONS
+      file_open_dialog_failed = 1
+      cntl_error              = 2
+      error_no_gui            = 3
+      not_supported_by_gui    = 4
+      OTHERS                  = 5.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+              WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+  IF lv_rc = 1.
+    READ TABLE lt_file INDEX 1 INTO ls_file.
+    IF sy-subrc EQ 0.
+      p_file = ls_file-filename.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    " select_file
+*&---------------------------------------------------------------------*
+*&      Form  READ_FILE
+*&---------------------------------------------------------------------*
+*       Read local file into a internal table
+*----------------------------------------------------------------------*
+FORM read_file .
+
+  DATA: lv_filename TYPE string.
+
+* Read file entires
+  lv_filename = p_file.
+
+  PERFORM get_from_pres IN PROGRAM yam_common_routines
+                                    TABLES  gt_lfile
+                                    USING   lv_filename
+                                            ycl_se_utility=>c_ft_asc
+                                            ' '.
+
+* Delete the blank lines
+  DELETE gt_lfile
+    WHERE text IS INITIAL.
+
+* Gain update characteristic names
+  IF cb_hflg IS NOT INITIAL.
+    DELETE gt_lfile INDEX 1.
+  ENDIF.
+
+ENDFORM.                    " READ_FILE
+*&---------------------------------------------------------------------*
+*&      Form  WRITE_DB
+*&---------------------------------------------------------------------*
+*       Write entry to datebase table
+*----------------------------------------------------------------------*
+FORM write_db .
+  DATA: ls_aufk     TYPE aufk,
+        ls_vbak     TYPE vbak,
+        lt_order    TYPE STANDARD TABLE OF bapi_pp_orderrange,
+        ls_order    TYPE bapi_pp_orderrange,
+        lv_exist    TYPE char1,
+        lv_old_aufnr TYPE aufnr.
+  DATA: lv_mess_str  TYPE string.
+  FIELD-SYMBOLS: <lfs_update> TYPE ty_input_file.
+
+* Get total process entires
+  DESCRIBE TABLE gt_lfile LINES gv_tot_lines.
+  PERFORM convert_to_struc.
+
+* Check if update entries is empty
+  IF gt_update IS INITIAL.
+    MESSAGE s000(yse_sales_log) DISPLAY LIKE gc_type_e
+      WITH text-002.
+    LEAVE LIST-PROCESSING.
+  ENDIF.
+
+** Make conversion of file equi-equnr
+  LOOP AT gt_update ASSIGNING <lfs_update>.
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+      EXPORTING
+        input  = <lfs_update>-aufnr
+      IMPORTING
+        output = <lfs_update>-aufnr.
+    ls_order-sign     = 'I'.
+    ls_order-option   = 'EQ'.
+    ls_order-low      = <lfs_update>-aufnr.
+    APPEND ls_order TO lt_order.
+  ENDLOOP.
+
+* Delete the dupliate work expense
+  LOOP AT gt_update ASSIGNING <lfs_update>.
+    IF <lfs_update>-aufnr = lv_old_aufnr.
+      IF lv_exist = 'X'.
+        CLEAR <lfs_update>-ac_exps.
+      ENDIF.
+    ELSE.
+      IF <lfs_update>-ac_exps IS NOT INITIAL.
+        lv_exist = 'X'.
+      ELSE.
+        CLEAR lv_exist.
+      ENDIF.
+    ENDIF.
+    IF <lfs_update>-ac_exps IS NOT INITIAL.
+      lv_exist = 'X'.
+    ENDIF.
+    lv_old_aufnr = <lfs_update>-aufnr.
+  ENDLOOP.
+
+  CLEAR: lv_exist.
+* Delete the duplicate allowance
+  LOOP AT gt_update ASSIGNING <lfs_update>.
+    IF <lfs_update>-aufnr = lv_old_aufnr.
+      IF lv_exist = 'X'.
+        CLEAR <lfs_update>-ac_allw.
+      ENDIF.
+    ELSE.
+      IF <lfs_update>-ac_allw IS NOT INITIAL.
+        lv_exist = 'X'.
+      ELSE.
+        CLEAR lv_exist.
+      ENDIF.
+    ENDIF.
+    IF <lfs_update>-ac_allw IS NOT INITIAL.
+      lv_exist = 'X'.
+    ENDIF.
+    lv_old_aufnr = <lfs_update>-aufnr.
+  ENDLOOP.
+
+  SELECT *
+    FROM aufk
+    INTO TABLE gt_aufk
+    FOR ALL ENTRIES IN  gt_update
+    WHERE aufnr = gt_update-aufnr.
+  IF sy-subrc <> 0.
+    MESSAGE s000(yse_sales_log) DISPLAY LIKE gc_type_e
+      WITH text-013.
+    LEAVE LIST-PROCESSING.
+  ENDIF.
+
+  SELECT *
+    FROM vbak
+    INTO TABLE gt_vbak
+    FOR ALL ENTRIES IN gt_aufk
+    WHERE vbeln = gt_aufk-kdauf.
+  SORT lt_order BY low.
+  DELETE ADJACENT DUPLICATES FROM lt_order
+    COMPARING low.
+* Get the confirmation list
+  CALL FUNCTION 'BAPI_ALM_CONF_GETLIST'
+    TABLES
+      order_range   = lt_order
+      confirmations = gt_list.
+  LOOP AT gt_update INTO gs_update.
+    READ TABLE gt_aufk INTO ls_aufk
+      WITH KEY aufnr = gs_update-aufnr.
+    IF sy-subrc <> 0.
+      lv_mess_str = 'The SEO order NO. not exist!'(058).
+      CONCATENATE gs_update-aufnr
+              lv_mess_str
+              INTO lv_mess_str
+              SEPARATED BY gc_colon.
+      APPEND lv_mess_str TO gt_update_log.
+      CONTINUE.
+    ELSE.
+      READ TABLE gt_vbak INTO ls_vbak
+        WITH KEY vbeln = ls_aufk-kdauf.
+      IF sy-subrc <> 0 .
+        lv_mess_str = 'Sales and Distribution not match with selection screen'(057).
+        CONCATENATE gs_update-aufnr
+                lv_mess_str
+                INTO lv_mess_str
+                SEPARATED BY gc_colon.
+        APPEND lv_mess_str TO gt_update_log.
+        CONTINUE.
+      ENDIF.
+    ENDIF.
+    PERFORM frm_create_confirm.
+    CLEAR: gs_update.
+  ENDLOOP.
+
+ENDFORM.                    " WRITE_DB
+
+*&---------------------------------------------------------------------*
+*&      Form  WRITE_LOG
+*&---------------------------------------------------------------------*
+*       WRITE process result message
+*----------------------------------------------------------------------*
+FORM write_log .
+
+  DATA: lv_mess_str     TYPE string.
+
+  gv_fai_lines = gv_tot_lines - gv_suc_lines.
+  WRITE: 'Total Process Entries:'(005) , AT 30(6) gv_tot_lines,
+         / 'Successful Process Entries:'(006), AT 30(6) gv_suc_lines,
+         / 'Failed Process Entries:'(007), AT 30(6) gv_fai_lines.
+  ULINE.
+
+  IF gv_tot_lines = gv_suc_lines.
+    MESSAGE s000(yse_sales_log)
+      WITH 'Successfully update all equipment'(008).
+  ENDIF.
+  IF gt_update_suc IS NOT INITIAL.
+    WRITE: 'Successfully processed entries:'(009), /.
+    LOOP AT gt_update_suc INTO lv_mess_str.
+      WRITE: lv_mess_str , /.
+    ENDLOOP.
+    ULINE.
+  ENDIF.
+  IF gt_update_log IS NOT INITIAL.
+    WRITE: 'Failed processed entries:'(034), /.
+    LOOP AT gt_update_log INTO lv_mess_str.
+      WRITE: lv_mess_str , /.
+    ENDLOOP.
+    ULINE.
+  ENDIF.
+
+ENDFORM.                    " WRITE_LOG
+*&---------------------------------------------------------------------*
+*&      Form  CONVERT_TO_STRUC
+*&---------------------------------------------------------------------*
+*       Convert internal table to structure ty_input_file
+*----------------------------------------------------------------------*
+FORM convert_to_struc .
+
+  DATA:
+    ls_lfile TYPE yse_s_lfile,
+    lt_field TYPE TABLE OF string,
+    lv_field TYPE string,
+    lv_line  TYPE string,
+    lflg_suc TYPE c,
+    lv_mess_str  TYPE string.
+  FIELD-SYMBOLS:
+    <fs_tab> TYPE STANDARD TABLE,
+    <fs_wa> TYPE ANY,
+    <fs_field> TYPE ANY.
+  DATA: lo_wa TYPE REF TO data,
+        lo_itab TYPE REF TO data.
+  CREATE DATA:
+    lo_wa TYPE ty_input_file,
+    lo_itab TYPE TABLE OF ty_input_file INITIAL SIZE 1.
+
+  ASSIGN lo_wa->* TO <fs_wa>.
+  ASSIGN lo_itab->* TO <fs_tab>.
+  ASSIGN gt_update TO <fs_tab>.
+
+  LOOP AT gt_lfile INTO ls_lfile.
+    CLEAR: lt_field,
+           lflg_suc.
+    lv_line = ls_lfile-text.
+    SPLIT lv_line AT gc_tab INTO TABLE lt_field.
+    lv_mess_str = lv_line.
+    REPLACE ALL OCCURRENCES OF  gc_tab
+      IN lv_mess_str
+      WITH gc_hifi.
+    LOOP AT lt_field INTO lv_field.
+      SHIFT lv_field LEFT DELETING LEADING '0'.
+      ASSIGN COMPONENT sy-tabix OF STRUCTURE <fs_wa> TO <fs_field>.
+      TRY .
+          <fs_field> = lv_field.
+        CATCH cx_sy_conversion_no_number.
+          lflg_suc = gc_type_e.
+          CONCATENATE
+                text-012
+                lv_mess_str+4
+            INTO lv_mess_str.
+          APPEND lv_mess_str TO gt_update_log.
+          EXIT.
+      ENDTRY.
+    ENDLOOP.
+    IF lflg_suc IS NOT INITIAL.
+      CONTINUE.
+    ENDIF.
+    APPEND <fs_wa> TO <fs_tab>.
+    CLEAR  <fs_wa>.
+  ENDLOOP.
+
+ENDFORM.                    " CONVERT_TO_STRUC
+
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_FILENAME
+*&---------------------------------------------------------------------*
+*       Check if the file path and name exist
+*----------------------------------------------------------------------*
+FORM check_filename .
+
+  DATA:
+    lv_exist TYPE c.
+  CALL FUNCTION 'TMP_GUI_GET_FILE_EXIST'
+    EXPORTING
+      fname          = p_file
+    IMPORTING
+      exist          = lv_exist
+    EXCEPTIONS
+      fileinfo_error = 1
+      OTHERS         = 2.
+  IF sy-subrc <> 0 OR lv_exist IS INITIAL.
+    MESSAGE e000(yse_sales_log)
+      WITH 'Please enter an invaild filename'(010).
+  ENDIF.
+
+ENDFORM.                    " CHECK_FILENAME
+
+*&---------------------------------------------------------------------*
+*&      Form  FRM_DO_INIT
+*&---------------------------------------------------------------------*
+*       Do initialization
+*----------------------------------------------------------------------*
+FORM frm_do_init .
+
+  CLEAR: gs_update.
+
+  CLEAR:
+"    gv_obtab        ,
+    gv_tot_lines    ,                           "Process lines
+    gv_suc_lines    ,                           "Success Lines
+    gv_fai_lines    .                           "Failed lines
+
+  REFRESH:
+    gt_lfile        ,                           "Local file name
+    gt_update       ,                           "Update file data
+    gt_update_log   .                           "update process log
+
+ENDFORM.                    " FRM_DO_INIT
+*&---------------------------------------------------------------------*
+*&      Form  SET_SCREEN
+*&---------------------------------------------------------------------*
+*       Set selection screen
+*----------------------------------------------------------------------*
+FORM set_screen .
+
+* Set editable for parameter [p_class],[p_charno],[p_hflg]
+  LOOP AT SCREEN.
+    IF screen-group1 = 'M1'.
+      screen-input = '0'.
+      screen-invisible = '1'.
+      MODIFY SCREEN.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    " SET_SCREEN
+*&      Form  FRM_CREATE_CONFIRM
+*&---------------------------------------------------------------------*
+*       Maintain the head text and operation information
+*----------------------------------------------------------------------*
+FORM frm_create_confirm .
+
+  DATA:
+      ls_confirmation TYPE bapi_alm_timeconfirmation,
+      lt_confirmation TYPE STANDARD TABLE OF bapi_alm_timeconfirmation,
+      lt_detail_return  TYPE STANDARD TABLE OF bapi_alm_return,
+      ls_detail_return  TYPE bapi_alm_return,
+      ls_return   TYPE bapiret2,
+      lv_mess_str TYPE string,
+      ls_header	  TYPE bapi_alm_order_header_e,
+      lt_operation TYPE STANDARD TABLE OF bapi_alm_order_operation_e,
+      ls_operation TYPE bapi_alm_order_operation_e,
+      lt_return  TYPE STANDARD TABLE OF bapiret2.
+
+  CLEAR: lv_mess_str.
+  CALL FUNCTION 'BAPI_ALM_ORDER_GET_DETAIL'
+    EXPORTING
+      number        = gs_update-aufnr
+    IMPORTING
+      es_header     = ls_header
+    TABLES
+      et_operations = lt_operation
+      return        = lt_return.
+
+  IF gs_update-ac_work IS NOT INITIAL.
+    READ TABLE lt_operation INTO ls_operation
+      WITH KEY  acttype = 'ZAM001'.
+    IF sy-subrc = 0.
+      CONCATENATE '('
+                  ls_operation-activity
+            INTO lv_mess_str .
+      CLEAR: ls_confirmation.
+      ls_confirmation-orderid = gs_update-aufnr.
+      ls_confirmation-operation = ls_operation-activity.
+      ls_confirmation-work_cntr = gs_update-arbpl.
+      ls_confirmation-act_work  = gs_update-ac_work.
+      ls_confirmation-fin_conf  = 'X'.
+      ls_confirmation-complete  = 'X'.
+      ls_confirmation-clear_res = 'X'.
+      ls_confirmation-un_work   = 'STD'.
+      ls_confirmation-act_type  = 'ZAM001'.
+      ls_confirmation-calc_motive = ls_header-calc_motive.
+      ls_confirmation-conf_text = gs_update-cfm_txt.
+      APPEND ls_confirmation TO lt_confirmation.
+    ELSE.
+      READ TABLE lt_operation INTO ls_operation
+        WITH KEY  acttype = 'ZAM007'.
+      IF sy-subrc = 0.
+        CONCATENATE '('
+                    ls_operation-activity
+              INTO lv_mess_str .
+        CLEAR: ls_confirmation.
+        ls_confirmation-orderid = gs_update-aufnr.
+        ls_confirmation-operation = ls_operation-activity.
+        ls_confirmation-work_cntr = gs_update-arbpl.
+        ls_confirmation-act_work  = gs_update-ac_work.
+        ls_confirmation-fin_conf  = 'X'.
+        ls_confirmation-complete  = 'X'.
+        ls_confirmation-clear_res = 'X'.
+        ls_confirmation-un_work   = 'STD'.
+        ls_confirmation-act_type  = 'ZAM007'.
+        ls_confirmation-calc_motive = ls_header-calc_motive.
+        ls_confirmation-conf_text = gs_update-cfm_txt.
+        APPEND ls_confirmation TO lt_confirmation.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+  IF gs_update-ac_exps IS NOT INITIAL.
+    READ TABLE lt_operation INTO ls_operation
+      WITH KEY  acttype = 'ZAM063'.
+    IF sy-subrc = 0.
+      READ TABLE gt_list TRANSPORTING NO FIELDS
+        WITH KEY orderid    = gs_update-aufnr
+                 operation  = ls_operation-activity.
+      IF sy-subrc <> 0. " Only when ZAM050 not exist, then create
+        IF lv_mess_str IS NOT INITIAL.
+          CONCATENATE lv_mess_str
+                      gc_hifi
+                      ls_operation-activity
+                      ')'
+                      INTO lv_mess_str.
+        ELSE.
+          CONCATENATE '(' ls_operation-activity ')'
+           INTO lv_mess_str.
+        ENDIF.
+        CLEAR: ls_confirmation.
+        ls_confirmation-orderid = gs_update-aufnr.
+        ls_confirmation-operation = ls_operation-activity.
+        CONCATENATE gs_update-arbpl(6)
+                    'DS'
+               INTO ls_confirmation-work_cntr.
+*        ls_confirmation-work_cntr = ls_operation-work_cntr.
+        ls_confirmation-act_work  = gs_update-ac_exps.
+        ls_confirmation-fin_conf  = 'X'.
+        ls_confirmation-complete  = 'X'.
+        ls_confirmation-clear_res = 'X'.
+        ls_confirmation-un_work   = 'KMT'.
+        ls_confirmation-act_type  = 'ZAM063'.
+        ls_confirmation-calc_motive = ls_header-calc_motive.
+        ls_confirmation-conf_text = gs_update-cfm_txt.
+        APPEND ls_confirmation TO lt_confirmation.
+      ENDIF.
+    ENDIF.
+  ELSE.
+    IF lv_mess_str IS NOT INITIAL.
+      CONCATENATE lv_mess_str
+                  ')'
+               INTO lv_mess_str.
+    ENDIF.
+  ENDIF.
+
+  IF gs_update-ac_allw IS NOT INITIAL.
+    READ TABLE lt_operation INTO ls_operation
+      WITH KEY  acttype = 'ZAM051'.
+    IF sy-subrc = 0.
+      READ TABLE gt_list TRANSPORTING NO FIELDS
+        WITH KEY orderid    = gs_update-aufnr
+                 operation  = ls_operation-activity.
+      IF sy-subrc <> 0. " Only when ZAM050 not exist, then create
+        IF lv_mess_str IS NOT INITIAL.
+          CONCATENATE lv_mess_str
+                      gc_hifi
+                      ls_operation-activity
+                      ')'
+                      INTO lv_mess_str.
+        ELSE.
+          CONCATENATE '(' ls_operation-activity ')'
+           INTO lv_mess_str.
+        ENDIF.
+        CLEAR: ls_confirmation.
+        ls_confirmation-orderid = gs_update-aufnr.
+        ls_confirmation-operation = ls_operation-activity.
+        CONCATENATE gs_update-arbpl(6)
+                    'TR'
+               INTO ls_confirmation-work_cntr.
+*        ls_confirmation-work_cntr = ls_operation-work_cntr.
+        ls_confirmation-act_work  = gs_update-ac_allw.
+        ls_confirmation-fin_conf  = 'X'.
+        ls_confirmation-complete  = 'X'.
+        ls_confirmation-clear_res = 'X'.
+        ls_confirmation-un_work   = 'LCU'.
+        ls_confirmation-act_type  = 'ZAM051'.
+        ls_confirmation-calc_motive = ls_header-calc_motive.
+        ls_confirmation-conf_text = gs_update-cfm_txt.
+        APPEND ls_confirmation TO lt_confirmation.
+      ENDIF.
+    ENDIF.
+  ELSE.
+    IF lv_mess_str IS NOT INITIAL.
+      CONCATENATE lv_mess_str
+                  ')'
+               INTO lv_mess_str.
+    ENDIF.
+  ENDIF.
+
+  IF lt_confirmation IS INITIAL.
+    lv_mess_str = 'Can not be processed!'(056).
+    CONCATENATE gs_update-aufnr
+            lv_mess_str
+            INTO lv_mess_str
+            SEPARATED BY gc_colon.
+    APPEND lv_mess_str TO gt_update_log.
+  ENDIF.
+  CHECK lt_confirmation  IS NOT INITIAL.
+
+  CALL FUNCTION 'BAPI_ALM_CONF_CREATE'
+    IMPORTING
+      return        = ls_return
+    TABLES
+      timetickets   = lt_confirmation
+      detail_return = lt_detail_return.
+  READ TABLE lt_detail_return TRANSPORTING NO FIELDS
+    WITH KEY type = gc_type_e.
+  IF sy-subrc <> 0.
+    gv_suc_lines =  gv_suc_lines + 1.
+    CONCATENATE gs_update-aufnr
+                lv_mess_str
+                'Successfully created'(053)
+             INTO lv_mess_str
+             SEPARATED BY gc_colon.
+    APPEND lv_mess_str TO gt_update_suc.
+    CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+      EXPORTING
+        wait = 'X'.
+  ELSE.
+    LOOP AT lt_detail_return INTO ls_detail_return.
+      CLEAR: lv_mess_str.
+*      MESSAGE ID ls_detail_return-message_id
+*          TYPE ls_detail_return-type
+*          NUMBER ls_detail_return-message_number
+*          WITH ls_detail_return-message_v1 ls_detail_return-message_v2
+*               ls_detail_return-message_v3 ls_detail_return-message_v4
+      lv_mess_str = ls_detail_return-message.
+      CONCATENATE gs_update-aufnr
+                  lv_mess_str
+                  INTO lv_mess_str
+                  SEPARATED BY gc_colon.
+      APPEND lv_mess_str TO gt_update_log.
+    ENDLOOP.
+  ENDIF.
+
+ENDFORM.                    " FRM_CREATE_CONFIRM
+
+*Text symbol text£º
+*001:Select a file for upload
+*002:[No Input Data] or [Error Happen On Converting]
+*005:Total Process Entries:
+*006:Successful Process Entries:
+*007:Failed Process Entries:
+*008:Successfully update all equipment
+*009:Successfully processed entries:
+*010:Please enter an invaild filename
+*012:Error to convert record:
+*013:Please check your file of the field service order No.s
+*034:Failed processed entries:
+*053:Successfully created
+*056:Can not be processed!
+*057:Sales and Distribution not match with selection screen
+*058:The SEO order NO. not exist!
+*T01:Input
+
+*T02:Sales and Distribution
+*Selection text£º
+*CB_HFLG:        With Header Text
+*P_FILE:        Local File
+*P_SPART:D       .
+*P_VKORG:D       .
+*P_VTWEG:D       .

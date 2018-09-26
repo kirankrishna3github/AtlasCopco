@@ -1,0 +1,1731 @@
+***********************************************************************
+* Program ID           : YSE_REN_RET_ON_INVEST                        *
+* Program Title        : Return on investment report                  *
+* Author               : Erik Walravens                               *
+* Date                 : 18.01.2007                                   *
+* Transport Number     : CD1K909463                                   *
+* Development          : D030                                         *
+* Description          : This report displays the acquisition price of*
+*                        a rental equipment, the revenue over a user  *
+*                        selected period and its return on investment *
+*                        over this period, based on rental contracts  *
+*                        stored in table YSE_RENT_SME.                *
+***********************************************************************
+* Notes: Authorization check is commented out until Wouter Deplancke  *
+*        agrees on the security roles.                                *
+***********************************************************************
+* Change History Log                                                  *
+*---------------------------------------------------------------------*
+* Mod. no.|  Date    | Name           | Correction Number | Change    *
+*---------------------------------------------------------------------*
+* MOD-001 |28/03/2007| Erik Walravens | CD1K912095        | 001       *
+* Description: Added Return on Investment 'on rent' option.           *
+*              Corrected weighted average by GAC, PGC, Revenue PGC    *
+*              and by model.                                          *
+*              Changed revenue from contract to revenue from COPA.    *
+*              Corrected acquisition value.                           *
+*              Added ROI over year.                                   *
+*---------------------------------------------------------------------*
+* MOD-002 |04/04/2007| Erik Walravens | CD1K913630        | 002       *
+* Description: Added weighted average on ROI over year.               *
+*              Readjusted ROI over year with acquisition date and     *
+*              desinvestment date.                                    *
+*---------------------------------------------------------------------*
+* MOD-003 |05/04/2007| Erik Walravens | CD1K913710        | 003       *
+* Description: Fixed error nil deactivation date.                     *
+*---------------------------------------------------------------------*
+* MOD-004 |06/04/2007| Erik Walravens | CD1K913798        | 004       *
+* Description: Corrected cascading summations error.                  *
+*              Cosmetic change (column descriptions)                  *
+*         |12/04/2007| Pieter Jespers |                               *
+* Description: Authorisation check                                    *
+*         |24/04/2007| Erik Walravens |                               *
+* Description: Add 12 Months Rolling.                                 *
+*---------------------------------------------------------------------*
+* MOD-005 |25/04/2007| Erik Walravens | CD1K914254        | 005       *
+* Description: * Cleanup unused variables.                            *
+*         |21/05/2007| Erik Walravens                                 *
+*              * Rectify ROI annualized.                              *
+*              * Cosmetic changes.                                    *
+*---------------------------------------------------------------------*
+* MOD-006 |21/05/2007| Erik Walravens | CD1K915159        | 006       *
+* Description: * Change annualize factor precision from int to float. *
+*---------------------------------------------------------------------*
+* MOD-007 |23/05/2007| Erik Walravens | CD1K915231        | 007       *
+* Description: * Include Company code in assets SELECT.               *
+*              * Plant is not mandatory.                              *
+*---------------------------------------------------------------------*
+* MOD-008 |05/05/2009| Marc Jacobs    | CD1K947976        | NEWGL     *
+***********************************************************************
+REPORT yse_ren_ret_on_invest MESSAGE-ID yse_rental.
+
+***********************************************************************
+* OBJECTS                                                             *
+***********************************************************************
+DATA:
+  obj_container     TYPE REF TO cl_gui_docking_container,
+  obj_alv           TYPE REF TO cl_gui_alv_grid.
+
+***********************************************************************
+* TABLES                                                              *
+***********************************************************************
+TABLES:
+  iloa,
+  equi,
+  yse_pgc_gac,
+  t179,
+  eqbs.
+
+***********************************************************************
+* TYPE-POOLS                                                          *
+***********************************************************************
+TYPE-POOLS slis.
+
+***********************************************************************
+* INTERNAL TYPES                                                      *
+***********************************************************************
+TYPES:
+  BEGIN OF str_result,
+    bukrs        TYPE iloa-bukrs,            " Company Code
+    swerk        TYPE iloa-swerk,            " Owning plant
+    gac          TYPE yse_pgc_gac-gac,       " GAC
+    pgc          TYPE yse_pgc_gac-pgc,       " PGC
+    rpgc         TYPE yse_pgc_gac-pgc,       " Revenue PGC
+    model        TYPE matnr,                 " Model
+    modesc       TYPE maktx,                 " Model description
+    matnr        TYPE matnr,                 " Material
+    madesc       TYPE maktx,                 " Material description
+    equnr        TYPE equnr,                 " Equipment number
+    sernr        TYPE gernr,                 " Serial number
+    zugdt        TYPE dzugdat,               " Acquisition date
+    deakt        TYPE deakt,                 " Desinvestment date
+    rent         TYPE updkz_d,               " On Rent
+    answl        TYPE zannbv,                " Acquisition value
+    revnu        TYPE zrevnu,                " Revenue over period
+    roinv        TYPE zroinv,                " Return on investment
+    roiyr        TYPE zroinv,                " Return over year
+    roiyxa       TYPE zroinv,                " ROI x Acquisition value
+    revtmr       TYPE zrevnu,                " Revenue over 12 mr
+    roitmr       TYPE zroinv,                " ROI over 12 months rol
+    linecolor(4) TYPE c,                     " Line color
+  END OF str_result,
+
+  BEGIN OF str_equ_a,
+    equnr       TYPE equi-equnr,   " Equipment number
+  END OF str_equ_a,
+
+  BEGIN OF str_equ_b,
+    equnr TYPE equnr,
+    matnr TYPE matnr,
+    sernr TYPE gernr,
+    iloan TYPE iloan,
+    werks TYPE werks_d,
+  END OF str_equ_b,
+
+  BEGIN OF str_equ_c,
+    iloan TYPE iloan,
+    bukrs TYPE bukrs,
+    vkorg TYPE vkorg,
+    vtweg TYPE vtweg,
+  END OF str_equ_c,
+
+  BEGIN OF str_eq,
+    equnr     TYPE equi-equnr,  " Equipment nr
+    matnr     TYPE equi-matnr,  " Material nr
+    sernr     TYPE equi-sernr,  " Serial nr
+    pmatn     TYPE mvke-pmatn,  " Model
+    prodh     TYPE mvke-prodh,  " Product hierarchy
+  END OF str_eq,
+
+  BEGIN OF str_mvke,
+    matnr     TYPE mvke-matnr,
+    pmatn     TYPE mvke-pmatn,
+    prodh     TYPE mvke-prodh,
+  END OF str_mvke,
+
+  BEGIN OF str_anlc,
+     equnr    TYPE equi-equnr,  " Equipment nr
+     anln1    TYPE anlc-anln1,  " Asset nr
+     zugdt    TYPE anla-zugdt,  " Acquisition date
+     deakt    TYPE anla-deakt,  " Desinvestment date
+     answl    TYPE anlc-answl,  " Acquisition value
+     nafag    TYPE anlc-nafag,  " Posted Ordinary Depreciation
+     safag    TYPE anlc-safag,  " Posted Special Depreciation
+     aafag    TYPE anlc-aafag,  " Posted Unplanned Depreciation
+     kansw    TYPE anlc-kansw,  " Acquisition cumulated value
+  END OF str_anlc,
+
+  BEGIN OF str_eqbs,
+      equnr     TYPE eqbs-equnr,
+      b_werks   TYPE eqbs-b_werk,
+  END OF str_eqbs,
+
+  BEGIN OF str_matnr,
+    matnr    TYPE matnr,
+  END OF str_matnr,
+
+  BEGIN OF str_models,
+    matnr     TYPE matnr,
+    model     TYPE matnr,
+  END OF str_models,
+
+  BEGIN OF str_makt,
+    matnr     TYPE makt-matnr,
+    maktx     TYPE makt-maktx,
+  END OF str_makt.
+
+***********************************************************************
+* INTERNAL TABLES                                                     *
+***********************************************************************
+DATA:
+  it_result   TYPE TABLE OF str_result       WITH HEADER LINE,
+  it_eq       TYPE TABLE OF str_eq           WITH HEADER LINE,
+  it_equ_a    TYPE TABLE OF str_equ_a        WITH HEADER LINE,
+  it_equ_b    TYPE TABLE OF str_equ_b        WITH HEADER LINE,
+  it_equ_c    TYPE TABLE OF str_equ_c        WITH HEADER LINE,
+  it_mvke     TYPE TABLE OF str_mvke         WITH HEADER LINE,
+  it_anlc     TYPE TABLE OF str_anlc         WITH HEADER LINE,
+  it_copa     TYPE yse_rent_copa_rv OCCURS 0 WITH HEADER LINE,
+  it_eqbs     TYPE TABLE OF str_eqbs         WITH HEADER LINE,
+  it_pgc      TYPE TABLE OF yse_pgc_gac      WITH HEADER LINE,
+  it_matnr    TYPE TABLE OF str_matnr        WITH HEADER LINE,
+  it_models   TYPE TABLE OF str_models       WITH HEADER LINE,
+  it_makt     TYPE TABLE OF str_makt         WITH HEADER LINE.
+
+DATA:
+  it_fieldcat TYPE lvc_t_fcat           WITH HEADER LINE,
+  it_rows     TYPE lvc_t_row.      " table selected rows ALV grid
+
+***********************************************************************
+* CONSTANTS                                                           *
+***********************************************************************
+CONSTANTS:
+  gc_true      TYPE char1       VALUE 'X',   " true
+  gc_engl      LIKE tvagt-spras VALUE 'E',   " english.
+  gc_rent      TYPE vbak-vtweg  VALUE '21',  " rental distr.
+  gc_afabe     TYPE anlc-afabe  VALUE '30',  " Depreciation area
+  gc_cont      TYPE vbak-auart  VALUE 'ZQP', " rental contr.
+  gc_eqtypx    TYPE equi-eqtyp  VALUE 'X',   " rental equipment
+  gc_eqtypy    TYPE equi-eqtyp  VALUE 'Y',   " rental equipment
+  gc_factcal   LIKE fplt-fakca  VALUE '99',  " Factory calender
+  gc_yellow(4) TYPE c           VALUE 'C300',
+  gc_gray(4)   TYPE c           VALUE 'C200',
+  gc_bluish(4) TYPE c           VALUE 'C400',
+  gc_blue(4)   TYPE c           VALUE 'C100',
+  gc_green(4)  TYPE c           VALUE 'C500',
+  gc_red(4)    TYPE c           VALUE 'C600'.
+
+***********************************************************************
+* VARIABLES                                                           *
+***********************************************************************
+* Process
+DATA:
+  lv_criterium     TYPE string,        " dynamic select where-clause
+  lv_crit_matnr    TYPE string,        " where-clause matnr
+  lv_lines         TYPE p,             " lines in an internal table
+  lv_prevequnr     LIKE vbap-zzequnr,  " previous equipment
+  lv_angdt         TYPE dats,          " Readjusted start date
+  lv_bnddt         TYPE dats,          " Readjusted end date
+  lv_factor        TYPE f,             " Extrapolation factor
+  wa_result        TYPE str_result.
+* ALV grid
+DATA:
+  okcode           LIKE sy-ucomm,      " return param screen 100
+  gs_layout        TYPE lvc_s_layo,    " ALV grid layout
+  gs_variant       TYPE disvariant,    " ALV grid variant
+  lv_index         TYPE lvc_index,     " index alv grid
+  o_bukrs(4)       TYPE c,             " Output field Company Code
+  o_werks(4)       TYPE c,             " Output field Plant
+  o_vkorg(4)       TYPE c,             " Output field Sales Org.
+  o_angdt(10)      TYPE c,             " Output field Start date
+  o_bnddt(10)      TYPE c.             " Output field End date
+
+***********************************************************************
+* FIELD SYMBOLS                                                       *
+***********************************************************************
+FIELD-SYMBOLS:
+  <fs_anlc> LIKE LINE OF it_anlc.
+
+***********************************************************************
+* SELECTION SCREEN                                                    *
+***********************************************************************
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE text-s01.
+PARAMETERS:
+  p_angdt       TYPE veda-vbegdat,    " Date start period
+  p_bnddt       TYPE veda-venddat,    " Date end period
+  p_bukrs       TYPE iloa-bukrs       " Company code
+                OBLIGATORY MEMORY ID buk.
+SELECT-OPTIONS:
+  so_werks  FOR eqbs-b_werk,          " Owning Plant
+  so_vkorg  FOR iloa-vkorg            " Sales org
+            OBLIGATORY MEMORY ID vko,
+  so_vtweg  FOR iloa-vtweg            " Distr. ch.
+            OBLIGATORY DEFAULT gc_rent,
+  so_gac    FOR yse_pgc_gac-gac,      " GAC
+  so_pgc    FOR t179-prodh,           " PGC
+  so_model  FOR equi-matnr,           " Model
+  so_matnr  FOR equi-matnr,           " Material nr
+  so_equnr  FOR equi-equnr.           " Equipment
+SELECTION-SCREEN END OF BLOCK b1.
+
+SELECTION-SCREEN BEGIN OF BLOCK b2 WITH FRAME TITLE text-s02.
+PARAMETER: cb_rent AS CHECKBOX DEFAULT gc_true.
+SELECTION-SCREEN END OF BLOCK b2.
+
+***********************************************************************
+AT SELECTION-SCREEN.
+***********************************************************************
+
+*  PERFORM check_authorization.
+
+***********************************************************************
+*  START OF SELECTION                                                 *
+***********************************************************************
+START-OF-SELECTION.
+
+* Process dates
+  PERFORM calc_dates.
+
+* Load equipment table
+  PERFORM load_equipment.
+
+
+* Load revenue from YSE_RENT_COPA_RV
+  PERFORM load_revenue.
+
+* Load material and model description tables
+  PERFORM load_descriptions.
+
+* Load asset acquis values
+  PERFORM load_assets.
+
+* clean up equipment with deactivation date before start-date
+  PERFORM delete_deactivated_equipments.
+
+
+
+* Process data
+  PERFORM loop_eq.
+
+* Calculate mean values per GAC / PGC / model
+  PERFORM calc_mean.
+
+* Display
+  IF sy-batch = 'X'.
+    PERFORM build_alv.
+  ELSE.
+    CALL SCREEN 100.
+  ENDIF.
+
+***********************************************************************
+** FORM    CALC_DATES                                                 *
+***********************************************************************
+FORM calc_dates.
+
+* If no dates were entered, set to extremes
+  IF p_angdt IS INITIAL.
+    p_angdt = '00000000'.
+  ENDIF.
+  IF p_bnddt IS INITIAL.
+    p_bnddt = '99991231'.
+  ENDIF.
+
+ENDFORM.  " calc_dates
+
+***********************************************************************
+** FORM    LOAD_EQUIPMENT                                             *
+***********************************************************************
+* Select all equipments based on selection parameters.                *
+* Material, model, equipment and serial number in the selection fields*
+* should be entered exclusively. If more than one of these fields is  *
+* entered, only the equipments are loaded that correspond to all the  *
+* conditions. If some options are mutually exclusive, no equipment    *
+* will be found. If nothing is entered, then all equipments are loaded*
+***********************************************************************
+FORM load_equipment.
+
+* Local internal table
+  DATA: BEGIN OF lt_matnr OCCURS 0,
+          matnr TYPE matnr,
+        END OF lt_matnr.
+
+* If models are entered, select all underlying materials and replace
+* the entered material range.
+  IF NOT so_model IS INITIAL.
+
+*   Note: if materials in so_matnr should also be included, remove
+*         next CLEAR/REFRESH and append materials from model instead.
+    CLEAR so_matnr.
+    REFRESH so_matnr.
+
+*   Get all material numbers for selected models...
+    SELECT matnr
+        INTO TABLE lt_matnr
+        FROM mvke
+       WHERE pmatn IN so_model
+         AND vkorg IN so_vkorg
+         AND vtweg IN so_vtweg.
+
+    SORT lt_matnr.
+    DELETE ADJACENT DUPLICATES FROM lt_matnr.
+
+    so_matnr-sign = 'I'.
+    so_matnr-option = 'EQ'.
+    so_matnr-high = space.
+
+*   and add them to the list of selected materials.
+    LOOP AT lt_matnr.
+      so_matnr-low = lt_matnr-matnr.
+      APPEND so_matnr.
+    ENDLOOP.
+
+    SORT so_matnr.
+    DELETE ADJACENT DUPLICATES FROM so_matnr.
+  ENDIF.    " so_model NOT INITIAL
+
+* Select all basic equipment information
+
+* First: select equipments with rental equipment categories
+  SELECT equnr
+      INTO TABLE it_equ_a
+      FROM equi
+     WHERE equnr IN so_equnr  AND
+         ( eqtyp EQ gc_eqtypx   OR
+           eqtyp EQ gc_eqtypy )
+         AND NOT EXISTS  ( SELECT * FROM jest
+                           WHERE objnr EQ equi~objnr
+                           AND  stat EQ 'I0076'
+                           AND  inact EQ ' ' ) .
+
+* If equipments found
+  IF NOT ( it_equ_a[] IS INITIAL ).
+
+*   Second: obtain iloan code for selected equipments
+    SELECT equi~equnr
+           equi~matnr
+           equi~sernr
+*           eqkt~eqktx
+           equz~iloan
+           eqbs~b_werk AS werks
+        FROM equi
+        JOIN equz
+          ON equi~equnr = equz~equnr
+*        JOIN eqbs
+        LEFT JOIN eqbs
+          ON equi~equnr = eqbs~equnr
+*        JOIN eqkt
+*          ON equi~equnr = eqkt~equnr
+        INTO CORRESPONDING FIELDS OF TABLE it_equ_b
+         FOR ALL ENTRIES IN it_equ_a
+       WHERE equi~equnr EQ it_equ_a-equnr
+         AND equz~datbi EQ '99991231'
+         AND equi~matnr IN so_matnr.
+*         AND eqkt~spras EQ 'EN'.
+
+* sold and scrap items don't have a plant, in the history determine the plant
+    PERFORM fill_missing_plant TABLES it_equ_b.
+
+*   Third: obtain Company Code, Sales Org and Distr. Channel
+    IF NOT ( it_equ_b[] IS INITIAL ).
+      SELECT iloan
+             bukrs
+             vkorg
+             vtweg
+          INTO TABLE it_equ_c
+          FROM iloa
+           FOR ALL ENTRIES IN it_equ_b
+         WHERE iloan = it_equ_b-iloan.
+      SORT it_equ_c.
+
+    ENDIF.
+
+*   Fourth: Load models and product hierarchies
+    SELECT matnr pmatn prodh
+        INTO TABLE it_mvke
+        FROM mvke
+         FOR ALL ENTRIES IN it_equ_b
+       WHERE matnr EQ it_equ_b-matnr
+         AND vkorg IN so_vkorg
+         AND vtweg IN so_vtweg.
+
+    SORT it_mvke.
+    DELETE ADJACENT DUPLICATES FROM it_mvke.
+
+    SORT it_equ_b BY iloan.
+
+    LOOP AT it_equ_b.
+*     If the plant is not part of the depots
+      IF NOT ( it_equ_b-werks IN so_werks ).
+        CONTINUE.
+      ENDIF.
+*     Check if the CCode,  SalesOrg. and Distr. Ch. are as selected
+      READ TABLE it_equ_c
+        WITH KEY iloan = it_equ_b-iloan
+        BINARY SEARCH.
+      IF sy-subrc EQ 0.
+        IF it_equ_c-bukrs EQ p_bukrs AND
+           it_equ_c-vkorg IN so_vkorg AND
+           it_equ_c-vtweg IN so_vtweg.
+*         Check model (and read product hierarchy)
+          READ TABLE it_mvke WITH KEY matnr = it_equ_b-matnr.
+          IF it_mvke-pmatn IN so_model.
+*           Copy equipment nr, material nr and serial nr
+            MOVE-CORRESPONDING it_equ_b TO it_eq.
+*           Copy model and product hierarchy
+            it_eq-pmatn = it_mvke-pmatn.
+            it_eq-prodh = it_mvke-prodh.
+*           Add record
+            APPEND it_eq.
+          ENDIF.    " Check model
+        ENDIF.    " Check VKORG VTWEG BUKRS
+      ENDIF.    "  Check ILOA record exists
+    ENDLOOP.  " it_equ_b
+
+    SORT it_eq.
+    DELETE ADJACENT DUPLICATES FROM it_eq.
+
+*   Build PGC/GAC conversion table
+    PERFORM load_pgc_gac.
+
+*   Check if PGC/GAC codes are as selected
+    LOOP AT it_eq.
+      READ TABLE it_pgc WITH KEY pgc = it_eq-prodh.
+      IF NOT ( it_pgc-pgc IN so_pgc ) OR
+         NOT ( it_pgc-gac IN so_gac ).
+        DELETE it_eq.
+      ENDIF.    " check PGC GAC
+    ENDLOOP.  " it_eq
+  ENDIF.    " it_equ_a not empty
+
+  SELECT equnr b_werk
+      INTO TABLE it_eqbs
+      FROM eqbs
+       FOR ALL ENTRIES IN it_eq
+     WHERE equnr = it_eq-equnr.
+
+ENDFORM.    " load_equipment
+
+
+***********************************************************************
+*  Form LOAD_REVENUE                                                  *
+***********************************************************************
+* Load revenue from YSE_RENT_COPA_RV for each equipment in all depots *
+* in selected period.                                                 *
+***********************************************************************
+FORM load_revenue.
+
+  RANGES r_vkbur FOR yse_rent_copa_rv-vkbur.
+  DATA:
+    p_angdt_month(2) TYPE c,
+    p_angdt_year(4)  TYPE c,
+    p_bnddt_month(2) TYPE c,
+    p_bnddt_year(4)  TYPE c,
+    lv_year(4)       TYPE c.
+
+  SELECT vkbur AS low
+      INTO CORRESPONDING FIELDS OF TABLE r_vkbur
+      FROM yse_rent_depot
+     WHERE vkorg IN so_vkorg
+       AND werks IN so_werks
+       AND bukrs EQ p_bukrs.
+
+  LOOP AT r_vkbur.
+    r_vkbur-sign = 'I'.
+    r_vkbur-option = 'EQ'.
+    MODIFY r_vkbur.
+  ENDLOOP.  " r_vkbur
+
+  lv_year = sy-datum(4) - 1.
+  IF lv_year > p_angdt(4).
+    lv_year = p_angdt(4).
+  ENDIF.
+
+* If equipments selected, load all revenue
+  IF NOT ( it_eq[] IS INITIAL ).
+    SELECT      *
+           INTO TABLE it_copa
+           FROM yse_rent_copa_rv
+            FOR ALL ENTRIES IN it_eq
+          WHERE equnr EQ it_eq-equnr
+            AND bukrs EQ p_bukrs
+            AND vkorg IN so_vkorg
+            AND vkbur IN r_vkbur
+            AND fyear GE lv_year.
+  ENDIF.
+
+ENDFORM.                    "load_revenue
+
+
+***********************************************************************
+*  Form LOOP_EQ                                                       *
+***********************************************************************
+* Loops through equipments and fills the output table with static     *
+* and revenue and acquisition costs. And most imporatntly, calculates *
+* the Return on Investment.                                           *
+***********************************************************************
+FORM loop_eq.
+
+  DATA:
+    lv_period   TYPE dats,
+    lv_tmrol    TYPE dats.
+
+* Calculate date 12 months ago for Revenue 12 MR
+  lv_tmrol = sy-datum.
+  lv_tmrol(4) = lv_tmrol(4) - 1.
+
+* Loop over the equipments in scope
+  LOOP AT it_eq.
+
+*   Clear the output table header line
+    CLEAR it_result.
+
+*   Set company code
+    it_result-bukrs = p_bukrs.
+*   Set equipment number
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+      EXPORTING
+        input  = it_eq-equnr
+      IMPORTING
+        output = it_result-equnr.
+*   Set serial number
+    it_result-sernr = it_eq-sernr.
+*   Set material
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+      EXPORTING
+        input  = it_eq-matnr
+      IMPORTING
+        output = it_result-matnr.
+    CLEAR it_makt.
+*   Set material and description
+    READ TABLE it_makt WITH KEY matnr = it_eq-matnr.
+    it_result-madesc = it_makt-maktx.
+*   Set model
+    READ TABLE it_models WITH KEY matnr = it_eq-matnr.
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+      EXPORTING
+        input  = it_models-model
+      IMPORTING
+        output = it_result-model.
+*   Set model description
+    READ TABLE it_makt WITH KEY matnr = it_models-model.
+    it_result-modesc = it_makt-maktx.
+*   Set issuing plant
+    CLEAR it_eqbs.
+    READ TABLE it_eqbs WITH KEY equnr = it_eq-equnr.
+    it_result-swerk = it_eqbs-b_werks.
+*   Set machine GAC/PGC
+    CLEAR it_pgc.
+    READ TABLE it_pgc WITH KEY pgc = it_eq-prodh.
+    it_result-gac   = it_pgc-gac.                " Machine GAC
+    it_result-pgc   = it_pgc-pgc.                " Machine PGC
+
+*   Loop over the revenue lines of this equipment
+    LOOP AT it_copa WHERE equnr = it_eq-equnr.
+*     If the value is different from zero
+      IF it_copa-vrevu NE 0.
+*       Determine the fiscal period to which this revenue belongs
+        lv_period(4) = it_copa-fyear.
+        lv_period+4(2) = it_copa-fperd.
+        lv_period+6(2) = '01'.
+
+*       Check if record lies within selection dates
+        IF lv_period GE p_angdt AND lv_period LE p_bnddt.
+          it_result-revnu = it_result-revnu + it_copa-vrevu.
+          it_result-rent = gc_true.
+        ENDIF.    " lv_period in selection dates
+
+*       Check if record lies within 12 months rolling
+        IF lv_period GE lv_tmrol AND lv_period LE sy-datum.
+          it_result-revtmr = it_result-revtmr + it_copa-vrevu.
+        ENDIF.    " lv_period in 12 rol
+      ENDIF.    " it_copa-vrevu > 0
+    ENDLOOP.  " it_copa
+
+*   Get Acquisition date and Deactivation date
+*   and readjust the start and end date accordingly
+    CLEAR it_anlc.
+    READ TABLE it_anlc WITH KEY equnr = it_eq-equnr.
+*   Determine latest start date
+    IF sy-subrc <> 0.
+*     If no record found...
+      it_result-answl = 0.
+      it_result-zugdt = '00000000'.
+      it_result-deakt = '99991231'.
+    ELSE.
+      it_result-answl = it_anlc-answl.
+      IF it_anlc-zugdt IS INITIAL.
+*       if acquisition date is '00000000'...
+        it_result-zugdt = '00000101'.
+        lv_angdt = p_angdt.
+      ELSE.
+        it_result-zugdt = it_anlc-zugdt.
+        IF p_angdt > it_anlc-zugdt.
+          lv_angdt = p_angdt.
+        ELSE.
+          lv_angdt = it_anlc-zugdt.
+        ENDIF.
+      ENDIF.
+      IF it_anlc-deakt IS INITIAL.
+*       if deactivation date is '00000000'...
+        it_result-deakt = '99991231'.
+        lv_bnddt = p_bnddt.
+      ELSE.
+        it_result-deakt = it_anlc-deakt.
+*       Determine earliest end date
+        IF p_bnddt < it_anlc-deakt.
+          lv_bnddt = p_bnddt.
+        ELSE.
+          lv_bnddt = it_anlc-deakt.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+*   Calculate extrapolation factor
+    IF lv_bnddt > lv_angdt.
+      lv_factor = 365 / ( lv_bnddt - lv_angdt + 1 ).
+    ELSE.
+      lv_factor = 365.
+    ENDIF.
+
+*   Calculate ROI derivates
+    IF it_result-answl <> 0.
+*     Calculate Return on Investment
+      it_result-roinv = ( it_result-revnu / it_result-answl ) * 100.
+*     Calculate ROI annualized
+      it_result-roiyr = it_result-roinv * lv_factor.
+*     Calculate Return on Investment over 12 month rolling
+      it_result-roitmr = ( it_result-revtmr / it_result-answl ) * 100.
+*     Calculate ROI by year multiplied by Aquisition value
+      it_result-roiyxa = it_result-roiyr * it_result-answl.
+    ENDIF.
+    APPEND it_result.
+  ENDLOOP.  " it_eq
+
+* If ROI on rent
+  IF cb_rent EQ gc_true.
+
+*   Delete lines without Revenue
+    LOOP AT it_result.
+      IF it_result-rent IS INITIAL.
+        DELETE it_result.
+      ENDIF.    " no net book value
+    ENDLOOP.  " it_result
+  ENDIF.    " cb_rent
+
+ENDFORM.  " loop_eq
+
+************************************************************************
+*  Form LOAD_ASSETS                                                    *
+************************************************************************
+FORM load_assets.
+
+  IF NOT it_eq[] IS INITIAL.
+
+*   Get asset data
+    SELECT equz~equnr anlc~anln1 anla~zugdt anla~deakt
+           anlc~answl anlc~nafag anlc~safag anlc~aafag anlc~kansw  "kansw added by Raskin Kevin issue 2615
+        INTO TABLE it_anlc
+        FROM equz
+        JOIN iloa
+          ON equz~iloan EQ iloa~iloan
+        JOIN anlc
+          ON iloa~anlnr EQ anlc~anln1
+        JOIN anla
+          ON anlc~anln1 EQ anla~anln1
+         AND anlc~bukrs EQ anla~bukrs
+         FOR ALL entries IN it_eq
+       WHERE equz~equnr EQ it_eq-equnr      " Equipment number
+         AND anlc~bukrs EQ p_bukrs          " Company code
+* begin of change MOD-008
+*         AND anlc~afabe EQ '30'.            " Depreciation Area
+         AND anlc~afabe EQ '01'.            " Depreciation Area
+* end of change MOD-008
+
+*{Insert raskin kevin issue 2615
+* To make sure cutover assets are also calculated correct
+    LOOP AT it_anlc ASSIGNING <fs_anlc>.
+*      ADD <fs_anlc>-kansw TO <fs_anlc>-answl.
+      IF <fs_anlc>-answl LE 0.
+        MOVE <fs_anlc>-kansw TO <fs_anlc>-answl.
+      ELSE.
+        ADD <fs_anlc>-kansw TO <fs_anlc>-answl.
+      ENDIF.
+    ENDLOOP.
+*}End insert Raskin Kevin
+
+  ENDIF.  " records in it_sme
+
+ENDFORM.    " load_assets
+
+************************************************************************
+*  Form LOAD_PGC_GAC                                                   *
+************************************************************************
+FORM load_pgc_gac.
+
+  DESCRIBE TABLE it_eq LINES lv_lines.
+  IF lv_lines > 0.
+
+*   Fill table with PGC codes from it_eq
+    SORT it_eq BY prodh.
+    LOOP AT it_eq.
+      IF it_eq-prodh <> it_pgc-pgc.
+        it_pgc-pgc = it_eq-prodh.
+        APPEND it_pgc.
+      ENDIF.
+    ENDLOOP.  " it_vbap
+
+*   Get the corresponding GAC codes for the PGC codes
+    CALL FUNCTION 'YSE_CONVERT_PGC_GAC'
+      TABLES
+        it_pgc_gac = it_pgc.
+    SORT it_pgc BY pgc.
+  ENDIF.    " records in it_eq
+
+ENDFORM.    " load_pgc_gac
+
+***********************************************************************
+*  Form LOAD_DESCRIPTIONS                                             *
+***********************************************************************
+FORM load_descriptions.
+
+*  DESCRIBE TABLE it_eq LINES lv_lines.
+*  IF lv_lines > 0.
+
+  IF NOT ( it_eq[] IS INITIAL ).
+
+*   Create list of unique material numbers from it_sme
+    LOOP AT it_eq.
+      it_matnr-matnr = it_eq-matnr.
+      APPEND it_matnr TO it_matnr.
+    ENDLOOP.
+    SORT it_matnr BY matnr.
+    DELETE ADJACENT DUPLICATES FROM it_matnr.
+
+    IF NOT ( it_matnr[] IS INITIAL ).
+
+*     Get material description for selected documents
+      SELECT matnr maktx
+          INTO TABLE it_makt
+          FROM makt
+           FOR ALL ENTRIES IN it_matnr
+         WHERE matnr = it_matnr-matnr
+           AND spras = gc_engl.
+    ENDIF.  " records in it_matnr
+
+*   Determine set of models
+    SELECT matnr pmatn
+        INTO TABLE it_models
+        FROM mvke
+        FOR ALL ENTRIES IN it_eq
+       WHERE matnr = it_eq-matnr
+         AND vkorg IN so_vkorg
+         AND vtweg IN so_vtweg.
+
+    SORT it_models.
+    DELETE ADJACENT DUPLICATES FROM it_models.
+
+    IF NOT ( it_models[] IS INITIAL ).
+
+*     Get material description for selected models
+      SELECT matnr maktx
+          APPENDING TABLE it_makt
+          FROM makt
+           FOR ALL ENTRIES IN it_models
+         WHERE matnr = it_models-model
+           AND spras = gc_engl.
+    ENDIF.    " records in it_models
+  ENDIF.    " records in it_eq
+
+
+ENDFORM.  " load_descriptions
+
+***********************************************************************
+** FORM  CALC_MEAN                                                    *
+***********************************************************************
+* Runs through the output table and calculates mean values on ROI     *
+* field for aggregations on Machine GAC, Machine PGC, Revenue PGC and *
+* model. This simulates and ALV grid layout with mean values, but the *
+* averages need to be 'weighted' by the equipment's revenue.          *
+***********************************************************************
+FORM calc_mean.
+
+  DATA:
+    lv_mgac        TYPE yse_pgc_gac-gac,
+    lv_mgac_answl  TYPE f,
+    lv_mgac_revnu  TYPE f,
+    lv_mgac_roiyxa TYPE f,
+    lv_mgac_revtmr TYPE f,
+*    lv_mgac_roitmr TYPE f,
+*    lv_mgac_roitxa TYPE f,
+    lv_mpgc        TYPE yse_pgc_gac-pgc,
+    lv_mpgc_answl  TYPE f,
+    lv_mpgc_revnu  TYPE f,
+    lv_mpgc_roiyxa TYPE f,
+    lv_mpgc_revtmr TYPE f,
+*    lv_mpgc_roitmr TYPE f,
+*    lv_mpgc_roitxa TYPE f,
+*    lv_rpgc        TYPE yse_pgc_gac-pgc,
+*    lv_rpgc_answl  TYPE f,
+*    lv_rpgc_revnu  TYPE f,
+*    lv_rpgc_roiyxa TYPE f,
+*    lv_rpgc_revtmr TYPE f,
+**    lv_rpgc_roitmr TYPE f,
+**    lv_rpgc_roitxa TYPE f,
+    lv_modl        TYPE matnr,
+    lv_modl_answl  TYPE f,
+    lv_modl_revnu  TYPE f,
+    lv_modl_roiyxa TYPE f,
+    lv_modl_revtmr TYPE f,
+*    lv_modl_roitmr TYPE f,
+*    lv_modl_roitxa TYPE f,
+    lv_gtot_answl  TYPE f,
+    lv_gtot_revnu  TYPE f,
+    lv_gtot_roiyxa TYPE f,
+    lv_gtot_revtmr TYPE f.
+*    lv_gtot_roitmr TYPE f.
+*    lv_gtot_roitxa TYPE f.
+
+* Sort the output table in order of averages
+  SORT it_result BY gac pgc rpgc matnr.
+
+* Read first record to initialize the averaging loop
+  READ TABLE it_result INDEX 1.
+  IF sy-subrc = 0.
+    lv_mgac   = it_result-gac.
+    lv_mpgc   = it_result-pgc.
+*    lv_rpgc   = it_result-rpgc.
+    lv_modl   = it_result-model.
+
+*   Go through all output records to insert averages
+    LOOP AT it_result.
+*     Color standard record
+      it_result-linecolor = gc_yellow.
+*     Update actual normal record
+      MODIFY it_result.
+
+*     Average by Model
+*     ----------------
+      IF ( it_result-model = lv_modl AND
+*           it_result-rpgc  = lv_rpgc AND
+           it_result-pgc   = lv_mpgc AND
+           it_result-gac   = lv_mgac ).
+        lv_modl_answl = lv_modl_answl + it_result-answl.
+        lv_modl_revnu = lv_modl_revnu + it_result-revnu.
+        lv_modl_roiyxa = lv_modl_roiyxa + it_result-roiyxa.
+        lv_modl_revtmr = lv_modl_revtmr + it_result-revtmr.
+*        lv_modl_roitmr = lv_modl_roitmr + it_result-roitmr.
+*        lv_modl_roitxa = lv_modl_roitxa + it_result-roitxa.
+      ELSE.
+*       Build mean value
+        CLEAR wa_result.
+        wa_result-linecolor = gc_gray.
+        wa_result-model = lv_modl.
+        wa_result-answl = lv_modl_answl.
+        wa_result-revnu = lv_modl_revnu.
+        wa_result-revtmr = lv_modl_revtmr.
+        IF wa_result-answl <> 0.
+          wa_result-roinv = wa_result-revnu / wa_result-answl * 100.
+          wa_result-roitmr = wa_result-revtmr / wa_result-answl * 100.
+        ELSE.
+          wa_result-roinv = 0.
+          wa_result-roitmr = 0.
+        ENDIF.
+*       ROI extrapolated to year
+        wa_result-roiyr = wa_result-roinv * lv_factor.
+*       Sum ( ROI x Acquisition Value )
+        wa_result-roiyxa = lv_modl_roiyxa.
+*        wa_result-roitxa = lv_modl_roitxa.
+*       Average ( ROI per Year x Acq val ), weighted by Acq Value
+        IF wa_result-answl <> 0.
+          wa_result-roiyr = wa_result-roiyxa / wa_result-answl.
+        ELSE.
+          wa_result-roiyr = 0.
+        ENDIF.
+
+*       Insert new line
+        INSERT wa_result INTO it_result.
+
+*       Reset for new range of Model
+        lv_modl = it_result-model.
+        lv_modl_answl = it_result-answl.
+        lv_modl_revnu = it_result-revnu.
+        lv_modl_roiyxa = it_result-roiyxa.
+        lv_modl_revtmr = it_result-revtmr.
+*        lv_modl_roitxa = it_result-roitxa.
+      ENDIF.
+
+**     Average by Revenue PGC
+**     ----------------------
+*      IF ( it_result-rpgc = lv_rpgc AND
+*           it_result-pgc   = lv_mpgc AND
+*           it_result-gac   = lv_mgac ).
+*        lv_rpgc_answl = lv_rpgc_answl + it_result-answl.
+*        lv_rpgc_revnu = lv_rpgc_revnu + it_result-revnu.
+*        lv_rpgc_roiyxa = lv_rpgc_roiyxa + it_result-roiyxa.
+*        lv_rpgc_revtmr = lv_rpgc_revtmr + it_result-revtmr.
+**        lv_rpgc_roitxa = lv_rpgc_roitxa + it_result-roitxa.
+*      ELSE.
+**       Build mean value
+*        CLEAR wa_result.
+*        wa_result-linecolor = gc_bluish.
+*        wa_result-rpgc = lv_rpgc.
+*        wa_result-answl = lv_rpgc_answl.
+*        wa_result-revnu = lv_rpgc_revnu.
+*        wa_result-revtmr = lv_rpgc_revtmr.
+*        IF wa_result-answl <> 0.
+*          wa_result-roinv = wa_result-revnu / wa_result-answl * 100.
+*          wa_result-roitmr = wa_result-revtmr / wa_result-answl * 100.
+*        ELSE.
+*          wa_result-roinv = 0.
+*          wa_result-roitmr = 0.
+*        ENDIF.
+**       ROI extrapolated to year
+*        wa_result-roiyr = wa_result-roinv * lv_factor.
+**       Sum ( ROI x Acquisition Value )
+*        wa_result-roiyxa = lv_rpgc_roiyxa.
+**       Average ( ROI per Year x Acq val ), weighted by Acq Value
+*        IF wa_result-answl <> 0.
+*          wa_result-roiyr = wa_result-roiyxa / wa_result-answl.
+*        ELSE.
+*          wa_result-roiyr = 0.
+*        ENDIF.*
+**       Insert new line
+*        INSERT wa_result INTO it_result.
+*
+**       Reset for new range of PGC
+*        lv_rpgc = it_result-rpgc.
+*        lv_rpgc_answl = it_result-answl.
+*        lv_rpgc_revnu = it_result-revnu.
+*        lv_rpgc_roiyxa = it_result-roiyxa.
+*        lv_rpgc_revtmr = it_result-revtmr.
+*        lv_rpgc_roitxa = it_result-roitxa.
+*      ENDIF.
+
+*     Average by Machine PGC
+*     ----------------------
+      IF ( it_result-pgc = lv_mpgc AND
+           it_result-gac = lv_mgac ).
+        lv_mpgc_answl = lv_mpgc_answl + it_result-answl.
+        lv_mpgc_revnu = lv_mpgc_revnu + it_result-revnu.
+        lv_mpgc_roiyxa = lv_mpgc_roiyxa + it_result-roiyxa.
+        lv_mpgc_revtmr = lv_mpgc_revtmr + it_result-revtmr.
+*        lv_mpgc_roitxa = lv_mpgc_roitxa + it_result-roitxa.
+      ELSE.
+*       Build mean value
+        CLEAR wa_result.
+        wa_result-linecolor = gc_bluish.
+        wa_result-pgc = lv_mpgc.
+        wa_result-answl = lv_mpgc_answl.
+        wa_result-revnu = lv_mpgc_revnu.
+        wa_result-revtmr = lv_mpgc_revtmr.
+        IF wa_result-answl <> 0.
+          wa_result-roinv = wa_result-revnu / wa_result-answl * 100.
+          wa_result-roitmr = wa_result-revtmr / wa_result-answl * 100.
+        ELSE.
+          wa_result-roinv = 0.
+          wa_result-roitmr = 0.
+        ENDIF.
+*       ROI extrapolated to year
+        wa_result-roiyr = wa_result-roinv * lv_factor.
+*       Sum ( ROI x Acquisition Value )
+        wa_result-roiyxa = lv_mpgc_roiyxa.
+*       Average ( ROI per Year x Acq val ), weighted by Acq Value
+        IF wa_result-answl <> 0.
+          wa_result-roiyr = wa_result-roiyxa / wa_result-answl.
+        ELSE.
+          wa_result-roiyr = 0.
+        ENDIF.
+
+*       Insert new line
+        INSERT wa_result INTO it_result.
+
+*       Reset for new range of PGC
+        lv_mpgc = it_result-pgc.
+        lv_mpgc_answl = it_result-answl.
+        lv_mpgc_revnu = it_result-revnu.
+        lv_mpgc_roiyxa = it_result-roiyxa.
+        lv_mpgc_revtmr = it_result-revtmr.
+*        lv_mpgc_roitxa = it_result-roitxa.
+      ENDIF.
+
+*     Average by Machine GAC
+*     ----------------------
+      IF it_result-gac = lv_mgac.
+        lv_mgac_answl = lv_mgac_answl + it_result-answl.
+        lv_mgac_revnu = lv_mgac_revnu + it_result-revnu.
+        lv_mgac_roiyxa = lv_mgac_roiyxa + it_result-roiyxa.
+        lv_mgac_revtmr = lv_mgac_revtmr + it_result-revtmr.
+*        lv_mgac_roitxa = lv_mgac_roitxa + it_result-roitxa.
+      ELSE.
+*       Build mean value
+        CLEAR wa_result.
+        wa_result-linecolor = gc_blue.
+        wa_result-gac = lv_mgac.
+        wa_result-answl = lv_mgac_answl.
+        wa_result-revnu = lv_mgac_revnu.
+        wa_result-revtmr = lv_mgac_revtmr.
+        IF wa_result-answl <> 0.
+          wa_result-roinv = wa_result-revnu / wa_result-answl * 100.
+          wa_result-roitmr = wa_result-revtmr / wa_result-answl * 100.
+        ELSE.
+          wa_result-roinv = 0.
+        ENDIF.
+*       ROI extrapolated to year
+        wa_result-roiyr = wa_result-roinv * lv_factor.
+*       Sum ( ROI x Acquisition Value )
+        wa_result-roiyxa = lv_mgac_roiyxa.
+*        wa_result-roitxa = lv_mgac_roitxa.
+*       Average ( ROI per Year x Acq val ), weighted by Acq Value
+        IF wa_result-answl <> 0.
+          wa_result-roiyr = wa_result-roiyxa / wa_result-answl.
+        ELSE.
+          wa_result-roiyr = 0.
+        ENDIF.
+
+*       Insert new line
+        INSERT wa_result INTO it_result.
+
+*       Reset for new range of GAC
+        lv_mgac = it_result-gac.
+        lv_mgac_answl = it_result-answl.
+        lv_mgac_revnu = it_result-revnu.
+        lv_mgac_roiyxa = it_result-roiyxa.
+        lv_mgac_revtmr = it_result-revtmr.
+*        lv_mgac_roitxa = it_result-roitxa.
+      ENDIF.
+
+*     Add for grand totals
+      lv_gtot_answl = lv_gtot_answl + it_result-answl.
+      lv_gtot_revnu = lv_gtot_revnu + it_result-revnu.
+      lv_gtot_roiyxa = lv_gtot_roiyxa + it_result-roiyxa.
+      lv_gtot_revtmr = lv_gtot_revtmr + it_result-revtmr.
+*      lv_gtot_roitxa = lv_gtot_roitxa + it_result-roitxa.
+
+    ENDLOOP.  " it_result
+*   Calculate last averages
+
+*   Closing averages
+*   Average by Model
+*   ----------------
+    CLEAR wa_result.
+    wa_result-linecolor = gc_gray.
+    wa_result-model = lv_modl.
+    wa_result-answl = lv_modl_answl.
+    wa_result-revnu = lv_modl_revnu.
+    wa_result-revtmr = lv_modl_revtmr.
+    IF wa_result-answl <> 0.
+      wa_result-roinv = wa_result-revnu / wa_result-answl * 100.
+      wa_result-roitmr = wa_result-revtmr / wa_result-answl * 100.
+    ELSE.
+      wa_result-roinv = 0.
+      wa_result-roitmr = 0.
+    ENDIF.
+*   ROI extrapolated to year
+    wa_result-roiyr = wa_result-roinv * lv_factor.
+*   Sum ( ROI x Acquisition Value )
+    wa_result-roiyxa = lv_modl_roiyxa.
+*   Average ( ROI per Year x Acq val ), weighted by Acq Value
+    IF wa_result-answl <> 0.
+      wa_result-roiyr = wa_result-roiyxa / wa_result-answl.
+    ELSE.
+      wa_result-roiyr = 0.
+    ENDIF.
+
+*   Insert new line
+    APPEND wa_result TO it_result.
+
+**   Average by Revenue PGC
+**   ----------------------
+*    CLEAR wa_result.
+*    wa_result-linecolor = gc_bluish.
+*    wa_result-rpgc = lv_rpgc.
+*    wa_result-answl = lv_rpgc_answl.
+*    wa_result-revnu = lv_rpgc_revnu.
+*    wa_result-revtmr = lv_rpgc_revtmr.
+*    IF wa_result-answl <> 0.
+*      wa_result-roinv = wa_result-revnu / wa_result-answl * 100.
+*      wa_result-roitmr = wa_result-revtmr / wa_result-answl * 100.
+*    ELSE.
+*      wa_result-roinv = 0.
+*      wa_result-roitmr = 0.
+*    ENDIF.
+**   ROI extrapolated to year
+*    wa_result-roiyr = wa_result-roinv * lv_factor.
+**   Sum ( ROI x Acquisition Value )
+*    wa_result-roiyxa = lv_rpgc_roiyxa.
+**   Average ( ROI per Year x Acq val ), weighted by Acq Value
+*    IF wa_result-answl <> 0.
+*      wa_result-roiyr = wa_result-roiyxa / wa_result-answl.
+*    ELSE.
+*      wa_result-roiyr = 0.
+*    ENDIF.
+*
+**   Insert new line
+*    APPEND wa_result TO it_result.
+
+*   Average by Machine PGC
+*   ----------------------
+    CLEAR wa_result.
+    wa_result-linecolor = gc_bluish.
+    wa_result-pgc = lv_mpgc.
+    wa_result-answl = lv_mpgc_answl.
+    wa_result-revnu = lv_mpgc_revnu.
+    wa_result-revtmr = lv_mpgc_revtmr.
+    IF wa_result-answl <> 0.
+      wa_result-roinv = wa_result-revnu / wa_result-answl * 100.
+      wa_result-roitmr = wa_result-revtmr / wa_result-answl * 100.
+    ELSE.
+      wa_result-roinv = 0.
+      wa_result-roitmr = 0.
+    ENDIF.
+*   ROI extrapolated to year
+    wa_result-roiyr = wa_result-roinv * lv_factor.
+*   Sum ( ROI x Acquisition Value )
+    wa_result-roiyxa = lv_mpgc_roiyxa.
+*   Average ( ROI per Year x Acq val ), weighted by Acq Value
+    IF wa_result-answl <> 0.
+      wa_result-roiyr = wa_result-roiyxa / wa_result-answl.
+    ELSE.
+      wa_result-roiyr = 0.
+    ENDIF.
+
+*   Insert new line
+    APPEND wa_result TO it_result.
+
+*   Average by Machine GAC
+*   ----------------------
+    CLEAR wa_result.
+    wa_result-linecolor = gc_blue.
+    wa_result-gac = lv_mgac.
+    wa_result-answl = lv_mgac_answl.
+    wa_result-revnu = lv_mgac_revnu.
+    wa_result-revtmr = lv_mgac_revtmr.
+    IF wa_result-answl <> 0.
+      wa_result-roinv = wa_result-revnu / wa_result-answl * 100.
+      wa_result-roitmr = wa_result-revtmr / wa_result-answl * 100.
+    ELSE.
+      wa_result-roinv = 0.
+      wa_result-roitmr = 0.
+    ENDIF.
+*   ROI extrapolated to year
+    wa_result-roiyr = wa_result-roinv * lv_factor.
+*   Sum ( ROI x Acquisition Value )
+    wa_result-roiyxa = lv_mgac_roiyxa.
+*   Average ( ROI per Year x Acq val ), weighted by Acq Value
+    IF wa_result-answl <> 0.
+      wa_result-roiyr = wa_result-roiyxa / wa_result-answl.
+    ELSE.
+      wa_result-roiyr = 0.
+    ENDIF.
+
+*   Insert new line
+    APPEND wa_result TO it_result.
+
+*   Grand Totals
+*   ------------
+    CLEAR wa_result.
+    wa_result-linecolor = gc_red.
+    wa_result-answl = lv_gtot_answl.
+    wa_result-revnu = lv_gtot_revnu.
+    wa_result-revtmr = lv_gtot_revtmr.
+    IF wa_result-answl <> 0.
+      wa_result-roinv = wa_result-revnu / wa_result-answl * 100.
+      wa_result-roitmr = wa_result-revtmr / wa_result-answl * 100.
+    ELSE.
+      wa_result-roinv = 0.
+      wa_result-roitmr = 0.
+    ENDIF.
+*   ROI extrapolated to year
+    wa_result-roiyr = wa_result-roinv * lv_factor.
+*   Sum ( ROI x Acquisition Value )
+    wa_result-roiyxa = lv_gtot_roiyxa.
+*   Average ( ROI per Year x Acq val ), weighted by Acq Value
+    IF wa_result-answl <> 0.
+      wa_result-roiyr = wa_result-roiyxa / wa_result-answl.
+    ELSE.
+      wa_result-roiyr = 0.
+    ENDIF.
+
+*   Insert new line
+    APPEND wa_result TO it_result.
+
+  ENDIF.    " data in it_result.
+ENDFORM.  " calc_mean
+
+***********************************************************************
+** Module STATUS_0100 OUTPUT                                          *
+***********************************************************************
+MODULE status_0100 OUTPUT.
+  SET TITLEBAR 'TITLE100' .
+  SET PF-STATUS 'STATUS100'.
+ENDMODULE.                 " STATUS_0100  OUTPUT
+
+***********************************************************************
+** Module USER_COMMAND_0100 INPUT                                     *
+***********************************************************************
+MODULE user_command_0100 INPUT.
+
+  CASE okcode.
+    WHEN 'BACK'.
+      LEAVE TO SCREEN 0.
+    WHEN 'EXIT'.
+      LEAVE TO SCREEN 0.
+  ENDCASE.  " okcode
+ENDMODULE.  " USER_COMMAND_0100 INPUT
+
+
+***********************************************************************
+** Module PREPARE_SCREEN OUTPUT                                       *
+***********************************************************************
+MODULE prepare_screen OUTPUT.
+
+  IF obj_container IS INITIAL.
+    PERFORM build_alv.
+  ENDIF.    " obj_container INITIAL
+
+ENDMODULE.    " prepare_screen
+
+
+***********************************************************************
+* Form BUILD_ALV                                                      *
+***********************************************************************
+* No arguments                                                        *
+***********************************************************************
+* Builds the field catalog, sets display parameters and calls the     *
+* method to display the results on screen.                            *
+***********************************************************************
+FORM build_alv.
+
+  DATA:  lv_off TYPE int4.
+  CALL METHOD cl_gui_alv_grid=>offline
+    RECEIVING
+      e_offline = lv_off.
+
+  IF lv_off IS INITIAL.                                     "MOD-004
+    IF obj_container IS INITIAL .
+      CREATE OBJECT obj_container
+        EXPORTING
+            repid           =  sy-repid
+            dynnr           =  sy-dynnr
+            lifetime        =  cntl_lifetime_dynpro
+*          ratio           =  90.
+            extension       =  285                          " 5000
+            side  = cl_gui_docking_container=>dock_at_bottom.
+
+    ENDIF.                                                  "MOD-004
+  ENDIF.                                                    "MOD-004
+  IF obj_alv IS INITIAL.                                    "MOD-004
+    CREATE OBJECT obj_alv
+              EXPORTING i_parent = obj_container.
+
+  ENDIF.
+
+
+
+
+
+
+
+
+
+* Set screen variables
+  o_bukrs = p_bukrs.
+  o_werks = so_werks-low.
+  o_vkorg = so_vkorg-low.
+* Start date
+  o_angdt(2)   = p_angdt+6(2).
+  o_angdt+2    = '.'.
+  o_angdt+3(2) = p_angdt+4(2).
+  o_angdt+5    = '.'.
+  o_angdt+6(4) = p_angdt(4).
+* End date
+  o_bnddt(2)   = p_bnddt+6(2).
+  o_bnddt+2    = '.'.
+  o_bnddt+3(2) = p_bnddt+4(2).
+  o_bnddt+5    = '.'.
+  o_bnddt+6(4) = p_bnddt(4).
+
+  PERFORM build_field_catalog.
+
+*  lv_tmpcol = 'C000'.
+*  LOOP AT it_result.
+*    lv_tmpcol+1(1) = sy-tabix MOD 10.
+*    it_result-linecolor = lv_tmpcol.
+*    MODIFY it_result.
+*  ENDLOOP.
+
+** Build layout, including default variant with subtotals
+  gs_variant-report = sy-repid.
+*  gs_variant-variant = '/SUB_TOTALS'.
+*  gs_layout-no_toolbar = lc_true.
+  gs_layout-info_fname = 'LINECOLOR'.   " Color field name
+  gs_layout-cwidth_opt = 'X'.           " Auto size column with
+  gs_layout-sel_mode   = 'B'.           " single row selectable
+
+*    Note: i_save parameter:
+*    U Only user specific layouts can be saved
+*    X Only global layouts can be saved
+*    A Both user specific and global layouts can be saved
+*    Space Layouts can not be saved
+
+  CALL METHOD obj_alv->set_table_for_first_display
+    EXPORTING
+      i_save          = 'A'
+      is_variant      = gs_variant
+      is_layout       = gs_layout
+    CHANGING
+      it_outtab       = it_result[]
+      it_fieldcatalog = it_fieldcat[].
+
+ENDFORM.                    "build_alv
+
+
+***********************************************************************
+* Form BUILD_FIELD_CATALOG                                            *
+***********************************************************************
+* Builds the field catalog for each field in it_result.               *
+***********************************************************************
+FORM build_field_catalog.
+
+  CLEAR it_fieldcat.
+
+* Field: Company Code
+  it_fieldcat-fieldname = 'BUKRS'.
+  it_fieldcat-coltext = 'CCode'(001).
+  it_fieldcat-tooltip = 'Company Code'(002).
+  it_fieldcat-fix_column = 'X'.
+  it_fieldcat-emphasize = 'X'.
+  APPEND it_fieldcat.
+
+* Field: Plant
+  it_fieldcat-fieldname = 'SWERK'.
+  it_fieldcat-coltext = 'Plant'(003).
+  it_fieldcat-tooltip = 'Owning plant'(004).
+  it_fieldcat-fix_column = 'X'.
+  it_fieldcat-emphasize = 'X'.
+  APPEND it_fieldcat.
+
+* Field: GAC
+  it_fieldcat-fieldname = 'GAC'.
+  it_fieldcat-coltext = 'GAC'(005).
+  it_fieldcat-tooltip = 'GAC'(006).
+  it_fieldcat-fix_column = 'X'.
+  it_fieldcat-emphasize = 'X'.
+  APPEND it_fieldcat.
+
+* Field: PGC
+  it_fieldcat-fieldname = 'PGC'.
+  it_fieldcat-coltext = 'PGC'(007).
+  it_fieldcat-tooltip = 'PGC'(008).
+  it_fieldcat-fix_column = 'X'.
+  it_fieldcat-emphasize = 'X'.
+  APPEND it_fieldcat.
+
+*   Field: Revenue PGC
+*    it_fieldcat-fieldname = 'RPGC'.
+*    it_fieldcat-coltext = 'Rev PGC'(009).
+*    it_fieldcat-tooltip = 'Revenue PGC'(010).
+*    it_fieldcat-fix_column = 'X'.
+*    it_fieldcat-emphasize = 'X'.
+*    APPEND it_fieldcat.
+
+* Field: Model
+  it_fieldcat-fieldname = 'MODEL'.
+  it_fieldcat-coltext = 'Model'(011).
+  it_fieldcat-tooltip = 'Model material number'(012).
+  it_fieldcat-fix_column = 'X'.
+  it_fieldcat-emphasize = 'X'.
+  APPEND it_fieldcat.
+
+* Field: Model description
+  it_fieldcat-fieldname = 'MODESC'.
+  it_fieldcat-coltext = 'Model desc'(013).
+  it_fieldcat-tooltip = 'Model description'(014).
+  it_fieldcat-fix_column = 'X'.
+  it_fieldcat-emphasize = 'X'.
+  APPEND it_fieldcat.
+
+* Field: Material number
+  it_fieldcat-fieldname = 'MATNR'.
+  it_fieldcat-coltext = 'Material'(015).
+  it_fieldcat-tooltip = 'Material number'(016).
+  it_fieldcat-fix_column = 'X'.
+  it_fieldcat-emphasize = 'X'.
+  APPEND it_fieldcat.
+
+* Field: Material description
+  it_fieldcat-fieldname = 'MADESC'.
+  it_fieldcat-coltext = 'Material desc'(017).
+  it_fieldcat-tooltip = 'Material description'(018).
+  it_fieldcat-fix_column = 'X'.
+  it_fieldcat-emphasize = 'X'.
+  APPEND it_fieldcat.
+
+* Field: Equipment number
+  it_fieldcat-fieldname = 'EQUNR'.
+  it_fieldcat-coltext = 'Equipment nr'(019).
+  it_fieldcat-tooltip = 'Equipment number'(020).
+  it_fieldcat-fix_column = 'X'.
+  it_fieldcat-emphasize = 'X'.
+  APPEND it_fieldcat.
+
+* Field: Serial number
+  it_fieldcat-fieldname = 'SERNR'.
+  it_fieldcat-coltext = 'Serial nr'(021).
+  it_fieldcat-tooltip = 'Serial number'(022).
+  it_fieldcat-fix_column = 'X'.
+  it_fieldcat-emphasize = 'X'.
+  APPEND it_fieldcat.
+
+* Field: Acquisition date
+  it_fieldcat-fieldname = 'ZUGDT'.
+  it_fieldcat-coltext = 'Acq date'(023).
+  it_fieldcat-tooltip = 'Acquisition date'(024).
+  it_fieldcat-fix_column = 'X'.
+  it_fieldcat-emphasize = 'X'.
+  APPEND it_fieldcat.
+
+* Field: Desinvestment date
+  it_fieldcat-fieldname = 'DEAKT'.
+  it_fieldcat-coltext = 'Desinv date'(033).
+  it_fieldcat-tooltip = 'Desinvestment date'(034).
+  it_fieldcat-fix_column = 'X'.
+  it_fieldcat-emphasize = 'X'.
+  APPEND it_fieldcat.
+
+* Field: Net Book value
+  it_fieldcat-fieldname = 'ANSWL'.
+  it_fieldcat-coltext = 'Acq Value'(025).
+  it_fieldcat-tooltip = 'Acquisition Value'(026).
+  it_fieldcat-fix_column = 'X'.
+  it_fieldcat-emphasize = 'X'.
+  APPEND it_fieldcat.
+
+* Field: Rental revenue
+  it_fieldcat-fieldname = 'REVNU'.
+  it_fieldcat-coltext = 'Revenue'(027).
+  it_fieldcat-tooltip = 'Rental revenue within selected period'(028).
+  it_fieldcat-fix_column = 'X'.
+  it_fieldcat-emphasize = 'X'.
+  APPEND it_fieldcat.
+
+* Field: Return of Investment
+  it_fieldcat-fieldname = 'ROINV'.
+  it_fieldcat-coltext = 'ROI'(029).
+  it_fieldcat-tooltip = 'ROI selected period'(030).
+  it_fieldcat-fix_column = 'X'.
+  it_fieldcat-emphasize = 'X'.
+  APPEND it_fieldcat.
+
+* Field: Return of Investment extrapolated to year period
+  it_fieldcat-fieldname = 'ROIYR'.
+  it_fieldcat-coltext = 'ROI annualized'(031).
+  it_fieldcat-tooltip = 'ROI annualized'(032).
+  it_fieldcat-fix_column = 'X'.
+  it_fieldcat-emphasize = 'X'.
+  APPEND it_fieldcat.
+
+* Field: ROI per year multiplied by Acquisition Value
+*  it_fieldcat-fieldname = 'ROIYXA'.
+*  it_fieldcat-coltext = 'ROI(Year) x Acq'(035).
+*  it_fieldcat-tooltip = 'ROI (Year) x Acquisition Value'(036).
+*  it_fieldcat-fix_column = 'X'.
+*  it_fieldcat-emphasize = 'X'.
+*  APPEND it_fieldcat.
+
+* Field: Rental revenue over 12 months rolling
+  it_fieldcat-fieldname = 'REVTMR'.
+  it_fieldcat-coltext = '12MR Rev'(037).
+  it_fieldcat-tooltip = 'Rental revenue over 12 months rolling'(038).
+  it_fieldcat-fix_column = 'X'.
+  it_fieldcat-emphasize = 'X'.
+  APPEND it_fieldcat.
+
+* Field: Return of Investment over 12 months rolling
+  it_fieldcat-fieldname = 'ROITMR'.
+  it_fieldcat-coltext = '12MR ROI'(039).
+  it_fieldcat-tooltip = 'Return on investment over 12 months rolling'(040).
+  it_fieldcat-fix_column = 'X'.
+  it_fieldcat-emphasize = 'X'.
+  APPEND it_fieldcat.
+* 40
+ENDFORM.    " build_field_catalog
+
+
+*&---------------------------------------------------------------------*
+*&      Form  Check_Authorization
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM check_authorization.
+
+  DATA: t_tvko LIKE STANDARD TABLE OF tvko WITH HEADER LINE.
+
+  SELECT * FROM tvko
+  INTO TABLE t_tvko WHERE vkorg IN so_vkorg.
+
+  LOOP AT t_tvko.
+    AUTHORITY-CHECK OBJECT 'M_MATE_VKO'
+             ID 'ACTVT' DUMMY
+             ID 'VKORG' FIELD t_tvko-vkorg
+             ID 'VTWEG' DUMMY.
+
+    IF sy-subrc = 4.
+*   No authorisation to display the data
+      MESSAGE ID 'YSE_GENERAL' TYPE 'E' NUMBER '006' WITH t_tvko-vkorg.
+    ELSEIF sy-subrc <> 0.
+*   Error checking authorization.
+      MESSAGE ID 'YSE_GENERAL' TYPE 'E' NUMBER '004'.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    " Check_Authorization
+
+
+*&---------------------------------------------------------------------*
+*&      Form  fill_missing_plant
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->L_I_EQUI_TMP  text
+*----------------------------------------------------------------------*
+FORM fill_missing_plant  TABLES   l_i_equi_tmp STRUCTURE it_equ_b.
+
+  DATA:
+       l_matnr  LIKE riserx1-matnr,
+       l_sernr  LIKE riserx1-sernr,
+       l_equi_nr LIKE riserx1-equnr.
+
+  DATA: BEGIN OF da_sertab OCCURS 1.
+          INCLUDE STRUCTURE riserx1.
+  DATA: END OF da_sertab.
+
+  DATA: BEGIN OF intobjk OCCURS 30.
+          INCLUDE STRUCTURE objk.
+  DATA: END  OF intobjk.
+  DATA: BEGIN OF it_ser03 OCCURS 999.
+          INCLUDE STRUCTURE ser03.
+  DATA: END OF it_ser03.
+
+  LOOP AT l_i_equi_tmp WHERE werks IS INITIAL.
+    CALL FUNCTION 'SERIAL_NOT_UNIQUE'
+      EXPORTING
+        material  = l_i_equi_tmp-matnr
+        serial    = l_i_equi_tmp-sernr
+      IMPORTING
+        serial    = l_sernr
+        equipment = l_equi_nr
+      EXCEPTIONS
+        not_found = 01.
+
+    CHECK sy-subrc = 0.
+    CHECK NOT l_equi_nr IS INITIAL.
+
+* Es werden alle Objektlisten zur Serialnummer selektiert.
+    CLEAR intobjk[].
+    SELECT *
+    FROM objk
+    INTO TABLE intobjk
+    WHERE equnr = l_equi_nr
+    AND taser EQ 'SER03'.
+    IF sy-subrc EQ 0.
+      SELECT *
+      INTO TABLE it_ser03
+      FROM ser03
+      FOR ALL ENTRIES IN intobjk
+      WHERE obknr = intobjk-obknr
+      AND ( bwart EQ '601' OR bwart EQ '551' ).
+      IF sy-subrc EQ 0.
+        LOOP AT it_ser03.
+          MOVE it_ser03-werk TO l_i_equi_tmp-werks.
+          MODIFY l_i_equi_tmp.
+          EXIT.
+        ENDLOOP.
+      ENDIF.
+    ENDIF.
+
+  ENDLOOP.
+
+ENDFORM.                    "fill_missing_plant
+
+*&---------------------------------------------------------------------*
+*&      Form  delete_deactivated_equipments
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM delete_deactivated_equipments .
+
+  LOOP AT it_eq.
+*  read table it_invest
+    READ TABLE it_anlc WITH KEY equnr = it_eq-equnr.
+    IF sy-subrc = 0.
+      IF ( it_anlc-deakt LT p_angdt AND NOT it_anlc-deakt IS INITIAL )
+        OR  it_anlc-zugdt GT p_bnddt.
+        DELETE it_eq.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+
+ENDFORM.                    "delete_deactivated_equipments
+
+*Text symbol text£º
+*001:CCode
+*002:Company Code
+*003:Plant
+*004:Owning plant
+*005:GAC
+*006:GAC
+*007:PGC
+*008:PGC
+*009:Rev PGC
+*010:Revenue PGC
+*011:Model
+*012:Model material number
+*013:Model desc
+*014:Model description
+*015:Material
+*016:Material number
+*017:Material desc
+*018:Material description
+*019:Equipment nr
+*020:Equipment number
+*021:Serial nr
+*022:Serial number
+*023:Acq date
+*024:Acquisition date
+*025:Acq Value
+*026:Acquisition Value
+*027:Revenue
+*028:Rental revenue within selected period
+*029:ROI
+*030:ROI selected period
+*031:ROI annualized
+*032:ROI annualized
+*033:Desinv date
+*034:Desinvestment date
+*035:ROI(Year) x Acq
+*036:ROI (Year) x Acquisition Value
+*037:12MR Rev
+*038:Rental revenue over 12 months rolling
+*039:12MR ROI
+*040:Return on investment over 12 months rolling
+*S01:Selection parameters (empty = all options)
+
+*S02:Equipment on rent
+*Selection text£º
+*CB_RENT:        Rent
+*P_ANGDT:        Start date
+*P_BNDDT:        End date
+*P_BUKRS:        Company code
+*SO_EQUNR:        Equipment
+*SO_GAC:        GAC
+*SO_MATNR:        Material
+*SO_MODEL:        Model
+*SO_PGC:        PGC
+*SO_VKORG:        Sales organisation
+*SO_VTWEG:        Distribution channel
+*SO_WERKS:        Plant

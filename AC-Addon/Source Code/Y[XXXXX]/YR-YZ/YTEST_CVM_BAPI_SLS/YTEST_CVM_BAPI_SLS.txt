@@ -1,0 +1,203 @@
+*&---------------------------------------------------------------------*
+*& Report  YTEST_CVM_BAPI_SLS
+*&
+*&---------------------------------------------------------------------*
+*&
+*&
+*&---------------------------------------------------------------------*
+
+REPORT  YTEST_CVM_BAPI_SLS.
+
+
+
+data:
+      lv_objnr type J_OBJNR,
+      lv_vbeln LIKE vbak-vbeln,
+      ls_header LIKE BAPISDHD1,
+      ls_headerx LIKE BAPISDHD1X,
+      lt_partner LIKE BAPIPARNR OCCURS 0 WITH HEADER LINE,
+      lt_return LIKE bapiret2 OCCURS 0 WITH HEADER LINE,
+
+      lv_objkey type SWO_TYPEID,
+      lt_vbeln TYPE VBELN_VA OCCURS 0 WITH HEADER LINE,
+      lv_auart type auart,
+
+      ls_pmsdo type pmsdo,
+
+      lv_sold_to type i_parnr,
+      lv_ship_to type i_parnr,
+
+      lv_short_text type auftext,
+
+      ls_caufvd type caufvd,
+
+      lv_zzcon type zzcon,
+      lv_zztrc type zztrc,
+      lv_zzpsf type zzpsf,
+      lv_ship_to_adrnr type AD_ADDRNUM,
+      lv_bemot type bemot,
+      ls_afih  type afih.
+*First check if an adv ship so already exists,
+*REL status is trigger but when SEO has TECO and this si cancelled
+*SEO get's REL again, which triggers this again and also recreates a
+*new ASSO
+
+*Get order type
+****       swc_get_property self 'OrderType' lv_auart.
+*break air22306.
+clear: lt_vbeln[], lt_vbeln.
+parameter: l_aufnr type CAUFVD-aufnr.
+move 'ZAM1' to LV_AUART.
+
+  move: l_aufnr to lv_objkey.
+    CALL FUNCTION 'ISM4_GET_EXISTING_LINK'
+      EXPORTING
+        OBJECTKEY_IMP = lv_objkey
+        AUART_IMP     = lv_auart
+      TABLES
+        VBELN_EXP     = lt_vbeln
+      EXCEPTIONS
+        NONSENSE      = 1
+        OTHERS        = 2.
+
+    check sy-subrc eq 0.
+*Check if a SO nr has been returned
+    loop at lt_vbeln.
+    endloop.
+    check sy-subrc ne 0.
+
+*Get the obj nr of the current SEO
+*      swc_get_property self 'StatusObjNumber' lv_objnr.
+       concatenate 'OR' l_aufnr into lv_objnr.
+
+*Get the sales area data
+      if sy-subrc eq 0.
+       select single * from pmsdo into ls_pmsdo where objnr eq lv_objnr.
+       select single * from afih into ls_afih where aufnr eq l_aufnr.
+      endif.
+*Fill header structure of bapi
+      ls_header-doc_type = 'ZO03'.
+      ls_headerx-doc_type = 'X'.
+
+      ls_header-sales_org = ls_pmsdo-vkorg.
+      ls_headerx-sales_org = 'X'.
+
+      ls_header-distr_chan = ls_pmsdo-vtweg.
+      ls_headerx-distr_chan = 'X'.
+
+      ls_header-division = ls_pmsdo-spart.
+      ls_headerx-division = 'X'.
+
+      ls_header-req_date_h = ls_afih-addat.
+      ls_headerx-req_date_h = 'X'.
+*PO
+      ls_header-PURCH_NO_C = ls_pmsdo-bstkd.
+      ls_headerx-PURCH_NO_C = 'X'.
+*Get urgency, consingee and transport code, from SEO custom fields
+      select single ZZAPC zzcon zztrc zzpsf
+      from aufk into (ls_header-ship_cond, lv_zzcon, lv_zztrc, lv_zzpsf)
+         where aufnr eq l_aufnr.
+      if sy-subrc eq 0.
+         ls_headerx-ship_cond = 'X'.
+*Calc Special Proc Ind
+       select single sdabw from YSE_ASO_SDABW into ls_header-S_PROC_INd
+          where zzcon = lv_zzcon
+            and zztrc = lv_zztrc.
+        if sy-subrc eq 0.
+          ls_headerx-S_PROC_INd = 'X'.
+        endif.
+      endif.
+*Customer group 4
+      select single kvgr4 autlf
+       from YSE_ASO_SHIP
+           into (ls_header-CUST_GRP4, ls_header-COMPL_DLV)
+           where zzpsf = lv_zzpsf.
+      if sy-subrc eq 0.
+         ls_headerx-CUST_GRP4 = 'X'.
+         ls_headerx-COMPL_DLV = 'X'.
+      endif.
+**New logic. If CPL + requirements in SEO both purchased and stock
+**set delivery block
+*      data: lt_resb type standard table of resb,
+      ls_headerx-updateflag = 'I'.
+*Get sold to and ship to
+      select single parnr from ihpa into lv_sold_to
+             where objnr eq lv_objnr
+             and parvw eq 'AG'.
+
+      select single
+         parnr adrnr from ihpa into (lv_ship_to, lv_ship_to_adrnr)
+             where objnr eq lv_objnr
+             and parvw eq 'WE'.
+
+
+* PARTNER DATA
+
+       lt_partner-partn_role = 'AG'.
+       lt_partner-partn_numb = lv_sold_to.
+       APPEND lt_partner.
+
+       lt_partner-partn_role = 'WE'.
+       lt_partner-partn_numb = lv_ship_to.
+       lt_partner-address    = lv_ship_to_adrnr.
+       APPEND lt_partner.
+
+*Select ref sales order for doc flow
+     select single kdauf bemot
+        from aufk into (ls_header-ref_doc, lv_bemot)
+        where aufnr eq l_aufnr.
+     if sy-subrc eq 0.
+       select single vbtyp from vbak
+           into ls_header-refdoc_cat
+           where vbeln eq ls_header-ref_doc.
+        ls_headerx-refdoc_cat = 'X'.
+     endif.
+
+     ls_headerx-ref_doc = 'X'.
+*Order reason
+select single augru from yse_aso_augru into ls_header-ord_reason
+       where bemot = lv_bemot.
+if sy-subrc eq 0.
+   ls_headerx-ord_reason = 'X'.
+endif.
+
+*Export aufnr to memory to update doc flow field on vbak
+data: lv_asso_aufnr type aufnr.
+move: l_aufnr to ls_header-REF_1,
+      'X'               to ls_headerx-ref_1.
+*export lv_asso_aufnr to memory id 'YSE_ASSO_CREA_AUFNR'.
+*break air22306.
+*Create empty sales order
+CALL FUNCTION 'BAPI_SALESORDER_CREATEFROMDAT2'
+EXPORTING
+ORDER_HEADER_IN = ls_header
+ORDER_HEADER_INx = ls_headerx
+IMPORTING
+salesdocument = lv_vbeln
+TABLES
+return = lt_return
+ORDER_PARTNERS = lt_partner.
+*And free the memory again for the aso del blocl check
+*free memory id 'YSE_ASSO_CREA_AUFNR'.
+
+LOOP AT lt_return WHERE type = 'E' OR type = 'A'.
+EXIT.
+ENDLOOP.
+
+IF sy-subrc = 0.
+*Error so exit
+exit.
+ELSE.
+*Sales order created so now link it to the service order
+ select single * from caufv into corresponding fields of ls_caufvd
+     where aufnr eq l_aufnr.
+ ls_caufvd-vorab_sm = 'X'.   "Adv Ship SO
+
+
+CALL FUNCTION 'YSE_SAVE_LINK_VORABVERSAND'
+  EXPORTING
+    CAUFVD_IMP          = ls_caufvd
+    VBELN_IMP           = lv_vbeln
+                    .
+commit work and wait.
+ENDIF.

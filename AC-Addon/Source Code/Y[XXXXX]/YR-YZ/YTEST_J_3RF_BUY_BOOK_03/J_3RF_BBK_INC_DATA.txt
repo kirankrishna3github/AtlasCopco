@@ -1,0 +1,422 @@
+*----------------------------------------------------------------------*
+* Data definition of report PurBook
+*----------------------------------------------------------------------*
+type-pools: abap, slis, j3rdl, sdydo.
+tables: bkpf, bseg, bset, t001, t007f, t007k, t021v, sscrfields,
+        j_3rbue_book_ind,
+        j_3rbue_book_num.
+
+* Reference to BAdI Object
+data: ref type ref to j_3rf_sp_ledger_badi.
+
+* Extended document list, including:
+* - BUKRS_ADD - reversed/corrected document company code
+* - BELNR_ADD - reversed/corrected document's number
+* - GJAHR_ADD - reversed/corrected document's year
+* - MONAT_ADD - reversed/corrected document's fiscal period
+* - FLAG_ADD  - 'X' - reversed, '' - corrected
+
+* Structure type
+types begin of j3rdl_doclist_ext.
+include type j3rdl_doclist.
+types: bukrs_add type bkpf-bukrs,
+       belnr_add type bkpf-belnr,
+       gjahr_add type bkpf-gjahr,
+       monat_add type bkpf-monat,
+       flag_add(1) type c.
+types end of j3rdl_doclist_ext.
+
+* Table type
+types: j3rdl_t_doclist_ext type standard table of j3rdl_doclist_ext.
+
+* Structure type without additional sheets
+types begin of j_3rbuy_old.
+        include structure j_3rbue_book_1.
+types:
+      col22                   type slis_fieldname,
+      flg_tax_sum(1)          type c,
+      flg_belnr_pay_storno(1) type c,
+      flg_vornu(1)            type c,
+      tmp_zuonr_belnr         like bseg-belnr,
+      tmp_zuonr_gjahr         like bseg-gjahr,
+      glvor                   like bkpf-glvor,
+      reserv                  like j_3rbue_bk_table-reserv,
+      one_time_acc            type xcpds.
+types end of j_3rbuy_old.
+
+* Structure type with additional sheets (for extracts)
+types begin of j_3rbuy_283.
+        include structure j_3rbuy_book_ext.
+types:
+      col22                   type slis_fieldname,
+      flg_tax_sum(1)          type c,
+      flg_belnr_pay_storno(1) type c,
+      flg_vornu(1)            type c,
+      tmp_zuonr_belnr         like bseg-belnr,
+      tmp_zuonr_gjahr         like bseg-gjahr,
+      glvor                   like bkpf-glvor,
+      reserv                  like j_3rbue_bk_table-reserv,
+      one_time_acc            type xcpds.
+types end of j_3rbuy_283.
+
+* Structure type with additional sheets (for extracts)
+types begin of j_3rbuy_ex.
+        include structure j_3rbuy_book_14.
+types:
+      col22                   type slis_fieldname,
+      glvor                   like bkpf-glvor,
+      reserv                  like j_3rbue_bk_table-reserv,
+      one_time_acc            type xcpds.
+types end of j_3rbuy_ex.
+
+* Structure type with additional sheets
+types j_3rbuy type j_3rf_sp_ledger_badi_interface=>j_3r_purchase_ledger.
+
+types: j_3r_t_buy    type standard table of j_3rbuy,
+       j_3r_t_buy_ex type standard table of j_3rbuy_ex.
+
+* ALV table type
+types: begin of j_3rbuy_alv.
+    include type j_3rbuy.
+types: tabcol type lvc_t_scol,
+  end of j_3rbuy_alv,
+  j_3rbuy_t_alv type standard table of j_3rbuy_alv.
+
+types begin of j_3r_totals.
+        include structure j_3rf_bk_totals_line.
+types basic(1) type c.
+types end of j_3r_totals.
+
+types j_3r_t_totals type standard table of j_3r_totals
+  with key bukrs
+           gjahr_bas
+           gjahr_add
+           monat_bas
+           monat_add
+           waers
+           basic.
+
+types t_book_num type sorted table of j_3rbue_book_num
+      with non-unique key bukrs belnr gjahr buzei.
+
+data: gs_extract1 like disextract,
+      gs_extract2 like disextract,
+      gs_extract3 like disextract,
+      gs_extract1c like disextract,
+      ex_laufi    like j_3rbue_bk_htabl-laufi.
+
+* Global internal tables and structures
+data: gt_doclist type j3rdl_t_doclist_ext,
+      gt_bkpf    type j3rdl_t_bkpf_cache,
+      gt_bseg    type j3rdl_t_bseg_cache,
+      gt_totals  type j_3r_t_totals,
+      gs_totals  type j_3rbuy.
+
+data: p_book     type standard table of j_3rbuy with header line,
+      p_book_alv type j_3rbuy_t_alv with header line.
+
+* Internal table for buffering of J_3RBUE_BOOK_NUM
+data: itab_book_num type t_book_num with header line.
+
+*----------------------------------------------------------------------*
+* ALV data
+*----------------------------------------------------------------------*
+* 'X' - additional sheets
+* ' ' - basic sheets
+data: g_add_mode(1) type c.
+
+constants: gc_formname_top_of_page type slis_formname value 'TOP_OF_PAGE'.
+
+data:  g_variant      like disvariant,
+       gx_variant     like disvariant,
+       g_repid        like sy-repid,
+       g_save(1)      type c,
+       g_exit(1)      type c,
+       g_default(1)   type c,
+       gt_fieldcat    type slis_t_fieldcat_alv,
+       gs_layout      type slis_layout_alv,
+       gt_events      type slis_t_event,
+       gs_print       type slis_print_alv,
+       g_status       type slis_formname value 'SET_STATUS',
+       g_user_command type slis_formname value 'USER_COMMAND',
+       gt_sort        type slis_t_sortinfo_alv.
+
+data: lt_header type sdydo_text_table,
+      lt_footer type sdydo_text_table.
+
+data: header_form      type slis_alv_event-form,
+      header_form_list type slis_alv_event-form,
+      footer_form      type slis_alv_event-form,
+      header_height    type i,
+      footer_height    type i.
+
+* ADOBE interface
+data: fm_name         type rs38l_fnam,
+      fp_docparams    type sfpdocparams,
+      fp_outputparams type sfpoutputparams,
+      fpname          type fpcontext-name.
+
+TYPES:
+      ty_adobe_line  TYPE j_3r_purchase_ledger_line14,
+      ty_adobe_total TYPE j_3r_purchase_ledger_line,
+      ty_adobe_tab   TYPE j_3r_purchase_ledger_tab14.
+* Form Interface
+data: buff_tab        type ty_adobe_tab,
+      buff_tab_add    type ty_adobe_tab,
+      buff_header     type j_3r_sp_ledger_header,
+      buff_header_add type j_3r_sp_ledger_header,
+      in_totals       type ty_adobe_total,
+* An approximate number of pages output per one package
+* This value can be changed to suit individual requirements
+*{   REPLACE        CD1K984508                                        1
+*\      pages_per_package type i value 200.
+      pages_per_package type i value 100.
+*}   REPLACE
+
+data: version_(10), date_(10), request_(10), ver1(60),
+      flg_ok_records type c.
+
+data: p_book_alv1 like standard table of p_book
+      with non-unique key
+      bukrs
+      belnr_inv
+      xblnr_inv
+      bldat_inv
+      budat_inv
+      dmbtr_inv
+      dmbtr_wrs_inv
+      wrbtr_inv
+      wrbtr_wrs_inv
+      bktxt_inv
+      belnr_pay
+      xblnr_pay
+      bldat_pay
+      budat_pay
+      dmbtr_wrs_pay
+      wrbtr_wrs_pay
+      bktxt_pay
+      belnr_origpay
+      gjahr_origpay
+      bldat_origpay
+      budat_origpay
+      xblnr_origpay
+      bktxt_origpay
+      bldat_trn
+      budat_trn
+      monat_trn
+      dmbtr_wrs_trn
+      wrbtr_wrs_trn
+      hwbas_wrs_trn
+      fwbas_wrs_trn
+      hwbas2_wrs_trn
+      fwbas2_wrs_trn
+      hwbas3_wrs_trn
+      fwbas3_wrs_trn
+      hwbas4_wrs_trn
+      fwbas4_wrs_trn
+      hwbas5_wrs_trn
+      fwbas5_wrs_trn
+      hwste_wrs_trn
+      fwste_wrs_trn
+      hwste2_wrs_trn
+      fwste2_wrs_trn
+      hwste3_wrs_trn
+      fwste3_wrs_trn
+      hwste5_wrs_trn
+      fwste5_wrs_trn
+      gjahr_test
+      lifnr_cred
+      name1_cred
+      name2_cred
+      name3_cred
+      name4_cred
+      name1_cred_r
+      name2_cred_r
+      name3_cred_r
+      name4_cred_r
+      stcd1_cred
+      stcd3_cred
+      part_payment
+      basgruno
+      stegruno
+      buzei_test
+      xblnr_test
+      flg_belnr_trn
+      bktxt_trn
+      mwskz
+      lights
+      box
+      flg_belnr_pay
+      flg_belnr_inv
+      flg_xragl_pay
+      flg_belnr_all
+      mm_inv_budat
+      mm_inv_ebln
+      mm_inv_ebelp
+      mm_inv_voiso
+      mwskz_inv
+      gjahr_trn
+      gjahr_inv
+      gjahr_pay
+      butxt
+      paval
+      dat_begin
+      dat_end
+      ekbe_belnr_mm
+      xref1_inv
+      xref1_dat
+      hkont_inv
+      hkont_trn
+      hkont_cln
+      mm_inv_vornu
+      usnam_inv
+      usnam_pay
+      usnam_pay_fct
+      num_line
+      belnr_trn
+      gsber_trn
+*      col22
+*      flg_tax_sum
+*      flg_belnr_pay_storno
+*      flg_vornu
+*      tmp_zuonr_belnr
+*      tmp_zuonr_gjahr
+      corr_type     " 1695097
+      corr_book
+      belnr_orig_inv
+      gjahr_orig_inv
+      bldat_orig_inv
+      budat_orig_inv
+      xblnr_orig_inv
+      number_rev
+      number_corr_rev
+      vatdate_inv
+      vatdate_trn   " end of 1695097
+      bldat_corr_inv " 1710598
+      xblnr_corr_inv " 1739523
+      journal        " 1711413
+      belnr_corr_inv gjahr_corr_inv  " 1720794
+      belnr_orig_rev gjahr_orig_rev  " 1734773
+      belnr_corr_rev gjahr_corr_rev
+      bldat_orig_rev bldat_corr_rev
+      ext_text_orig  ext_text_corr   " 1909868
+      oper_typ                            " 2074991
+      pay_ext_number pay_ext_bldat
+      comm_trade     agent_lifnr
+      agent_name     agent_inn  agent_kpp
+      glvor
+*      reserv
+      one_time_acc
+      ext_number
+      fullname
+      bukrs_add
+      belnr_add
+      gjahr_add
+      monat_add
+      buzei_add
+      flag_add
+   with header line.
+
+data: begin of postab occurs 50.
+data: xauth(1)      type c.                 " Berechtigung?
+data: xhell(1)      type c.                 " Hell anzeigen?
+        include structure rfpos.              " Listanzeigen-Struktur
+include rfeposc9.                                           "#EC *
+" Kunden-Sonderfelder
+data: xbkpf(1)      type c.                 " BKPF nachgelesen?
+data: xbseg(1)      type c.                 " BSEG nachgelesen?
+data: xbsec(1)      type c.                 " BSEC nachgelesen?
+data: xbsed(1)      type c.                 " BSED nachgelesen?
+data: xpayr(1)      type c.                 " PAYR nachgelesen?
+data: xbsegc(1)     type c.                 " BSEGC nachgelesen?
+data: xmod(1)       type c.                 " POSTAB modifiziert?
+data: end   of postab.
+
+data: begin of kontab occurs 10.
+        include structure rfepk.
+data: end   of kontab.
+
+data: begin of epos,
+      errnr(1)          type c,             " Fehlernummer
+      gjahr             like bseg-gjahr,    " Gesch#ftsjahr
+      varnr             like t021-varnr,    " Zeilenaufbau-Variante
+      title(30)         type c,             " Text f¨¹r TITLEBAR
+      info1(29)         type c,             " Zusatzinformation 1
+      xhell(1)          type c,             " POSTAB-XHELL genutzt?
+      ident             like tfav-ident,    " Arbeitsvorrat
+      end   of epos.
+
+data: begin of dynp_value_tab occurs 0.
+        include structure dynpread.
+data: end   of dynp_value_tab.
+
+data: code_page    like tcp00-cpcodepage,
+      blines       type i,
+      temp_t001    like table of t001 with header line,
+      wa_temp_t001 like line of temp_t001.
+
+DATA M_RANGE like range of bkpf-monat.
+
+constants:
+* OPERA codes (T007L-OPERA):
+*      downpayments, address data from company code
+       gc_opera_minus type t007l-opera value '-',
+*      downpayments, dmbtr_pay = HWBAS + HWSTE
+       gc_opera_plus  type t007l-opera value '+',
+*      change sign of all fields
+       gc_opera_neg   type t007l-opera value 'N',
+*      ignore deftax_item, use BSET
+       gc_opera_bset  type t007l-opera value 'B',
+*      gross tax amount, dmbtr_pay = HWBAS
+       gc_opera_gross type t007l-opera value 'G',
+*      payment to customs or tax office, dmbtr_pay = HWSTE
+       gc_opera_tax   type t007l-opera value 'T',
+*      downpayments, address data from partner (in opposite to '-')
+       gc_opera_pay   type t007l-opera value 'P',
+*      VAT agents, address data from company code (1897808)
+       gc_opera_agent type t007l-opera value 'V',
+*      Invoice amount is printed in Payment column (2108349)
+       gc_opera_payinv type t007l-opera value 'I',
+****
+*     name of the ALV structure
+       gc_j_3rbuy_alv type slis_fieldcat_alv-ref_tabname VALUE 'J_3RBUY_BOOK_14',
+       " maximum length of GTD per PDF row
+       max_gtd_len type i value 250.
+constants:
+*      1626029 - Customs Union
+       gc_rcu_xblnr type bkpf-xblnr value 'RCU^'.
+
+* 1718196 - split architecture
+types: begin of ty_s_itab_rseg,
+         ebeln type bseg-ebeln,
+         ebelp type bseg-ebelp,
+       end of ty_s_itab_rseg,
+       ty_t_itab_rseg type standard table of ty_s_itab_rseg,
+
+       begin of ty_s_tab_gtd_pos,
+         ebeln type bseg-ebeln,
+         ebelp type bseg-ebelp,
+         exnum type ekko-exnum,
+       end of ty_s_tab_gtd_pos,
+       ty_t_tab_gtd_pos type standard table of ty_s_tab_gtd_pos,
+
+       begin of ty_s_ekbe,
+         ebeln type ekbe-ebeln,
+         ebelp type ekbe-ebelp,
+         bewtp type ekbe-bewtp,
+         belnr type ekbe-belnr,
+         gjahr type ekbe-gjahr,
+         buzei type ekbe-buzei,
+         budat type ekbe-budat,
+         shkzg type ekbe-shkzg,
+         lfbnr type ekbe-lfbnr,
+         xwsbr type ekbe-xwsbr,
+         bwart type ekbe-bwart,
+         menge type ekbe-menge,
+         dmbtr type ekbe-dmbtr,
+       end of ty_s_ekbe,
+       ty_t_ekbe type standard table of ty_s_ekbe.
+
+data: " 1743956 - global customizing
+      gc_customizing TYPE j3rdl_customizing,
+      gc_params      TYPE j3rdl_bk_params.  " 2074991

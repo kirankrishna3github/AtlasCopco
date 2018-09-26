@@ -1,0 +1,645 @@
+************************************************************************
+*         Copyright(c) 2003 Deutsche Bank AG
+* All rights reserved. This Software is proprietary to Deutsche Bank AG
+* and is protected by copyright law and international treaties. Under no
+* circumstances are you permitted to make any attempt to alter, decrypt
+* or reverse engineer this software, and any unauthorised reproduction
+* of this software or any portion thereof may result in severe civil and
+* criminal penalties, and will be prosecuted to the maximum extent
+* possible under the law.
+************************************************************************
+REPORT YHFDBIPY NO STANDARD PAGE HEADING
+                LINE-COUNT 65
+                LINE-SIZE  100
+                MESSAGE-ID 38.
+************************************************************************
+*  Author       :  Deutsche Bank AG
+*  Date         :  Dec/2003
+*  Description  :  This program is used to download the payment details
+*                  for Auto or Outgoing payment.
+*  Assumption   :  WTX not netted for partial payment in foreign ccy.
+************************************************************************
+** DDIC-Customized Objects ********************************************
+TABLES: REGUH, REGUP, WITH_ITEM, T059P.
+TABLES: BSIK, BSAK, BSEG, BKPF, T001.
+TABLES: BSID, BSAD, TCURF, YHFPARMI.
+TABLES: RSEG.
+** Global fields *******************************************************
+** Global constants ****************************************************
+************************* Data Declaration *****************************
+DATA : ITAB_BSAK LIKE BSAK OCCURS 0 WITH HEADER LINE.
+DATA : ITAB_BSAD LIKE BSAD OCCURS 0 WITH HEADER LINE.
+DATA : ITAB_BSIK2 LIKE BSIK OCCURS 0 WITH HEADER LINE.
+DATA:  ITAB_RSEG LIKE RSEG OCCURS 0 WITH HEADER LINE.
+
+
+DATA : DC_IND LIKE BSEG-SHKZG,
+              AMOUNT LIKE BSEG-WRBTR,
+              IN_AMT LIKE RSEG-WRBTR,
+             TEMP_WHT LIKE BSEG-QBSHB,
+             WS_TEXT LIKE BSEG-SGTXT,
+              WS_AUGBL LIKE BSEG-AUGBL.
+DATA: W_SNO(4) TYPE N, INV_CURR LIKE BKPF-WAERS,
+            AMOUNT1(15), V_WTX_OPTION LIKE YHFPARMI-PARM_VAL,
+            IN_AMT1(15),
+            V_AMT_OPTION LIKE YHFPARMI-PARM_VAL.
+DATA: ITAB_BSIK LIKE BSIK OCCURS 0 WITH HEADER LINE.
+DATA: SEL_IND(1) TYPE C, WHT_INV_FLAG(1),FLAG(1).
+DATA: V_INV_TOT LIKE BSEG-WRBTR, V_OPY_FLAG(1) , V_REM_SRO_FLAG(1).
+DATA: V_WHT_AMT LIKE WITH_ITEM-WT_QBSHB, PAY_CURR LIKE BKPF-WAERS.
+
+*  PLPPF = previous line partial payment
+DATA: PLPPF(1).
+
+** Global arrays and internal tables ***********************************
+DATA: BEGIN OF I_REGUH OCCURS 0.
+        INCLUDE STRUCTURE REGUH.
+DATA: END OF I_REGUH.
+
+*to extract invoice description
+DATA:  lDocNo  TYPE BSEG-BELNR,
+           lDescp  TYPE BSEG-SGTXT.
+
+DATA : BEGIN OF DOWNTAB OCCURS 1,
+        LINE(100),
+END   OF DOWNTAB.
+************************* User Selection *******************************
+** Selection screen parameters *****************************************
+SELECT-OPTIONS: W_LAUFI FOR REGUH-LAUFI NO INTERVALS.
+SELECTION-SCREEN SKIP 1.
+
+SELECTION-SCREEN BEGIN OF BLOCK CRITERIA WITH FRAME TITLE TEXT-012.
+PARAMETERS: CO_CODE  LIKE BSIK-BUKRS.
+SELECT-OPTIONS: W_DOCNO  FOR BSIK-BELNR,
+PAY_METH FOR BSEG-ZLSCH.
+PARAMETERS:  W_FYR LIKE BSEG-GJAHR.
+SELECTION-SCREEN END OF BLOCK CRITERIA.
+
+PARAMETERS: PAYDET LIKE YHFHELP-YHPAYFILE.
+
+SELECTION-SCREEN SKIP 1.
+
+SELECTION-SCREEN BEGIN OF LINE.
+PARAMETERS: REF1 RADIOBUTTON GROUP RAD.
+SELECTION-SCREEN COMMENT 4(50) TEXT-010 .
+SELECTION-SCREEN END OF LINE.
+
+SELECTION-SCREEN BEGIN OF LINE.
+PARAMETERS: REF2 RADIOBUTTON GROUP RAD.
+SELECTION-SCREEN COMMENT 4(50) TEXT-011 .
+SELECTION-SCREEN END OF LINE.
+
+SELECTION-SCREEN BEGIN OF LINE.
+PARAMETERS: REF3 RADIOBUTTON GROUP RAD.
+SELECTION-SCREEN COMMENT 4(50) TEXT-009 .
+SELECTION-SCREEN END OF LINE.
+
+START-OF-SELECTION.
+  SELECT SINGLE * FROM T001 WHERE BUKRS = CO_CODE.
+
+  SELECT SINGLE PARM_VAL INTO V_REM_SRO_FLAG FROM YHFPARMI
+                         WHERE BUKRS = CO_CODE
+                         AND PARM1   = 'PDL'
+                         AND PARM2   = 'FMT'.
+
+  PERFORM GET_PAYMENT.
+
+  SORT ITAB_BSIK BY BUKRS AUGBL PENRC DESCENDING BELNR.
+  LOOP AT ITAB_BSIK.
+* get rid of reverse document
+    CLEAR: PAY_CURR, INV_CURR.
+    IF V_OPY_FLAG = 'Y'.
+      SELECT SINGLE * FROM BKPF WHERE BUKRS = ITAB_BSIK-BUKRS
+                                AND   BELNR = ITAB_BSIK-AUGBL
+                                AND   GJAHR = W_FYR.
+      IF NOT BKPF-STBLG IS INITIAL.
+        CONTINUE.
+      ENDIF.
+      PAY_CURR = BKPF-WAERS.
+    ELSE.
+      PAY_CURR = ITAB_BSIK-WAERS.
+    ENDIF.
+
+*   PLPPF EQ Y to separate first part pay from second
+    IF ITAB_BSIK-AUGBL NE WS_AUGBL OR PLPPF EQ 'Y'.
+
+      CLEAR: PLPPF.
+*Print the totals for the previous payment
+*      PERFORM print_totals.
+      W_SNO = 1.
+      WS_AUGBL = ITAB_BSIK-AUGBL.
+      WRITE:/.
+*     IF FLAG NE 'Y'.
+      IF ITAB_BSIK-PENRC NE 'Y'.
+        WRITE: / TEXT-001, ITAB_BSIK-AUGBL.
+      ELSE.
+        WRITE: / TEXT-001, ITAB_BSIK-BELNR.
+      ENDIF.
+      IF V_REM_SRO_FLAG EQ '1'.
+        IF V_OPY_FLAG = 'Y'. "outgoing payment
+          WRITE: / TEXT-016.
+          ULINE: /1(80).
+        ELSE.                "auto payment
+          WRITE: / TEXT-015.
+          ULINE: /1(80).
+        ENDIF.
+      ELSEIF V_REM_SRO_FLAG EQ '2'.
+        IF V_OPY_FLAG = 'Y'. "outgoing payment
+          WRITE: / TEXT-018.
+          ULINE: /1(80).
+        ELSE.                "auto payment
+          WRITE: / TEXT-017.
+          ULINE: /1(80).
+        ENDIF.
+      ELSE.
+        IF V_OPY_FLAG = 'Y'. "outgoing payment
+          WRITE: / TEXT-008.
+          ULINE: /1(80).
+        ELSE.                "auto payment
+          IF V_REM_SRO_FLAG EQ '4'.
+            WRITE: / TEXT-019.
+          ELSE.
+            WRITE: / TEXT-007.
+          ENDIF.
+          ULINE: /1(80).
+        ENDIF.
+      ENDIF.
+    ENDIF.
+    CLEAR:BKPF.
+    SELECT SINGLE * FROM BKPF WHERE BUKRS = ITAB_BSIK-BUKRS
+                              AND   BELNR = ITAB_BSIK-BELNR
+                              AND   GJAHR = ITAB_BSIK-GJAHR.
+    INV_CURR = BKPF-WAERS.
+
+    CLEAR:BSEG.
+    SELECT SINGLE * FROM BSEG WHERE BUKRS = ITAB_BSIK-BUKRS
+                              AND BELNR = ITAB_BSIK-BELNR
+                              AND GJAHR = ITAB_BSIK-GJAHR
+*                              AND BUZEI = 1.
+                         AND BUZEI = ITAB_BSIK-BUZEI.
+
+    IF V_REM_SRO_FLAG EQ '1'.
+      IF REF1 = 'X'.
+        WRITE: / BKPF-XBLNR(9).
+      ELSEIF REF2 = 'X'.
+        WRITE: / BKPF-BKTXT(9).
+      ELSE.
+        WRITE: / BSEG-ZUONR(9).
+      ENDIF.
+    ELSEIF V_REM_SRO_FLAG EQ '2'.
+      IF REF1 = 'X'.
+        WRITE: / BKPF-XBLNR.
+      ELSEIF REF2 = 'X'.
+        WRITE: / BKPF-BKTXT.
+      ELSE.
+        WRITE: / BSEG-ZUONR.
+      ENDIF.
+    ELSE.
+    ENDIF.
+    DC_IND = ITAB_BSIK-SHKZG.
+    TRANSLATE DC_IND USING 'H+S-'.
+
+    IF V_OPY_FLAG = 'Y'.
+      PERFORM GET_OPY_AMOUNT.
+    ELSE.
+      AMOUNT = ITAB_BSIK-WRBTR - ITAB_BSIK-QBSHB - ITAB_BSIK-WSKTO.
+    ENDIF.
+
+    IF V_REM_SRO_FLAG EQ '1'.
+      IF V_OPY_FLAG = 'Y'.   "for outgoing payment details.
+        WRITE: AMOUNT CURRENCY BSEG-PSWSL TO AMOUNT1.
+        WRITE: 11 BKPF-BLDAT NO-ZERO,
+        (35) BSEG-SGTXT.
+        WRITE: 58 ITAB_BSIK-WAERS,
+        65(15) AMOUNT1,
+        80 DC_IND.
+      ELSE.                   "for auto payment details
+        WRITE: AMOUNT CURRENCY ITAB_BSIK-WAERS TO AMOUNT1.
+        WRITE: 11 BKPF-BLDAT NO-ZERO,
+        (37) BSEG-SGTXT,
+        ITAB_BSIK-WAERS,
+        65(15) AMOUNT1,
+        80 DC_IND.
+      ENDIF.
+    ELSEIF V_REM_SRO_FLAG EQ '2'.
+      IF V_OPY_FLAG = 'Y'.   "for outgoing payment details.
+        WRITE: AMOUNT CURRENCY BSEG-PSWSL TO AMOUNT1.
+        WRITE: 18 BKPF-BLDAT NO-ZERO.
+*      IF FLAG NE 'Y'.
+       IF ITAB_BSIK-PENRC NE 'Y'.
+          WRITE: 29 ITAB_BSIK-BELNR.
+        ELSE.
+          WRITE: 29 ITAB_BSIK-REBZG.
+        ENDIF.
+        WRITE: 40 BSEG-SGTXT(15).
+        WRITE: 57  ITAB_BSIK-WAERS,
+        63 ITAB_BSIK-ZLSCH,
+         65(15) AMOUNT1,
+         80 DC_IND.
+      ELSE.                   "for auto payment details
+        WRITE: AMOUNT CURRENCY ITAB_BSIK-WAERS TO AMOUNT1.
+        WRITE: 18 BKPF-BLDAT NO-ZERO,
+        ITAB_BSIK-BELNR,
+        (16) BSEG-SGTXT,
+        ITAB_BSIK-WAERS,
+        65(15) AMOUNT1,
+        80 DC_IND.
+      ENDIF.
+    ELSE.
+      IF V_OPY_FLAG = 'Y'.   "for outgoing payment details.
+**  Changes for Punnee Req. 10.07.2006 no new line problem
+      IF REF1 = 'X'.
+        WRITE: / W_SNO,(10) BKPF-XBLNR.
+      ELSEIF REF2 = 'X'.
+        WRITE: / W_SNO, (10) BKPF-BKTXT.
+      ELSE.
+        WRITE: / W_SNO, (10) BSEG-ZUONR.
+      ENDIF.
+***
+        WRITE: AMOUNT CURRENCY BSEG-PSWSL TO AMOUNT1.
+        WRITE: 18 BKPF-BLDAT NO-ZERO.
+
+*Fully paid
+*       IF FLAG NE 'Y'.
+        IF ITAB_BSIK-PENRC NE 'Y'.
+          lDocNo = ITAB_BSIK-BELNR.
+          WRITE: 29 ITAB_BSIK-BELNR.
+*Partial paid
+        ELSE.
+          lDocNo = ITAB_BSIK-REBZG.
+          WRITE: 29 ITAB_BSIK-REBZG.
+        ENDIF.
+
+*Always select desc of the doc shown
+        SELECT SINGLE SGTXT into lDescp FROM BSEG
+                            WHERE BUKRS = ITAB_BSIK-BUKRS
+                              AND GJAHR = ITAB_BSIK-GJAHR
+                              AND BELNR = lDocNo
+                              AND BUZEI = 1.
+*        WRITE: 40(15) BSEG-SGTXT.
+        WRITE: 40(15) lDescp.
+        WRITE: 57 ITAB_BSIK-WAERS,
+        63 ITAB_BSIK-ZLSCH,
+        65(15) AMOUNT1,
+        80 DC_IND.
+      ELSE.                   "for auto payment details
+        CLEAR: ITAB_RSEG.
+        SELECT * FROM RSEG INTO TABLE ITAB_RSEG
+                            WHERE BUKRS = ITAB_BSIK-BUKRS
+                            AND BELNR = ITAB_BSIK-XBLNR
+                            AND GJAHR = ITAB_BSIK-GJAHR.
+        IF SY-SUBRC EQ 0.
+          IF  V_REM_SRO_FLAG EQ '4'.
+            LOOP AT ITAB_RSEG.
+              IN_AMT = ITAB_RSEG-WRBTR.
+              DC_IND = ITAB_RSEG-SHKZG.
+              TRANSLATE DC_IND USING 'H-S+'.
+              WRITE: IN_AMT CURRENCY ITAB_BSIK-WAERS TO IN_AMT1.
+              WRITE: / W_SNO, (10) ITAB_RSEG-BELNR .
+              WRITE: 18 BKPF-BLDAT NO-ZERO,
+                                  ITAB_RSEG-XBLNR,
+                                  ITAB_RSEG-EBELN,
+                                  ITAB_RSEG-LFBNR,
+                                  67(15) IN_AMT1,
+                                  82 DC_IND.
+              W_SNO = W_SNO + 1.
+            ENDLOOP.
+          ENDIF.
+        ELSE.
+          WRITE: AMOUNT CURRENCY ITAB_BSIK-WAERS TO AMOUNT1.
+          IF REF1 = 'X'.
+            WRITE: / W_SNO, (10) BKPF-XBLNR.
+          ELSEIF REF2 = 'X'.
+            WRITE: / W_SNO, (10) BKPF-BKTXT.
+          ELSE.
+            WRITE: / W_SNO, (10) BSEG-ZUONR.
+          ENDIF.
+          WRITE: 18 BKPF-BLDAT NO-ZERO,
+                               ITAB_BSIK-BELNR,
+                               (16) BSEG-SGTXT,
+                               ITAB_BSIK-WAERS,
+                              67(15) AMOUNT1,
+                              82 DC_IND.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+    W_SNO = W_SNO + 1.
+    PLPPF = ITAB_BSIK-PENRC.
+  ENDLOOP.
+
+  REFRESH DOWNTAB.
+  CALL FUNCTION 'LIST_TO_ASCI'
+       EXPORTING
+            LIST_INDEX         = SY-LSIND
+       TABLES
+            LISTASCI           = DOWNTAB
+       EXCEPTIONS
+            EMPTY_LIST         = 1
+            LIST_INDEX_INVALID = 2
+            OTHERS             = 3.
+*FOR 4.6
+*  OPEN DATASET PAYDET FOR OUTPUT IN TEXT MODE.
+*END 4.6
+
+*FOR 4.7
+  OPEN DATASET PAYDET FOR OUTPUT IN TEXT MODE ENCODING DEFAULT.
+*END 4.7
+
+  IF SY-SUBRC <> 0.
+    MESSAGE I001 WITH 'Could not open file'.
+  ELSE.
+    LOOP AT DOWNTAB.
+      TRANSFER DOWNTAB TO PAYDET.
+    ENDLOOP.
+    CLOSE DATASET PAYDET.
+  ENDIF.
+
+*---------------------------------------------------------------------*
+*       FORM GET_PAYMETH                                              *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+FORM GET_PAYMETH.
+  CLEAR BSEG.
+  SELECT SINGLE ZLSCH INTO ITAB_BSIK-ZLSCH  FROM BSEG
+                      WHERE BUKRS = ITAB_BSIK-BUKRS
+                      AND BELNR   = ITAB_BSIK-BELNR
+                      AND GJAHR   = ITAB_BSIK-GJAHR
+                      AND ZLSCH   NE SPACE.
+ENDFORM.
+
+*---------------------------------------------------------------------*
+*       FORM GET_PAYMENT                                              *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+FORM GET_PAYMENT.
+  DATA: IREGUH LIKE REGUH OCCURS 0 WITH HEADER LINE.
+  DATA: IREGUP LIKE REGUP OCCURS 0 WITH HEADER LINE.
+
+  IF ZW_LAUFI NE SPACE.
+    IF W_LAUFI EQ SPACE.
+      SELECT * FROM REGUH INTO TABLE IREGUH
+                          WHERE LAUFD = ZW_LAUFD
+                          AND LAUFI = ZW_LAUFI
+                          AND XVORL = ' '.
+      LOOP AT IREGUH.
+        SELECT * FROM REGUP INTO TABLE IREGUP
+                            WHERE LAUFD  = IREGUH-LAUFD
+                            AND   LAUFI = IREGUH-LAUFI
+                            AND   XVORL = ' '
+                            AND   ZBUKR = IREGUH-ZBUKR
+                            AND   VBLNR = IREGUH-VBLNR.
+        LOOP AT IREGUP.
+          MOVE-CORRESPONDING IREGUP TO ITAB_BSIK.
+          ITAB_BSIK-AUGBL = IREGUP-VBLNR.
+          APPEND ITAB_BSIK.
+          CLEAR ITAB_BSIK.
+        ENDLOOP.
+      ENDLOOP.
+    ELSE.
+      SELECT * FROM REGUH INTO TABLE IREGUH
+                          WHERE LAUFD = ZW_LAUFD
+                          AND ( LAUFI = ZW_LAUFI OR LAUFI IN W_LAUFI )
+                          AND XVORL = ' '.
+      LOOP AT IREGUH.
+        SELECT * FROM REGUP INTO TABLE IREGUP
+                            WHERE LAUFD  = IREGUH-LAUFD
+                            AND   LAUFI = IREGUH-LAUFI
+                            AND   XVORL = ' '
+                            AND   ZBUKR = IREGUH-ZBUKR
+                            AND   VBLNR = IREGUH-VBLNR.                .
+        LOOP AT IREGUP.
+          MOVE-CORRESPONDING IREGUP TO ITAB_BSIK.
+          ITAB_BSIK-AUGBL = IREGUP-VBLNR.
+          APPEND ITAB_BSIK.
+          CLEAR ITAB_BSIK.
+        ENDLOOP.
+      ENDLOOP.
+    ENDIF.
+* For extracting WTX from auto payment.
+  ELSE.
+    V_OPY_FLAG = 'Y'.
+    PERFORM GET_OUTGOING_DETAILS.
+  ENDIF.
+ENDFORM.
+*---------------------------------------------------------------------*
+*       FORM GET_OUTGOING_DETAILS                                     *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+FORM GET_OUTGOING_DETAILS.
+  DATA: C_FACTOR TYPE P DECIMALS 8.
+
+**changes by yupinto 19.12.2006
+**performance tuning
+
+*  DATA: ITAB_BSEG LIKE BSEG OCCURS 0 WITH HEADER LINE.
+*
+*   CLEAR: ITAB_BSIK.
+*  SELECT * FROM BSEG INTO TABLE ITAB_BSEG
+*                     WHERE  BUKRS = CO_CODE
+*                    AND    BELNR IN W_DOCNO
+*                     AND    GJAHR = W_FYR
+*                     AND    AUGBL NE SPACE.
+
+data: begin of itab_bseg OCCURS 1,
+        bukrs like bseg-bukrs,
+        belnr like bseg-belnr,
+        gjahr like bseg-gjahr,
+        augdt like bseg-augdt,
+        augbl like bseg-augbl,
+       end of itab_bseg.
+
+  CLEAR: ITAB_BSIK.
+
+  SELECT bukrs belnr gjahr augdt augbl FROM BSEG INTO TABLE ITAB_BSEG
+                           WHERE  BUKRS = CO_CODE
+                           AND BELNR IN W_DOCNO
+                           AND GJAHR = W_FYR.
+*                           AND AUGBL NE SPACE.
+** end
+
+
+  delete itab_bseg where augbl eq space.
+
+  SORT ITAB_BSEG BY BUKRS AUGBL BELNR.
+
+  DELETE ADJACENT DUPLICATES FROM ITAB_BSEG COMPARING BUKRS AUGBL
+BELNR.
+
+  LOOP AT ITAB_BSEG.
+     SELECT * FROM BSAK INTO TABLE ITAB_BSAK
+                       WHERE  BUKRS = CO_CODE
+                       AND   AUGBL  = ITAB_BSEG-BELNR
+                      AND   AUGDT  = ITAB_BSEG-AUGDT.
+*                      AND GJAHR    = ITAB_BSEG-GJAHR.
+    IF SY-SUBRC NE 0.
+      SELECT * FROM BSAK INTO TABLE ITAB_BSAK
+                         WHERE  BUKRS = CO_CODE
+                         AND   BELNR  = ITAB_BSEG-BELNR
+                        AND   AUGDT  = ITAB_BSEG-AUGDT.
+*                        AND GJAHR    = ITAB_BSEG-GJAHR.
+    ENDIF.
+    SELECT * FROM BSAD INTO TABLE ITAB_BSAD
+                       WHERE BUKRS = CO_CODE
+                       AND   AUGBL = ITAB_BSEG-BELNR
+*                      AND GJAHR    = ITAB_BSEG-GJAHR.
+                     AND   AUGDT = ITAB_BSEG-AUGDT.
+*    ENDAT.
+    LOOP AT ITAB_BSAK WHERE  BUKRS = CO_CODE
+                      AND   AUGBL  = ITAB_BSEG-BELNR
+                      AND   AUGDT  = ITAB_BSEG-AUGDT.
+**                     AND GJAHR    = ITAB_BSEG-GJAHR.
+      IF ITAB_BSAK-AUGBL NE ITAB_BSAK-BELNR.
+          MOVE-CORRESPONDING ITAB_BSAK TO ITAB_BSIK.
+          PERFORM GET_PAYMETH.
+          APPEND ITAB_BSIK.
+      ENDIF.
+    ENDLOOP.
+    IF SY-SUBRC NE 0.
+      LOOP AT ITAB_BSAK WHERE  BUKRS = CO_CODE
+                      AND   BELNR  = ITAB_BSEG-BELNR
+*                      AND   AUGBL  = ITAB_BSEG-BELNR
+                        AND   AUGDT  = ITAB_BSEG-AUGDT.
+**                       AND GJAHR    = ITAB_BSEG-GJAHR.
+*      IF ITAB_BSAK-AUGBL NE ITAB_BSAK-BELNR.
+        MOVE-CORRESPONDING ITAB_BSAK TO ITAB_BSIK.
+        FLAG ='Y'.
+*       For fixing the partial paymnt missing extended dtls prob
+*       Use PENRC field as a flag - assume it is unused in future
+        ITAB_BSIK-PENRC = 'Y'.
+        PERFORM GET_PAYMETH.
+        APPEND ITAB_BSIK.
+      ENDLOOP.
+    ENDIF.
+
+    LOOP AT ITAB_BSAD WHERE BUKRS = CO_CODE
+                      AND   AUGBL = ITAB_BSEG-BELNR
+                      AND   AUGDT = ITAB_BSEG-AUGDT.
+
+      IF ITAB_BSAD-BELNR NE ITAB_BSAD-AUGBL.
+        MOVE-CORRESPONDING ITAB_BSAD TO ITAB_BSIK.
+        PERFORM GET_PAYMETH.
+        APPEND ITAB_BSIK.
+      ENDIF.
+    ENDLOOP.
+
+  ENDLOOP.
+
+  CLEAR: ITAB_BSIK.
+  SELECT * FROM BSIK INTO TABLE ITAB_BSIK2
+                     WHERE ( BUKRS = CO_CODE
+                     AND   BELNR IN W_DOCNO
+                     AND   GJAHR = W_FYR
+                     AND   AUGBL = SPACE ).
+  LOOP AT ITAB_BSIK2.
+    MOVE-CORRESPONDING ITAB_BSIK2 TO ITAB_BSIK.
+    ITAB_BSIK-AUGBL = ITAB_BSIK2-BELNR.
+    ITAB_BSIK-BELNR = ITAB_BSIK2-REBZG.
+    ITAB_BSIK-SHKZG = '+'.
+
+    PERFORM GET_PAYMETH.
+    APPEND ITAB_BSIK.
+  ENDLOOP.
+
+  CLEAR: ITAB_BSIK.
+
+  SELECT * FROM BSID INTO CORRESPONDING FIELDS OF TABLE ITAB_BSIK2
+                     WHERE ( BUKRS = CO_CODE
+                     AND   BELNR IN W_DOCNO
+                     AND   GJAHR = W_FYR
+                     AND   AUGBL = SPACE ).
+  LOOP AT ITAB_BSIK2.
+    MOVE-CORRESPONDING ITAB_BSIK2 TO ITAB_BSIK.
+    ITAB_BSIK-AUGBL = ITAB_BSIK2-BELNR.
+    ITAB_BSIK-BELNR = ITAB_BSIK2-REBZG.
+    ITAB_BSIK-SHKZG = '+'.
+    PERFORM GET_PAYMETH.
+    APPEND ITAB_BSIK.
+  ENDLOOP.
+ENDFORM.
+
+*---------------------------------------------------------------------*
+*       FORM print_totals                                             *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+FORM PRINT_TOTALS.
+  IF WS_AUGBL NE SPACE.
+    ULINE: /65(15).
+    WRITE V_INV_TOT CURRENCY BSEG-PSWSL TO AMOUNT1.
+    WRITE: /50 'Total',
+    65(15) AMOUNT1.
+    ULINE: /65(15).
+  ENDIF.
+  V_INV_TOT = 0.
+ENDFORM.
+
+*---------------------------------------------------------------------*
+*       FORM GET_OPY_AMOUNT                                           *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+FORM GET_OPY_AMOUNT.
+  IF ITAB_BSIK-REBZG NE SPACE. " Partial Payment
+    AMOUNT = ITAB_BSIK-WRBTR - ITAB_BSIK-QBSHB - ITAB_BSIK-WSKTO.
+  ELSE.
+    CLEAR: WHT_INV_FLAG, V_WHT_AMT.
+    SELECT * FROM WITH_ITEM WHERE BUKRS = ITAB_BSIK-BUKRS
+                            AND GJAHR   = ITAB_BSIK-GJAHR
+                            AND BELNR   = ITAB_BSIK-BELNR
+                            AND WT_QBSHB NE 0.
+      SELECT * FROM T059P WHERE LAND1 = T001-LAND1
+                          AND   WITHT = WITH_ITEM-WITHT.
+        IF T059P-WT_POSTM = 1.
+          WHT_INV_FLAG = 'Y'.
+        ELSEIF PAY_CURR <> INV_CURR.
+          V_WHT_AMT = V_WHT_AMT + WITH_ITEM-WT_QBSHB.
+        ENDIF.
+      ENDSELECT.
+    ENDSELECT.
+    IF SY-SUBRC NE 0.
+      IF PAY_CURR = INV_CURR.
+        V_WHT_AMT = ITAB_BSIK-QBSHB.
+      ELSE.
+        V_WHT_AMT = 0.
+      ENDIF.
+    ENDIF.
+    IF WHT_INV_FLAG = 'Y'. "handle wht at invoice level
+      AMOUNT = ITAB_BSIK-WRBTR - ITAB_BSIK-WSKTO.
+    ELSEIF PAY_CURR <> INV_CURR.
+      COMPUTE V_WHT_AMT = ABS( V_WHT_AMT ).
+      AMOUNT = ITAB_BSIK-WRBTR - V_WHT_AMT - ITAB_BSIK-WSKTO.
+    ELSE.
+      AMOUNT = ITAB_BSIK-WRBTR - ITAB_BSIK-QBSHB - ITAB_BSIK-WSKTO.
+    ENDIF.
+  ENDIF.
+ENDFORM.
+
+*Text symbol text£º
+*001:>>PAYMENT :
+*007:S/No Inv No.     Inv Date   Our Ref    Description      Curr            Amount
+*008:S/No Inv No.     Inv Date   Our Ref    Description      Curr      PM    Amount
+*009:'Invoice No.' from 'Assignment'
+*010:'Invoice No.' from 'Reference'
+*011:'Invoice No.' from 'Doc.Header Text'
+*012:Outgoing Payment Selection
+*013:S/No Inv No.     Inv Date   Our Ref    Description      Curr            Amount        WTaxAmt
+*014:S/No Inv No.     Inv Date   Our Ref    Description      Curr  PM        Amount        WTaxAmt
+*015:Inv No.     Inv Date              Description            Curr            Amount
+*016:Inv No.     Inv Date              Description            Curr            Amount
+*017:Inv No.          Inv Date   Our Ref    Description      Curr             Amount
+*018:Inv No.          Inv Date   Our Ref    Description      Curr  PM        Amount
+*019:S/No Inv No.     Inv Date   Delivery Note    P.O.No.     G.R.No.        Amount
+*020:Inv No.          Inv Date   Our Ref    Description      Curr  PM        Amount
+*021:Inv No.          Inv Date   Delivery Note    P.O.No.     G.R.No.        Amount
+
+*112:Invoice No. from Reference Key 1
+*Selection text£º
+*CO_CODE:        Company code
+*PAYDET:        Output File
+*PAY_METH:        Payment Method
+*W_DOCNO:        Payment document number
+*W_FYR:        Fiscal Year
+*W_LAUFI:        Additional Identification

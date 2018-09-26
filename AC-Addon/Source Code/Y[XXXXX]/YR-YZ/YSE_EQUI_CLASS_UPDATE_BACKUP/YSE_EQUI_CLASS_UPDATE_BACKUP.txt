@@ -1,0 +1,560 @@
+*----------------------------------------------------------------------*
+* PROGRAM ID    : YSE_EQUI_CLASS_UPDATE                                *
+* PROGRAM TITLE : Mass update equip classification via local file      *
+* AUTHOR        : Anda Wu                                              *
+* DATE          : 11/04/2013                                           *
+* DEVELOPMENT ID:                                                      *
+*                                                                      *
+* CHANGE REQUEST NUMBER:                                               *
+*                                                                      *
+* Program Description: Update  equip classification                     *
+*                                                                      *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+*  DATE    | NAME     |TRANSPORT  | CR# and short Description          *
+*----------------------------------------------------------------------*
+*11/04/2013|Anda Wu   |CD1K975445 |CR2825: Initial version             *
+*----------------------------------------------------------------------*
+REPORT  yse_equi_class_update_backup NO STANDARD PAGE HEADING LINE-SIZE 255.
+
+************************************************************************
+* TYPES                                                                *
+************************************************************************
+TYPES:
+  BEGIN OF ty_input_file,
+    equnr         TYPE equi-equnr,
+    atwrt1        TYPE cawn-atwrt,
+    atwrt2        TYPE cawn-atwrt,
+    atwrt3        TYPE cawn-atwrt,
+    atwrt4        TYPE cawn-atwrt,
+  END OF ty_input_file,
+
+  BEGIN OF ty_atinn,
+    atinn         TYPE cabn-atinn,
+    atnam         TYPE cabn-atnam,
+  END OF ty_atinn.
+
+************************************************************************
+* WORKAREAS                                                            *
+************************************************************************
+DATA:
+  gs_char_name    TYPE ty_input_file.               "charactistic name
+
+************************************************************************
+* INTERNAL TABLES                                                      *
+************************************************************************
+DATA:
+  gt_lfile        TYPE yse_t_lfile,                 "Local file name
+  gt_update       TYPE TABLE OF ty_input_file,      "Update file data
+  gt_update_log   TYPE TABLE OF string,             "update process log
+  gt_character    TYPE TABLE OF ty_atinn.           "Inter character
+
+************************************************************************
+* VARIABLES                                                            *
+************************************************************************
+DATA:
+  gv_obtab        TYPE tcla-obtab,    "Name of database table for object
+  gv_tot_lines    TYPE i,                           "Process lines
+  gv_suc_lines    TYPE i,                           "Success Lines
+  gv_fai_lines    TYPE i.                           "Failed lines
+
+************************************************************************
+* CONSTANTS                                                            *
+************************************************************************
+CONSTANTS:
+  gc_tab          TYPE c VALUE cl_abap_char_utilities=>horizontal_tab,
+  gc_type_e       TYPE c VALUE 'E',
+  gc_hifi         TYPE c VALUE '-',
+  gc_colon        TYPE c VALUE ':',
+  gc_x            TYPE c VALUE 'X'.
+
+************************************************************************
+* SELECTION-SCREEN                                                     *
+************************************************************************
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE text-t01.
+PARAMETERS:
+          p_file(1024) TYPE c LOWER CASE OBLIGATORY.  "Local File Path
+PARAMETERS: p_class TYPE klah-class                   " Class
+            DEFAULT 'ZAM_CLASS_02' MODIF ID m1 OBLIGATORY.
+PARAMETERS: p_klart TYPE tcla-klart                   "Class Type
+            DEFAULT '002' MODIF ID m1 OBLIGATORY.
+PARAMETERS: p_charno TYPE i                           "Character No
+            DEFAULT 3 MODIF ID m1 OBLIGATORY.
+SELECTION-SCREEN BEGIN OF LINE.
+PARAMETERS: cb_hflg    AS CHECKBOX                    "Header text flag
+              DEFAULT 'X' MODIF ID m1.
+SELECTION-SCREEN COMMENT 4(48) text-c01 FOR FIELD cb_hflg.
+SELECTION-SCREEN END OF LINE.
+PARAMETERS: p_edit  AS CHECKBOX DEFAULT space.
+SELECTION-SCREEN END OF BLOCK b1.
+
+*&---------------------------------------------------------------------*
+*& INITIALIZATION                                                      *
+*&---------------------------------------------------------------------*
+INITIALIZATION.
+* Do initialization
+  PERFORM frm_do_init.
+
+*&---------------------------------------------------------------------*
+*& AT SELECTION-SCREEN OUTPUT                                          *
+*&---------------------------------------------------------------------*
+AT SELECTION-SCREEN OUTPUT.
+* Set selection screen
+  PERFORM set_screen.
+
+*&---------------------------------------------------------------------*
+*& AT SELECTION-SCREEN                                                 *
+*&---------------------------------------------------------------------*
+AT SELECTION-SCREEN.
+* Check if the file path and name exist
+  PERFORM check_filename.
+
+*&---------------------------------------------------------------------*
+*& AT SELECTION-SCREEN  ON VALUE-REQUEST                               *
+*&---------------------------------------------------------------------*
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_file.
+* Get local file path
+  PERFORM select_file.
+
+*&---------------------------------------------------------------------*
+*& START-OF-SELECTION                                                  *
+*&---------------------------------------------------------------------*
+START-OF-SELECTION.
+* Read local file into a internal table
+  PERFORM read_file.
+* Write entry to datebase table
+  PERFORM write_db.
+
+*&---------------------------------------------------------------------*
+*& END-OF-SELECTION                                                    *
+*&---------------------------------------------------------------------*
+END-OF-SELECTION.
+  IF gv_tot_lines > 0.
+*   WRITE process result message
+    PERFORM write_log.
+  ENDIF.
+
+*&---------------------------------------------------------------------*
+*&      Form  select_file
+*&---------------------------------------------------------------------*
+*       Get local file path
+*----------------------------------------------------------------------*
+FORM select_file .
+
+  DATA:
+    lv_title  TYPE string,     "Referrence title
+    lt_file   TYPE filetable,  "Internal table of dialog filenames
+    ls_file   TYPE file_table, "Working area for IT_FILE,
+    lv_rc     TYPE i.          "Return Code
+
+  lv_title = text-001.
+  CLEAR: lt_file[],
+         ls_file.
+* Open local file dialog
+  CALL METHOD cl_gui_frontend_services=>file_open_dialog
+    EXPORTING
+      window_title            = lv_title
+    CHANGING
+      file_table              = lt_file
+      rc                      = lv_rc
+    EXCEPTIONS
+      file_open_dialog_failed = 1
+      cntl_error              = 2
+      error_no_gui            = 3
+      not_supported_by_gui    = 4
+      OTHERS                  = 5.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+              WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+  IF lv_rc = 1.
+    READ TABLE lt_file INDEX 1 INTO ls_file.
+    IF sy-subrc EQ 0.
+      p_file = ls_file-filename.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    " select_file
+*&---------------------------------------------------------------------*
+*&      Form  READ_FILE
+*&---------------------------------------------------------------------*
+*       Read local file into a internal table
+*----------------------------------------------------------------------*
+FORM read_file .
+
+  DATA: lv_filename TYPE string.
+* Read file entires
+  lv_filename = p_file.
+  PERFORM get_from_pres IN PROGRAM yam_common_routines
+                                    TABLES  gt_lfile
+                                    USING   lv_filename
+                                            ycl_se_utility=>c_ft_asc
+                                            ' '.
+* Delete the blank lines
+  DELETE gt_lfile
+    WHERE text IS INITIAL.
+
+ENDFORM.                    " READ_FILE
+*&---------------------------------------------------------------------*
+*&      Form  WRITE_DB
+*&---------------------------------------------------------------------*
+*       Write entry to datebase table
+*----------------------------------------------------------------------*
+FORM write_db .
+
+  DATA: ls_update     TYPE ty_input_file,
+        lv_mess_str   TYPE string,
+        lv_mess_str2  TYPE string,
+        lv_index      TYPE i,
+        ls_return     TYPE  bapiret2,
+        lv_objectkey  TYPE bapi1003_key-object,
+        ls_newchar    TYPE bapi1003_alloc_values_char.
+
+  DATA: lt_return     TYPE STANDARD TABLE OF bapiret2,
+        lt_newnum     TYPE STANDARD TABLE OF bapi1003_alloc_values_num,
+        lt_newchar    TYPE STANDARD TABLE OF bapi1003_alloc_values_char,
+        lt_newcurr    TYPE STANDARD TABLE OF  bapi1003_alloc_values_curr.
+  FIELD-SYMBOLS: <lfs_update> TYPE ty_input_file,
+                 <lfs_charname> TYPE cabn-atnam,
+                 <lfs_atwrt>    TYPE cawn-atwrt.
+
+* Get total process entires
+  DESCRIBE TABLE gt_lfile LINES gv_tot_lines.
+  PERFORM convert_to_struc.
+  gv_tot_lines = gv_tot_lines - 1.
+
+* Gain update characteristic names
+  IF cb_hflg IS NOT INITIAL.
+    READ TABLE gt_update INTO gs_char_name INDEX 1.
+    DELETE gt_update INDEX 1.
+  ENDIF.
+
+* Check if update entries is empty
+  IF gt_update IS INITIAL.
+    MESSAGE w000(yse_sales_log) WITH text-002.
+  ENDIF.
+
+* Make conversion of file equi-equnr
+  LOOP AT gt_update ASSIGNING <lfs_update>.
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+      EXPORTING
+        input  = <lfs_update>-equnr
+      IMPORTING
+        output = <lfs_update>-equnr.
+  ENDLOOP.
+
+* Check validiation of characteristic name
+  lv_index = 1.
+  DO p_charno TIMES.
+    CLEAR ls_newchar.
+    lv_index = lv_index + 1.
+    ASSIGN COMPONENT lv_index
+      OF STRUCTURE gs_char_name  TO <lfs_charname>.
+    READ TABLE gt_character TRANSPORTING NO FIELDS
+      with key atnam = <lfs_charname>.
+    IF sy-subrc <> 0.
+      gv_tot_lines = 0.
+      MESSAGE S000(yse_sales_log)
+        WITH text-015 <lfs_charname> text-016
+        DISPLAY LIKE gc_type_e.
+      LEAVE LIST-PROCESSING.
+    ENDIF.
+  ENDDO.
+
+* Update characteristics by BAPI [BAPI_OBJCL_CHANGE]
+  LOOP AT gt_update INTO ls_update.
+    lv_index = 1.
+    DO p_charno TIMES.
+      CLEAR ls_newchar.
+      lv_index = lv_index + 1.
+      ASSIGN COMPONENT lv_index
+        OF STRUCTURE gs_char_name  TO <lfs_charname>.
+      ASSIGN COMPONENT lv_index
+        OF STRUCTURE ls_update  TO <lfs_atwrt>.
+      ls_newchar-charact  = <lfs_charname>.
+      ls_newchar-value_char = <lfs_atwrt>.
+      APPEND ls_newchar TO lt_newchar.
+    ENDDO.
+
+    lv_objectkey = ls_update-equnr.
+    CALL FUNCTION 'BAPI_OBJCL_CHANGE'
+      EXPORTING
+        objectkey          = lv_objectkey
+        objecttable        = gv_obtab
+        classnum           = p_class
+        classtype          = p_klart
+      TABLES
+        allocvaluesnumnew  = lt_newnum
+        allocvaluescharnew = lt_newchar
+        allocvaluescurrnew = lt_newcurr
+        return             = lt_return.
+    LOOP AT lt_return INTO ls_return WHERE type = 'E'.
+      CLEAR: lv_mess_str , lv_mess_str2.
+      CONCATENATE
+            ls_update-equnr
+            ls_update-atwrt1
+            ls_update-atwrt2
+            ls_update-atwrt3
+        INTO lv_mess_str
+        SEPARATED BY gc_hifi.
+      MESSAGE ID ls_return-id TYPE ls_return-type NUMBER ls_return-number
+          WITH  ls_return-message_v1 ls_return-message_v2
+                ls_return-message_v3 ls_return-message_v4
+          INTO lv_mess_str2.
+      CONCATENATE
+            lv_mess_str
+            lv_mess_str2
+        INTO lv_mess_str
+        SEPARATED BY gc_colon.
+      APPEND lv_mess_str TO gt_update_log.
+    ENDLOOP.
+    IF sy-subrc <> 0.
+      CLEAR: ls_return.
+      CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+        EXPORTING
+          wait   = gc_x
+        IMPORTING
+          return = ls_return.
+      IF ls_return-type = 'E'.
+        CLEAR: lv_mess_str , lv_mess_str2.
+        CONCATENATE
+              ls_update-equnr
+              ls_update-atwrt1
+              ls_update-atwrt2
+              ls_update-atwrt3
+          INTO lv_mess_str
+          SEPARATED BY gc_hifi.
+        MESSAGE ID ls_return-id TYPE ls_return-type NUMBER ls_return-number
+            WITH  ls_return-message_v1 ls_return-message_v2
+                  ls_return-message_v3 ls_return-message_v4
+            INTO lv_mess_str2.
+        CONCATENATE
+              lv_mess_str
+              lv_mess_str2
+          INTO lv_mess_str
+          SEPARATED BY gc_colon.
+        APPEND lv_mess_str TO gt_update_log.
+      ELSE.
+        gv_suc_lines = gv_suc_lines + 1.
+      ENDIF.
+    ENDIF.
+    CLEAR ls_update.
+    REFRESH: lt_return,
+             lt_newnum,
+             lt_newchar,
+             lt_newcurr.
+  ENDLOOP.
+  gv_fai_lines = gv_tot_lines - gv_suc_lines.
+
+ENDFORM.                    " WRITE_DB
+
+*&---------------------------------------------------------------------*
+*&      Form  WRITE_LOG
+*&---------------------------------------------------------------------*
+*       WRITE process result message
+*----------------------------------------------------------------------*
+FORM write_log .
+
+  DATA: lv_mess_str  TYPE string.
+  WRITE: 'Total Process Entries:'(005) , AT 30(6) gv_tot_lines,
+         / 'Successful Update Entries:'(006), AT 30(6) gv_suc_lines,
+         / 'Failed Update Entries:'(007), AT 30(6) gv_fai_lines.
+  ULINE.
+
+  IF gv_tot_lines = gv_suc_lines.
+    MESSAGE s000(yse_sales_log)
+      WITH 'Successfully update all equipment'(008).
+  ELSE.
+    LOOP AT gt_update_log INTO lv_mess_str.
+      WRITE: / lv_mess_str.
+    ENDLOOP.
+    MESSAGE s000(yse_sales_log)
+      WITH 'Failed to update all equipment'(009)
+      DISPLAY LIKE gc_type_e.
+  ENDIF.
+
+ENDFORM.                    " WRITE_LOG
+*&---------------------------------------------------------------------*
+*&      Form  CONVERT_TO_STRUC
+*&---------------------------------------------------------------------*
+*       Convert internal table to structure ty_input_file
+*----------------------------------------------------------------------*
+FORM convert_to_struc .
+
+  DATA:
+    ls_lfile TYPE yse_s_lfile,
+    lt_field TYPE TABLE OF string,
+    lv_field TYPE string,
+    lv_line  TYPE string,
+    lflg_suc TYPE c,
+    lv_mess_str  TYPE string.
+  FIELD-SYMBOLS:
+    <fs_tab> TYPE STANDARD TABLE,
+    <fs_wa> TYPE ANY,
+    <fs_field> TYPE ANY.
+  DATA: lo_wa TYPE REF TO data,
+        lo_itab TYPE REF TO data.
+  CREATE DATA:
+    lo_wa TYPE ty_input_file,
+    lo_itab TYPE TABLE OF ty_input_file INITIAL SIZE 1.
+
+  ASSIGN lo_wa->* TO <fs_wa>.
+  ASSIGN lo_itab->* TO <fs_tab>.
+  ASSIGN gt_update TO <fs_tab>.
+
+  LOOP AT gt_lfile INTO ls_lfile.
+    CLEAR: lt_field,
+           lflg_suc.
+    lv_line = ls_lfile-text.
+    SPLIT lv_line AT gc_tab INTO TABLE lt_field.
+    lv_mess_str = lv_line.
+    REPLACE ALL OCCURRENCES OF  gc_tab
+      IN lv_mess_str
+      WITH gc_hifi.
+    LOOP AT lt_field INTO lv_field.
+      ASSIGN COMPONENT sy-tabix OF STRUCTURE <fs_wa> TO <fs_field>.
+      TRY .
+          <fs_field> = lv_field.
+        CATCH cx_sy_conversion_no_number.
+          lflg_suc = gc_type_e.
+          CONCATENATE
+                text-012
+                lv_mess_str+4
+            INTO lv_mess_str.
+          APPEND lv_mess_str TO gt_update_log.
+          EXIT.
+      ENDTRY.
+    ENDLOOP.
+    IF lflg_suc IS NOT INITIAL.
+      CONTINUE.
+    ENDIF.
+    APPEND <fs_wa> TO <fs_tab>.
+    CLEAR  <fs_wa>.
+  ENDLOOP.
+
+ENDFORM.                    " CONVERT_TO_STRUC
+
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_FILENAME
+*&---------------------------------------------------------------------*
+*       Check if the file path and name exist
+*----------------------------------------------------------------------*
+FORM check_filename .
+
+  DATA:
+    lv_exist TYPE c.
+  CALL FUNCTION 'TMP_GUI_GET_FILE_EXIST'
+    EXPORTING
+      fname          = p_file
+    IMPORTING
+      exist          = lv_exist
+    EXCEPTIONS
+      fileinfo_error = 1
+      OTHERS         = 2.
+  IF sy-subrc <> 0 OR lv_exist IS INITIAL.
+    MESSAGE e000(yse_sales_log)
+      WITH 'Please enter an invaild filename'(010).
+  ENDIF.
+
+  SELECT cabn~atinn
+         cabn~atnam
+    INTO TABLE gt_character
+    FROM  cabn
+      INNER JOIN ksml
+      ON cabn~atinn = ksml~imerk
+      INNER JOIN klah
+      ON klah~clint = ksml~clint
+    WHERE klah~class = p_class.
+  SORT gt_character.
+  DELETE ADJACENT DUPLICATES FROM gt_character.
+  IF gt_character IS INITIAL.
+    MESSAGE e000(yse_sales_log)
+      WITH 'The class['(003) p_class '] has no characteristic!!!'(004).
+  ENDIF.
+
+  SELECT SINGLE obtab
+    FROM tcla
+    INTO gv_obtab
+    WHERE klart = p_klart.
+  IF sy-subrc <> 0.
+    MESSAGE e000(yse_sales_log)
+      WITH 'The Class Type['(013) p_klart '] not exist!!!'(014).
+  ENDIF.
+
+ENDFORM.                    " CHECK_FILENAME
+
+*&---------------------------------------------------------------------*
+*&      Form  FRM_DO_INIT
+*&---------------------------------------------------------------------*
+*       Do initialization
+*----------------------------------------------------------------------*
+FORM frm_do_init .
+
+  CLEAR: gs_char_name.
+
+  CLEAR:
+    gv_obtab        ,
+    gv_tot_lines    ,                           "Process lines
+    gv_suc_lines    ,                           "Success Lines
+    gv_fai_lines    .                           "Failed lines
+
+  REFRESH:
+    gt_lfile        ,                           "Local file name
+    gt_update       ,                           "Update file data
+    gt_update_log   ,                           "update process log
+    gt_character    .                           "Inter character
+
+ENDFORM.                    " FRM_DO_INIT
+*&---------------------------------------------------------------------*
+*&      Form  SET_SCREEN
+*&---------------------------------------------------------------------*
+*       Set selection screen
+*----------------------------------------------------------------------*
+FORM set_screen .
+
+* Set PARAMETER p_edit invisible
+  LOOP AT SCREEN.
+    IF screen-name = 'P_EDIT'.
+      screen-invisible = '1'.
+      MODIFY SCREEN.
+    ENDIF.
+  ENDLOOP.
+* Set editable for parameter [p_class],[p_charno],[p_hflg]
+  IF p_edit IS INITIAL.
+    LOOP AT SCREEN.
+      IF screen-group1 = 'M1'.
+        screen-input = '0'.
+        MODIFY SCREEN.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+
+ENDFORM.                    " SET_SCREEN
+
+*Text symbol text£º
+*001:Select a file for upload
+*002:[No Input Data] or [Error Happen On Converting]
+*003:The class[
+*004:] has no characteristic!!!
+*005:Total Process Entries:
+*006:Successful Update Entries:
+*007:Failed Update Entries:
+*008:Successfully update all equipment
+*009:Failed to update all equipment
+*010:Please enter an invaild filename
+*012:Error to convert record:
+*013:The Class Type[
+*014:] not exist!!!
+*015:The characteristic name [
+*016:] is not valid!!
+*C01:First line as characteristic name[File Upload]
+
+*T01:Input
+*Selection text£º
+*CB_HFLG:        Characteristic name
+*P_CHARNO:        Characteristic Name Num( <= 4)
+*P_CLASS:D       .
+*P_EDIT:        Parameters Editable ?
+*P_FILE:        Local File
+*P_KLART:D       .

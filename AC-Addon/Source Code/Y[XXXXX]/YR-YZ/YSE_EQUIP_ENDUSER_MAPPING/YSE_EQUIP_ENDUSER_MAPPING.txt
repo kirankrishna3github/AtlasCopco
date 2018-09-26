@@ -1,0 +1,379 @@
+*----------------------------------------------------------------------*
+* PROGRAM ID           : YSE_EQUIP_ENDUSER_MAPPING                     *
+* PROGRAM TITLE        : Add End-customer partner in Equipment         *
+* AUTHOR               : Anda Wu                                       *
+* DATE                 : 28/04/2016                                    *
+* DEVELOPMENT ID       :                                               *
+*                                                                      *
+* CHANGE REQUEST NUMBER:                                               *
+*                                                                      *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME         |CORRECTION Nr| CHANGE REFERENCE # *
+*----------------------------------------------------------------------*
+************************************************************************
+REPORT  yse_equip_enduser_mapping   NO STANDARD PAGE HEADING
+                                   LINE-SIZE 165
+                                   LINE-COUNT 80
+                                   MESSAGE-ID yse_i006.
+
+************************************************************************
+*                   TYPES                                              *
+************************************************************************
+** Equipment details
+TYPES: BEGIN OF ty_equi,
+          equnr TYPE equi-equnr,         " Equipment Number
+          erdat TYPE equi-erdat,         " Equipment Creation Date
+          matnr TYPE equi-matnr,         " Material Number
+          sernr TYPE equi-sernr,         " Serial Number
+          obknr TYPE objk-obknr,         " object nr
+          lief_nr TYPE ser01-lief_nr,    " delivery
+          posnr TYPE ser01-posnr,        " delivery item
+       END OF ty_equi,
+
+       BEGIN OF ty_log,
+         equnr    TYPE equi-equnr,       " Equipment Number
+         msttyp   TYPE sy-msgty,        " Process Type
+         message  TYPE char120,          " Message
+       END OF ty_log.
+
+************************************************************************
+*                   V A R I A B L E S                                  *
+************************************************************************
+DATA:  gv_erdat       TYPE equi-erdat ,           " Order Number
+       gv_werks       TYPE equi-werk  ,           " Plant
+       gv_datlwb      TYPE equi-datlwb,           "Goods Movement Date
+       gv_equnr       TYPE equi-equnr ,           " Equipment Number
+       gv_day_forw    TYPE i  VALUE '7',          "Forward days
+       gv_subrc         TYPE subrc,
+       gv_text(100)     TYPE c,
+       gv_runhours_exist,
+       l_mpobj          TYPE imptt-mpobj ,
+       gv_point         TYPE imptt-point,
+       gv_valuefield    TYPE zvalue_field,
+       gv_old_procedure TYPE c,
+       gv_new_procedure TYPE c,
+       gv_vbelv         TYPE lips-vbelv,
+       gv_vgpos         TYPE lips-vgpos,
+       gv_posnr         TYPE lips-posnr,
+       gv_iwerk         TYPE vbap-werks,
+       gv_tplnr         TYPE yse_i006_mapping-tplnr,
+       gv_ingrp         TYPE yse_i006_mapping-ingrp,
+       gv_eqtyp         TYPE yse_i006_equicat-eqtyp,
+       gv_vgbel         TYPE lips-vgbel,
+       gv_ekgrp         TYPE t024-ekgrp,
+       gv_eknam         TYPE t024-eknam,
+       gv_bukrs         TYPE ekko-bukrs,
+       gv_adrnr         TYPE vbpa-adrnr,
+       gv_vkorg         TYPE vbak-vkorg,
+       gv_n_vkorg       TYPE vbak-vkorg,
+       gv_ekorg         TYPE ekko-ekorg,
+       gv_matnr         TYPE ekpo-matnr,
+       gv_spart         TYPE vbak-spart,
+       gv_objnr         TYPE ihpa-objnr,
+       gv_status_esto(1) TYPE c,
+       gv_indx(2)       TYPE n,
+       gv_scr_fld(20)   TYPE c,
+       gv_mestx        TYPE t100-text,
+       gv_spaces(48)   TYPE c,
+       gv_msgnr        TYPE t100-msgnr.
+
+************************************************************************
+*                  I N T E R N A L   T A B L E S                       *
+************************************************************************
+DATA: gt_equi TYPE STANDARD TABLE OF ty_equi,
+      gt_log  TYPE STANDARD TABLE OF ty_log.
+
+************************************************************************
+*                  CONSTANTS                                           *
+************************************************************************
+CONSTANTS: gc_parvw TYPE vbpa-parvw VALUE 'ZE'.
+
+************************************************************************
+*       S E L E C T - O P T I O N S / P A R A M E T E R S              *
+************************************************************************
+SELECTION-SCREEN : BEGIN OF BLOCK b1 WITH FRAME TITLE text-001.
+
+SELECT-OPTIONS: s_equnr FOR gv_equnr ,            "equipment number
+                s_erdat FOR gv_erdat ,            "creation date
+                s_datlw	FOR gv_datlwb.            "MovementDate
+
+PARAMETERS: p_parvw TYPE vbpa-parvw NO-DISPLAY.
+
+SELECTION-SCREEN: END OF BLOCK b1.
+
+************************************************************************
+*    Selection Screen Validations                                      *
+************************************************************************
+AT SELECTION-SCREEN.
+  IF      s_equnr IS INITIAL
+    AND   s_erdat IS INITIAL
+    AND   s_datlw IS INITIAL.
+    MESSAGE e002.
+  ENDIF.
+
+  IF NOT s_equnr[] IS INITIAL .
+    SELECT equnr INTO gv_equnr
+           UP TO 1 ROWS
+           FROM equi
+           WHERE equnr IN s_equnr.
+    ENDSELECT .
+    IF sy-subrc NE 0.
+      MESSAGE e001.
+    ENDIF.
+  ENDIF .
+
+************************************************************************
+*       S T A R T - O F - S E L E C T I O N    E V E N T               *
+************************************************************************
+START-OF-SELECTION.
+
+  p_parvw = gc_parvw.
+
+** get Equipment Numbers based on the Selection Criteria
+  PERFORM get_equipment_numbers .
+
+** update the selected equipments
+  PERFORM loop-over-iequi.
+
+END-OF-SELECTION.
+
+  PERFORM show_log.
+
+
+*&---------------------------------------------------------------------*
+*&      Form  Get_Equipment_Numbers
+*&---------------------------------------------------------------------*
+*       Get the Equipments based on Selection Criteria
+*----------------------------------------------------------------------*
+FORM get_equipment_numbers .
+
+  REFRESH gt_equi.
+
+  DATA: l_date TYPE sy-datum .
+
+  l_date = sy-datum - gv_day_forw.
+
+** IF selection screen date range and equipment no. range are not
+** provided --> take equipments of yesterday and today
+
+  IF s_erdat[] IS INITIAL AND s_equnr[] IS INITIAL AND s_datlw IS INITIAL.
+    SELECT a~equnr a~erdat a~matnr a~sernr
+           b~obknr c~lief_nr c~posnr
+           INTO TABLE gt_equi
+           FROM ( (  equi AS a JOIN objk AS b
+               ON a~equnr = b~equnr   )
+                JOIN ser01 AS c
+              ON c~obknr = b~obknr )
+           WHERE a~erdat BETWEEN l_date AND sy-datum
+*           AND  a~eqart = ' '
+           AND c~vbtyp = 'J'.
+
+    IF sy-subrc NE 0  .
+*  Write Error message - No data available for the Selection Criteria
+      WRITE: / text-002 .
+    ELSE .
+      DELETE ADJACENT DUPLICATES FROM gt_equi COMPARING equnr .
+    ENDIF .
+
+  ELSE .
+
+** IF selection screen date range or equipment no. range are
+** provided in the selection screen
+
+    SELECT a~equnr a~erdat a~matnr a~sernr
+           b~obknr c~lief_nr c~posnr
+           INTO TABLE gt_equi
+           FROM ( (  equi AS a JOIN objk AS b
+                     ON a~equnr = b~equnr   )
+                      JOIN ser01 AS c
+                    ON c~obknr = b~obknr )
+                 WHERE a~equnr IN s_equnr
+                 AND   a~erdat IN s_erdat
+                 AND   a~datlwb IN s_datlw
+*                 AND  a~eqart = ' '
+                 AND c~vbtyp = 'J'.
+
+    IF sy-subrc NE 0  .
+*  Write Error message - No data available for the Selection Criteria
+      WRITE: / text-002 .
+    ELSE .
+      DELETE ADJACENT DUPLICATES FROM gt_equi COMPARING equnr .
+    ENDIF .
+  ENDIF .
+
+ENDFORM.                    " Get_Equipment_Numbers
+
+*&---------------------------------------------------------------------*
+*&      Form  loop_over_iequi
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM loop-over-iequi.
+
+  DATA: ls_equi TYPE ty_equi.
+  DATA: lt_lips     TYPE STANDARD TABLE OF lips,
+        lt_ekko     TYPE STANDARD TABLE OF ekko,
+        lt_equicat  TYPE STANDARD TABLE OF yse_i006_equicat,
+        ls_lips     TYPE lips,
+        ls_ekko     TYPE ekko,
+        ls_equicat  TYPE yse_i006_equicat.
+  CHECK: gt_equi[] IS NOT INITIAL.
+  IF NOT gt_equi[] IS INITIAL.
+    LOOP AT gt_equi INTO ls_equi.
+*     equipment update
+      PERFORM update-equipments USING ls_equi.
+    ENDLOOP.
+  ENDIF.
+ENDFORM.                    "loop-over-iequi
+
+*&---------------------------------------------------------------------*
+*&      Form  update equipments
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM update-equipments USING us_equi TYPE ty_equi.
+
+*  DATA: lrec_equnr TYPE ty_equnr.
+  DATA: l_objnr     TYPE ihpa-objnr,
+        l_counter   TYPE ihpa-counter,
+        l_sold_to   TYPE ihpa-parnr,
+        l_end_cust  TYPE ihpa-parnr.
+  DATA: lv_kunnr    TYPE vbpa-kunnr,
+        lv_parnr    TYPE vbpa-parnr,
+        ls_vbfa     TYPE vbfa,
+        ls_log      TYPE ty_log.
+
+  DATA: lrec_xihpa    TYPE ihpavb,
+        li_xihpa      TYPE TABLE OF ihpavb.
+
+* Check if the end user exist already
+*   Set Object number
+  CONCATENATE 'IE' us_equi-equnr INTO l_objnr.
+  SELECT COUNT(*)
+    FROM ihpa
+    WHERE objnr = l_objnr
+      AND parvw = p_parvw.
+  IF sy-subrc = 0.
+    MESSAGE s003 WITH us_equi-equnr INTO ls_log-message.
+    ls_log-msttyp = 'I'.
+    ls_log-equnr = us_equi-equnr.
+    APPEND ls_log TO gt_log.
+    EXIT.
+  ENDIF.
+
+* Get sales order
+  SELECT SINGLE  *
+    FROM vbfa
+    INTO ls_vbfa
+    WHERE vbeln = us_equi-lief_nr
+      AND posnn = us_equi-posnr
+      AND vbtyp_n = 'J'.  "Delivery
+  IF sy-subrc <> 0 .
+    MESSAGE s004 WITH us_equi-lief_nr INTO ls_log-message.
+    ls_log-msttyp = 'E'.
+    ls_log-equnr = us_equi-equnr.
+    APPEND ls_log TO gt_log.
+    EXIT.
+  ENDIF.
+
+* Get end customer number
+  SELECT SINGLE kunnr
+                parnr
+    INTO (lv_kunnr,lv_parnr)
+    FROM vbpa
+    WHERE vbeln = ls_vbfa-vbelv
+      AND parvw = p_parvw.
+  IF sy-subrc <> 0.
+    MESSAGE s004 WITH us_equi-lief_nr INTO ls_log-message.
+    ls_log-msttyp = 'E'.
+    ls_log-equnr = us_equi-equnr.
+    APPEND ls_log TO gt_log.
+    EXIT.
+  ENDIF.
+
+  IF lv_parnr IS INITIAL.
+    lv_parnr = lv_kunnr.
+  ENDIF.
+
+* Build the End-Customer is equal to Sold-to
+  IF lv_parnr IS NOT INITIAL.
+    lrec_xihpa-mandt   = sy-mandt.
+    lrec_xihpa-objnr   = l_objnr.
+    lrec_xihpa-obtyp   = 'IEQ'.
+    lrec_xihpa-erdat   = sy-datum.
+    lrec_xihpa-erzeit  = sy-uzeit.
+    lrec_xihpa-ernam   = sy-uname.
+    lrec_xihpa-aedat   = sy-datum.
+    lrec_xihpa-aezeit  = sy-uzeit.
+    lrec_xihpa-aenam   = sy-uname.
+*   Insert new partner
+    lrec_xihpa-updkz   = 'I'.
+*   'ZE' is End-Customer
+    lrec_xihpa-parvw   = p_parvw.
+*   Get Max counter
+    SELECT MAX( counter )
+      INTO l_counter
+      FROM ihpa
+      WHERE objnr = l_objnr.
+    lrec_xihpa-counter = l_counter + 1.
+    lrec_xihpa-parnr   = lv_parnr.
+    APPEND lrec_xihpa TO li_xihpa.
+    CLEAR  lrec_xihpa.
+
+  ENDIF.
+  CLEAR l_objnr.
+
+  IF li_xihpa IS NOT INITIAL.
+*   Partner Update
+    CALL FUNCTION 'PM_PARTNER_UPDATE'
+      TABLES
+        fxihpa = li_xihpa.
+    SELECT COUNT(*)
+      FROM ihpa
+      WHERE objnr = l_objnr
+        AND parvw = p_parvw.
+    IF sy-subrc = 0.
+      MESSAGE s005 INTO ls_log-message.
+      ls_log-msttyp = 'S'.
+      ls_log-equnr = us_equi-equnr.
+      APPEND ls_log TO gt_log.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    "update-equipments
+*&---------------------------------------------------------------------*
+*&      Form  SHOW_LOG
+*&---------------------------------------------------------------------*
+*       Show Process Log
+*----------------------------------------------------------------------*
+FORM show_log .
+
+  DATA: lv_tot  TYPE char10,
+        ls_log  TYPE ty_log.
+
+  CHECK: gt_equi[] IS NOT INITIAL.
+
+  DESCRIBE TABLE gt_equi LINES lv_tot.
+
+  WRITE: 'Total process equipment:'(013) , 30 lv_tot , /.
+  WRITE: 'Process messages as below'(014).
+  ULINE.
+
+  LOOP AT gt_log   INTO ls_log.
+    WRITE: / ls_log-equnr, ':', 20 ls_log-message.
+  ENDLOOP.
+
+ENDFORM.                    " SHOW_LOG
+
+*Text symbol text£º
+*001:Selection Screen Input
+*002:No data available for the Selection Criteria
+*013:Total process equipment:
+
+*014:Process messages as below
+*Selection text£º
+*S_DATLW:D       .
+*S_EQUNR:        Equipment Number
+*S_ERDAT:        Equipment Creation Date

@@ -1,0 +1,1378 @@
+*&---------------------------------------------------------------------*
+*&  Include           YSE_SL_CTP_QUOT_F01
+*&---------------------------------------------------------------------*
+* MOD-003 |08.08.2011|L. Mertens USG Innotiv| CD1K967066 | CR2167      *
+* MOD-004 |05.11.2013|Anda Wu               |CD1K978205  |CR3095       *
+*   - Change logic for program YSE_SL_CTP_QUOT to handle the freight
+* MOD-005 |14.11.2013|Anda Wu               |CD1K978389  |CR3107       *
+*   - Exclude multiple lines in condition for whole SO
+*MOD-006  |23.06.2016|Uma Maheswararao K    | CD1K989103 |CR3923       *
+*   Issues with wrong plant as well as empty plant                     *
+*----------------------------------------------------------------------*
+
+*&---------------------------------------------------------------------*
+*&      Form  initialization
+*&---------------------------------------------------------------------*
+*       Perform the necessary initialization actions
+*----------------------------------------------------------------------*
+form initialization.
+
+* FIND WAREHOUSE TYPES
+  SELECT * INTO TABLE IT_YSE_EM_PLANT
+    FROM YSE_EM_PLANT.
+
+* FIND BRANCH PLANTS
+  SELECT * INTO TABLE IT_YSE_EM_PL_DISTR
+  FROM YSE_EM_PL_DISTR.
+
+  select * into table it_yse_em_pl_so
+  from yse_em_pl_so.
+
+endform.                    "initialization
+
+*&---------------------------------------------------------------------*
+*&      Form  read_inputfile
+*&---------------------------------------------------------------------*
+*       Read inputfile and make available for further treatment
+*----------------------------------------------------------------------*
+form read_inputfile.
+
+  data: lv_erdat    type erdat,
+        lv_matkl    type matkl,
+        lv_matnr    type matnr,
+        lv_prctr    type prctr,
+        lv_dwerk    type mvke-dwerk,
+        lv_sernp    type marc-sernp,
+        lv_segment  type FB_SEGMENT,
+        lv_times(2) type n,
+        lv_lifnr    type lifnr,
+        lv_prev_quotn type vbeln,
+        lv_prev_custn type kunnr,
+        lv_idx(3)   type n,
+        lv_isocd    type isocd,
+        lv_ortob    type ortob,
+        lv_zdart    type dzdart,
+        lv_i        type i,
+        lv_gmach,
+        lv_first,
+        lv_quant(5) type n,
+        wa_recg     like line of t_rec,
+        wa_rec      like line of t_rec,
+        t_rec_gm    like t_rec occurs 0 with header line,
+        t_rec_inter like t_rec occurs 0 with header line.
+
+* begin of insert MOD-003
+  DATA: lv_found(1)            TYPE c,
+        ls_yse_guard_vendor    LIKE yse_guard_vendor.
+
+  DATA: begin of lt_vendors OCCURS 0,
+          lifnr TYPE elifn,
+        end of lt_vendors.
+* end of insert MOD-003
+* begin of insert MOD-004
+  DATA: lv_quotn  TYPE vbeln.
+  FIELD-SYMBOLS: <LFS_REC> LIKE gt_rec.
+* end of insert MOD-004
+
+  data: BEGIN OF lt_quot occurs 0,
+          quotn     type vbeln,
+          custn     type kunnr,
+        END OF lt_quot.
+
+* Read inputfile (text tab delimited .txt)
+  DATA : wa_string  TYPE string.
+
+  CLASS cl_abap_char_utilities DEFINITION LOAD.
+
+  CONSTANTS:
+    con_tab  TYPE c VALUE cl_abap_char_utilities=>horizontal_tab.
+
+* READ FILE FROM PRESENTATION SERVER
+  MOVE p_infil1 TO gv_filename.
+  PERFORM get_from_pres IN PROGRAM yam_common_routines
+                                  TABLES  gt_upload
+                                  USING   gv_filename
+                                          c_filetype
+                                          c_blanc.
+
+  REFRESH gt_rec.
+
+  LOOP AT gt_upload INTO wa_string.
+    SPLIT wa_string AT con_tab
+     INTO gt_rec-quotn
+          gt_rec-custn
+          gt_rec-consn
+          gt_rec-quotd
+          gt_rec-partn
+          gt_rec-netpr
+          gt_rec-quant
+          gt_rec-slman
+          gt_rec-qucur
+          gt_rec-payte
+          gt_rec-delt1
+          gt_rec-delt2
+          gt_rec-reqdt
+* begin of change MOD-001
+*          gt_rec-relcd.
+          gt_rec-relcd
+          gt_rec-werks
+          gt_rec-freight
+* begin of insert MOD-006
+          gt_rec-vkbur.
+* end of insert MOD-006
+* end of change MOD-001
+    APPEND gt_rec.
+    CLEAR gt_rec.
+  ENDLOOP.
+
+* begin of change MOD-004
+  IF    p_vkorg = 'RU01'
+    AND p_vtweg = '01'
+    AND p_spart = '01'.
+    LOOP AT gt_rec ASSIGNING <LFS_REC>.
+      IF lv_quotn = <LFS_REC>-quotn.
+        CLEAR <LFS_REC>-freight.
+      ENDIF.
+      lv_quotn = <LFS_REC>-quotn.
+    ENDLOOP.
+  ENDIF.
+* end of change MOD-001
+
+  perform sub_fill_rec.
+
+* Check for duplicates
+  clear: lv_prev_quotn,
+         lv_prev_custn.
+  LOOP AT t_rec.
+    IF t_rec-quotn <> lv_prev_quotn OR
+       t_rec-custn <> lv_prev_custn.
+      move t_rec-quotn to lt_quot-quotn.
+      move t_rec-custn to lt_quot-custn.
+      append lt_quot.
+      clear lt_quot.
+      move t_rec-quotn to lv_prev_quotn.
+      move t_rec-custn to lv_prev_custn.
+    ENDIF.
+  ENDLOOP.
+
+  sort lt_quot by quotn custn.
+  delete ADJACENT DUPLICATES FROM lt_quot COMPARING ALL FIELDS.
+  if sy-subrc = 0.
+*.. Duplicates exist on quotation number and customer
+    MESSAGE e001(00) WITH text-e20.
+  endif.
+
+* Check on machine with options
+  clear: lv_gmach,
+         lv_quant,
+         lv_first.
+
+  loop at t_rec.
+    wa_recg = t_rec.
+    wa_rec  = t_rec.
+
+    at new relcd.
+      if not wa_rec-relcd is initial.
+        lv_quant = wa_rec-quant - 1.
+        lv_gmach = 'X'.
+        wa_rec-quant = '1'.
+
+        wa_recg-partn = 'GMACH'.
+        wa_recg-quant = '1'.
+        wa_recg-relcd = 'GM'.
+
+        refresh t_rec_gm.
+        CLEAR: wa_recg-netpr.
+
+        move wa_recg to t_rec_inter.     " GMACH
+        append t_rec_inter.
+        clear t_rec_inter.
+
+        move wa_rec to t_rec_inter.
+        append t_rec_inter.
+        clear t_rec_inter.
+
+        move wa_recg to t_rec_gm.  " GMACH
+        append t_rec_gm.
+        clear t_rec_gm.
+
+        lv_first = 'X'.
+      endif.
+    endat.
+
+    if lv_gmach = 'X'.
+      move wa_rec to t_rec_gm.
+      append t_rec_gm.
+      clear t_rec_gm.
+    endif.
+
+    if lv_gmach = 'X' and lv_first = 'X'.
+      clear lv_first.
+    else.
+      move wa_rec to t_rec_inter.
+      append t_rec_inter.
+      clear t_rec_inter.
+    endif.
+
+    at end of relcd.
+      if lv_gmach = 'X'.
+        do lv_quant times.
+          loop at t_rec_gm.
+* begin of insert MOD-005
+            CLEAR t_rec_gm-freight.
+* end of insert MOD-005
+            move t_rec_gm to t_rec_inter.
+            append t_rec_inter.
+* begin of mod MOD-005
+*            READ TABLE  t_rec_inter  with key partn = t_rec_inter-partn.
+*            IF sy-subrc = 0.
+*              insert t_rec_inter INDEX sy-tabix.
+*            ELSE.
+*              append t_rec_inter.
+*            ENDIF.
+* begin of mod MOD-005
+            clear t_rec_inter.
+          endloop.
+        enddo.
+        clear lv_gmach.
+      endif.
+    endat.
+  endloop.
+
+  t_rec[] = t_rec_inter[].
+
+* Check on 'Guard qty 1'
+  loop at t_rec.
+    clear lv_quant.
+
+    if t_rec-relcd = ' ' and t_rec-quant > 1.
+      CALL FUNCTION 'CONVERSION_EXIT_MATN1_INPUT'
+        EXPORTING
+          INPUT  = t_rec-partn
+        IMPORTING
+          OUTPUT = lv_matnr.
+
+      clear lv_matkl.
+      select single matkl from MARA
+        into lv_matkl
+        where matnr = lv_matnr.
+
+      select single dwerk from MVKE
+        into lv_dwerk
+        where matnr = lv_matnr
+          and vkorg = p_vkorg
+          and vtweg = p_vtweg.
+
+      clear: lv_sernp,
+             lv_prctr,
+             lv_segment.
+
+      select single sernp prctr from MARC
+             into (lv_sernp, lv_prctr)
+             where matnr = lv_matnr
+               and werks = lv_dwerk.
+
+* begin of change MOD-003
+*      select single segment from YSE_PRCTR_BL
+*             into lv_segment
+*             where prctr = lv_prctr.
+*
+*      if lv_segment+6(1) = '1'.
+*.... Get vendor from source list
+      refresh lt_vendors.
+      SELECT lifnr INTO CORRESPONDING FIELDS OF TABLE lt_vendors
+        FROM eord WHERE matnr = lv_matnr
+                    AND werks = lv_dwerk
+                    AND vdatu < sy-datum
+                    AND bdatu > sy-datum.
+
+      CLEAR lv_found.
+      LOOP AT lt_vendors.
+        SELECT SINGLE * INTO ls_yse_guard_vendor
+          FROM yse_guard_vendor
+          WHERE lifnr = lt_vendors-lifnr.
+
+        IF sy-subrc = 0.
+          lv_found = 'X'.
+          exit.
+        ENDIF.
+      ENDLOOP.
+
+      if lv_found = 'X'.
+* end of change MOD-003
+        if lv_sernp = 'Z001'   OR
+* begin of insert MOD-003
+           lv_matkl = '03' or
+* end of insert MOD-003
+           lv_matkl = '01'.
+          lv_times = t_rec-quant - 1.
+          t_rec-quant = '1'.
+          modify t_rec transporting quant.
+
+          clear wa_rec.
+          move t_rec to wa_rec.
+* begin of insert MOD-005
+          CLEAR wa_rec-freight.
+* end of insert MOD-005
+          do lv_times times.
+            insert wa_rec into t_rec.
+          enddo.
+        endif.
+      endif.
+    endif.
+  endloop.
+
+endform.                    "read_inputfile
+
+*&---------------------------------------------------------------------*
+*&      Form  validate_retrieve_data
+*&---------------------------------------------------------------------*
+*       Validate input data and retrieve additional data
+*----------------------------------------------------------------------*
+form validate_retrieve_data.
+
+  data: lv_erdat    type erdat,
+        lv_lifnr    type lifnr,
+        lv_kunnr    type kunnr,
+        lv_matnr    type matnr,
+        lv_xblnr    type vbak-xblnr,
+        lv_uepst    type t184-uepst,
+        lv_count(2) type n,
+        lv_idx(2)   type n,
+        lv_isocd    type isocd,
+        lv_ortob    type ortob,
+        lv_zdart    type dzdart,
+        lv_i        type i.
+
+* validate input data + retrieve additional data
+  refresh: gt_valerr.
+  clear: lv_idx.
+
+  loop at t_rec.
+
+    add 1 to lv_idx.
+    t_rec-line = lv_idx.
+
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+      EXPORTING
+        INPUT  = t_rec-custn
+      IMPORTING
+        OUTPUT = lv_kunnr.
+
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+      EXPORTING
+        INPUT  = t_rec-consn
+      IMPORTING
+        OUTPUT = lv_lifnr.
+
+    CALL FUNCTION 'CONVERSION_EXIT_MATN1_INPUT'
+      EXPORTING
+        INPUT  = t_rec-partn
+      IMPORTING
+        OUTPUT = lv_matnr.
+
+*.. quotation number
+    select single xblnr into lv_xblnr
+      from vbak where vkorg = p_vkorg
+                  and kunnr = lv_kunnr
+                  and vtweg = p_vtweg
+                  and spart = p_spart
+                  and xblnr = t_rec-quotn.
+
+    if sy-subrc = 0.
+      move t_rec-quotn to gt_valerr-quotn.
+      move t_rec-partn to gt_valerr-matnr.
+      move t_rec-quotn to gt_valerr-value.
+      move text-e01    to gt_valerr-messg.
+      move t_rec-line  to gt_valerr-line.
+      append gt_valerr.
+      clear gt_valerr.
+    endif.
+
+*.. customer number
+    select single vkbur vsbed kvgr1 kvgr4
+      into (gv_vkbur, gv_vsbed, gv_kvgr1, gv_kvgr4)
+      from knvv where kunnr = lv_kunnr
+                  and vkorg = p_vkorg
+                  and vtweg = p_vtweg
+                  and spart = p_spart.
+
+    if sy-subrc <> 0.
+      move t_rec-quotn to gt_valerr-quotn.
+      move t_rec-partn to gt_valerr-matnr.
+      move t_rec-custn to gt_valerr-value.
+      move text-e02    to gt_valerr-messg.
+      move t_rec-line  to gt_valerr-line.
+      append gt_valerr.
+      clear gt_valerr.
+* begin of insert MOD-006
+    ELSE.
+      IF t_rec-vkbur IS NOT INITIAL.
+        gv_vkbur = t_rec-vkbur.
+      ENDIF.
+
+* end of insert MOD-006
+    endif.
+
+*.. ship-to number
+    select single erdat
+      into lv_erdat
+      from knvv where kunnr = lv_lifnr
+                  and vkorg = p_vkorg
+                  and vtweg = p_vtweg
+                  and spart = p_spart.
+
+    if sy-subrc <> 0.
+      move t_rec-quotn to gt_valerr-quotn.
+      move t_rec-partn to gt_valerr-matnr.
+      move t_rec-consn to gt_valerr-value.
+      move text-e03    to gt_valerr-messg.
+      move t_rec-line  to gt_valerr-line.
+      append gt_valerr.
+      clear gt_valerr.
+    else.
+      select single lifnr
+        into lv_lifnr
+        from knvp where kunnr = lv_kunnr
+                    and vkorg = p_vkorg
+                    and vtweg = p_vtweg
+                    and spart = p_spart
+                    and parvw = 'WE'
+                    and kunn2 = lv_lifnr.
+
+      if sy-subrc <> 0.
+        move t_rec-quotn to gt_valerr-quotn.
+        move t_rec-partn to gt_valerr-matnr.
+        move t_rec-consn to gt_valerr-value.
+        move text-e13    to gt_valerr-messg.
+        move t_rec-line  to gt_valerr-line.
+        append gt_valerr.
+        clear gt_valerr.
+      endif.
+    endif.
+
+*.. quotation date
+    lv_i = t_rec-quotd.
+
+    if lv_i = 0.
+      move t_rec-quotn to gt_valerr-quotn.
+      move t_rec-partn to gt_valerr-matnr.
+      move t_rec-quotd to gt_valerr-value.
+      move text-e04    to gt_valerr-messg.
+      move t_rec-line  to gt_valerr-line.
+      append gt_valerr.
+      clear gt_valerr.
+    endif.
+
+*.. part number
+    select single vmsta mtpos dwerk
+      into (gv_vmsta, gv_mtpos, gv_dwerk)
+      from mvke where vkorg = p_vkorg
+                  and vtweg = p_vtweg
+                  and matnr = lv_matnr.
+
+    if sy-subrc <> 0.
+      move t_rec-quotn to gt_valerr-quotn.
+      move t_rec-partn to gt_valerr-matnr.
+*      move t_rec-partn to gt_valerr-value.
+      move text-e05    to gt_valerr-messg.
+      move t_rec-line  to gt_valerr-line.
+      append gt_valerr.
+      clear gt_valerr.
+    else.
+      if not gv_vmsta is initial.
+        move t_rec-quotn to gt_valerr-quotn.
+        move t_rec-partn to gt_valerr-matnr.
+*        move t_rec-consn to gt_valerr-value.
+        move text-e15    to gt_valerr-messg.
+        move t_rec-line  to gt_valerr-line.
+        append gt_valerr.
+        clear gt_valerr.
+      endif.
+    endif.
+
+*.. sales man code
+* begin of change MOD-001
+*    select single vkgrp into gv_vkgrp
+*      from tvkgr where vkgrp = t_rec-slman.
+    select single vkgrp into gv_vkgrp
+      from tvbvk where vkbur = gv_vkbur
+                   and vkgrp = t_rec-slman.
+* end of change MOD-01
+
+    if sy-subrc <> 0.
+      move t_rec-quotn to gt_valerr-quotn.
+      move t_rec-partn to gt_valerr-matnr.
+      move t_rec-slman to gt_valerr-value.
+      move text-e06    to gt_valerr-messg.
+      move t_rec-line  to gt_valerr-line.
+      append gt_valerr.
+      clear gt_valerr.
+    endif.
+
+*.. quote currency
+    select single isocd into lv_isocd
+      from tcurc where waers = t_rec-qucur.
+
+    if sy-subrc <> 0.
+      move t_rec-quotn to gt_valerr-quotn.
+      move t_rec-partn to gt_valerr-matnr.
+      move t_rec-qucur to gt_valerr-value.
+      move text-e07    to gt_valerr-messg.
+      move t_rec-line  to gt_valerr-line.
+      append gt_valerr.
+      clear gt_valerr.
+    endif.
+
+*.. delivery terms-part1
+    select single ortob into lv_ortob
+      from tinc where inco1 = t_rec-delt1.
+
+    if sy-subrc <> 0.
+      move t_rec-quotn to gt_valerr-quotn.
+      move t_rec-partn to gt_valerr-matnr.
+      move t_rec-delt1 to gt_valerr-value.
+      move text-e08    to gt_valerr-messg.
+      move t_rec-line  to gt_valerr-line.
+      append gt_valerr.
+      clear gt_valerr.
+    endif.
+
+*.. payment terms
+    select single zdart into lv_zdart
+      from t052 where zterm = t_rec-payte
+                  and ztagg = '00'.
+
+    if sy-subrc <> 0.
+      move t_rec-quotn to gt_valerr-quotn.
+      move t_rec-partn to gt_valerr-matnr.
+      move t_rec-payte to gt_valerr-value.
+      move text-e09    to gt_valerr-messg.
+      move t_rec-line  to gt_valerr-line.
+      append gt_valerr.
+      clear gt_valerr.
+    endif.
+
+*.. requested delivery date
+    lv_i = t_rec-reqdt.
+
+    if lv_i = 0.
+      move t_rec-quotn to gt_valerr-quotn.
+      move t_rec-partn to gt_valerr-matnr.
+      move t_rec-reqdt to gt_valerr-value.
+      move text-e10    to gt_valerr-messg.
+      move t_rec-line  to gt_valerr-line.
+      append gt_valerr.
+      clear gt_valerr.
+    endif.
+
+*.. quantity
+    if t_rec-quant is initial or t_rec-quant = 0.
+      move t_rec-quotn to gt_valerr-quotn.
+      move t_rec-partn to gt_valerr-matnr.
+      move t_rec-quant to gt_valerr-value.
+      move text-e11    to gt_valerr-messg.
+      move t_rec-line  to gt_valerr-line.
+      append gt_valerr.
+      clear gt_valerr.
+    endif.
+
+*.. retrieve additional data
+    move gv_vkbur to t_rec-vkbur.
+    move gv_vsbed to t_rec-vsbed.
+    move gv_kvgr1 to t_rec-kvgr1.
+    move gv_kvgr4 to t_rec-kvgr4.
+    move gv_mtpos to t_rec-mtpos.
+* begin of delete MOD-001
+*    move gv_dwerk to t_rec-werks.
+* end of delete MOD-001
+
+*.. Get item category from table T184
+    if not t_rec-relcd is initial and t_rec-relcd <> 'GM'.
+      lv_uepst = 'ZP1'.
+    else.
+      clear lv_uepst.
+    endif.
+
+    select single pstyv into t_rec-pstyv
+      from T184 where auart = c_auart
+                  and mtpos = t_rec-mtpos
+                  and vwpos = space
+                  and uepst = lv_uepst.
+
+* begin of insert MOD-001
+    CLEAR gv_vkorg.
+    SELECT vkorg into gv_vkorg
+      UP TO 1 rows
+      FROM YSE_ATP_CONFIG WHERE vkorg = p_vkorg
+                            AND vtweg = p_vtweg.
+    ENDSELECT.
+
+    if sy-subrc = 0.
+      if gv_vkorg NE c_ru02. "+MOD-006
+* end of insert MOD-001
+*.... determine item category and plant via atp cascade
+        perform atp_cascade using lv_matnr lv_kunnr.
+* begin of insert MOD-001
+      endif.    "+MOD-006
+    endif.
+* end of insert MOD-001
+
+*.. Check on incomplete requisitions
+    if t_rec-pstyv = 'ZDTC'.
+      SELECT COUNT( * ) INTO lv_count
+        FROM eord WHERE matnr = lv_matnr
+                    AND werks = gv_dwerk.
+
+      IF lv_count = 1.
+*...... 1 record is found
+        SELECT SINGLE zeord INTO eord-zeord
+          FROM eord WHERE matnr  = lv_matnr
+                      AND werks  = gv_dwerk
+                      AND vdatu <= sy-datum
+                      AND bdatu >= sy-datum.
+
+        IF sy-subrc <> 0.
+          move t_rec-quotn to gt_valerr-quotn.
+          move t_rec-partn to gt_valerr-matnr.
+          move text-e22    to gt_valerr-messg.
+          move t_rec-line  to gt_valerr-line.
+          append gt_valerr.
+          clear gt_valerr.
+        ENDIF.
+
+      ELSEIF lv_count > 1.
+*...... More than 1 record is found
+        SELECT zeord INTO eord-zeord
+          FROM eord WHERE matnr  = lv_matnr
+                      AND werks  = gv_dwerk
+                      AND vdatu <= sy-datum
+                      AND bdatu >= sy-datum.
+        ENDSELECT.
+
+        IF sy-subrc = 0.
+          if sy-dbcnt <> 1.
+            SELECT SINGLE zeord INTO eord-zeord
+              FROM eord WHERE matnr  = lv_matnr
+                          AND werks  = gv_dwerk
+                          AND vdatu <= sy-datum
+                          AND bdatu >= sy-datum
+                          AND flifn  = 'X'.       " fixed vendor
+
+            IF sy-subrc <> 0.
+              move t_rec-quotn to gt_valerr-quotn.
+              move t_rec-partn to gt_valerr-matnr.
+              move text-e23    to gt_valerr-messg.
+              move t_rec-line  to gt_valerr-line.
+              append gt_valerr.
+              clear gt_valerr.
+            ENDIF.
+          endif.
+        ELSE.
+          move t_rec-quotn to gt_valerr-quotn.
+          move t_rec-partn to gt_valerr-matnr.
+          move text-e22    to gt_valerr-messg.
+          move t_rec-line  to gt_valerr-line.
+          append gt_valerr.
+          clear gt_valerr.
+        ENDIF.
+      ELSE.
+*...... No record(s) found
+        move t_rec-quotn to gt_valerr-quotn.
+        move t_rec-partn to gt_valerr-matnr.
+        move text-e21    to gt_valerr-messg.
+        move t_rec-line  to gt_valerr-line.
+        append gt_valerr.
+        clear gt_valerr.
+      ENDIF.
+    endif.
+
+    modify t_rec transporting line
+                              vkbur
+                              vsbed
+                              kvgr1
+                              kvgr4
+                              mtpos
+                              pstyv
+                              werks.
+  endloop.
+
+  gt_valerr2[] = gt_valerr[].
+  sort gt_valerr2 by quotn.
+
+endform.                    "validate_retrieve_data
+
+*&---------------------------------------------------------------------*
+*&      Form  sub_fill_rec
+*&---------------------------------------------------------------------*
+*       Fill record in table to process
+*----------------------------------------------------------------------*
+FORM sub_fill_rec.
+
+  LOOP AT gt_rec.
+    clear t_rec.
+    move-corresponding gt_rec to t_rec.
+    append t_rec.
+  endloop.
+
+endform.                    "sub_fill_rec
+
+*&---------------------------------------------------------------------*
+*&      Form  atp_cascade
+*&---------------------------------------------------------------------*
+*       Perform the atp cascade
+*----------------------------------------------------------------------*
+* ---> r_matnr : material in internal format
+* ---> r_kunnr : customer in internal format
+*----------------------------------------------------------------------*
+form atp_cascade using r_matnr r_kunnr.
+
+  data: lv_bzirk type bzirk.
+
+  IF NOT t_rec-partn IS INITIAL
+   AND t_rec-quant NE 0
+   AND t_rec-MTPOS NE 'ZLMF'       " NOT FOR MACHINES WITH OPTIONS
+   AND t_rec-relcd EQ '   '.       " NOT FOR MACHINES WITH OPTIONS
+
+*.. FIND DISTRIBUTION MODE AND MATERIAL GROUP AND STOCK POLICY
+    SELECT SINGLE A~MATKL B~DISMM B~WERKS C~MTPOS
+      INTO (gV_MATKL, gV_DISMM, gV_WERKS, gV_MTPOS)
+      FROM MARA AS A
+       INNER JOIN MARC AS B
+        ON A~MATNR = B~MATNR
+       INNER JOIN MVKE AS C
+        ON B~MATNR = C~MATNR
+       AND B~WERKS = C~DWERK
+      WHERE A~MATNR EQ r_matnr
+        AND C~VKORG EQ p_VKORG
+        AND C~VTWEG EQ p_VTWEG.
+
+    if sy-subrc <> 0.
+      move t_rec-quotn to gt_valerr-quotn.
+      move t_rec-partn to gt_valerr-matnr.
+*      move  to gt_valerr-field.
+      move text-e14    to gt_valerr-messg.
+      move t_rec-line  to gt_valerr-line.
+      append gt_valerr.
+      clear gt_valerr.
+    endif.
+
+*.. FIND VENDOR - MARKED AS FIXED
+    SELECT SINGLE LIFNR INTO gV_LIFNR
+      FROM EORD
+      WHERE MATNR EQ r_matnr
+        AND WERKS EQ gV_WERKS
+        AND BDATU > SY-DATUM
+        AND FLIFN EQ C_X.
+
+*.. CHECK URGENCY CODE
+    IF t_rec-VSBED IS INITIAL.
+      t_rec-VSBED = C_Z1.
+    ENDIF.
+
+*.. CHECK CONFIGURATION TABLE FOR FINDING ATP CASCADE CHECKS ARE NECESSARY
+    SELECT SINGLE * INTO gV_YSE_ATP_CONFIG
+      FROM YSE_ATP_CONFIG
+      WHERE VKORG EQ p_VKORG
+        AND VTWEG EQ p_VTWEG
+        AND MATKL EQ gV_MATKL
+        AND LIFNR EQ gV_LIFNR
+        AND DISMM EQ gV_DISMM
+        AND ZZURGCODE EQ t_rec-VSBED
+        AND MTPOS EQ gV_MTPOS.
+
+    IF SY-SUBRC NE 0.
+      SELECT SINGLE * INTO gV_YSE_ATP_CONFIG
+        FROM YSE_ATP_CONFIG
+        WHERE VKORG EQ p_VKORG
+          AND VTWEG EQ p_VTWEG
+          AND MATKL EQ gv_MATKL
+          AND LIFNR EQ '*'
+          AND DISMM EQ gv_DISMM
+          AND ZZURGCODE EQ t_rec-VSBED
+          AND MTPOS EQ gV_MTPOS.
+    ENDIF.
+
+    IF SY-SUBRC EQ 0.
+      refresh it_wmdvsx.        " +lme 2011.02.08
+
+*.... CHECK AVAILABILITY
+      IT_WMDVSX-REQ_DATE(2)   = SY-DATUM+6(2).
+      IT_WMDVSX-REQ_DATE+2(2) = SY-DATUM+4(2).
+      IT_WMDVSX-REQ_DATE+4(4) = SY-DATUM(4).
+* begin of change MOD-002
+*      IT_WMDVSX-REQ_QTY = t_rec-quant.
+      IT_WMDVSX-REQ_QTY = t_rec-quant * 1000.
+* end of change MOD-002
+      APPEND IT_WMDVSX.
+
+      gV_WERKS = gV_YSE_ATP_CONFIG-SOURCE1.
+      gV_CHECK_AVAIL = C_X.
+      gV_LASTSOURCE = 1.
+      clear gv_sdtc.
+
+      WHILE gV_CHECK_AVAIL EQ C_X.
+        REFRESH IT_WMDVEX.
+        IF gV_WERKS NE C_BRAN.             " NO BRANCH PLANT
+          READ TABLE IT_YSE_EM_PLANT WITH KEY WERKS = gV_WERKS.
+
+          MOVE C_PC TO gV_UNIT.
+
+          CALL FUNCTION 'YSE_BAPI_MATERIAL_AVAILABILITY'
+            EXPORTING
+              PLANT      = gV_WERKS
+              MATERIAL   = r_matnr
+              UNIT       = gV_UNIT
+              CHECK_RULE = C_A
+            TABLES
+              WMDVSX     = IT_WMDVSX
+              WMDVEX     = IT_WMDVEX.
+
+          READ TABLE IT_WMDVEX INDEX 1.
+          IF SY-SUBRC EQ 0.
+            IF  IT_WMDVEX-COM_QTY >= IT_WMDVEX-REQ_QTY.
+              if it_yse_em_plant-whtype = c_d.
+                case gv_lastsource.
+                  when 1.
+                    if not gv_yse_atp_config-source2 is initial.
+                      gv_werks = gv_yse_atp_config-source2.
+                      gv_sdtc = c_x.
+                    endif.
+                  when 2.
+                    if not gv_yse_atp_config-source3 is initial.
+                      gv_werks = gv_yse_atp_config-source3.
+                      gv_sdtc = c_x.
+                    endif.
+                  when 3.
+                    if not gv_yse_atp_config-source4 is initial.
+                      gv_werks = gv_yse_atp_config-source4.
+                      gv_sdtc = c_x.
+                    endif.
+                endcase.
+              endif.
+              CLEAR gV_CHECK_AVAIL.
+            ELSE.
+              IF gV_LASTSOURCE = 1.
+                IF NOT gV_YSE_ATP_CONFIG-SOURCE2 IS INITIAL.
+                  if it_yse_em_plant-whtype = c_d.
+                    gv_sdtc = c_x.
+                    CLEAR gV_CHECK_AVAIL.
+                  endif.
+                  gV_WERKS = gV_YSE_ATP_CONFIG-SOURCE2.
+                  gV_LASTSOURCE = 2.
+                ELSE.
+                  CLEAR gV_CHECK_AVAIL.
+                ENDIF.
+              ELSEIF gV_LASTSOURCE = 2.
+                IF NOT gV_YSE_ATP_CONFIG-SOURCE3 IS INITIAL.
+                  if it_yse_em_plant-whtype = c_d.
+                    gv_sdtc = c_x.
+                    CLEAR gV_CHECK_AVAIL.
+                  endif.
+                  gV_WERKS = gV_YSE_ATP_CONFIG-SOURCE3.
+                  gV_LASTSOURCE = 3.
+                else.
+                  CLEAR gV_CHECK_AVAIL.
+                ENDIF.
+              elseif gv_lastsource = 3.
+                IF NOT gV_YSE_ATP_CONFIG-SOURCE4 IS INITIAL.
+                  if it_yse_em_plant-whtype = c_d.
+                    gv_sdtc = c_x.
+                  endif.
+                  gV_WERKS = gV_YSE_ATP_CONFIG-SOURCE4.
+                  gV_LASTSOURCE = 4.
+                endif.
+                CLEAR gV_CHECK_AVAIL.
+              ENDIF.
+            ENDIF.
+          ELSE.
+            IF gV_LASTSOURCE = 1.
+              IF NOT gV_YSE_ATP_CONFIG-SOURCE2 IS INITIAL.
+                if it_yse_em_plant-whtype = c_d.
+                  gv_sdtc = c_x.
+                  CLEAR gV_CHECK_AVAIL.
+                endif.
+                gV_WERKS = gV_YSE_ATP_CONFIG-SOURCE2.
+                gV_LASTSOURCE = 2.
+              ELSE.
+                CLEAR gV_CHECK_AVAIL.
+              ENDIF.
+            ELSEIF gV_LASTSOURCE = 2.
+              IF NOT gV_YSE_ATP_CONFIG-SOURCE3 IS INITIAL.
+                if it_yse_em_plant-whtype = c_d.
+                  gv_sdtc = c_x.
+                  CLEAR gV_CHECK_AVAIL.
+                endif.
+                gV_WERKS = gV_YSE_ATP_CONFIG-SOURCE3.
+                gV_LASTSOURCE = 3.
+              else.
+                CLEAR gV_CHECK_AVAIL.
+              ENDIF.
+            elseif gv_lastsource = 3.
+              IF NOT gV_YSE_ATP_CONFIG-SOURCE4 IS INITIAL.
+                if it_yse_em_plant-whtype = c_d.
+                  gv_sdtc = c_x.
+                endif.
+                gV_WERKS = gV_YSE_ATP_CONFIG-SOURCE4.
+                gV_LASTSOURCE = 4.
+              endif.
+              CLEAR gV_CHECK_AVAIL.
+            ENDIF.
+          ENDIF.
+        ELSE.         "WHEN BRANCH
+          read table it_yse_em_pl_so with key vkbur = t_rec-vkbur.
+          if sy-subrc = 0.
+            gv_werks = it_yse_em_pl_so-werks.
+          else.
+*.......... stock availability check in brancH plant
+            select single bzirk into lv_bzirk
+              from knvv where kunnr = r_kunnr
+                          and vkorg = p_vkorg
+                          and vtweg = p_vtweg
+                          and spart = p_spart.
+            READ TABLE IT_YSE_EM_PL_DISTR WITH KEY BZIRK = lv_BZIRK.
+
+            IF SY-SUBRC EQ 0.
+              gV_WERKS = IT_YSE_EM_PL_DISTR-WERKS.
+
+*............ CHECK BRANCH WAREHOUSE IS TYPE B
+              READ TABLE IT_YSE_EM_PLANT WITH KEY WERKS = gV_WERKS.
+
+              CASE IT_YSE_EM_PLANT-WHTYPE.
+                WHEN C_B.
+                  MOVE C_PC TO gV_UNIT.
+
+                  CALL FUNCTION 'YSE_BAPI_MATERIAL_AVAILABILITY'
+                    EXPORTING
+                      PLANT      = gV_WERKS
+                      MATERIAL   = r_matnr
+                      UNIT       = gV_UNIT
+                      CHECK_RULE = C_A
+                    TABLES
+                      WMDVSX     = IT_WMDVSX
+                      WMDVEX     = IT_WMDVEX.
+
+                  READ TABLE IT_WMDVEX INDEX 1.
+
+                  IF SY-SUBRC EQ 0.
+                    IF  IT_WMDVEX-COM_QTY >= IT_WMDVEX-REQ_QTY.
+                      if it_yse_em_plant-whtype = c_d.
+                        case gv_lastsource.
+                          when 1.
+                            if not gv_yse_atp_config-source2 is initial.
+                              gv_werks = gv_yse_atp_config-source2.
+                              gv_sdtc = c_x.
+                            endif.
+                          when 2.
+                            if not gv_yse_atp_config-source3 is initial.
+                              gv_werks = gv_yse_atp_config-source3.
+                              gv_sdtc = c_x.
+                            endif.
+                          when 3.
+                            if not gv_yse_atp_config-source4 is initial.
+                              gv_werks = gv_yse_atp_config-source4.
+                              gv_sdtc = c_x.
+                            endif.
+                        endcase.
+                      endif.
+                      CLEAR gV_CHECK_AVAIL.
+                    ELSE.
+                      IF gV_LASTSOURCE = 1.
+                        IF NOT gV_YSE_ATP_CONFIG-SOURCE2 IS INITIAL.
+                          if it_yse_em_plant-whtype = c_d.
+                            gv_sdtc = c_x.
+                            CLEAR gV_CHECK_AVAIL.
+                          endif.
+                          gV_WERKS = gV_YSE_ATP_CONFIG-SOURCE2.
+                          gV_LASTSOURCE = 2.
+                        ELSE.
+                          CLEAR gV_CHECK_AVAIL.
+                        ENDIF.
+                      ELSEIF gV_LASTSOURCE = 2.
+                        IF NOT gV_YSE_ATP_CONFIG-SOURCE3 IS INITIAL.
+                          if it_yse_em_plant-whtype = c_d.
+                            gv_sdtc = c_x.
+                            CLEAR gV_CHECK_AVAIL.
+                          endif.
+                          gV_WERKS = gV_YSE_ATP_CONFIG-SOURCE3.
+                          gV_LASTSOURCE = 3.
+                        else.
+                          CLEAR gV_CHECK_AVAIL.
+                        ENDIF.
+                      elseif gv_lastsource = 3.
+                        IF NOT gV_YSE_ATP_CONFIG-SOURCE4 IS INITIAL.
+                          if it_yse_em_plant-whtype = c_d.
+                            gv_sdtc = c_x.
+                          endif.
+                          gV_WERKS = gV_YSE_ATP_CONFIG-SOURCE4.
+                          gV_LASTSOURCE = 4.
+                        endif.
+                        CLEAR gV_CHECK_AVAIL.
+                      ENDIF.
+                    ENDIF.
+                  ELSE.
+                    IF gV_LASTSOURCE = 1.
+                      IF NOT gV_YSE_ATP_CONFIG-SOURCE2 IS INITIAL.
+                        if it_yse_em_plant-whtype = c_d.
+                          gv_sdtc = c_x.
+                          CLEAR gV_CHECK_AVAIL.
+                        endif.
+                        gV_WERKS = gV_YSE_ATP_CONFIG-SOURCE2.
+                        gV_LASTSOURCE = 2.
+                      ELSE.
+                        CLEAR gV_CHECK_AVAIL.
+                      ENDIF.
+                    ELSEIF gV_LASTSOURCE = 2.
+                      IF NOT gV_YSE_ATP_CONFIG-SOURCE3 IS INITIAL.
+                        if it_yse_em_plant-whtype = c_d.
+                          gv_sdtc = c_x.
+                          CLEAR gV_CHECK_AVAIL.
+                        endif.
+                        gV_WERKS = gV_YSE_ATP_CONFIG-SOURCE3.
+                        gV_LASTSOURCE = 3.
+                      else.
+                        CLEAR gV_CHECK_AVAIL.
+                      ENDIF.
+                    elseif gv_lastsource = 3.
+                      IF NOT gV_YSE_ATP_CONFIG-SOURCE4 IS INITIAL.
+                        if it_yse_em_plant-whtype = c_d.
+                          gv_sdtc = c_x.
+                        endif.
+                        gV_WERKS = gV_YSE_ATP_CONFIG-SOURCE4.
+                        gV_LASTSOURCE = 4.
+                      endif.
+                      CLEAR gV_CHECK_AVAIL.
+                    ENDIF.
+                  ENDIF.
+                WHEN OTHERS.
+                  move t_rec-quotn to gt_valerr-quotn.
+                  move t_rec-partn to gt_valerr-matnr.
+*                  move  to gt_valerr-field.
+                  move text-e14    to gt_valerr-messg.
+                  move t_rec-line  to gt_valerr-line.
+                  append gt_valerr.
+                  clear gt_valerr.
+              ENDCASE.
+            ELSE.
+              CLEAR gV_CHECK_AVAIL.
+              move t_rec-quotn to gt_valerr-quotn.
+              move t_rec-partn to gt_valerr-matnr.
+*              move  to gt_valerr-field.
+              move text-e14    to gt_valerr-messg.
+              move t_rec-line  to gt_valerr-line.
+              append gt_valerr.
+              clear gt_valerr.
+            ENDIF.
+          endif.
+        endif.
+      ENDWHILE.
+
+      t_rec-werks = gv_werks.
+      READ TABLE IT_YSE_EM_PLANT WITH KEY WERKS = gV_WERKS.
+
+      IF IT_YSE_EM_PLANT-WHTYPE = C_D or gv_sdtc = c_x.
+*...... read item category from table YSE_ATP_ITEMCAT
+        SELECT SINGLE *
+          FROM YSE_ATP_ITEMCAT
+          WHERE DTC EQ 'X'
+            AND PSTYV_SAP EQ t_rec-pstyv.
+
+        IF SY-SUBRC EQ 0.
+          t_rec-pstyv = YSE_ATP_ITEMCAT-PSTYV_ATP.
+        ENDIF.
+      ELSE.
+        SELECT SINGLE *
+          FROM YSE_ATP_ITEMCAT
+          WHERE DTC EQ ' '
+            AND PSTYV_SAP EQ t_rec-pstyv.
+
+        IF SY-SUBRC EQ 0.
+          t_rec-pstyv = YSE_ATP_ITEMCAT-PSTYV_ATP.
+        ENDIF.
+      endif.
+    ENDIF.
+  ENDIF.
+
+endform.                    "atp_cascade
+
+*&---------------------------------------------------------------------*
+*&      Form review_screen
+*&---------------------------------------------------------------------*
+*       Show reviewed data
+*----------------------------------------------------------------------*
+form review_data.
+
+  EXPORT t_rec gt_valerr2 TO MEMORY ID 'YSE_SL_CTP_QUOT'.
+  SET parameter id 'VKO' field p_vkorg.
+  SET parameter id 'VTW' field p_vtweg.
+  SET parameter id 'SPA' field p_spart.
+
+  CALL TRANSACTION 'YSE_SL_CTP_QUOTATION'.
+  import gv_ucomm gt_errmsg from memory id 'YSE_SL_CTP_QUOT'.
+  CHECK gv_ucomm EQ 'EXEC'.
+
+* Write errors of validation on screen
+  PERFORM write_log.
+
+* Write overview of sales order creation(s)
+  skip 2.
+  write: / text-h02.
+  uline.
+  skip.
+
+  loop at gt_errmsg.
+    write: / gt_errmsg-quotn,
+             gt_errmsg-type,
+             gt_errmsg-messg.
+  endloop.
+
+endform.                    "review_data
+
+*&---------------------------------------------------------------------*
+*&      Form  CREATE_SALES_ORDER
+*&---------------------------------------------------------------------*
+*       Create sales order
+*----------------------------------------------------------------------*
+*  -->  r_rec
+*  <--  r_mestab      error messages
+*  <--  r_retcd       return code
+*----------------------------------------------------------------------*
+FORM CREATE_SALES_ORDER tables r_mestab
+                         using r_rec structure t_rec
+                      changing r_retcd.
+
+  data: lv_posnr      type POSNR_VA,
+        lv_vbeln      type vbeln,
+        lv_lifnr      type lifnr,
+        lv_kunnr      type kunnr,
+        lv_matnr      type matnr,
+        lv_netpr(11)  type p decimals 2,
+        lv_save_relcd like t_rec_det-relcd,
+        lv_gm,
+        lv_posnr_gm   type posnr_va.
+
+  clear r_retcd.
+
+  clear: gs_header, gs_headerx.
+  refresh: gt_order_item_in, gt_order_item_inx,
+           gt_condition, gt_conditionx, r_mestab,
+           gt_sched_in, gt_sched_inx.
+
+  get PARAMETER ID 'VKO' field p_vkorg.
+  get PARAMETER ID 'VTW' field p_vtweg.
+  get PARAMETER ID 'SPA' field p_spart.
+
+  CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+    EXPORTING
+      INPUT  = r_rec-custn
+    IMPORTING
+      OUTPUT = lv_kunnr.
+
+  CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+    EXPORTING
+      INPUT  = r_rec-consn
+    IMPORTING
+      OUTPUT = lv_lifnr.
+
+* Header
+  gs_headerx-updateflag = 'I'.
+
+  gs_header-doc_type  = 'ZOR '.
+  gs_headerx-doc_type = 'X'.
+
+  gs_header-sales_org  = p_vkorg.
+  gs_headerx-sales_org = 'X'.
+
+  gs_header-distr_chan  = p_vtweg.
+  gs_headerx-distr_chan = 'X'.
+
+  gs_header-division  = p_spart.
+  gs_headerx-division = 'X'.
+
+  gs_header-sales_off  = r_rec-vkbur.
+  gs_headerx-sales_off = 'X'.
+
+  gs_header-sales_grp  = r_rec-slman.
+  gs_headerx-sales_grp = 'X'.
+
+  gs_header-req_date_h  = r_rec-reqdt.
+  gs_headerx-req_date_h = 'X'.
+
+  gs_header-ship_cond  = r_rec-vsbed.
+  gs_headerx-ship_cond = 'X'.
+
+  gs_header-currency  = r_rec-qucur.
+  gs_headerx-currency = 'X'.
+
+  gs_header-incoterms1  = r_rec-delt1.
+  gs_headerx-incoterms1 = 'X'.
+
+  gs_header-incoterms2  = r_rec-delt2.
+  gs_headerx-incoterms2 = 'X'.
+
+  gs_header-PMNTTRMS  = r_rec-payte.
+  gs_headerx-PMNTTRMS = 'X'.
+
+  gs_header-PO_METHOD  = 'CTP'.
+  gs_headerx-PO_METHOD = 'X'.
+
+  gs_header-PURCH_NO_C = r_rec-quotn.
+  gs_headerx-PURCH_NO_C = 'X'.
+
+  gs_header-PRICE_DATE  = r_rec-quotd.
+  gs_headerx-PRICE_DATE = 'X'.
+
+  gs_header-CUST_GRP4 = r_rec-kvgr4.
+  gs_headerx-CUST_GRP4 = 'X'.
+
+  gs_header-CUST_GRP1 = r_rec-kvgr1.
+  gs_headerx-CUST_GRP4 = 'X'.
+
+  gs_header-REF_DOC_L = r_rec-quotn.
+  gs_headerx-REF_DOC_L = 'X'.
+
+  gs_header-DLV_BLOCK = 'ZD'.
+  gs_headerx-DLV_BLOCK = 'X'.
+
+* Partner
+  gt_partner-partn_role = 'AG'.
+  gt_partner-partn_numb = lv_kunnr.
+  APPEND gt_partner.
+
+  gt_partner-partn_role = 'WE'.
+  gt_partner-partn_numb = lv_lifnr.
+  APPEND gt_partner.
+
+* Items and conditions
+  lv_posnr = 10.
+  clear lv_gm.
+
+  loop at t_rec_det where quotn = r_rec-quotn.
+    clear: gs_order_item_in, gs_order_item_inx,
+           gs_condition, gs_conditionx,
+           gs_sched_in, gs_sched_inx.
+
+    lv_save_relcd = t_rec_det-relcd.
+
+*.. Items
+    gS_ORDER_ITEM_INX-UPDATEFLAG = 'I'.
+
+    gS_ORDER_ITEM_IN-ITM_NUMBER  = lv_POSNR.
+    gS_ORDER_ITEM_INX-ITM_NUMBER = lv_POSNR.
+
+    CALL FUNCTION 'CONVERSION_EXIT_MATN1_INPUT'
+      EXPORTING
+        INPUT  = t_rec_det-partn
+      IMPORTING
+        OUTPUT = lv_matnr.
+
+    gs_ORDER_item_in-material  = lv_matnr.
+    gs_ORDER_item_inx-material = 'X'.
+
+    gs_ORDER_item_in-plant  = t_rec_det-werks.
+    gs_ORDER_item_inx-plant = 'X'.
+
+    gs_ORDER_item_in-item_categ = t_rec_det-pstyv.
+    gs_ORDER_item_inx-item_categ = 'X'.
+
+    if lv_gm = 'X'.
+      if lv_save_relcd <> ' '.
+        gs_order_item_in-HG_LV_ITEM = lv_posnr_gm.
+        gs_order_item_inx-HG_LV_ITEM = 'X'.
+      else.
+        clear lv_gm.
+      endif.
+    endif.
+
+    if lv_save_relcd = 'GM'.
+      clear: gs_order_item_in-HG_LV_ITEM,
+             gs_order_item_inx-HG_LV_ITEM.
+      lv_posnr_gm = lv_posnr.
+      lv_gm = 'X'.
+    endif.
+
+    append gs_order_item_in to gt_order_item_in.
+    APPEND gs_order_item_inx to gt_order_item_inx.
+
+*.. Schedule line for quantity
+    gs_sched_in-itm_number  = lv_posnr.
+    gs_sched_inx-itm_number = lv_posnr.
+    gs_sched_inx-updateflag = 'I'.
+
+    gs_sched_in-req_qty  = t_rec_det-quant * 1000.
+    gs_sched_inx-req_qty = 'X'.
+
+    append gs_sched_in  to gt_sched_in.
+    append gs_sched_inx to gt_sched_inx.
+
+*.. Conditions
+    if lv_save_relcd <> 'GM'.
+* begin of insert MOD-001
+*      IF lv_posnr = 10 AND NOT t_rec_det-freight IS INITIAL.
+      IF NOT t_rec_det-freight IS INITIAL.
+        MOVE '000000'        TO gs_condition-itm_number.
+        MOVE 'ZD00'          TO gs_condition-cond_type.
+        gs_condition-cond_value = t_rec_det-freight * 10000000.
+        move t_rec_det-qucur to gs_condition-currency.
+        append gs_condition  to gt_condition.
+        APPEND gs_conditionx TO gt_conditionx.
+      ENDIF.
+* end of insert MOD-001
+
+      MOVE lv_posnr        TO gs_condition-itm_number.
+      MOVE 'ZPNM'          TO gs_condition-cond_type.
+      gs_condition-cond_value = t_rec_det-netpr * 10000000.
+      move t_rec_det-qucur to gs_condition-currency.
+      append gs_condition  to gt_condition.
+      APPEND gs_conditionx TO gt_conditionx.
+    endif.
+
+    add 10 to lv_posnr.
+  endloop.
+
+* Create sales order and items
+  CALL FUNCTION 'BAPI_SALESORDER_CREATEFROMDAT2'
+    EXPORTING
+      ORDER_HEADER_IN      = gs_header
+      ORDER_HEADER_INx     = gs_headerx
+    IMPORTING
+      salesdocument        = lv_vbeln
+    TABLES
+      ORDER_ITEMs_IN       = gt_order_item_in
+      ORDER_ITEMs_INx      = gt_order_item_inx
+      ORDER_SCHEDULES_IN   = gt_sched_in
+      ORDER_SCHEDULES_INX  = gt_sched_inx
+      ORDER_CONDITIONS_IN  = gt_condition
+      ORDER_CONDITIONS_INX = gt_conditionx
+      return               = r_mestab
+      ORDER_PARTNERS       = gt_partner.
+
+  CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'.
+
+ENDFORM.                    " CREATE_SALES_ORDER
+
+*&---------------------------------------------------------------------*
+*&      Form  WRITE_LOG
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM WRITE_LOG .
+
+  LEAVE TO LIST-PROCESSING.
+
+  write: / text-h01.
+  uline.
+  skip.
+
+  loop at gt_valerr.
+    WRITE: / gt_valerr-line,
+             gt_valerr-quotn,
+             gt_valerr-matnr,
+             gt_valerr-value,
+             gt_valerr-messg.
+  endloop.
+
+ENDFORM.                    " WRITE_LOG

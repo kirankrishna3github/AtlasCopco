@@ -1,0 +1,609 @@
+*----------------------------------------------------------------------*
+*  INCLUDE SDRRR01C  ---   Subroutines
+*  ************************************
+*
+*  perform check_revenue_lines.
+*  perform collect_control_lines.
+*  perform complete_ctrl_info.
+*  perform create_ctrl_info.
+*  perform create_ctrl_info_from_crtl.
+*  perform create_error_log.
+*
+*----------------------------------------------------------------------*
+
+*----------------------------------------------------------------------*
+*       Form  CHECK_REVRENUE_LINES
+*----------------------------------------------------------------------*
+*       Check revenue lines: Open posting period
+*                            Check/create header keys
+*----------------------------------------------------------------------*
+*  --> PIT_VBREVK       Selected  control lines
+*  --> PIT_PEROPEN      Open/closed posting period
+*  --> PIF_REVFUNC      Recognition/Cancelation flag
+*  <-> PCT_VBREVEAV     Relevant revenue lines
+*  <-- PET_HEAD_KEYS    Relevant header keys
+*----------------------------------------------------------------------*
+form check_revenue_lines using pit_vbrevk    type gvt_strucst_vbrevk
+                               pit_peropen   type gvt_strucso_peropen
+                               pif_revfunc   type char1
+                      changing pct_vbreveav  type gvt_strucst_vbreveav
+                               pet_head_keys type gvt_strucst_head_keys.
+
+* Internal work areas
+  data: lvs_vbrevk       like vbrevk,
+        lvs_vbreveav     like vbreveav,
+        lvs_peropen      type gvs_struc_peropen,
+        lvs_head_keys    type gvs_struc_head,
+        lvs_ctrl_key     type gvs_struc_head,
+        lvs_ctrl_key_old type gvs_struc_head.
+
+* Internal fields
+  data: lvf_bukrs_old     like vbrevk-bukrs,
+        lvf_sakdr         like vbreve-sakdr,
+        lvf_rvamt         like vbreve-rvamt,
+        lvf_vbrevav_tabix like sy-tabix.
+
+* Read relevant revenue lines
+  loop at pct_vbreveav into lvs_vbreveav.
+
+*   Set tabix
+    lvf_vbrevav_tabix = sy-tabix.
+
+*   Initializing key work area
+    clear: lvs_head_keys.
+
+    if lvs_vbreveav-bukrs ne lvf_bukrs_old.
+*     Check posting period
+      read table pit_peropen into lvs_peropen
+                             with key mandt = lvs_vbreveav-mandt
+                                      bukrs = lvs_vbreveav-bukrs.
+    endif.
+
+    if not lvs_peropen-perclose is initial.
+*     Set red traffic light
+      lvs_vbreveav-stapo = gcf_red_light.
+    else.
+*     Set yellow traffic light
+      lvs_vbreveav-stapo = gcf_yellow_light.
+    endif.
+
+    if lvs_vbreveav-revpoblck eq gcf_bill_rel_yes.
+*     Populate icon: Blocked revenue line
+      concatenate '@06\Q' text-001 '@' into lvs_vbreveav-icon_poblck.
+    else.
+*     Populate icon: Unblocked revenue line
+      clear: lvs_vbreveav-icon_poblck.
+    endif.
+
+*   Determine posted revenue amount of account field SAKUR
+    if pif_revfunc eq gcf_cancelation.
+      lvs_vbreveav-rvamt_sakur =   lvs_vbreveav-wrbtr
+                                 - lvs_vbreveav-rvamt.
+    endif.
+
+*   Revenue amounts must be showed positive/cancelations negative
+    if lvs_vbreveav-kstat is initial.
+      lvs_vbreveav-wrbtr       = - lvs_vbreveav-wrbtr.
+      lvs_vbreveav-rvamt       = - lvs_vbreveav-rvamt.
+      lvs_vbreveav-rvamt_sakur = - lvs_vbreveav-rvamt_sakur.
+    endif.
+
+*   Set old company code
+    lvf_bukrs_old = lvs_vbreveav-bukrs.
+
+    if lvs_vbreveav-kstat is initial.
+
+*     Set control line key
+      move-corresponding lvs_vbreveav to lvs_ctrl_key.      "#EC ENHOK
+      lvs_ctrl_key-sakrr  = lvs_vbreveav-sakdr.
+      lvs_ctrl_key-sakrrk = lvs_vbreveav-sakur.
+
+      if lvs_ctrl_key ne lvs_ctrl_key_old.
+*       Initializing work area
+        clear: lvs_vbrevk.
+*       Read control line to determine revrec type/header key lines
+        read table pit_vbrevk into lvs_vbrevk
+                              with key mandt  = lvs_vbreveav-mandt
+                                       vbeln  = lvs_vbreveav-vbeln
+                                       posnr  = lvs_vbreveav-posnr
+                                       sakrr  = lvs_vbreveav-sakdr
+                              binary search.
+      endif.
+
+*     Create header key entries
+      move-corresponding lvs_vbreveav to lvs_head_keys.     "#EC ENHOK
+
+      do 2 times.
+
+        case sy-index.
+          when 1.
+*           Set accounts for first header line
+            lvs_head_keys-sakrr  = lvs_vbreveav-sakdr.
+            lvs_head_keys-sakrrk = lvs_vbreveav-sakur.
+          when 2.
+*           Set accounts for second header line
+            lvs_head_keys-sakrr  = lvs_vbreveav-sakur.
+            lvs_head_keys-sakrrk = lvs_vbreveav-sakdr.
+        endcase.
+
+*       Collect header key
+        collect lvs_head_keys into pet_head_keys.
+
+*       Set endloop because no second key lines must be created
+        if lvs_vbrevk-rrrel eq gcf_rrrel_billtipf.
+          exit.
+        endif.
+
+      enddo.
+
+*     Accounts changed?
+      if lvs_vbrevk-dukz eq gcf_dukz_unbilled.
+*       Change accounts
+        lvf_sakdr                   = lvs_vbreveav-sakdr.
+        lvs_vbreveav-sakdr          = lvs_vbreveav-sakur.
+        lvs_vbreveav-sakur          = lvf_sakdr.
+*       Change revenue amounts
+        if pif_revfunc eq gcf_cancelation.
+          lvf_rvamt                 = lvs_vbreveav-rvamt.
+          lvs_vbreveav-rvamt        = lvs_vbreveav-rvamt_sakur.
+          lvs_vbreveav-rvamt_sakur  = lvf_rvamt.
+        endif.
+*       Set changing account flag
+        lvs_vbreveav-account_change = gcf_charx.
+      endif.
+
+*     Set old control line key
+      lvs_ctrl_key_old = lvs_ctrl_key.
+
+    endif.
+
+*   Modify revenue line
+    modify pct_vbreveav from lvs_vbreveav index lvf_vbrevav_tabix.
+
+  endloop.
+
+* Sort header keys
+  sort pet_head_keys.
+
+endform.                                   " CHECK_REVRENUE_LINES
+
+*----------------------------------------------------------------------*
+*       Form  COLLECT_CONTROL_LINES
+*----------------------------------------------------------------------*
+*       Collect control lines with posting period check
+*----------------------------------------------------------------------*
+*  --> PIT_VBREVK     Selected  control lines
+*  --> PIF_POSTDAT    Posting date
+*  <-> PCT_CONTROL    Collected control lines
+*  <-> PCT_PEROPEN    Open/closed posting period
+*  <-> PCT_VBFS       Error log
+*----------------------------------------------------------------------*
+form collect_control_lines
+                     using pit_vbrevk  type gvt_strucst_vbrevk
+                           pif_postdat like sy-datum
+                  changing pct_control type gvt_strucst_control
+                           pct_peropen type gvt_strucso_peropen
+                           pct_vbfs    type gvt_strucst_vbfs.
+
+* Internal work areas
+  data: lvs_vbrevk  like vbrevk,
+        lvs_control type gvs_struc_control,
+        lvs_peropen type gvs_struc_peropen.
+
+* Internal fields
+  data: lvf_bukrs_old like vbrevk-bukrs,
+        lvf_gjahr     like vbrk-gjahr,
+        lvf_poper     like vbrk-poper,
+        lvf_monat           like bkpf-monat,
+        lvf_auth(1)         type c,
+        lvf_entry_exists(1) type c.
+
+* Internal tables
+  data: lvt_auth_check type standard table of vbrevauth.
+
+* Fill control lines into internal table
+  loop at pit_vbrevk into lvs_vbrevk.
+
+    if lvs_vbrevk-bukrs ne lvf_bukrs_old.
+
+*     check authorization for company code in display mode on
+*     document level
+      call function 'SD_REV_REC_CHECK_AUTH'
+        exporting
+          fif_caller       = gcf_auth_display
+          fif_bukrs        = lvs_vbrevk-bukrs
+        importing
+          fef_entry_exists = lvf_entry_exists
+        tables
+          fit_auth_check   = lvt_auth_check
+        changing
+          frf_auth         = lvf_auth.
+
+      if lvf_auth is initial.
+
+        if lvf_entry_exists ne gc_charx.
+
+          if sy-batch is initial.
+
+*           post log
+            perform create_error_log using  lvs_vbrevk-bukrs
+                                            space
+                                            gcf_vfrr
+                                            gcf_msgid_e
+                                            gcf_msgno_054
+                                            lvs_vbrevk-bukrs
+                                            space
+                                            space
+                                            space
+                                   changing pct_vbfs[].
+
+          else.
+
+*           post log
+            perform create_error_log using  lvs_vbrevk-bukrs
+                                            space
+                                            gcf_vfrr
+                                            gcf_msgid_e
+                                            gcf_msgno_055
+                                            lvs_vbrevk-bukrs
+                                            space
+                                            space
+                                            space
+                                   changing pct_vbfs[].
+
+          endif.
+
+        endif.
+
+*       set old company code
+        lvf_bukrs_old = lvs_vbrevk-bukrs.
+
+        continue.
+
+      endif.
+
+*     Check company code info
+      read table pct_peropen with key mandt   = lvs_vbrevk-mandt
+                                      bukrs   = lvs_vbrevk-bukrs
+                             transporting no fields.
+
+      if not sy-subrc is initial.
+
+*       Determine posting period
+        call function 'FI_PERIOD_DETERMINE'
+          exporting
+            i_budat = pif_postdat
+            i_bukrs = lvs_vbrevk-bukrs
+          importing
+            e_gjahr = lvf_gjahr
+            e_monat = lvf_monat.
+
+*       Determine specific posting period
+        call function 'FI_PERIOD_DETERMINE_SP'
+          exporting
+            i_bukrs = lvs_vbrevk-bukrs
+            i_gjahr = lvf_gjahr
+            i_monat = lvf_monat
+          importing
+            e_monat = lvf_monat.
+
+*       Set relevant posting period
+        lvf_poper = lvf_monat.
+
+*       Check to posting period
+        call function 'FI_PERIOD_CHECK'
+          exporting
+            i_bukrs       = lvs_vbrevk-bukrs
+            i_gjahr       = lvf_gjahr
+            i_koart       = gc_char_plus
+            i_konto       = gcf_account_plus
+            i_monat       = lvf_poper
+          exceptions
+            others        = 2.                              "#EC *
+
+*       Set company code
+        lvs_peropen-mandt = lvs_vbrevk-mandt.
+        lvs_peropen-bukrs = lvs_vbrevk-bukrs.
+*       Initialize flag: Closed period
+        clear: lvs_peropen-perclose.
+
+*       No open posting period for this company code
+        if sy-subrc ne 0.
+*         Set closed period flag
+          lvs_peropen-perclose = gc_charx.
+*         Collect company code info
+          insert lvs_peropen into table pct_peropen.
+*         Write error log for closed posted periods
+          perform create_error_log using lvs_peropen-bukrs
+                                         space
+                                         gcf_vfrr
+                                         gcf_msgid_e
+                                         gcf_msgno_015
+                                         lvs_peropen-bukrs
+                                         lvf_poper
+                                         lvf_gjahr
+                                         space
+                                changing pct_vbfs[].
+        endif.
+
+      endif.
+
+    endif.
+
+    if not lvf_auth is initial.
+
+*     Collect control lines
+      lvs_control-mandt = lvs_vbrevk-mandt.
+      lvs_control-vbeln = lvs_vbrevk-vbeln.
+      lvs_control-posnr = lvs_vbrevk-posnr.
+      collect lvs_control into pct_control.
+
+    endif.
+
+*   Set old company code
+    lvf_bukrs_old = lvs_vbrevk-bukrs.
+
+  endloop.
+
+endform.                                   " COLLECT_CONTROL_LINES
+
+*----------------------------------------------------------------------*
+*       Form  COMPLETE_CTRL_INFO
+*----------------------------------------------------------------------*
+*       Complete control line info (ALV)
+*----------------------------------------------------------------------*
+*  --> PIT_REFAMT     Relevant reference lines with amount (WRBTR)
+*  --> PIS_VBREVK     Relevant control line
+*  <-> PCT_VBREVKAV   Control line infos
+*----------------------------------------------------------------------*
+form complete_ctrl_info using pit_refamt   type gvt_strucst_refamt
+                              pis_vbrevk   like vbrevk
+                     changing pct_vbrevkav type gvt_strucst_vbrav51hd.
+
+* Internal work areas
+  data: lvs_vbrevkav like vbrav51hd,
+        lvs_refamt   type gvs_struc_refamt.
+
+* Internal fields
+  data: lvf_sakrr          like vbrevr-sakrr,
+        lvf_sakrrk         like vbrevr-sakrrk,
+        lvf_vbrevkav_tabix like sy-tabix.
+
+* Positioning to relevant reference line
+  read table pit_refamt with key mandt  = pis_vbrevk-mandt
+                                 vbeln  = pis_vbrevk-vbeln
+                                 posnr  = pis_vbrevk-posnr
+                                 transporting no fields
+                                 binary search.
+
+* Read relevant reference lines with amount
+  loop at pit_refamt into lvs_refamt from sy-tabix.
+
+    if not ( lvs_refamt-vbeln eq pis_vbrevk-vbeln and
+             lvs_refamt-posnr eq pis_vbrevk-posnr ).
+*     Set endloop
+      exit.
+    endif.
+
+    if ( lvs_refamt-sakrr  eq pis_vbrevk-sakrr and
+         lvs_refamt-sakrrk eq pis_vbrevk-sakrrk )  or
+       ( lvs_refamt-sakrr  eq pis_vbrevk-sakrrk and
+         lvs_refamt-sakrrk eq pis_vbrevk-sakrr  ).
+
+*     Set key fields
+      lvf_sakrr  = lvs_refamt-sakrr.
+      lvf_sakrrk = lvs_refamt-sakrrk.
+
+      do 2 times.                          " Do 2 times.
+
+*       Read control line info of the reference line
+        read table pct_vbrevkav into lvs_vbrevkav
+                                with key mandt  = lvs_refamt-mandt
+                                         vbeln  = lvs_refamt-vbeln
+                                         posnr  = lvs_refamt-posnr
+                                         sakrr  = lvf_sakrr
+                                         sakrrk = lvf_sakrrk
+                                binary search.
+
+*       Set SY-TABIX
+        lvf_vbrevkav_tabix = sy-tabix.
+
+        if sy-subrc is initial.
+*         Set endloop
+          exit.
+        else.
+*         Set key fields
+          lvf_sakrr  = lvs_refamt-sakrrk.
+          lvf_sakrrk = lvs_refamt-sakrr.
+        endif.
+
+      enddo.                               " Do 2 times.
+
+      if sy-subrc is initial.
+*       Fill amount into control line info (invoiced revenues)
+        lvs_vbrevkav-rvamt_inv =   lvs_vbrevkav-rvamt_inv
+                                 + lvs_refamt-wrbtr.
+*       Modify control line info
+        modify pct_vbrevkav from lvs_vbrevkav index lvf_vbrevkav_tabix.
+      endif.
+
+    endif.
+
+  endloop.
+
+endform.                                   " COMPLETE_CTRL_INFO
+
+*----------------------------------------------------------------------*
+*       Form  CREATE_CTRL_INFO
+*----------------------------------------------------------------------*
+*       Create conrol line infos for ALV
+*----------------------------------------------------------------------*
+*  --> PIT_HEAD_KEYS  Relevant header keys
+*  --> PIT_REFAMT     Relevant reference lines with amount (WRBTR)
+*  <-> PCT_VBREVK     Selected control lines
+*  <-> PCT_VBREVKAV   Control line infos
+*----------------------------------------------------------------------*
+form create_ctrl_info using pit_head_keys type gvt_strucst_head_keys
+                            pit_refamt    type gvt_strucst_refamt
+                   changing pct_vbrevk    type gvt_strucst_vbrevk
+                            pct_vbrevkav  type gvt_strucst_vbrav51hd.
+
+* Internal work areas
+  data: lvs_vbrevk like vbrevk.
+
+* Sort control lines (deferred revenues/unbilled receivables)
+  sort pct_vbrevk by mandt vbeln posnr dukz sakrr sakrrk.
+
+* Read relevant control lines
+  loop at pct_vbrevk into lvs_vbrevk.
+
+*   Check out control lines which aren't used
+    read table pit_head_keys with key mandt  = lvs_vbrevk-mandt
+                                      vbeln  = lvs_vbrevk-vbeln
+                                      posnr  = lvs_vbrevk-posnr
+                                      sakrr  = lvs_vbrevk-sakrr
+                                      sakrrk = lvs_vbrevk-sakrrk
+                             transporting no fields
+                             binary search.
+
+    if sy-subrc is initial.
+*     Create control line info from relevant control lines (ALV)
+      perform create_ctrl_info_from_crtl using pit_refamt[]
+                                               lvs_vbrevk
+                                      changing pct_vbrevkav[].
+    endif.
+
+  endloop.
+
+endform.                                   " CREATE_CTRL_INFO
+
+*----------------------------------------------------------------------*
+*       Form  CREATE_CTRL_INFO_FROM_CRTL
+*----------------------------------------------------------------------*
+*       Create control line info from relevant control lines (ALV)
+*----------------------------------------------------------------------*
+*  --> PIT_REFAMT     Relevant reference lines with amount (WRBTR)
+*  --> PIS_VBREVK     Relevant control line
+*  <-> PCT_VBREVKAV   Control line infos
+*----------------------------------------------------------------------*
+form create_ctrl_info_from_crtl
+                          using pit_refamt   type gvt_strucst_refamt
+                                pis_vbrevk   like vbrevk
+                       changing pct_vbrevkav type gvt_strucst_vbrav51hd.
+
+* Internal work area
+  data: lvs_vbrevkav like vbrav51hd.
+
+  if pis_vbrevk-dukz eq gcf_dukz_deferred.  " If lvs_vbrevk-dukz ...
+
+*   Fill fields into header (deferred revenues)
+    move-corresponding pis_vbrevk to lvs_vbrevkav.          "#EC ENHOK
+*   Fill amount for deferred revenue
+    lvs_vbrevkav-wrbtr_sakdr   = pis_vbrevk-wrbtr.
+*   Fill amounts for realized revenues
+    lvs_vbrevkav-rvamt_real_g  = pis_vbrevk-rvamt.
+    lvs_vbrevkav-rvamt_real_dr = pis_vbrevk-rvamt.
+
+*   Append header
+    append lvs_vbrevkav to pct_vbrevkav.
+
+*   Complete control line info (ALV)
+    perform complete_ctrl_info using pit_refamt[]
+                                     pis_vbrevk
+                            changing pct_vbrevkav[].
+
+  else.
+
+*   Read header (deferred revenues)
+    read table pct_vbrevkav into lvs_vbrevkav
+                            with key mandt  = pis_vbrevk-mandt
+                                     vbeln  = pis_vbrevk-vbeln
+                                     posnr  = pis_vbrevk-posnr
+                                     sakrr  = pis_vbrevk-sakrrk
+                                     sakrrk = pis_vbrevk-sakrr
+                                     binary search.
+
+    if sy-subrc is initial.
+*     Fill amount for unbilled receivables
+      lvs_vbrevkav-wrbtr_sakur    = pis_vbrevk-wrbtr * -1.
+*     Fill amounts for realized revenues
+      lvs_vbrevkav-rvamt_real_g   =
+                   lvs_vbrevkav-rvamt_real_g + pis_vbrevk-rvamt.
+      lvs_vbrevkav-rvamt_real_ur  = pis_vbrevk-rvamt.
+*     Fill amount for not realized revenues
+      lvs_vbrevkav-rvamt_not_real =
+                   pis_vbrevk-acc_value - lvs_vbrevkav-rvamt_real_g.
+*     Modify header
+      modify pct_vbrevkav from lvs_vbrevkav index sy-tabix.
+    endif.
+
+  endif.                                    " If lvs_vbrevk-dukz ...
+
+endform.                                   " CREATE_CTRL_INFO_FROM_CRTL
+
+*----------------------------------------------------------------------*
+*       Form  CREATE_ERROR_LOG
+*----------------------------------------------------------------------*
+*       Create entry in error log table (VBFS)
+*----------------------------------------------------------------------*
+*   --> PIF_VBELN     Document number
+*   --> PIF_POSNR     Document item number
+*   --> PIF_MSGID     Message ID
+*   --> PIF_MSGTY     Message type
+*   --> PIF_MSGNO     Message number
+*   --> PIF_MSGV1     Message variable 1
+*   --> PIF_MSGV2     Message variable 2
+*   --> PIF_MSGV3     Message variable 3
+*   --> PIF_MSGV4     Message variable 4
+*   <-> PCT_VBFS      Error log table
+*----------------------------------------------------------------------*
+form create_error_log using pif_vbeln
+                            pif_posnr
+                            pif_msgid
+                            pif_msgty
+                            pif_msgno
+                            pif_msgv1
+                            pif_msgv2
+                            pif_msgv3
+                            pif_msgv4
+                   changing pct_vbfs  type gvt_strucst_vbfs.
+
+* Internal work areas
+  data: lvs_vbfs like vbfs.
+
+* Initialize work area
+  clear: lvs_vbfs.
+
+* Fill error info
+  lvs_vbfs-mandt = sy-mandt.
+  lvs_vbfs-vbeln = pif_vbeln.
+  lvs_vbfs-posnr = pif_posnr.
+  lvs_vbfs-etenr = pif_msgno.
+  lvs_vbfs-msgid = pif_msgid.
+  lvs_vbfs-msgty = pif_msgty.
+  lvs_vbfs-msgno = pif_msgno.
+  lvs_vbfs-msgv1 = pif_msgv1.
+  lvs_vbfs-msgv2 = pif_msgv2.
+  lvs_vbfs-msgv3 = pif_msgv3.
+  lvs_vbfs-msgv4 = pif_msgv4.
+
+* Check error protocol table
+  read table pct_vbfs with key sammg = lvs_vbfs-sammg
+                               vbeln = lvs_vbfs-vbeln
+                               posnr = lvs_vbfs-posnr
+                               etenr = lvs_vbfs-etenr
+                               zaehl = lvs_vbfs-zaehl
+                      transporting no fields
+                      binary search.
+
+  case sy-subrc.
+    when 8.
+*     Append new error line
+      append lvs_vbfs to pct_vbfs.
+    when 4.
+*     Insert new error line
+      insert lvs_vbfs into pct_vbfs index sy-tabix.
+  endcase.
+
+
+endform.                                  " CREATE_ERROR_LOG

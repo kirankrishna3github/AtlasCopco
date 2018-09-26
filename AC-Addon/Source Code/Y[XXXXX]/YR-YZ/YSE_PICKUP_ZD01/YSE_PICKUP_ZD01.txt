@@ -1,0 +1,195 @@
+*&---------------------------------------------------------------------*
+*& Report  YSE_PICKUP_ZD01                                             *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+*&                                                                     *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+
+*Created by Christophe Geerts
+*Issue: 1375
+*Purpose:
+*  Pick up all sales orders that were not changed by the workflow
+*  task 90000025
+*  object YSE_BUS2096 event CREATED
+*  triggered via the transaction DP91 (a DMR is created and immediately
+*  transaction DP91 takes this newly created DMR into change (blocking it)
+*  it the user goes out of this change immediately, the workflow was
+*  triggered and it will not be picked up in this program.
+*  REMEMBER that this program and also the workflow only triggers a change
+*  so that the user exit in MV45AFZZ (include yse_update_condition_sdi)
+*  will be triggered that will execute the code necessary for the functionality!!!
+
+REPORT  YSE_PICKUP_ZD01                         .
+
+TABLES: KONV,
+        YSE_PICKUP_DP91,
+        VBAK.
+
+DATA: IN_VBAK TYPE TABLE OF VBAK.
+DATA: WA_VBAK TYPE VBAK.
+DATA: WA_VBAK_1 TYPE VBAK.
+
+DATA: LT_ENQ TYPE STANDARD TABLE OF SEQG3,
+      LV_GNAME TYPE EQEGRANAME VALUE 'VBAK',
+      LV_GARG TYPE EQEGRAARG,
+      LV_COUNT TYPE SYTABIX.
+DATA: GS_VBAK TYPE VBAK.
+* Return
+DATA LT_RETURN TYPE STANDARD TABLE OF BAPIRET2.
+* BAPI Sales order change
+DATA: BEGIN OF LS_ORDER_HEADER_INX.
+        INCLUDE STRUCTURE BAPISDH1X.
+DATA: END   OF LS_ORDER_HEADER_INX.
+* Item
+DATA:   LS_ORDER_ITEM_IN TYPE BAPISDITM.
+DATA:   LT_ORDER_ITEM_IN TYPE CRMT_BAPISDITM_T.
+DATA:   LS_ORDER_ITEM_INX TYPE BAPISDITMX.
+DATA:   LT_ORDER_ITEM_INX TYPE CRMT_BAPISDITMX_T.
+
+DATA: LS_SALESORDER TYPE VBAK.
+DATA: BEGIN OF IT_VBAP OCCURS 0,
+        VBELN TYPE VBELN_VA,
+        POSNR TYPE POSNR_VA,
+        WERKS TYPE WERKS_EXT,
+      END OF IT_VBAP.
+
+DATA: IN_DP91 TYPE TABLE OF YSE_PICKUP_DP91.
+DATA: WA_DP91 TYPE YSE_PICKUP_DP91.
+
+DATA: IN_DP91_SUCCESS TYPE TABLE OF YSE_PICKUP_DP91.
+DATA: IN_DP91_ERROR TYPE TABLE OF YSE_PICKUP_DP91.
+
+DATA WA_RETURN TYPE BAPIRET2.
+
+SELECT-OPTIONS: S_VBELN FOR VBAK-VBELN.
+
+**Select the relevant Debit memo requests
+*SELECT * INTO WA_VBAK FROM VBAK
+*               WHERE AUART EQ 'ZD01' AND
+*                     VGBEL NE '          '.
+**Doublecheck that VGBEL is of type ZO01
+*  CLEAR WA_VBAK_1.
+*  SELECT SINGLE * FROM VBAK INTO WA_VBAK_1
+*             WHERE VBELN EQ WA_VBAK-VBELN AND
+*                   AUART EQ 'ZO01'.
+*  IF SY-SUBRC EQ 0.
+**OK, its the right type, now select the condition Z100 from the sales order (ZO01)
+**This should be equal to the total amount of the DMR (ZD01)
+*    SELECT SINGLE * FROM KONV INTO KONV
+*                WHERE KNUMV EQ WA_VBAK-KNUMV AND
+*                      KSCHL EQ 'Z100' AND
+*                      KBETR EQ WA_VBAK-NETWR.
+*    IF SY-SUBRC EQ 0.
+*      APPEND WA_VBAK TO IN_VBAK.
+*    ENDIF.
+*  ENDIF.
+*  CLEAR WA_VBAK.
+*ENDSELECT.
+
+
+*------------------------------------
+*Get the sales orders that need to be reprocessed
+SELECT * FROM YSE_PICKUP_DP91 INTO TABLE IN_DP91
+                  WHERE VBELN IN S_VBELN AND
+                        PICKED_UP EQ ''.
+
+
+*------------------------------------
+*Process the sales orders
+LOOP AT IN_DP91 INTO WA_DP91.
+  REFRESH: IT_VBAP,
+          LT_ORDER_ITEM_IN,
+          LT_ORDER_ITEM_INX,
+          LT_RETURN.
+  CLEAR LS_ORDER_HEADER_INX.
+
+  SELECT VBELN POSNR WERKS FROM VBAP INTO TABLE IT_VBAP
+                   WHERE VBELN = WA_DP91-VBELN.
+
+
+* Updateflag in the headerrecord:
+  LS_ORDER_HEADER_INX-UPDATEFLAG = 'U'.
+
+  LOOP AT IT_VBAP.
+    LS_ORDER_ITEM_INX-UPDATEFLAG = 'X'.
+* Itemnumber
+    LS_ORDER_ITEM_IN-ITM_NUMBER = IT_VBAP-POSNR.
+    LS_ORDER_ITEM_INX-ITM_NUMBER = IT_VBAP-POSNR.
+* Plant
+    LS_ORDER_ITEM_IN-PLANT = IT_VBAP-WERKS.
+    LS_ORDER_ITEM_INX-PLANT = 'X'.
+
+    APPEND LS_ORDER_ITEM_IN TO LT_ORDER_ITEM_IN.
+    APPEND LS_ORDER_ITEM_INX TO LT_ORDER_ITEM_INX.
+    CLEAR: LS_ORDER_ITEM_IN,
+           LS_ORDER_ITEM_INX.
+  ENDLOOP.
+
+
+  CALL FUNCTION 'BAPI_SALESORDER_CHANGE'
+    EXPORTING
+      SALESDOCUMENT    = WA_DP91-VBELN
+      ORDER_HEADER_INX = LS_ORDER_HEADER_INX
+    TABLES
+      RETURN           = LT_RETURN
+      ORDER_ITEM_IN    = LT_ORDER_ITEM_IN
+      ORDER_ITEM_INX   = LT_ORDER_ITEM_INX.
+* The BAPI used above will trigger the creation of a service
+* As we need this new service order later in this method, th
+* t will be triggered with the wait-parameter on. That way t
+* update should already be done when the execution of the fu
+* e is finished.
+*CALL FUNCTION 'YSE_WRKFL_ERRORS'
+*  EXPORTING
+*    DOC_TYPE  = 'ZD01'
+*    VBELN     = LS_SALESORDER-VBELN
+*    METHOD    = 'PRICECONDITIONCHANGE'
+*  TABLES
+*    IT_RETURN = LT_RETURN.
+
+*Check if there were errors (ex. sales order was locked!)
+  READ TABLE LT_RETURN INTO WA_RETURN WITH KEY TYPE = 'E'.
+  IF SY-SUBRC EQ 0.
+    APPEND WA_DP91 TO IN_DP91_ERROR.
+  ELSE.
+*Put the processed entry on PICKED UP with the current date so
+*it will not be picked up the next time
+    WA_DP91-PICKED_UP = 'X'.
+    WA_DP91-PICKED_UP_DATE = SY-DATUM.
+    MODIFY YSE_PICKUP_DP91 FROM WA_DP91.
+    APPEND WA_DP91 TO IN_DP91_SUCCESS.
+  ENDIF.
+
+
+  CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+      EXPORTING
+         WAIT          = 'X'
+*   IMPORTING
+*     RETURN        =
+  .
+
+  CLEAR WA_DP91.
+ENDLOOP.
+
+
+END-OF-SELECTION.
+  IF NOT IN_DP91_ERROR[] IS INITIAL.
+    WRITE: /'ERRORS:'.
+    WRITE: /'---------'.
+    LOOP AT IN_DP91_ERROR INTO WA_DP91.
+      WRITE: / WA_DP91-VBELN.
+    ENDLOOP.
+  ENDIF.
+
+  IF NOT IN_DP91_SUCCESS IS INITIAL.
+    SKIP 1.
+    WRITE: /'SUCCESS:'.
+    WRITE: /'---------'.
+    LOOP AT IN_DP91_SUCCESS INTO WA_DP91.
+      WRITE: / WA_DP91-VBELN.
+    ENDLOOP.
+  ENDIF.
+
+*Selection text£º
+*S_VBELN:        Sales orders (ZO01)

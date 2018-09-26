@@ -1,0 +1,431 @@
+*----------------------------------------------------------------------*
+* PROGRAM ID           : YAM_REPAIR_GOODSMVTS                          *
+* PROGRAM TITLE        : AM: Repair goodsmovements                     *
+* AUTHOR               : Luc Mertens                                   *
+* DATE                 : 14/12/2007                                    *
+* DEVELOPMENT ID       :                                               *
+*                                                                      *
+* CHANGE REQUEST NUMBER:                                               *
+*                                                                      *
+* Program Description:  Repair of wrongly posted goods movements       *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME     |CORRECTION NUMBER| CHANGE REFERENCE # *
+*----------------------------------------------------------------------*
+*         |          |          |           |             |            *
+************************************************************************
+REPORT YAM_REPAIR_GOODSMVTS.
+
+*---------------------------------------------------------------------*
+* PARAMETERS                                                          *
+*---------------------------------------------------------------------*
+PARAMETERS: p_infil1 LIKE /sapdmc/lsoinp-filename OBLIGATORY.
+selection-screen skip 1.
+PARAMETERS: p_canc   TYPE c RADIOBUTTON GROUP radi DEFAULT 'X',
+            p_post   TYPE c RADIOBUTTON GROUP radi .
+
+*---------------------------------------------------------------------*
+* CONSTANTS                                                           *
+*---------------------------------------------------------------------*
+CONSTANTS: c_filetype(10)   TYPE c VALUE 'ASC',     " FILE TYPE
+           c_blanc          TYPE c VALUE ' '.       " no separator
+CONSTANTS: c_zero(1)        TYPE c VALUE '0'.       " zero
+
+*---------------------------------------------------------------------*
+* TYPES                                                               *
+*---------------------------------------------------------------------*
+TYPES: BEGIN OF ty_upload,
+         v_text(100)  TYPE c,            " FILE UPLOAD TEXT
+       END OF ty_upload.
+
+*---------------------------------------------------------------------*
+* INTERNAL TABLES                                                     *
+*---------------------------------------------------------------------*
+DATA: gt_upload TYPE STANDARD TABLE OF ty_upload
+                INITIAL SIZE 0 WITH HEADER LINE.
+
+DATA: BEGIN OF gt_irec OCCURS 0,
+         mblnr     type mblnr,
+         mjahr     type mjahr,
+         ziele     type mblpo,
+         bwart     type bwart,
+         matnr     type matnr,
+         werks     type werks_d,
+         lgort     type lgort_d,
+         menge(4)  type n,
+         meins     type meins,
+         aufnr     TYPE aufnr,
+         prctr     type prctr,
+         prctr_2   type prctr,
+         bemot     type bemot,
+      END OF gt_irec.
+
+DATA: BEGIN OF i_logtab OCCURS 0,
+        msg(120)   TYPE c,
+      END OF i_logtab.
+
+DATA: gt_item  TYPE bapi2017_gm_item_create OCCURS 0 WITH HEADER LINE.
+
+DATA: BEGIN OF gt_return OCCURS 100.
+        INCLUDE STRUCTURE bapiret2.
+DATA: END OF gt_return.
+
+DATA: gt_status TYPE STANDARD TABLE OF jstat
+        INITIAL SIZE 0 WITH HEADER LINE.
+
+*---------------------------------------------------------------------*
+* VARIABLES                                                           *
+*---------------------------------------------------------------------*
+DATA: gv_filename          TYPE string,
+      GV_OBJNR             LIKE JEST-OBJNR,
+      gv_aufnr             TYPE aufnr,
+      gv_bwart             type bwart,
+      gv_retcd             LIKE sy-subrc,
+      gv_header            LIKE bapi2017_gm_head_01,
+      gv_headret           LIKE bapi2017_gm_head_ret,
+      gv_goodsmvt_code_tmp TYPE bapi2017_gm_code,
+      gv_msg(120)          TYPE c,
+      gv_msgnr             LIKE t100-msgnr,
+      gv_mestx             LIKE t100-text,
+      gv_reopened(1)       type c,
+      gv_errflag(1)        TYPE c.
+
+
+*- AT selection-screen  ----------------------------------------------*
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_infil1.
+
+  CALL FUNCTION 'WS_FILENAME_GET'
+    EXPORTING
+      def_path = 'C:\SAP\'
+      mask     = ',*,*.txt.'
+    IMPORTING
+      filename = p_infil1
+    EXCEPTIONS
+      OTHERS   = 5.
+
+
+*- START_OF_SELECTION   -----------------------------------------------*
+START-OF-SELECTION.
+
+* READ FILE FROM PRESENTATION SERVER
+  MOVE p_infil1 TO gv_filename.
+  PERFORM get_from_pres IN PROGRAM yam_common_routines
+                                  TABLES  gt_upload
+                                  USING   gv_filename
+                                          c_filetype
+                                          c_blanc.
+
+  CLASS cl_abap_char_utilities DEFINITION LOAD.
+
+  LOOP AT gt_upload.
+    SPLIT gt_upload AT cl_abap_char_utilities=>horizontal_tab
+    INTO gt_irec-mblnr
+         gt_irec-mjahr
+         gt_irec-ziele
+         gt_irec-bwart
+         gt_irec-matnr
+         gt_irec-werks
+         gt_irec-lgort
+         gt_irec-menge
+         gt_irec-meins
+         gt_irec-aufnr
+         gt_irec-prctr
+         gt_irec-prctr_2
+         gt_irec-bemot.
+    APPEND gt_irec.
+    CLEAR gt_irec.
+  ENDLOOP.
+
+* Post the lines
+  LOOP AT gt_irec.
+
+*.. Check if order is already closed, then reopen
+    clear gv_reopened.
+
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+      EXPORTING
+        input  = gt_irec-aufnr
+      IMPORTING
+        output = gv_aufnr.
+
+    CONCATENATE 'OR' gv_AUFNR INTO GV_OBJNR.
+
+    CALL FUNCTION 'STATUS_CHECK'
+      EXPORTING
+*       BYPASS_BUFFER           = ' '
+*       CLIENT                  = SY-MANDT
+        OBJNR                   = GV_OBJNR
+        STATUS                  = 'I0046'
+      EXCEPTIONS
+        OBJECT_NOT_FOUND        = 1
+        STATUS_NOT_ACTIVE       = 2
+        OTHERS                  = 3.
+
+    IF SY-SUBRC = 0.
+      PERFORM open_order using gv_objnr gv_retcd.
+      if gv_retcd <> 0.
+        message i001(38) with text-e02
+                  gt_irec-aufnr '/' gt_irec-mblnr into gv_msg.
+        perform add_message_to_tab.
+        continue.
+      else.
+        gv_reopened = 'X'.
+      endif.
+    endif.
+
+    if p_canc = 'X'.
+      clear gv_bwart.
+      case gt_irec-bwart.
+        when '261'.
+          gv_bwart = '262'.
+        when '262'.
+          gv_bwart = '261'.
+        when '961'.
+          gv_bwart = '962'.
+        when '962'.
+          gv_bwart = '961'.
+      endcase.
+
+      perform create_goodsmvt using    gv_bwart
+                              changing gv_retcd.
+      if gv_retcd <> 0.
+        message i001(38) with text-e03 gv_bwart '/'
+                  gt_irec-mblnr into gv_msg.
+        perform add_message_to_tab.
+*        concatenate '   --> ' gt_return-message
+*                into gv_msg separated by space.
+*        PERFORM add_message_to_tab.
+      endif.
+    else.
+      perform create_goodsmvt using    gt_irec-bwart
+                              changing gv_retcd.
+      if gv_retcd <> 0.
+        message i001(38) with text-e01 gt_irec-bwart '/'
+                  gt_irec-mblnr into gv_msg.
+        perform add_message_to_tab.
+*        concatenate '   --> ' gt_return-message
+*                into gv_msg separated by space.
+*        PERFORM add_message_to_tab.
+      endif.
+    endif.
+
+    if gv_reopened = 'X'.
+      PERFORM close_order using gv_objnr gv_retcd.
+      if gv_retcd <> 0.
+        message i001(38) with text-e04
+                  gt_irec-aufnr '/' gt_irec-mblnr into gv_msg.
+        perform add_message_to_tab.
+      endif.
+    endif.
+
+  ENDLOOP.
+
+
+*- END_OF_SELECTION   ------------------------------------------------*
+END-OF-SELECTION.
+
+  IF NOT i_logtab[] IS INITIAL.
+    PERFORM list_logtab.
+  ENDIF.
+
+
+*-- S U B R O U T I N E S ---------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  open_order
+*&---------------------------------------------------------------------*
+*       Cancel business complete
+*----------------------------------------------------------------------*
+FORM open_order using r_objnr r_retc.
+
+  clear: r_retc.
+
+* Inactivate CLSD-status
+  REFRESH gt_status.
+  gt_status-stat = 'I0046'.
+  gt_status-inact = 'X'.
+  APPEND gt_status.
+  gt_status-stat = 'I0045'.
+  gt_status-inact = space.
+  APPEND gt_status.
+
+  CALL FUNCTION 'STATUS_CHANGE_INTERN'
+     EXPORTING
+           OBJNR               = r_objnr
+     TABLES
+           STATUS              = gt_status
+     EXCEPTIONS
+           OBJECT_NOT_FOUND
+           STATUS_INCONSISTENT
+           STATUS_NOT_ALLOWED.
+
+  COMMIT WORK AND WAIT.
+
+  r_retc = sy-subrc.
+
+ENDFORM.                    " open_order
+
+*&---------------------------------------------------------------------*
+*&      Form  close_order
+*&---------------------------------------------------------------------*
+*       Set business complete
+*----------------------------------------------------------------------*
+FORM close_order using r_objnr r_retc.
+
+  clear: r_retc.
+
+* Activate CLSD-status
+  REFRESH gt_status.
+  gt_status-stat = 'I0045'.
+  gt_status-inact = 'X'.
+  APPEND gt_status.
+  gt_status-stat = 'I0046'.
+  gt_status-inact = space.
+  APPEND gt_status.
+
+  CALL FUNCTION 'STATUS_CHANGE_INTERN'
+     EXPORTING
+           OBJNR               = r_objnr
+     TABLES
+           STATUS              = gt_status
+     EXCEPTIONS
+           OBJECT_NOT_FOUND
+           STATUS_INCONSISTENT
+           STATUS_NOT_ALLOWED.
+
+  COMMIT WORK AND WAIT.
+
+  r_retc = sy-subrc.
+
+ENDFORM.                    " close_order
+
+*&---------------------------------------------------------------------*
+*&      Form  create_goodsmvt
+*&---------------------------------------------------------------------*
+*       Create goodsmovement against service order
+*----------------------------------------------------------------------*
+FORM create_goodsmvt USING    p_gv_bwart
+                     CHANGING p_gv_retcd.
+
+  PERFORM prep_goods_movement USING p_gv_bwart.
+
+  CLEAR: gv_headret,
+         p_gv_retcd.
+
+  CLEAR gt_return[].
+  gv_goodsmvt_code_tmp = '05'.
+
+  CALL FUNCTION 'BAPI_GOODSMVT_CREATE'
+    EXPORTING
+      goodsmvt_header  = gv_header
+      goodsmvt_code    = gv_goodsmvt_code_tmp
+    IMPORTING
+      goodsmvt_headret = gv_headret
+    TABLES
+      goodsmvt_item    = gt_item
+      return           = gt_return.
+
+  IF gv_headret IS INITIAL.
+    MOVE 4 TO p_gv_retcd.
+  ELSE.
+    CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+      EXPORTING
+        wait = 'X'.
+  ENDIF.
+
+ENDFORM.                    " create_goodsmvt
+
+*&---------------------------------------------------------------------*
+*&      Form  prep_goods_movement
+*&---------------------------------------------------------------------*
+*       Fill goodsmovement item data
+*----------------------------------------------------------------------*
+*      -->  R_GV_BWART  Movement type
+*      -->  R_LGORT     Storage location
+*----------------------------------------------------------------------*
+FORM prep_goods_movement  USING    r_bwart.
+
+  DATA: lv_meins   TYPE meins,
+        lv_matnr   TYPE matnr.
+
+  gv_header-pstng_date = sy-datum.
+  gv_header-doc_date   = sy-datum.
+
+  REFRESH gt_item.
+
+  CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+    EXPORTING
+      input  = gt_irec-matnr
+    IMPORTING
+      output = lv_matnr.
+
+  CLEAR gt_item.
+  gt_item-material  = lv_matnr.
+  gt_item-plant     = gt_irec-werks.
+  gt_item-stge_loc  = gt_irec-lgort.
+  gt_item-move_type = r_bwart.
+
+  gt_item-entry_qnt = gt_irec-menge.
+
+  SELECT SINGLE meins INTO lv_meins FROM mara
+      WHERE matnr = lv_matnr.
+
+  IF sy-subrc = 0.
+    SELECT SINGLE isocode INTO gt_item-entry_uom_iso
+       FROM t006
+       WHERE msehi = lv_meins.
+  ENDIF.
+
+  gt_item-orderid = gv_aufnr.
+
+  APPEND gt_item.
+
+ENDFORM.                    " prep_goods_movement
+
+*&---------------------------------------------------------------------*
+*&      Form  add_message_to_tab
+*&---------------------------------------------------------------------*
+*       Add messages to log
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM add_message_to_tab .
+
+  i_logtab-msg = gv_msg.
+  APPEND i_logtab.
+  CLEAR i_logtab.
+
+ENDFORM.                    " add_message_to_tab
+
+*&---------------------------------------------------------------------*
+*&      Form  list_logtab
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM list_logtab .
+
+* leave to list-processing.
+
+  LOOP AT i_logtab.
+    WRITE: / i_logtab-msg.
+  ENDLOOP.
+
+  REFRESH i_logtab.
+  CLEAR i_logtab.
+
+ENDFORM.                    " list_logtab
+
+*Text symbol text£º
+*E01:Could not post movement :
+*E02:Could not reopen service order :
+*E03:Could not cancel movement :
+
+*E04:Could not close service order :
+*Selection text£º
+*P_CANC:        Cancel movement
+*P_INFIL1:        Input filename
+*P_POST:        Re-Post movement

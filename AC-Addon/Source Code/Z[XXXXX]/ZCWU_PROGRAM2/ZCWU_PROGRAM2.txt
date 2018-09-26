@@ -1,0 +1,193 @@
+*&---------------------------------------------------------------------*
+*& Report  ZCWU_PROGRAM2
+*&
+*&---------------------------------------------------------------------*
+*&
+*&
+*&---------------------------------------------------------------------*
+
+REPORT  ZCWU_PROGRAM2.
+
+DATA: lt_buffer TYPE STANDARD TABLE OF char255 WITH HEADER LINE,
+      binary_content  TYPE solix_tab,
+      size           TYPE so_obj_len,
+      lt_TBTCP  TYPE STANDARD TABLE OF TBTCP,
+      ls_TBTCP  TYPE TBTCP,
+      lv_string TYPE string,
+      gt_attach_tab    type soli_tab,
+      ls_soli   TYPE soli,
+      lv_spono  TYPE sy-SPONO.
+
+
+SELECT *
+  FROM TBTCP
+  into TABLE lt_TBTCP
+  WHERE JOBNAME = 'ZTEST_CSV'
+    AND PROGNAME = 'ZCWU_PROGRAM2'
+    AND SDLUNAME = 'SSCEXTCWU'.
+SORT lt_TBTCP by SDLTIME DESCENDING.
+READ TABLE lt_TBTCP INDEX 1 INTO LS_TBTCP.
+IF sy-SUBRC = 0.
+  WRITE: LS_TBTCP-LISTIDENT.
+ENDIF.
+WRITE: 'Program 2.'.
+
+lv_string = sy-uname+0(1).
+lv_string = sy-uname+1.
+*export SY-SPONO to MEMORY id 'test'.
+import  p1 = lv_SPONO from  MEMORY id 'test'.
+WRITE: lv_SPONO.
+
+
+CALL FUNCTION 'RSPO_RETURN_ABAP_SPOOLJOB'
+  EXPORTING
+    rqident                    =    5350
+*   FIRST_LINE                 = 1
+*   LAST_LINE                  =
+*   PAGES                      =
+  tables
+    buffer                     =  lt_buffer
+* EXCEPTIONS
+*   NO_SUCH_JOB                = 1
+*   NOT_ABAP_LIST              = 2
+*   JOB_CONTAINS_NO_DATA       = 3
+*   SELECTION_EMPTY            = 4
+*   NO_PERMISSION              = 5
+*   CAN_NOT_ACCESS             = 6
+*   READ_ERROR                 = 7
+*   OTHERS                     = 8
+          .
+IF sy-subrc <> 0.
+* MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*         WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+ENDIF.
+
+LOOP AT lt_buffer.
+  REPLACE ALL OCCURRENCES OF '|' in lt_buffer
+    WITH cl_abap_char_utilities=>HORIZONTAL_TAB.
+  CONCATENATE lv_string lt_buffer cl_abap_char_utilities=>cr_lf
+  into lv_string.
+ENDLOOP.
+
+CONCATENATE lv_string  '我是中国人' cl_abap_char_utilities=>cr_lf
+  INTO lv_string.
+
+CONCATENATE lv_string  '为什么是乱码' cl_abap_char_utilities=>cr_lf
+  INTO lv_string.
+
+CONCATENATE lv_string  'Торговый Дом Полиметалл' cl_abap_char_utilities=>cr_lf
+  INTO lv_string.
+
+  TRY.
+      cl_bcs_convert=>string_to_solix(
+        EXPORTING
+          iv_string   = lv_string
+          iv_codepage = '4103'  "suitable for MS Excel, leave empty
+          iv_add_bom  = 'X'     "for other doc types
+        IMPORTING
+          et_solix  = binary_content
+          ev_size   = size ).
+    CATCH cx_bcs.
+      MESSAGE e445(so).
+  ENDTRY.
+
+PERFORM send_mail.
+
+FORM send_mail .
+  DATA: send_request   TYPE REF TO cl_bcs,
+          document       TYPE REF TO cl_document_bcs,
+          recipient      TYPE REF TO if_recipient_bcs,
+          bcs_exception  TYPE REF TO cx_bcs,
+          main_text      TYPE bcsy_text,
+          mailto         TYPE ad_smtpadr,
+*          size           TYPE so_obj_len,
+          sent_to_all    TYPE os_boolean,
+          lv_docnr       TYPE so_obj_des,
+          lv_subject  TYPE so_obj_des,
+          ls_batch_mail TYPE yse_batch_mail,
+          it_documents TYPE TABLE OF acc_doc WITH HEADER LINE,
+          lt_data TYPE solix_tab,
+*       Internal table to hold the data from the FM CONVERT_OTF
+
+          w_bin_filesize TYPE i, " Binary File Size
+          lt_pdf TYPE TABLE OF tline,
+          ls_pdf TYPE tline,
+          lv_kunnr_st TYPE vbpa-kunnr,
+          lv_content  TYPE xstring.
+  DATA: lt_compressed LIKE solisti1 OCCURS 10 WITH HEADER LINE,
+        lt_decompressed LIKE solisti1 OCCURS 10 WITH HEADER LINE.
+
+  CONCATENATE sy-cprog '_' sy-datum INTO lv_docnr.
+
+  CALL FUNCTION 'TABLE_COMPRESS'
+    TABLES
+      in  = gt_attach_tab
+      out = lt_compressed.
+
+  CALL FUNCTION 'TABLE_DECOMPRESS'
+    TABLES
+      in  = lt_compressed
+      out = lt_decompressed.
+
+  TRY.
+*     -------- create persistent send request ------------------------
+      send_request = cl_bcs=>create_persistent( ).
+
+*     -------- create and set document with attachment ---------------
+
+*     create document object from internal table with text
+      APPEND text-t71
+        TO main_text.                                       "#EC NOTEXT
+      APPEND INITIAL LINE TO  main_text.
+
+      CONCATENATE 'Background Processing Spool'(t15) '-' sy-cprog
+        INTO lv_subject SEPARATED BY space.
+      document = cl_document_bcs=>create_document(
+        i_type    = 'RAW'
+        i_text    = main_text
+        i_subject = lv_subject ).                           "#EC NOTEXT
+
+*     add the spread sheet as attachment to document object
+      document->add_attachment(
+        i_attachment_type    = 'CSV'                        "#EC NOTEXT
+        i_attachment_subject = lv_docnr                     "#EC NOTEXT
+        i_attachment_size    = size
+        i_attachment_language  = '1'
+        i_att_content_hex =  binary_content[] ).
+*        i_att_content_text   = lt_decompressed[] ).
+
+*     add document object to send request
+      send_request->set_document( document ).
+
+*    --------- add recipient (e-mail address) -----------------------
+        mailto  = 'chang.chun.wu@cn.atlascopco.com'.
+*    create recipient object
+        recipient =
+                cl_cam_address_bcs=>create_internet_address( mailto ).
+
+*     add recipient object to send request
+        send_request->add_recipient( recipient ).
+        CLEAR: mailto.
+
+*      TRY.
+      CALL METHOD send_request->set_status_attributes
+        EXPORTING
+          i_requested_status = 'E'.
+
+*     ---------- send document ---------------------------------------
+      sent_to_all = send_request->send( i_with_error_screen = 'X' ).
+*      COMMIT WORK.
+
+      IF sent_to_all IS INITIAL.
+        MESSAGE i500(sbcoms) WITH mailto.
+      ELSE.
+        MESSAGE s022(so).
+        COMMIT  WORK.
+      ENDIF.
+
+*     ------------ exception handling ---------------------------------
+*     replace this rudimentary exception handling with your own one !!
+    CATCH cx_bcs INTO bcs_exception.
+      MESSAGE i865(so) WITH bcs_exception->error_type.
+  ENDTRY.
+ENDFORM.                    " SEND_MAIL

@@ -1,0 +1,620 @@
+************************************************************************
+* Program ID            : YSE_EM_EXC_MGT_RUN                           *
+* Program Title         : EM: Exception Management Run                 *
+* Author                : Inge Bruyndonckx                             *
+* Date                  : 24.11.2006                                   *
+* Change Request Number : 141106-SE-OTH-D168-Exception Management      *
+* Description           :                                              *
+************************************************************************
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME         |CORRECTION| Description           *
+*----------------------------------------------------------------------*
+* MOD-001 |2014.12.16| Dashmantha   |CD1K984134| Correct the program to*
+* avoid the run time error while using the SQRT functionality          *
+*----------------------------------------------------------------------*
+
+REPORT yse_em_exc_mgt_run NO STANDARD PAGE HEADING
+                            LINE-SIZE 132
+                            MESSAGE-ID yse_sales_log.
+
+INCLUDE yse_em_exc_mgt_run_top.
+
+*----------------------------------------------------------------------*
+* Selection screen                                                     *
+*----------------------------------------------------------------------*
+*--- Layout selection screen
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE text-s01.
+PARAMETERS: p_vkorg LIKE vbak-vkorg MEMORY ID VKO OBLIGATORY.
+SELECT-OPTIONS: s_vtweg FOR vbak-vtweg MEMORY ID VTW.
+PARAMETER: p_werks LIKE marc-werks OBLIGATORY MEMORY ID WRK.
+SELECT-OPTIONS: s_dismm FOR marc-dismm.
+SELECT-OPTIONS: s_matnr FOR marc-matnr.
+*PARAMETERS: p_datum LIKE sy-datum DEFAULT sy-datum NO-DISPLAY.
+PARAMETERS: p_n TYPE num2 DEFAULT 12 NO-DISPLAY.
+SELECTION-SCREEN END OF BLOCK b1.
+
+*--- Initialize selection screen
+*----------------------------------------------------------------------*
+INITIALIZATION.
+*----------------------------------------------------------------------*
+  REFRESH: i_plants.
+  SELECT * FROM yse_em_plant INTO TABLE i_plants
+                             WHERE whtype EQ 'B'
+                                OR whtype EQ 'C'.
+
+*--- Checks on the selection screen
+*----------------------------------------------------------------------*
+AT SELECTION-SCREEN.
+*----------------------------------------------------------------------*
+
+  perform  check_authorization .
+
+  IF sy-ucomm = 'ONLI'.
+    READ TABLE i_plants WITH KEY werks = p_werks.
+    IF sy-subrc NE 0.
+      MESSAGE e000(yse_sales_log) WITH text-e01.
+    ENDIF.
+  ENDIF.
+
+* Fill plants table for limited selection
+*----------------------------------------------------------------------*
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_werks.
+*----------------------------------------------------------------------*
+
+* Call list with selected plants
+  CALL FUNCTION 'F4IF_INT_TABLE_VALUE_REQUEST'
+    EXPORTING
+      value_org       = 'S'
+      retfield        = 'WERKS'
+      window_title    = 'Plants'
+    TABLES
+      value_tab       = i_plants
+      return_tab      = i_ddshretval
+    EXCEPTIONS
+      parameter_error = 1
+      no_values_found = 2
+      OTHERS          = 3.
+  IF sy-subrc EQ 0.
+    READ TABLE i_ddshretval INDEX 1.
+    p_werks = i_ddshretval-fieldval.
+  ENDIF.
+
+************************************************************************
+* START MAIN PROGRAM                                                   *
+************************************************************************
+START-OF-SELECTION.
+
+* Select sales history data
+  PERFORM select_data.
+* Process data to determine exception code
+  PERFORM process_data.
+* Write data to table YSE_EM_LOG
+  PERFORM write_data.
+
+*&---------------------------------------------------------------------*
+*&      Form  select_data
+*&---------------------------------------------------------------------*
+*    SELECT SALES HISTORY DATA
+*----------------------------------------------------------------------*
+
+FORM select_data .
+
+* Determine begin & end period
+  PERFORM fill_dates.
+* check if plant is Central or Branch
+  SELECT SINGLE *
+           FROM yse_em_plant
+          WHERE werks EQ p_werks.
+  IF sy-subrc EQ 0.
+*   Get warehouse parameters
+    PERFORM get_whs_par.
+*   Select Sales history
+    PERFORM select_sohist.
+*   Delete entries from log file for the selected Sales org, plant & material
+*    DELETE FROM yse_em_log WHERE vkorg EQ p_vkorg
+*                        AND werks EQ p_werks
+*                        AND matnr IN r_matnr.  ==> dumps if too many entries
+    LOOP AT R_MATNR.
+      DELETE FROM YSE_EM_LOG WHERE vkorg EQ p_vkorg
+                               AND werks EQ p_werks
+                               AND matnr EQ r_matnr-low.
+    ENDLOOP.
+
+  ENDIF.
+ENDFORM.                    " select_data
+
+*&---------------------------------------------------------------------*
+*&      Form  fill_districts
+*&---------------------------------------------------------------------*
+*      Warehouse responsible for districts
+*----------------------------------------------------------------------*
+FORM fill_districts .
+
+* CENTRAL WAREHOUSE
+  IF yse_em_plant-whtype EQ 'C'.
+* Find responsible plants.
+    SELECT bwerks
+    FROM yse_em_pl_centr
+    INTO TABLE i_werks
+    WHERE cwerks EQ p_werks.
+
+* Add central plant to responsible plants
+    i_werks-werks = p_werks.
+    APPEND i_werks.
+    SORT i_werks.
+
+* check relation between plant and sales organisation
+    LOOP AT i_werks.
+      IF i_werks-werks CP 'Z*'.
+      ELSE.
+        SELECT SINGLE *
+        FROM tvkwz WHERE vkorg EQ p_vkorg
+                   AND vtweg IN s_vtweg
+                   AND werks EQ i_werks-werks.
+        IF sy-subrc NE 0.
+          DELETE i_werks.
+        ENDIF.
+      ENDIF.
+    ENDLOOP.
+
+    DESCRIBE TABLE i_werks LINES sy-tfill.
+    IF sy-tfill NE 0.
+* Fill table with responsible sales districts
+      SELECT bzirk
+      FROM yse_em_pl_distr
+      INTO TABLE i_bzirk
+      FOR ALL ENTRIES IN i_werks
+      WHERE werks EQ i_werks-werks.
+    ENDIF.
+
+* BRANCH WAREHOUSE
+  ELSEIF yse_em_plant-whtype EQ 'B'.
+    SELECT bzirk
+    FROM yse_em_pl_distr
+    INTO TABLE i_bzirk
+    WHERE werks EQ p_werks.
+
+  ENDIF.
+  DESCRIBE TABLE i_bzirk LINES sy-tfill.
+  IF sy-tfill EQ 0.
+    MESSAGE e001.
+  ENDIF.
+* make a range with sales districts
+  LOOP AT i_bzirk.
+    r_bzirk-sign = 'I'.
+    r_bzirk-option = 'EQ'.
+    r_bzirk-low = i_bzirk-bzirk.
+    APPEND r_bzirk.
+  ENDLOOP.
+
+ENDFORM.                    " fill_districts
+
+*&---------------------------------------------------------------------*
+*&      Form  fill_materials
+*&---------------------------------------------------------------------*
+
+FORM fill_materials .
+
+  SELECT MARC~matnr werks dismm maxlz bstfe eisbe minbe plifz webaz VOLUM VOLEH
+  FROM marc
+  JOIN MARA
+    ON MARC~MATNR EQ MARA~MATNR
+  INTO CORRESPONDING FIELDS OF TABLE i_marc
+  WHERE MARC~matnr IN s_matnr
+  AND werks EQ p_werks
+  AND dismm IN s_dismm.
+
+  DESCRIBE TABLE i_marc LINES sy-tfill.
+  IF sy-tfill EQ 0.
+    MESSAGE e002.
+  ENDIF.
+  SORT i_marc.
+
+* make a range with selected materials
+  LOOP AT i_marc.
+    CLEAR mvke.
+    SELECT SINGLE mvgr4 mtpos
+    FROM mvke
+    INTO CORRESPONDING FIELDS OF i_marc
+    WHERE matnr EQ i_marc-matnr
+    AND vkorg EQ p_vkorg
+    AND vtweg EQ '01'.
+    IF sy-subrc EQ 0.
+      IF i_marc-mtpos EQ c_dtc.
+        i_marc-cudimo = i_marc-mtpos.
+      ELSEIF i_marc-mtpos EQ c_norm AND i_marc-mvgr4 IS INITIAL.
+        i_marc-cudimo = c_ndtc.
+      ELSEIF i_marc-mtpos EQ c_norm AND i_marc-mvgr4 EQ c_lcl.
+        i_marc-cudimo = c_lcl.
+      ENDIF.
+      MODIFY i_marc.
+    ENDIF.
+    r_matnr-sign = 'I'.
+    r_matnr-option = 'EQ'.
+    r_matnr-low = i_marc-matnr.
+    APPEND r_matnr.
+  ENDLOOP.
+
+
+ENDFORM.                    " fill_materials
+*&---------------------------------------------------------------------*
+*&      Form  fill_dates
+*&---------------------------------------------------------------------*
+
+FORM fill_dates .
+
+* Define beginning and end period, begin and end date
+* End date = last day of previous month
+*  end_date = p_datum.
+  end_date = SY-DATUM.
+  end_date+6(2) = 01.
+  end_date = end_date - 1.
+* End period = current month
+  end_period = end_date(6).
+
+* Start date = end date - (N) months
+* Take first day of the month
+
+  v_n2 = - ( p_n - 1 ).
+
+  CALL FUNCTION 'MONTH_PLUS_DETERMINE'
+    EXPORTING
+      months  = v_n2
+      olddate = end_date
+    IMPORTING
+      newdate = start_date.
+      " Negative to subtract from old date, positive to add
+  start_date+6(2) = 01.
+* Start Period = period from start date
+  start_period = start_date(6).
+
+
+  CLEAR: v_period6, v_period4, v_period2, v_datum6, v_datum4, v_datum2.
+
+* Determine period over last six months
+  v_n2 = - 6.
+  CALL FUNCTION 'MONTH_PLUS_DETERMINE'
+    EXPORTING
+      months  = v_n2
+*     olddate = p_datum
+      olddate = SY-DATUM
+    IMPORTING
+      newdate = v_datum6.
+      " Negative to subtract from old date, positive to add
+  v_period6 = v_datum6(6).
+
+* Determine period over last four months
+  v_n2 = - 4.
+  CALL FUNCTION 'MONTH_PLUS_DETERMINE'
+    EXPORTING
+      months  = v_n2
+*     olddate = p_datum
+      olddate = SY-DATUM
+    IMPORTING
+      newdate = v_datum4.
+      " Negative to subtract from old date, positive to add
+  v_period4 = v_datum4(6).
+
+* Determine period over last four months
+  v_n2 = - 2.
+  CALL FUNCTION 'MONTH_PLUS_DETERMINE'
+    EXPORTING
+      months  = v_n2
+*     olddate = p_datum
+      olddate = SY-DATUM
+    IMPORTING
+      newdate = v_datum2.
+      " Negative to subtract from old date, positive to add
+  v_period2 = v_datum2(6).
+
+
+ENDFORM.                    " fill_dates
+*&---------------------------------------------------------------------*
+*&      Form  create_temp_file
+*&---------------------------------------------------------------------*
+*       store temporary work file in table YSE_EM_WORK
+*----------------------------------------------------------------------*
+
+FORM create_temp_file .
+
+* Create Temporary work file
+  LOOP AT i_sohist.
+    MOVE-CORRESPONDING i_sohist TO i_temp.
+    COLLECT i_temp.
+  ENDLOOP.
+
+* Save Temporary work file
+* DELETE FROM yse_em_work WHERE matnr IN r_matnr. ==> dumps if too many entries
+  LOOP AT R_MATNR.
+    DELETE FROM YSE_EM_WORK WHERE matnr EQ r_matnr-low.
+  ENDLOOP.
+  INSERT yse_em_work FROM i_temp.
+
+ENDFORM.                    " create_temp_file
+
+*&---------------------------------------------------------------------*
+*&      Form  process_data
+*&---------------------------------------------------------------------*
+*       Process data to determine exception code
+*----------------------------------------------------------------------*
+
+FORM process_data .
+
+  IF yse_em_plant-whtype EQ 'C'.
+    PERFORM fill_exception_central.
+  ELSEIF yse_em_plant-whtype EQ 'B'.
+    PERFORM fill_exception_branch.
+  ENDIF.
+ENDFORM.                    " process_data
+
+
+*&---------------------------------------------------------------------*
+*&      Form  get_whs_par
+*&---------------------------------------------------------------------*
+*       Get Warehouse Parameters
+*----------------------------------------------------------------------*
+
+FORM get_whs_par .
+
+
+  SELECT SINGLE *
+  FROM yse_em_whstypar
+  WHERE vkorg  EQ p_vkorg
+    AND whtype EQ yse_em_plant-whtype.
+
+  IF sy-subrc NE 0.
+    MESSAGE e101.
+  ENDIF.
+
+ENDFORM.                    " get_whs_par
+
+*&---------------------------------------------------------------------*
+*&      Form  set_em_msg
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*----------------------------------------------------------------------*
+FORM set_em_msg  USING p_exc.
+
+  i_log-vkorg = p_vkorg.
+  i_log-werks = p_werks.
+
+* DTC to NDTC
+  IF p_exc EQ 'D01'.
+    i_log-extypnr = 1.
+    i_log-extypdesc = text-t01.
+    i_log-addimo = c_ndtc.
+    i_log-adstopo = c_st.
+* NDTC to DTC
+  ELSEIF p_exc EQ 'D02'.
+    i_log-extypnr = 2.
+    i_log-extypdesc = text-t02.
+    i_log-addimo = c_dtc.
+    IF i_marc-mtpos EQ c_norm AND i_marc-mvgr4 EQ c_lcl.
+      i_log-adstopo = c_lns.
+    ELSE.
+      i_log-adstopo = c_cns.
+    ENDIF.
+    i_log-adeisbe = 0.
+    i_log-adrepo = 0.
+    I_LOG-ADLSFL = SPACE.
+    i_log-adlosi = 1.
+
+* Non-stocked to Stocked
+  ELSEIF p_exc EQ 'A01'.
+    i_log-extypnr = 3.
+    i_log-extypdesc = text-t03.
+    i_log-addimo = i_log-cudimo.
+    i_log-adstopo = c_st.
+* Stocked to Non-Stocked
+  ELSEIF p_exc EQ 'A02'.
+*   TO DO: fill stocked policy with value not stocked
+    i_log-extypnr = 4.
+    i_log-extypdesc = text-t04.
+    IF i_marc-mtpos EQ c_norm AND i_marc-mvgr4 EQ c_lcl.
+      i_log-adstopo = c_lns.
+    ELSE.
+      i_log-adstopo = c_cns.
+    ENDIF.
+    i_log-adeisbe = 0.
+    i_log-adrepo = 0.
+    I_LOG-ADLSFL = SPACE.
+    i_log-adlosi = 1.
+    i_log-addimo = i_log-cudimo.
+* Non-stocked to Stocked
+  ELSEIF p_exc EQ 'A03'.
+    i_log-extypnr = 3.
+    i_log-extypdesc = text-t03.
+    i_log-adstopo = c_st.
+    i_log-addimo = i_log-cudimo.
+
+* Stocked to Non-Stocked
+  ELSEIF p_exc EQ 'A04'.
+    i_log-extypnr = 4.
+    i_log-extypdesc = text-t04.
+    IF i_marc-mtpos EQ c_norm AND i_marc-mvgr4 EQ c_lcl.
+      i_log-adstopo = c_lns.
+    ELSE.
+      i_log-adstopo = c_cns.
+    ENDIF.
+    i_log-adeisbe = 0.
+    i_log-adrepo = 0.
+    I_LOG-ADLSFL = SPACE.
+    i_log-adlosi = 1.
+    i_log-addimo = i_log-cudimo.
+* Lotsize
+  ELSEIF p_exc EQ 'B01'
+      OR P_EXC EQ 'B02'
+      OR P_EXC EQ 'B03'.
+    i_log-extypnr = 5.
+    i_log-extypdesc = text-t07.
+    i_log-addimo = i_log-cudimo.
+    i_log-adstopo = i_log-custopo.
+* Safety stock
+  ELSEIF p_exc EQ 'C01'.
+    i_log-extypnr = 6.
+    i_log-extypdesc = text-t08.
+    i_log-addimo = i_log-cudimo.
+    i_log-adstopo = i_log-custopo.
+* Reorder-point
+  ELSEIF p_exc EQ 'E01'.
+    i_log-extypnr = 7.
+    i_log-extypdesc = text-t09.
+    i_log-addimo = i_log-cudimo.
+    i_log-adstopo = i_log-custopo.
+  ENDIF.
+  i_log-matnr = i_marc-matnr.
+  i_log-excode = p_exc.
+  i_log-chngdat = sy-datum.
+
+ENDFORM.                    " set_em_msg
+
+
+*&---------------------------------------------------------------------*
+*&      Form  select_extra
+*&---------------------------------------------------------------------*
+FORM select_extra .
+
+* Select for MRP parameters => for delta max stock value
+  SELECT SINGLE *
+  FROM t399d
+  WHERE werks EQ p_werks.
+
+ENDFORM.                    " select_extra
+
+
+*&---------------------------------------------------------------------*
+*&      Form  write_data
+*&---------------------------------------------------------------------*
+*       modify table YSE_EM_LOG with the EM data
+*----------------------------------------------------------------------*
+
+FORM write_data .
+
+  DATA: BEGIN OF infotab OCCURS 0,
+        flag,
+        olength TYPE x,
+        line  LIKE rsvar-infoline.
+  DATA: END   OF infotab.
+  DATA: variant_space LIKE rsvar-variant.
+  LEAVE TO LIST-PROCESSING.
+
+
+  CALL FUNCTION 'RS_COVERPAGE_SELECTIONS'
+    EXPORTING
+      report                  = sy-repid
+      variant                 = variant_space
+*     NO_IMPORT               = ' '
+    TABLES
+      infotab                 = infotab
+   EXCEPTIONS
+     error_message           = 1
+     variant_not_found       = 2
+     OTHERS                  = 3
+            .
+
+
+
+  LOOP AT infotab.
+    WRITE: / infotab-line.
+  ENDLOOP.
+
+  DESCRIBE TABLE i_log LINES sy-tfill.
+  WRITE:/ sy-tfill, 'lines updated in Exception Management Log Table'.
+  ULINE.
+
+  LOOP AT i_log.
+    WRITE: / i_log-vkorg, i_log-werks, i_log-matnr,
+    i_log-excode, i_log-extypdesc.
+  ENDLOOP.
+  MODIFY yse_em_log FROM TABLE i_log.
+
+ENDFORM.                    " write_data
+
+
+INCLUDE yse_em_exc_mgt_run_f01.  "Branch Warehouse Includes
+INCLUDE yse_em_exc_mgt_run_f02.  "Central Warehouse Includes
+INCLUDE yse_em_exc_mgt_run_f03.  "Forecasting Includes
+*&---------------------------------------------------------------------*
+*&      Form  check_authorization
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+form check_authorization .
+
+
+  AUTHORITY-CHECK OBJECT 'M_MATE_WRK'
+           ID 'ACTVT' DUMMY
+           ID 'WERKS' FIELD p_werks.
+
+  IF sy-subrc = 4.
+*   No authorisation to display data from Sales Organisation p_vkorg
+    MESSAGE ID 'YSE_GENERAL' TYPE 'E' NUMBER '008' WITH P_WERKS.
+  ELSEIF sy-subrc <> 0.
+*   Error checking authorization.
+    MESSAGE ID 'YSE_GENERAL' TYPE 'E' NUMBER '004'.
+  ENDIF.
+
+
+endform.                    " check_authorization
+
+*&---------------------------------------------------------------------*
+*&      Form  FILL_SRCLIST
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM FILL_SRCLIST .
+
+  SELECT       MATNR WERKS ZEORD LIFNR FLIFN
+          INTO TABLE I_EORD
+          FROM EORD
+*         WHERE MATNR IN R_MATNR  => dumps if too many entries...
+*           AND FLIFN NE SPACE.
+         WHERE FLIFN NE SPACE.
+
+  CHECK SY-SUBRC EQ 0.
+*  LOOP AT I_EORD WHERE MATNR NOT IN R_MATNR.
+*    DELETE I_EORD.
+*  ENDLOOP.
+  LOOP AT I_EORD.
+    READ TABLE I_MARC WITH KEY MATNR = I_EORD-MATNR BINARY SEARCH.
+    IF SY-SUBRC NE 0.
+      DELETE I_EORD.
+    ENDIF.
+  ENDLOOP.
+
+  DESCRIBE TABLE I_EORD LINES SY-TFILL.
+  CHECK SY-TFILL GT 0.
+  SELECT      LIFNR KTOKK
+         INTO TABLE I_LFA1
+         FROM LFA1
+          FOR ALL ENTRIES IN I_EORD
+        WHERE LIFNR EQ I_EORD-LIFNR.
+
+ENDFORM.                    " FILL_SRCLIST
+
+*Text symbol text£º
+*E01:Entered plant is not allowed or does not exist
+*E02:No Valid Sales District Found!
+*S01:Selection Parameters
+*T01:DTC to NDTC
+*T02:NDTC to DTC
+*T03:Non-stocked to Stocked
+*T04:Stocked to Non-Stocked
+*T05:
+*T06:
+*T07:Lotsize
+*T08:Safety Stock
+
+*T09:Reorder Point
+*Selection text£º
+*P_DATUM:        Basic Date
+*P_N:        Number of months to include
+*P_VKORG:D       Sales Organization
+*P_WERKS:D       Plant
+*S_DISMM:D       MRP Type
+*S_MATNR:D       Material
+*S_VTWEG:D       Distribution Channel

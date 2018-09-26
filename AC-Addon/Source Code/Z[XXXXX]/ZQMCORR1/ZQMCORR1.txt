@@ -1,0 +1,247 @@
+*&---------------------------------------------------------------------*
+*& Title: Program to create status object for insp. lot, phys. samples *
+*&---------------------------------------------------------------------*
+
+REPORT  ZQMCORR1.
+
+TABLES: QALS,
+        QPRS,
+        TQ40,
+        JSTO.
+
+PARAMETERS LOT_NO LIKE QALS-PRUEFLOS OBLIGATORY.
+* lokale Tabelle fuer Statusfortschreibung
+DATA: BEGIN OF G_STATTAB OCCURS 0.
+        INCLUDE STRUCTURE JSTAT.
+DATA  END OF G_STATTAB.
+* Objektnummer Pr¨¹flos
+DATA: G_OBJNR_TMP LIKE QALS-OBJNR,
+      G_OBJNR     LIKE QALS-OBJNR.
+* Objektnummer Phys. Probe
+DATA: G_OBJNR_QP_TMP LIKE QPRS-OBJNR,
+      G_OBJNR_QP     LIKE QPRS-OBJNR.
+* Tabelle der Phys. Proben zum Pr¨¹flos
+DATA: G_QPRS         LIKE QPRS,
+      G_QPRS_TAB     LIKE QPRS OCCURS 0.
+* Hilfsvariable
+DATA: G_COMMIT_EXPECTED LIKE QM00-QKZ.
+
+SELECT SINGLE * FROM QALS WHERE PRUEFLOS EQ LOT_NO.
+IF SY-SUBRC IS INITIAL.
+* Check Status object
+  CALL FUNCTION 'OBJECT_NUMBER_READ_QL'
+       EXPORTING
+            PRUEFLOS = QALS-PRUEFLOS
+       IMPORTING
+            OBJNR    = G_OBJNR.
+*
+  SELECT SINGLE * FROM JSTO WHERE OBJNR EQ G_OBJNR.
+  IF SY-SUBRC IS INITIAL.
+    WRITE: 'status object still existing. wrong lot:'(002),
+           QALS-PRUEFLOS.
+  ELSE.
+*   delete ONR00 record
+    CALL FUNCTION 'OBJECT_NUMBER_DELETE_QL'
+         EXPORTING
+              OBJNR = G_OBJNR.
+    COMMIT WORK AND WAIT.
+*   generate status object number
+    CALL FUNCTION 'OBJECT_NUMBER_GET_QL'
+         EXPORTING
+              PRUEFLOS = QALS-PRUEFLOS
+         IMPORTING
+              OBJNR    = G_OBJNR.
+    IF QALS-OBTYP IS INITIAL.
+      IF QALS-AUFPL IS INITIAL.
+        MOVE 'QL3' TO QALS-OBTYP.
+      ELSE.
+        MOVE 'QL1' TO QALS-OBTYP.
+      ENDIF.
+    ENDIF.
+*   generate status object
+    CALL FUNCTION 'STATUS_OBJECT_CREATE'
+         EXPORTING
+              OBTYP = QALS-OBTYP
+              STSMA = QALS-STSMA
+              CHGKZ = QALS-STAT19
+         IMPORTING
+              OBJNR = G_OBJNR_TMP.
+    IF QALS-OBTYP EQ 'QL3'.
+*     no features
+      MOVE 'I0200' TO G_STATTAB-STAT.  "Insp. completion w/o confirm
+      MOVE SPACE   TO G_STATTAB-INACT.
+      APPEND G_STATTAB.
+    ELSE.
+*     with features
+      IF QALS-AUFPL IS INITIAL.
+        MOVE 'I0201' TO G_STATTAB-STAT."Plan/specific. required
+        MOVE SPACE   TO G_STATTAB-INACT.
+        APPEND G_STATTAB.
+        MOVE 'I0202' TO G_STATTAB-STAT."Characterist. must be created
+        MOVE SPACE   TO G_STATTAB-INACT.
+        APPEND G_STATTAB.
+      ELSE.
+*     operations generated
+        MOVE 'I0201' TO G_STATTAB-STAT."Plan/specific. required
+        MOVE 'X'     TO G_STATTAB-INACT.
+        APPEND G_STATTAB.
+        MOVE 'I0205' TO G_STATTAB-STAT."Plan/specification assigned
+        MOVE SPACE   TO G_STATTAB-INACT.
+        APPEND G_STATTAB.
+        MOVE 'I0202' TO G_STATTAB-STAT."Characterist. must be created
+        MOVE 'X'     TO G_STATTAB-INACT.
+        APPEND G_STATTAB.
+        MOVE 'I0206' TO G_STATTAB-STAT."Insp. characteristics created
+        MOVE SPACE   TO G_STATTAB-INACT.
+        APPEND G_STATTAB.
+        MOVE 'I0207' TO G_STATTAB-STAT."Sample calculated
+        MOVE SPACE   TO G_STATTAB-INACT.
+        APPEND G_STATTAB.
+        MOVE 'I0001' TO G_STATTAB-STAT.                     "created
+        MOVE 'X'     TO G_STATTAB-INACT.
+        APPEND G_STATTAB.
+        MOVE 'I0002' TO G_STATTAB-STAT.                     "released
+        MOVE SPACE   TO G_STATTAB-INACT.
+        APPEND G_STATTAB.
+        IF NOT QALS-DYNHEAD IS INITIAL.
+          MOVE 'I0208' TO G_STATTAB-STAT."Q-Level active
+          MOVE SPACE   TO G_STATTAB-INACT.
+          APPEND G_STATTAB.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+*   Los bestandsrelevant
+    IF QALS-LMENGEZUB > 0 AND QALS-INSMK EQ 'X'
+      AND QALS-HERKUNFT CO '01458'.
+      MOVE 'I0203' TO  G_STATTAB-STAT. "Quantity posting required
+      MOVE SPACE   TO G_STATTAB-INACT.
+      APPEND G_STATTAB.
+    ENDIF.
+    CALL FUNCTION 'STATUS_CHANGE_INTERN'
+         EXPORTING
+              CHECK_ONLY = SPACE
+              OBJNR      = G_OBJNR_TMP
+         TABLES
+              STATUS     = G_STATTAB.
+    G_COMMIT_EXPECTED = 'X'.
+
+*   Statusobjekt sichern
+    CALL FUNCTION 'STATUS_OBJECT_SWITCH_NUMBER'
+         EXPORTING
+              OBJNR_NEW = G_OBJNR
+              OBJNR_OLD = G_OBJNR_TMP.
+    IF QALS-OBJNR NE G_OBJNR.
+*   Neue Objektnr in QALS stellen
+      MOVE G_OBJNR TO QALS-OBJNR.
+      CALL FUNCTION 'QPBU_LOT_UPDATE'
+           EXPORTING
+                QALS_NEW = QALS.
+    ENDIF.
+    IF G_COMMIT_EXPECTED = 'X'.
+      CALL FUNCTION 'STATUS_UPDATE_DIALOG'.
+      COMMIT WORK.
+    ENDIF.
+  ENDIF.
+
+
+* #berpr¨¹fung und Korrektur der Status der Phys. Proben zum Pr¨¹flos
+  IF QALS-STAT13 = '3'.                 "Pr¨¹fpunkte f¨¹r Phys. Proben
+    SELECT * FROM QPRS INTO TABLE G_QPRS_TAB
+             WHERE PLOS2 = QALS-PRUEFLOS.
+
+    IF SY-SUBRC IS INITIAL.
+*     Proben vorhanden
+      LOOP AT G_QPRS_TAB INTO G_QPRS.
+*       Initialisierungen
+        CLEAR G_OBJNR_QP.
+        CLEAR G_OBJNR_QP_TMP.
+        CLEAR G_STATTAB.
+        REFRESH G_STATTAB.
+
+*       Check Status object
+        CALL FUNCTION 'OBJECT_NUMBER_READ_QP'
+             EXPORTING
+                  PHYNR = G_QPRS-PHYNR
+             IMPORTING
+                  OBJNR = G_OBJNR_QP.
+*
+        SELECT SINGLE * FROM JSTO WHERE OBJNR EQ G_OBJNR_QP.
+        IF SY-SUBRC IS INITIAL.
+*
+        ELSE.
+          CALL FUNCTION 'STATUS_BUFFER_REFRESH'.
+*         delete ONR00 record
+          CALL FUNCTION 'OBJECT_NUMBER_DELETE_QP'
+               EXPORTING
+                    OBJNR = G_OBJNR_QP.
+          COMMIT WORK AND WAIT.
+*         generate status object number
+          CALL FUNCTION 'OBJECT_NUMBER_GET_QP'
+               EXPORTING
+                    PHYNR = G_QPRS-PHYNR
+               IMPORTING
+                    OBJNR = G_OBJNR_QP.
+*         generate status object
+          CALL FUNCTION 'STATUS_OBJECT_CREATE'
+               EXPORTING
+                    OBTYP = 'QPR'
+                    STSMA = G_QPRS-STSMA
+                    CHGKZ = 'X'
+               IMPORTING
+                    OBJNR = G_OBJNR_QP_TMP.
+
+          MOVE 'I0001' TO G_STATTAB-STAT.                   "created
+          MOVE SPACE   TO G_STATTAB-INACT.
+          APPEND G_STATTAB.
+*         Wenn keine Quittierungspflicht, Probe direkt freigeben
+          IF QALS-STAT12 IS INITIAL.
+            MOVE 'I0002' TO G_STATTAB-STAT.                 "released
+            MOVE SPACE   TO G_STATTAB-INACT.
+            APPEND G_STATTAB.
+          ENDIF.
+*         Sofortdruck des Etikettes
+          IF G_QPRS-PRART NE TQ40-PRART.
+            CALL FUNCTION 'TQ40_READ'
+              EXPORTING
+                I_PRART                 = G_QPRS-PRART
+*               I_LANGUAGE              =
+              IMPORTING
+                E_TQ40                  = TQ40.
+          ENDIF.
+          IF NOT TQ40-QKZ_ETDR IS INITIAL.
+            MOVE 'I0367' TO G_STATTAB-STAT.          "label printed
+            MOVE SPACE   TO G_STATTAB-INACT.
+            APPEND G_STATTAB.
+          ENDIF.
+
+          CALL FUNCTION 'STATUS_CHANGE_INTERN'
+               EXPORTING
+                    CHECK_ONLY = SPACE
+                    OBJNR      = G_OBJNR_QP_TMP
+               TABLES
+                    STATUS     = G_STATTAB.
+*         Statusobjekt sichern
+          CALL FUNCTION 'STATUS_OBJECT_SWITCH_NUMBER'
+               EXPORTING
+                    OBJNR_NEW = G_OBJNR_QP
+                    OBJNR_OLD = G_OBJNR_QP_TMP.
+
+          IF G_QPRS-OBJNR NE G_OBJNR_QP.
+*           Neue Objektnr in QPRS stellen
+            MOVE G_OBJNR_QP TO G_QPRS-OBJNR.
+            CALL FUNCTION 'QPRB_MASTER_SAMPLE_UPDATE'
+                 EXPORTING
+                      I_QPRS_NEW = G_QPRS.
+          ENDIF.
+          CALL FUNCTION 'STATUS_UPDATE_DIALOG'.
+          COMMIT WORK.
+        ENDIF.
+      ENDLOOP.
+
+    ELSE.
+*     keine Proben
+    ENDIF.
+  ENDIF.
+ELSE.
+  WRITE: 'Inspection lot not found:'(001), LOT_NO.
+ENDIF.

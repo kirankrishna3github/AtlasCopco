@@ -1,0 +1,343 @@
+*----------------------------------------------------------------------*
+***INCLUDE YSE_RENT_PLBRD_F03 .
+*----------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  XFER2QUOT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM XFER2QUOT .
+
+  DATA: LV_ERROR1 TYPE I,
+        LV_ERROR2 TYPE I,
+        LV_ROWCNT TYPE I,
+        LV_AUART  TYPE AUART,
+        LV_VBELN  TYPE VBELN,
+        IT_MATNR  TYPE MATNR OCCURS 0 WITH HEADER LINE,
+        IT_BOXES1 LIKE BOXES OCCURS 0 WITH HEADER LINE,
+        IT_BOXES2 LIKE BOXES OCCURS 0 WITH HEADER LINE.
+
+  CONSTANTS: LC_AUART_QUWOR TYPE AUART VALUE 'QUWR'.
+
+* Read the selected lines from the barchart
+  PERFORM GET_LINES_SELECTED.
+
+* Split the selected lines in 2 tables: one for the top chart, one for the bottom chart
+  LOOP AT BOXES.
+    IF BOXES-CHART_ID = 1.
+      APPEND BOXES TO IT_BOXES1.
+    ELSEIF BOXES-CHART_ID = 2.
+      APPEND BOXES TO IT_BOXES2.
+    ENDIF.
+  ENDLOOP.
+
+* FIND THE SELECTED MODEL(S) ***
+* Loop over the lines which were selected from chart 1
+  LOOP AT IT_BOXES1.
+*   Read the line type of the current line
+    READ TABLE ALL_BOX_VALS WITH KEY ID = IT_BOXES1-ID FL = 9.
+*   If a line was selected that doesn't have linetype, set error flag
+    IF SY-SUBRC <> 0.
+      LV_ERROR1 = 1.
+*   If a line was selected that has a linetype different from 'Model', set error flag
+    ELSEIF NOT ALL_BOX_VALS-VAL = GC_BCLT_MD.
+      LV_ERROR1 = 2.
+*   If the line which is being processed is of type 'Model', read the key field of the line
+    ELSE.
+*     Read the key field of the current line
+      READ TABLE ALL_BOX_VALS WITH KEY ID = IT_BOXES1-ID FL = 10.
+*     If the key field wasn't found, set error flag
+      IF SY-SUBRC <> 0.
+        LV_ERROR1 = 3.
+*     Otherwise, add the key field to the materials that should be added to the quotation
+      ELSE.
+        APPEND ALL_BOX_VALS-VAL TO IT_MATNR.
+      ENDIF.
+    ENDIF.
+*   If an error occured, stop looping the remaining lines
+    IF NOT LV_ERROR1 IS INITIAL.
+      EXIT.
+    ENDIF.
+  ENDLOOP.      " IT_BOXES1
+* If IT_MATNR is initial, set error flag
+  IF IT_MATNR[] IS INITIAL AND LV_ERROR1 IS INITIAL.
+    LV_ERROR1 = 4.
+  ENDIF.
+
+* FIND THE SELECTED DOCUMENT(S) ***
+* Check the rowcount of selected lines in chart 2
+  DESCRIBE TABLE IT_BOXES2 LINES LV_ROWCNT.
+* If more then 1 line selected, set error flag2
+  IF LV_ROWCNT > 1.
+    LV_ERROR2 = 1.
+  ELSEIF LV_ROWCNT = 1.
+*   Read the selected line from chart 2
+    READ TABLE IT_BOXES2.
+*   Read the line type of the selected line
+    READ TABLE ALL_BOX_VALS WITH KEY ID = IT_BOXES2-ID FL = 9.
+*   If a line was selected that doesn't have linetype, set error flag
+    IF SY-SUBRC <> 0.
+      LV_ERROR2 = 2.
+*   If a line was selected that has a linetype different from 'Quotation' or 'Enquiry', set error flag
+    ELSEIF NOT ( ALL_BOX_VALS-VAL = GC_BCLT_EN OR ALL_BOX_VALS-VAL = GC_BCLT_QU ).
+      LV_ERROR2 = 3.
+*   If the line which is being processed is of a good type
+    ELSE.
+*     Save the line type (document type in thise case)
+      LV_AUART = ALL_BOX_VALS-VAL.
+*     Read the key field of the current line
+      READ TABLE ALL_BOX_VALS WITH KEY ID = IT_BOXES2-ID FL = 10.
+*     If the key field wasn't found, set error flag
+      IF SY-SUBRC <> 0.
+        LV_ERROR2 = 4.
+*     Otherwise, save the key field as the document which is supposed to be updated
+      ELSE.
+        LV_VBELN = ALL_BOX_VALS-VAL.
+*       Add preceding zeroes to the document number
+        CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+          EXPORTING
+            INPUT         = LV_VBELN
+          IMPORTING
+            OUTPUT        = LV_VBELN.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+* If no line selected, set the document type to "create quotation without reference"
+  IF ( LV_AUART IS INITIAL OR LV_VBELN IS INITIAL ) AND LV_ERROR2 IS INITIAL.
+    LV_AUART = LC_AUART_QUWOR.   " Create Quotation Without Reference
+  ENDIF.
+
+* If the error flag is not set
+  IF LV_ERROR1 IS INITIAL AND LV_ERROR2 IS INITIAL.
+    CASE LV_AUART.
+*     When selected document is an enquiry, create a quotation
+      WHEN GC_AUART_ENQU.
+        PERFORM DOC_CREATE_QUOT_WR TABLES IT_MATNR
+                                   USING  LV_VBELN.
+*     When selected document is a quotation, update the quotation
+      WHEN GC_AUART_QUOT.
+
+*     When no document selected, create a new quotation without reference
+      WHEN LC_AUART_QUWOR.
+        PERFORM DOC_CREATE_QUOT_WOR TABLES IT_MATNR.
+
+    ENDCASE.
+  ELSE.
+    MESSAGE E001 WITH LV_ERROR1 LV_ERROR2.
+  ENDIF.
+
+ENDFORM.                    " XFER2QUOT
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_LINES_SELECTED
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM GET_LINES_SELECTED .
+
+  STAT = SGRC_CONST-STAT_4.            "Wait for input
+
+* Tell the barchart that you want to read the selected items from the charts
+  CALL FUNCTION 'BARC_GRAPHIC_PBO'
+    EXPORTING
+      ABAP_CMD       = 'SEL'
+      STAT           = STAT
+      CONTROL_HANDLE = GV_BARC_OCX_HNDL.
+
+* Collect the selected items
+  CALL FUNCTION 'BARC_GRAPHIC_PAI'
+    EXPORTING
+      control_handle = GV_barc_ocx_HNDL  "f¨¹r Umstellung auf OCX
+    IMPORTING
+      graph_cmd      = graph_cmd
+      graph_cmd_info = graph_cmd_info
+      gr_sel_field   = gr_sel_field
+      layer_type     = layer_kind
+      settings       = settings
+      symboltype     = symboltype
+    TABLES
+      boxes          = boxes
+    EXCEPTIONS
+      inv_winid      = 1.
+
+ENDFORM.                    " GET_LINES_SELECTED
+
+*&---------------------------------------------------------------------*
+*&      Form  DOC_CREATE_QUOT_WOR
+*&---------------------------------------------------------------------*
+*      Create a quotation without reference
+*----------------------------------------------------------------------*
+FORM DOC_CREATE_QUOT_WOR TABLES IT_MATNR.
+
+  DATA: LV_ITEMCTRCH(2) TYPE C,
+        LV_FNAM         TYPE FNAM_____4,
+        LS_OPTIONS      TYPE CTU_PARAMS.
+
+  LS_OPTIONS-NOBINPT = 'X'.
+  LS_OPTIONS-NOBIEND = 'X'.
+  LS_OPTIONS-DISMODE = 'E'.
+  LS_OPTIONS-UPDMODE = 'S'.
+
+* Clear the BDC tables
+  CLEAR: IT_BDCDATA[], IT_BDCMSGS[].
+
+* Prepare the first screen of VA21
+  PERFORM BDC_ADD_SCREEN USING GC_BDCPRG_SAPMV45A '0101'.
+  PERFORM BDC_ADD_FIELD  USING 'VBAK-AUART' GC_AUART_QUOT.
+  PERFORM BDC_ADD_FIELD  USING 'VBAK-VKORG' 'CN01'.  " TVOTBA this should be made dynamic
+  PERFORM BDC_ADD_FIELD  USING 'VBAK-VTWEG' '21'.    " TVOTBA this should be made dynamic
+  PERFORM BDC_ADD_FIELD  USING 'VBAK-SPART' '01'.    " TVOTBA this should be made dynamic
+  PERFORM BDC_ADD_FIELD  USING 'BDC_OKCODE' '/00'.
+* Prepare the second screen of VA21 (enter the materials as items on the quotation)
+  PERFORM BDC_ADD_SCREEN USING GC_BDCPRG_SAPMV45A '4001'.
+* PERFORM BDC_ADD_FIELD  USING 'KUAGV-KUNNR' '14'.
+* PERFORM BDC_ADD_FIELD  USING 'RV45A-KETDAT' '1.1.07'.
+* Add the materials to the BDC
+  LOOP AT IT_MATNR.
+   LV_ITEMCTRCH = SY-TABIX.
+   CONCATENATE 'RV45A-MABNR(' LV_ITEMCTRCH ')' INTO LV_FNAM.
+   PERFORM BDC_ADD_FIELD  USING LV_FNAM IT_MATNR.
+  ENDLOOP. " IT_MATNR
+  PERFORM BDC_ADD_FIELD  USING 'BDC_OKCODE' '/00'.
+* Call the transaction to create a quotation
+  CALL TRANSACTION GC_TX_VA21 USING         IT_BDCDATA
+*                              MODE          GC_CALLTX_MODE_E
+*                              UPDATE        GC_CALLTX_UD_S
+                              OPTIONS  FROM LS_OPTIONS
+                              MESSAGES INTO IT_BDCMSGS.
+
+* Display the messages
+*  DATA: LV_MSGTXT(200) TYPE C.
+*  LOOP AT IT_BDCMSGS.
+*    SELECT SINGLE TEXT
+*          INTO LV_MSGTXT
+*          FROM T100
+*          WHERE SPRSL = 'EN'
+*            AND ARBGB = IT_BDCMSGS-MSGID
+*            AND MSGNR = IT_BDCMSGS-MSGNR.
+*    REPLACE '&' WITH IT_BDCMSGS-MSGV1 INTO LV_MSGTXT.
+*    REPLACE '&' WITH IT_BDCMSGS-MSGV2 INTO LV_MSGTXT.
+*    REPLACE '&' WITH IT_BDCMSGS-MSGV3 INTO LV_MSGTXT.
+*    REPLACE '&' WITH IT_BDCMSGS-MSGV4 INTO LV_MSGTXT.
+*    CALL FUNCTION 'POPUP_TO_CONFIRM'
+*      EXPORTING
+*        TEXT_QUESTION               = LV_MSGTXT.
+*  ENDLOOP. " IT_BDCMSGS
+
+ENDFORM.                    " DOC_CREATE_QUOT_WOR
+
+*&---------------------------------------------------------------------*
+*&      Form  DOC_CREATE_QUOT_WR
+*&---------------------------------------------------------------------*
+*      Create a quotation with reference
+*----------------------------------------------------------------------*
+FORM DOC_CREATE_QUOT_WR TABLES   IT_MATNR
+                        USING    P_VBELN.
+
+  DATA: LV_ITEMCTRCH(2)    TYPE C,
+        LV_FNAM            TYPE FNAM_____4,
+        LV_VBELN           TYPE VBELN,
+        LV_MSGTXT(200)     TYPE C,
+        LV_ANSWER          TYPE C,
+        LS_OPTIONS      TYPE CTU_PARAMS.
+
+*  LS_OPTIONS-NOBINPT = 'X'.
+  LS_OPTIONS-NOBIEND = 'X'.
+  LS_OPTIONS-DISMODE = 'E'.
+  LS_OPTIONS-UPDMODE = 'S'..
+
+  CONSTANTS: LC_POSNV_INIT TYPE POSNR VALUE '000000',
+             LC_VBTYP_QUOT TYPE VBTYP VALUE 'B'.      " Document Type succeeding doc = B = Quotation
+
+* Clear the BDC tables
+  CLEAR: IT_BDCDATA[], IT_BDCMSGS[].
+
+* Check if a quotation already exists for the enquiry
+  SELECT SINGLE VBELN
+      INTO LV_VBELN
+      FROM VBFA
+     WHERE VBELV   = P_VBELN
+       AND POSNV   = LC_POSNV_INIT
+       AND VBTYP_N = LC_VBTYP_QUOT.
+
+* If a quotation already exists, ask the user to confirm creating a new one
+  IF SY-SUBRC = 0.
+    CONCATENATE TEXT-911 LV_VBELN TEXT-913 INTO LV_MSGTXT SEPARATED BY SPACE.
+    CALL FUNCTION 'POPUP_TO_CONFIRM'
+      EXPORTING
+        TITLEBAR                    = TEXT-912   " Quotation already exists
+        TEXT_QUESTION               = LV_MSGTXT
+        DEFAULT_BUTTON              = '2'
+        DISPLAY_CANCEL_BUTTON       = SPACE
+        POPUP_TYPE                  = 'ICON_MESSAGE_WARNING'
+      IMPORTING
+        ANSWER                      = LV_ANSWER.
+  ELSE.
+    LV_ANSWER = '1'.
+  ENDIF.
+
+* If the creation should continue
+  IF LV_ANSWER = '1'.
+*   Prepare the first screen of VA21 (Create Quotation)
+    PERFORM BDC_ADD_SCREEN USING GC_BDCPRG_SAPMV45A '0101'.
+    PERFORM BDC_ADD_FIELD  USING 'VBAK-AUART' GC_AUART_QUOT.
+    PERFORM BDC_ADD_FIELD  USING 'VBAK-VKORG' 'CN01'.   " TVOTBA this should be made dynamic
+    PERFORM BDC_ADD_FIELD  USING 'VBAK-VTWEG' '21'.     " TVOTBA this should be made dynamic
+    PERFORM BDC_ADD_FIELD  USING 'VBAK-SPART' '01'.     " TVOTBA this should be made dynamic
+    PERFORM BDC_ADD_FIELD  USING 'BDC_OKCODE' '=COPY'.
+*   Prepare the second screen of VA21 (Enter the reference document)
+    PERFORM BDC_ADD_SCREEN USING GC_BDCPRG_SAPLV45C '0100'.
+    PERFORM BDC_ADD_FIELD  USING 'LV45C-VBELN' P_VBELN.
+    PERFORM BDC_ADD_FIELD  USING 'BDC_OKCODE' '=UEBR'.
+*   Prepare the 3rd screen: select all items
+    PERFORM BDC_ADD_SCREEN USING GC_BDCPRG_SAPMV45A '4001'.
+    PERFORM BDC_ADD_FIELD  USING 'BDC_OKCODE' '=MKAL'.
+*   Prepare the 4th screen: delete the selected items
+    PERFORM BDC_ADD_SCREEN USING GC_BDCPRG_SAPMV45A '4001'.
+    PERFORM BDC_ADD_FIELD  USING 'BDC_OKCODE' '=POLO'.
+*   Prepare the last screen of VA21 (enter the materials as items on the quotation)
+    PERFORM BDC_ADD_SCREEN USING GC_BDCPRG_SAPMV45A '4001'.
+*   Add the materials to the BDC
+    LOOP AT IT_MATNR.
+     LV_ITEMCTRCH = SY-TABIX.
+     CONCATENATE 'RV45A-MABNR(' LV_ITEMCTRCH ')' INTO LV_FNAM.
+     PERFORM BDC_ADD_FIELD  USING LV_FNAM IT_MATNR.
+    ENDLOOP. " IT_MATNR
+    PERFORM BDC_ADD_FIELD  USING 'BDC_OKCODE' '/00'.
+*   Call the transaction to create a quotation
+    CALL TRANSACTION GC_TX_VA21 USING         IT_BDCDATA
+*                                MODE          GC_CALLTX_MODE_E
+*                                UPDATE        GC_CALLTX_UD_S
+                                OPTIONS  FROM LS_OPTIONS
+                                MESSAGES INTO IT_BDCMSGS.
+  ENDIF. " LV_ANSWER = 1
+
+ENDFORM.                    " DOC_CREATE_QUOT_WR
+
+
+*&---------------------------------------------------------------------*
+*&      Form  BDC_ADD_SCREEN
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM BDC_ADD_SCREEN USING P_PROGRAM P_DYNPRO.
+  CLEAR IT_BDCDATA.
+  IT_BDCDATA-PROGRAM  = P_PROGRAM.
+  IT_BDCDATA-DYNPRO   = P_DYNPRO.
+  IT_BDCDATA-DYNBEGIN = GC_CHAR_X.
+  APPEND IT_BDCDATA.
+ENDFORM.    " BDC_ADD_SCREEN
+
+*&---------------------------------------------------------------------*
+*&      Form  BDC_ADD_FIELD
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM BDC_ADD_FIELD USING P_FNAM P_FVAL.
+  IF P_FVAL <> GC_CHAR_FS.   " Forward Slash
+    CLEAR IT_BDCDATA.
+    IT_BDCDATA-FNAM = P_FNAM.
+    IT_BDCDATA-FVAL = P_FVAL.
+    APPEND IT_BDCDATA.
+  ENDIF.
+ENDFORM.    " BDC_ADD_FIELD

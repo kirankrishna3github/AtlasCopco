@@ -1,0 +1,206 @@
+*&---------------------------------------------------------------------*
+*& Report  Z_AFKO_TERM
+*&
+*&---------------------------------------------------------------------*
+*&
+*&
+*&---------------------------------------------------------------------*
+
+REPORT  Z_AFKO_TERM.
+
+TABLES: afko.
+
+DATA: BEGIN OF afko_tmp OCCURS 0,
+        aufnr LIKE afko-aufnr,
+        aufpl LIKE afko-aufpl,
+        objnr LIKE aufk-objnr,
+        gstri LIKE afko-gstri,
+        gsuzi LIKE afko-gsuzi,
+        getri LIKE afko-getri,
+        geuzi LIKE afko-geuzi,
+      END OF afko_tmp.
+
+DATA: BEGIN OF afvc_tmp OCCURS 0,
+        aufpl LIKE afvc-aufpl,
+        aplzl LIKE afvc-aplzl,
+        rueck LIKE afvc-rueck,
+      END OF afvc_tmp.
+
+DATA: BEGIN OF afru_tmp OCCURS 0,
+        rueck LIKE afru-rueck,
+        rmzhl LIKE afru-rmzhl,
+        aufnr LIKE afru-aufnr,
+        isdd LIKE afru-isdd,
+        iedd LIKE afru-iedd,
+        isdz LIKE afru-isdz,
+        iedz LIKE afru-iedz,
+      END OF afru_tmp.
+
+DATA: BEGIN OF afko_upd OCCURS 0,
+        aufnr LIKE afko-aufnr,
+        gstri LIKE afko-gstri,
+        gsuzi LIKE afko-gsuzi,
+        getri LIKE afko-getri,
+        geuzi LIKE afko-geuzi,
+      END OF afko_upd.
+
+DATA: tmp_gstri LIKE afko-gstri.
+DATA: tmp_gsuzi LIKE afko-gsuzi.
+DATA: tmp_getri LIKE afko-getri.
+DATA: tmp_geuzi LIKE afko-geuzi.
+DATA: first_conf(1) TYPE c.
+
+PARAMETERS: test(1) TYPE c DEFAULT 'X'.
+SELECT-OPTIONS: ordernr FOR afko-aufnr.
+
+* Auftr#ge selektieren
+SELECT aufnr aufpl objnr gstri gsuzi getri geuzi FROM viaufks
+                   INTO CORRESPONDING FIELDS OF TABLE afko_tmp
+                   WHERE aufnr IN ordernr
+                   AND autyp = '30'
+                   AND iphas >= '2'.
+
+CHECK NOT afko_tmp[] IS INITIAL.
+* Vorg#nge zu Auftr#gen selektieren
+SELECT aufpl aplzl rueck FROM afvc
+                             INTO CORRESPONDING FIELDS OF TABLE afvc_tmp
+                             FOR ALL ENTRIES IN afko_tmp
+                             WHERE aufpl = afko_tmp-aufpl
+                             AND loekz <> 'X'.
+
+CHECK NOT afvc_tmp[] IS INITIAL.
+* R¨¹ckmeldungen zu Vorg#ngen selektieren
+SELECT rueck rmzhl aufnr isdd iedd isdz iedz FROM afru
+                             INTO CORRESPONDING FIELDS OF TABLE afru_tmp
+                             FOR ALL ENTRIES IN afvc_tmp
+                             WHERE rueck = afvc_tmp-rueck
+                             AND stokz <> 'X'
+                             AND stzhl = '00000000'.
+
+CHECK NOT afru_tmp[] IS INITIAL.
+* R¨¹ckmeldungen nach Auftr#gen sortieren
+SORT afru_tmp BY aufnr.
+
+* #ber die Auftr#ge loopen und Iststart und Istende bestimmen
+LOOP AT afko_tmp.
+  CLEAR: tmp_gstri,
+         tmp_gsuzi,
+         tmp_getri,
+         tmp_geuzi,
+         afko_upd.
+  first_conf = 'X'.
+* ¨¹ber die R¨¹ckmeldungen kleinsten Starttermin und
+* gr##ten Endtermin bestimmen
+  LOOP AT afru_tmp WHERE aufnr = afko_tmp-aufnr.
+    IF afru_tmp-isdd < tmp_gstri OR
+       NOT first_conf IS INITIAL.
+      tmp_gstri = afru_tmp-isdd.
+      tmp_gsuzi = afru_tmp-isdz.
+    ELSEIF afru_tmp-isdd = tmp_gstri.
+      IF afru_tmp-isdz < tmp_gsuzi OR
+        tmp_gsuzi IS INITIAL.
+        tmp_gsuzi = afru_tmp-isdz.
+      ENDIF.
+    ENDIF.
+    IF afru_tmp-iedd > tmp_getri OR
+       NOT first_conf IS INITIAL.
+      tmp_getri = afru_tmp-iedd.
+      tmp_geuzi = afru_tmp-iedz.
+    ELSEIF afru_tmp-iedd = tmp_getri.
+      IF afru_tmp-iedz > tmp_geuzi OR
+         tmp_geuzi IS INITIAL.
+        tmp_geuzi = afru_tmp-iedz.
+      ENDIF.
+    ENDIF.
+    CLEAR first_conf.
+  ENDLOOP.
+
+  IF sy-subrc IS INITIAL.
+*   kleinsten Starttermin setzen
+    afko_upd-aufnr = afko_tmp-aufnr.
+    afko_upd-gstri = tmp_gstri.
+    afko_upd-gsuzi = tmp_gsuzi.
+
+    CALL FUNCTION 'STATUS_CHECK'
+         EXPORTING
+              objnr             = afko_tmp-objnr
+              status            = 'I0009'
+         EXCEPTIONS
+              status_not_active = 1.
+
+    IF sy-subrc = 0.
+*   gr##ten Endtermin nur setzen, wenn Auftrag endr¨¹ckgemeldet
+      afko_upd-getri = tmp_getri.
+      afko_upd-geuzi = tmp_geuzi.
+*   sonst kein Termin
+    ELSE.
+      CLEAR: afko_upd-getri,
+             afko_upd-geuzi.
+    ENDIF.
+*   in die Update-Tabelle nur aufnehmen, wenn sich #nderungen ergeben
+*   haben
+    IF afko_upd-gstri <> afko_tmp-gstri OR
+       afko_upd-gsuzi <> afko_tmp-gsuzi OR
+       afko_upd-getri <> afko_tmp-getri OR
+       afko_upd-geuzi <> afko_tmp-geuzi.
+      APPEND afko_upd.
+    ENDIF.
+  ENDIF.
+ENDLOOP.
+
+IF NOT afko_upd[] IS INITIAL.
+  IF test IS INITIAL.
+    WRITE: / 'The following orders were corrected:'.
+    WRITE: /'Order'.
+    WRITE: 30 'new'.
+    WRITE: 45 'old'.
+    LOOP AT afko_upd.
+      SKIP 1.
+      READ TABLE afko_tmp WITH KEY aufnr = afko_upd-aufnr.
+      WRITE: / afko_upd-aufnr.
+      WRITE: /10 'Act.start date:'.
+      WRITE: 30 afko_upd-gstri.
+      WRITE: 45 afko_tmp-gstri.
+      WRITE: /10 'Act.start time:'.
+      WRITE: 30 afko_upd-gsuzi.
+      WRITE: 45 afko_tmp-gsuzi.
+      WRITE: /10 'Act.finish date:'.
+      WRITE: 30 afko_upd-getri.
+      WRITE: 45 afko_tmp-getri.
+      WRITE: /10 'Act.finish time:'.
+      WRITE: 30 afko_upd-geuzi.
+      WRITE: 45 afko_tmp-geuzi.
+*   Termine updaten
+      UPDATE afko SET gstri = afko_upd-gstri
+                      gsuzi = afko_upd-gsuzi
+                      getri = afko_upd-getri
+                      geuzi = afko_upd-geuzi
+                  WHERE aufnr = afko_upd-aufnr.
+    ENDLOOP.
+  ELSE.
+    WRITE: / 'The following orders have to be corrected:'.
+    WRITE: /'Order'.
+    WRITE: 30 'new'.
+    WRITE: 45 'old'.
+    LOOP AT afko_upd.
+      SKIP 1.
+      READ TABLE afko_tmp WITH KEY aufnr = afko_upd-aufnr.
+      WRITE: / afko_upd-aufnr.
+      WRITE: /10 'Act.start date:'.
+      WRITE: 30 afko_upd-gstri.
+      WRITE: 45 afko_tmp-gstri.
+      WRITE: /10 'Act.start time:'.
+      WRITE: 30 afko_upd-gsuzi.
+      WRITE: 45 afko_tmp-gsuzi.
+      WRITE: /10 'Act.finish date:'.
+      WRITE: 30 afko_upd-getri.
+      WRITE: 45 afko_tmp-getri.
+      WRITE: /10 'Act.finish time:'.
+      WRITE: 30 afko_upd-geuzi.
+      WRITE: 45 afko_tmp-geuzi.
+    ENDLOOP.
+  ENDIF.
+ELSE.
+  WRITE: /'No order to be corrected.'.
+ENDIF.
+

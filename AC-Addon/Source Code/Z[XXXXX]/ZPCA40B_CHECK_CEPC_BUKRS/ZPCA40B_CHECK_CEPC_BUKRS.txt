@@ -1,0 +1,780 @@
+*&---------------------------------------------------------------------*
+*& Report  ZPCA40B_CHECK_CEPC_BUKRS                                    *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+*& newest Version is in U4B                                            *
+*& test: inconsistencies can be created via ZPCA40B_PREPARE_CEPC_BUKRS *
+*&---------------------------------------------------------------------*
+*& Version 1.0: (2001/03/09)                                           *
+*& - checks if all-company-code assignments are correct                *
+*& - checks if profit center exists                                    *
+*& - checks if dummy profit center is assigned to all comp codes       *
+*& - checks if assigned company codes exists in controlling area       *
+*&---------------------------------------------------------------------*
+
+REPORT  ZPCA40B_CHECK_CEPC_BUKRS                .
+
+TYPES: TY_KOKRS LIKE TKA01-KOKRS,
+       TY_PRCTR LIKE CEPC-PRCTR,
+       TY_PRCTR_TAB TYPE TY_PRCTR OCCURS 0,
+       TY_PRCTR_TABLINE TYPE LINE OF TY_PRCTR_TAB,
+       TY_CEPC_BUKRS_TAB LIKE CEPC_BUKRS OCCURS 0,
+       TY_CEPC_BUKRS_TABLINE TYPE LINE OF TY_CEPC_BUKRS_TAB,
+       TY_BUKRS_TAB LIKE TKA02-BUKRS OCCURS 0,
+       TY_BUKRS_TABLINE TYPE LINE OF TY_BUKRS_TAB,
+       TY_RETURNCODE LIKE SY-SUBRC,
+       TY_PROTOCOL_LEVEL TYPE C,
+       TY_BOOLEAN TYPE C.
+
+CONSTANTS: CO_SUCCESS TYPE TY_RETURNCODE VALUE '0',
+           CO_FAILED  TYPE TY_RETURNCODE VALUE '1',
+           CO_PLEVEL_ALL TYPE TY_PROTOCOL_LEVEL VALUE 'A',
+           CO_PLEVEL_CHANGED TYPE TY_PROTOCOL_LEVEL VALUE 'C',
+           CO_TRUE TYPE TY_BOOLEAN VALUE 'X',
+           CO_FALSE TYPE TY_BOOLEAN VALUE SPACE.
+
+SELECTION-SCREEN BEGIN OF BLOCK SEL WITH FRAME.
+PARAMETERS: G_KOKRS LIKE TKA01-KOKRS MEMORY ID CAC OBLIGATORY .
+SELECTION-SCREEN END OF BLOCK sel.
+SELECTION-SCREEN BEGIN OF BLOCK STRG WITH FRAME.
+PARAMETERS:  G_TEST AS CHECKBOX DEFAULT 'X',
+            G_PROTLV TYPE TY_PROTOCOL_LEVEL
+              DEFAULT CO_PLEVEL_CHANGED NO-DISPLAY.
+SELECTION-SCREEN END OF BLOCK STRG.
+
+AT SELECTION-SCREEN ON G_KOKRS.
+  DATA: LD_TKA01 LIKE TKA01.
+  PERFORM READ_TKA01 USING G_KOKRS
+                     CHANGING LD_TKA01.
+  IF LD_TKA01 IS INITIAL.
+    MESSAGE E110(KM) WITH G_KOKRS.
+  ENDIF.
+
+START-OF-SELECTION.
+
+  DATA: LT_PRCTR TYPE TY_PRCTR_TAB,
+        LT_CEPC_BUKRS_OLD TYPE TY_CEPC_BUKRS_TAB, "data read from db
+        LT_CEPC_BUKRS_NEW TYPE TY_CEPC_BUKRS_TAB, "data to be written
+        LD_PRCTR TYPE TY_PRCTR_TABLINE,
+        LD_RC TYPE TY_RETURNCODE,
+        LD_OUTPUT_FLAG TYPE TY_BOOLEAN,
+        LD_CHANGED_FLAG TYPE TY_BOOLEAN.
+
+  IF G_TEST IS INITIAL.
+    G_TEST = CO_FALSE.
+  ELSE.
+    G_TEST = CO_TRUE.
+  ENDIF.
+
+* get data from cepc_bukrs, because we get the data from cepc_bukrs
+* we can be sure that at least one entry exists for each pc
+
+  PERFORM GET_DISTINCT_PRCTR USING G_KOKRS
+                             CHANGING LT_PRCTR.
+* DESIGN: if dummy profit center is not in lt_prctr we wont
+* check it! Only important if jv is active!
+
+  LD_OUTPUT_FLAG = CO_FALSE.
+
+  WRITE: / 'Check for controlling area: '(010)
+    COLOR COL_HEADING  INTENSIFIED ON,
+    G_KOKRS COLOR COL_HEADING  INTENSIFIED ON.
+  ULINE.
+
+  LOOP AT LT_PRCTR INTO LD_PRCTR.
+
+    PERFORM GET_CEPC_BUKRS USING G_KOKRS
+                                 LD_PRCTR
+                           CHANGING LT_CEPC_BUKRS_OLD
+                                    LD_RC.
+
+    LD_CHANGED_FLAG = CO_FALSE.
+
+    LT_CEPC_BUKRS_NEW[] = LT_CEPC_BUKRS_OLD[].
+
+    PERFORM CHECK_AND_CHANGE_ASSIGNMENT
+      USING G_KOKRS
+            LD_PRCTR
+      CHANGING LT_CEPC_BUKRS_NEW
+               LD_CHANGED_FLAG.
+
+    PERFORM WRITE_RESULT USING G_KOKRS
+                               LD_PRCTR
+                               LT_CEPC_BUKRS_NEW
+                               LT_CEPC_BUKRS_OLD
+                               LD_CHANGED_FLAG
+                               G_PROTLV
+                               LD_OUTPUT_FLAG.
+
+    IF G_TEST EQ CO_FALSE AND
+       LD_CHANGED_FLAG EQ CO_TRUE.
+      PERFORM UPDATE_CEPC_BUKRS USING G_KOKRS
+                                      LD_PRCTR
+                                      LT_CEPC_BUKRS_NEW
+                                CHANGING LD_RC.
+      IF LD_RC EQ CO_FAILED.
+        LD_OUTPUT_FLAG = CO_TRUE.
+        PERFORM WRITE_LOCK_ERROR USING G_KOKRS
+                                       LD_PRCTR.
+      ENDIF.
+
+    ENDIF.
+
+  ENDLOOP.
+
+  IF LD_OUTPUT_FLAG EQ CO_FALSE.
+    WRITE: /3 'No errors found'(020)
+      COLOR COL_NORMAL INTENSIFIED ON.
+  ENDIF.
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_DISTINCT_PRCTR
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_G_KOKRS  text                                              *
+*      <--P_LT_PRCTR  text                                             *
+*----------------------------------------------------------------------*
+FORM GET_DISTINCT_PRCTR USING    P_KOKRS TYPE TY_KOKRS
+                        CHANGING PT_PRCTR TYPE TY_PRCTR_TAB.
+
+  SELECT DISTINCT prctr FROM  cepc_bukrs
+                        INTO TABLE PT_PRCTR
+                        WHERE KOKRS = P_KOKRS.
+  SORT PT_PRCTR.
+
+ENDFORM.                               " GET_DISTINCT_PRCTR
+*&---------------------------------------------------------------------*
+*&      Form  GET_CEPC_BUKRS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_G_KOKRS  text                                              *
+*      -->P_LD_PRCTR  text                                             *
+*      <--P_LT_CEPC_BUKRS  text                                        *
+*----------------------------------------------------------------------*
+FORM GET_CEPC_BUKRS USING    P_KOKRS TYPE TY_KOKRS
+                             P_PRCTR TYPE TY_PRCTR
+                    CHANGING PT_CEPC_BUKRS TYPE TY_CEPC_BUKRS_TAB
+                             P_RC TYPE TY_RETURNCODE.
+
+
+  CLEAR PT_CEPC_BUKRS[].
+
+  SELECT * FROM CEPC_BUKRS INTO TABLE PT_CEPC_BUKRS
+    WHERE KOKRS = P_KOKRS
+    AND   PRCTR = P_PRCTR.
+
+  IF SY-SUBRC EQ 0.
+    P_RC = CO_SUCCESS.
+  ELSE.
+    P_RC = CO_FAILED.
+  ENDIF.
+
+ENDFORM.                               " GET_CEPC_BUKRS
+*&---------------------------------------------------------------------*
+*&      Form  DELETE_NOT_EXISTING_BUKRS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_LT_CEPC_BUKRS_NEW  text                                    *
+*----------------------------------------------------------------------*
+FORM DELETE_NON_EXISTING_BUKRS
+  CHANGING PT_CEPC_BUKRS TYPE TY_CEPC_BUKRS_TAB
+           P_CHANGED_FLAG TYPE TY_BOOLEAN.
+
+  DATA: LT_BUKRS_OF_KOKRS TYPE TY_BUKRS_TAB,
+        LD_BUKRS          TYPE TY_BUKRS_TABLINE, "#EC *
+        LD_KOKRS_OLD      TYPE TY_KOKRS,
+        LD_CEPC_BUKRS TYPE TY_CEPC_BUKRS_TABLINE.
+
+  P_CHANGED_FLAG = CO_FALSE.
+
+  LOOP AT PT_CEPC_BUKRS INTO LD_CEPC_BUKRS.
+    IF SY-TABIX EQ 1 OR
+       LD_KOKRS_OLD NE LD_CEPC_BUKRS-KOKRS.
+      LD_KOKRS_OLD = LD_CEPC_BUKRS-KOKRS.
+      CLEAR LT_BUKRS_OF_KOKRS[].
+      CALL FUNCTION 'RK_BUKRS_OF_KOKRS'
+           EXPORTING
+                KOKRS   = LD_CEPC_BUKRS-KOKRS
+           TABLES
+                T_BUKRS = LT_BUKRS_OF_KOKRS.
+      SORT LT_BUKRS_OF_KOKRS.
+    ENDIF.
+
+    READ TABLE LT_BUKRS_OF_KOKRS INTO LD_BUKRS
+      WITH KEY = LD_CEPC_BUKRS-BUKRS BINARY SEARCH.
+    IF SY-SUBRC NE 0.
+      P_CHANGED_FLAG = CO_TRUE.
+      DELETE PT_CEPC_BUKRS.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                               " DELETE_NOT_EXISTING_BUKRS
+*&---------------------------------------------------------------------*
+*&      Form  DELETE_NON_EXISTING_PRCTR
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_LT_CEPC_BUKRS_NEW  text                                    *
+*      <--P_LD_FLAG  text                                              *
+*----------------------------------------------------------------------*
+FORM DELETE_NON_EXISTING_PRCTR
+  CHANGING PT_CEPC_BUKRS TYPE TY_CEPC_BUKRS_TAB
+           P_CHANGED_FLAG TYPE TY_BOOLEAN.
+
+  DATA: LD_EXISTS_FLAG TYPE TY_BOOLEAN,
+        LD_CEPC_BUKRS TYPE TY_CEPC_BUKRS_TABLINE.
+
+  P_CHANGED_FLAG = CO_FALSE.
+
+  LOOP AT PT_CEPC_BUKRS INTO LD_CEPC_BUKRS.
+    PERFORM CHECK_IF_PRCTR_IN_CEPC USING LD_CEPC_BUKRS-KOKRS
+                                       LD_CEPC_BUKRS-PRCTR
+                                 CHANGING LD_EXISTS_FLAG.
+    IF LD_EXISTS_FLAG EQ CO_FALSE.
+      P_CHANGED_FLAG = CO_TRUE.
+      DELETE PT_CEPC_BUKRS.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                               " DELETE_NON_EXISTING_PRCTR
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_IF_PRCTR_IN_CEPC
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_LD_CEPC_BUKRS_KOKRS  text                                  *
+*      -->P_LD_CEPC_BUKRS_PRCTR  text                                  *
+*      <--P_LD_EXISTS_FLAG  text                                       *
+*----------------------------------------------------------------------*
+FORM CHECK_IF_PRCTR_IN_CEPC USING    P_KOKRS TYPE TY_KOKRS
+                                     P_PRCTR TYPE TY_PRCTR
+                            CHANGING P_EXISTS_FLAG TYPE TY_BOOLEAN.
+
+  STATICS: BEGIN OF LT_RESULT_CACHE OCCURS 0,
+             KOKRS TYPE TY_KOKRS,
+             PRCTR TYPE TY_PRCTR,
+             EXISTS TYPE TY_BOOLEAN,
+           END OF LT_RESULT_CACHE.
+
+  DATA: LD_TABIX LIKE SY-TABIX,
+        LD_CEPC LIKE CEPC.             "#EC *
+
+  READ TABLE LT_RESULT_CACHE
+    WITH KEY KOKRS = P_KOKRS
+             PRCTR = P_PRCTR
+  BINARY SEARCH.
+
+  IF SY-SUBRC EQ 0.
+    P_EXISTS_FLAG = LT_RESULT_CACHE-EXISTS.
+    EXIT.
+  ELSE.
+    LD_TABIX = SY-TABIX.
+    LT_RESULT_CACHE-KOKRS = P_KOKRS.
+    LT_RESULT_CACHE-PRCTR = P_PRCTR.
+
+    SELECT SINGLE * FROM CEPC INTO LD_CEPC
+      WHERE KOKRS = LT_RESULT_CACHE-KOKRS
+        AND PRCTR = LT_RESULT_CACHE-PRCTR.    "#EC *
+
+    IF SY-SUBRC EQ 0.
+      LT_RESULT_CACHE-EXISTS = CO_TRUE.
+    ELSE.
+      LT_RESULT_CACHE-EXISTS = CO_FALSE.
+    ENDIF.
+    INSERT LT_RESULT_CACHE INDEX LD_TABIX.
+    P_EXISTS_FLAG = LT_RESULT_CACHE-EXISTS.
+    EXIT.
+  ENDIF.
+ENDFORM.                               " CHECK_IF_PRCTR_IN_CEPC
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_ALL_BUKRS_ASSIGNED
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_LT_CEPC_BUKRS_NEW  text                                    *
+*      <--P_LD_FLAG  text                                              *
+*----------------------------------------------------------------------*
+FORM CHECK_ALL_BUKRS_ASSIGNED
+  USING    P_KOKRS TYPE TY_KOKRS
+  CHANGING PT_CEPC_BUKRS TYPE TY_CEPC_BUKRS_TAB
+              P_CHANGED_FLAG TYPE TY_BOOLEAN.
+* special logic. You have to make sure that PT_CEPC_BUKRS only
+* contains data for one prctr/kokrs and that all bukrs are
+* valid in p_kokrs.
+* if in doubt, call DELETE_NON_EXISTING_BUKRS first!
+
+  STATICS: LD_KOKRS_STORED TYPE TY_KOKRS VALUE SPACE,
+           LT_BUKRS_OF_KOKRS TYPE TY_BUKRS_TAB,
+           LD_NUM_BUKRS_OF_KOKRS LIKE SY-TABIX,
+           LD_JV_ACTIVE TYPE TY_BOOLEAN.
+
+  P_CHANGED_FLAG = CO_FALSE.
+
+  IF P_KOKRS NE LD_KOKRS_STORED.
+    LD_KOKRS_STORED = P_KOKRS.
+    PERFORM CHECK_JV_ACTIVE USING LD_KOKRS_STORED
+                            CHANGING LD_JV_ACTIVE.
+
+    CLEAR LT_BUKRS_OF_KOKRS[].
+
+    CALL FUNCTION 'RK_BUKRS_OF_KOKRS'
+         EXPORTING
+              KOKRS   = LD_KOKRS_STORED
+         TABLES
+              T_BUKRS = LT_BUKRS_OF_KOKRS.
+
+    SORT LT_BUKRS_OF_KOKRS.
+
+    DESCRIBE TABLE LT_BUKRS_OF_KOKRS[] LINES LD_NUM_BUKRS_OF_KOKRS.
+  ENDIF.
+
+  IF LD_JV_ACTIVE EQ CO_TRUE. EXIT. ENDIF.
+
+  DESCRIBE TABLE PT_CEPC_BUKRS[] LINES SY-TABIX.
+
+  IF SY-TABIX NE LD_NUM_BUKRS_OF_KOKRS.
+    EXIT.
+  ENDIF.
+
+  CLEAR PT_CEPC_BUKRS[].
+  P_CHANGED_FLAG = CO_TRUE.
+
+ENDFORM.                               " CHECK_ALL_BUKRS_ASSIGNED
+
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_JV_ACTIVE
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_P_KOKRS  text                                              *
+*      <--P_LD_FLAG  text                                              *
+*----------------------------------------------------------------------*
+FORM CHECK_JV_ACTIVE USING    P_KOKRS TYPE TY_KOKRS
+                     CHANGING P_FLAG TYPE TY_BOOLEAN.
+
+  STATICS: BEGIN OF LT_RESULT_CACHE OCCURS 0,
+             KOKRS TYPE TY_KOKRS,
+             ACTIVE TYPE TY_BOOLEAN,
+           END OF LT_RESULT_CACHE.
+
+  DATA: LD_TABIX LIKE SY-TABIX.
+
+
+  READ TABLE LT_RESULT_CACHE
+    WITH KEY KOKRS = P_KOKRS
+    BINARY SEARCH.
+
+  IF SY-SUBRC EQ 0.
+    P_FLAG = LT_RESULT_CACHE-ACTIVE.
+    EXIT.
+  ELSE.
+    LD_TABIX = SY-TABIX.
+    LT_RESULT_CACHE-KOKRS = P_KOKRS.
+    CALL FUNCTION 'JV_KOKRS_ACTIVE'
+         EXPORTING
+              KOKRS  = LT_RESULT_CACHE-KOKRS
+         IMPORTING
+              ACTIVE = LT_RESULT_CACHE-ACTIVE.
+
+    IF LT_RESULT_CACHE-ACTIVE IS INITIAL.
+      LT_RESULT_CACHE-ACTIVE = CO_FALSE.
+    ELSE.
+      LT_RESULT_CACHE-ACTIVE = CO_TRUE.
+    ENDIF.
+    INSERT LT_RESULT_CACHE INDEX LD_TABIX.
+    P_FLAG = LT_RESULT_CACHE-ACTIVE.
+    EXIT.
+  ENDIF.
+
+
+ENDFORM.                               " CHECK_JV_ACTIVE
+*&---------------------------------------------------------------------*
+*&      Form  SET_DPRCT_ASSIGNMENT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_G_KOKRS  text                                              *
+*      <--P_LT_CEPC_BUKRS_NEW  text                                    *
+*      <--P_LD_FLAG  text                                              *
+*----------------------------------------------------------------------*
+FORM CHECK_DPRCT_ASSIGNMENT
+  USING    P_KOKRS TYPE TY_KOKRS
+           P_PRCTR TYPE TY_PRCTR
+  CHANGING PT_CEPC_BUKRS TYPE TY_CEPC_BUKRS_TAB
+           P_CHANGED_FLAG TYPE TY_BOOLEAN.
+
+* special logic. You have to make sure that PT_CEPC_BUKRS only
+* contains data for one prctr/kokrs.
+
+  STATICS: LD_KOKRS_STORED TYPE TY_KOKRS VALUE SPACE,
+           LD_DPRCT     TYPE TY_PRCTR.
+
+  P_CHANGED_FLAG = CO_FALSE.
+
+* cache data for controlling area
+  IF  LD_KOKRS_STORED NE P_KOKRS.
+    LD_KOKRS_STORED = P_KOKRS.
+    PERFORM GET_DUMMY_PRCTR USING LD_KOKRS_STORED
+                            CHANGING LD_DPRCT.
+  ENDIF.
+
+* check if dummy profit center
+  IF P_PRCTR NE LD_DPRCT. EXIT. ENDIF.
+
+  PERFORM ASSIGN_TO_ALL_BUKRS
+      USING LD_KOKRS_STORED
+            P_PRCTR
+      CHANGING PT_CEPC_BUKRS
+               P_CHANGED_FLAG.
+
+ENDFORM.                               " SET_DPRCT_ASSIGNMENT
+*&---------------------------------------------------------------------*
+*&      Form  ASSIGN_TO_ALL_BUKRS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_PT_CEPC_BUKRS  text                                        *
+*      <--P_P_CHANGED_FLAG  text                                       *
+*----------------------------------------------------------------------*
+FORM ASSIGN_TO_ALL_BUKRS
+  USING P_KOKRS TYPE TY_KOKRS
+        P_PRCTR TYPE TY_PRCTR
+  CHANGING PT_CEPC_BUKRS TYPE TY_CEPC_BUKRS_TAB
+           P_CHANGED_FLAG TYPE TY_BOOLEAN.
+
+* special logic. You have to make sure that PT_CEPC_BUKRS only
+* contains data for one prctr/kokrs.
+
+  STATICS: LD_KOKRS_STORED TYPE TY_KOKRS VALUE SPACE,
+           LT_BUKRS_OF_KOKRS TYPE TY_BUKRS_TAB,
+           LD_JV_ACTIVE TYPE TY_BOOLEAN.
+
+  DATA: LD_CEPC_BUKRS TYPE TY_CEPC_BUKRS_TABLINE,
+        LD_TMP_CEPC_BUKRS TYPE TY_CEPC_BUKRS_TABLINE, "#EC *
+        LD_BUKRS TYPE TY_BUKRS_TABLINE.
+
+  P_CHANGED_FLAG = CO_FALSE.
+
+* cache data for controlling area
+  IF  LD_KOKRS_STORED NE P_KOKRS.
+    LD_KOKRS_STORED = P_KOKRS.
+    PERFORM CHECK_JV_ACTIVE USING LD_KOKRS_STORED
+                            CHANGING LD_JV_ACTIVE.
+    IF LD_JV_ACTIVE EQ CO_TRUE.
+      PERFORM GET_BUKRS_OF_KOKRS USING LD_KOKRS_STORED
+                                 CHANGING LT_BUKRS_OF_KOKRS.
+    ENDIF.
+  ENDIF.
+
+  IF LD_JV_ACTIVE EQ CO_FALSE.
+    DESCRIBE TABLE PT_CEPC_BUKRS[] LINES SY-TABIX.
+    IF SY-TABIX NE 0.
+      CLEAR PT_CEPC_BUKRS[].
+      P_CHANGED_FLAG = CO_TRUE.
+    ENDIF.
+  ELSE.
+    PERFORM DELETE_NON_EXISTING_BUKRS  "unnecessary within this
+      CHANGING PT_CEPC_BUKRS           "report, but now this form
+               P_CHANGED_FLAG.         "can be used externally !
+    SORT PT_CEPC_BUKRS BY MANDT KOKRS PRCTR BUKRS.
+    CLEAR LD_CEPC_BUKRS.
+    LD_CEPC_BUKRS-MANDT = SY-MANDT.
+    LD_CEPC_BUKRS-KOKRS = LD_KOKRS_STORED.
+    LD_CEPC_BUKRS-PRCTR = P_PRCTR.
+    LOOP AT LT_BUKRS_OF_KOKRS INTO LD_BUKRS.
+      READ TABLE PT_CEPC_BUKRS INTO LD_TMP_CEPC_BUKRS WITH KEY
+        MANDT = LD_CEPC_BUKRS-MANDT
+        KOKRS = LD_CEPC_BUKRS-KOKRS
+        PRCTR = LD_CEPC_BUKRS-PRCTR
+        BUKRS = LD_BUKRS
+      BINARY SEARCH.
+      IF SY-SUBRC NE 0.                "generate new entry
+        LD_CEPC_BUKRS-BUKRS = LD_BUKRS.
+        INSERT LD_CEPC_BUKRS INTO PT_CEPC_BUKRS INDEX SY-TABIX.
+        P_CHANGED_FLAG = CO_TRUE.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+ENDFORM.                               " ASSIGN_TO_ALL_BUKRS
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_BUKRS_OF_KOKRS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_LT_BUKRS_OF_KOKRS  text                                    *
+*----------------------------------------------------------------------*
+FORM GET_BUKRS_OF_KOKRS
+  USING    P_KOKRS TYPE TY_KOKRS
+  CHANGING PT_BUKRS TYPE TY_BUKRS_TAB.
+
+  CLEAR PT_BUKRS[].
+
+  CALL FUNCTION 'RK_BUKRS_OF_KOKRS'
+       EXPORTING
+            KOKRS   = P_KOKRS
+       TABLES
+            T_BUKRS = PT_BUKRS.
+
+  SORT PT_BUKRS.
+ENDFORM.                               " GET_BUKRS_OF_KOKRS
+*&---------------------------------------------------------------------*
+*&      Form  WRITE_RESULT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_G_KOKRS  text                                              *
+*      -->P_LD_PRCTR  text                                             *
+*      -->P_LT_CEPC_BUKRS_NEW  text                                    *
+*      -->P_LT_CEPC_BUKRS_OLD  text                                    *
+*      -->P_LD_FLAG  text                                              *
+*----------------------------------------------------------------------*
+FORM WRITE_RESULT USING    P_KOKRS TYPE TY_KOKRS "#EC *
+                           P_PRCTR TYPE TY_PRCTR
+                           PT_CEPC_BUKRS_NEW TYPE TY_CEPC_BUKRS_TAB
+                           PT_CEPC_BUKRS_OLD TYPE TY_CEPC_BUKRS_TAB
+                           P_CHANGED_FLAG TYPE TY_BOOLEAN
+                           P_PROTOCOL_LEVEL TYPE TY_PROTOCOL_LEVEL
+                           P_OUTPUT_FLAG TYPE TY_BOOLEAN.
+
+  DATA: LD_CEPC_BUKRS TYPE TY_CEPC_BUKRS_TABLINE,
+        LD_CEPC_BUKRS_1 TYPE TY_CEPC_BUKRS_TABLINE, "#EC *
+        LD_FLAG TYPE TY_BOOLEAN.
+
+  IF P_CHANGED_FLAG EQ CO_FALSE.       "nothing changed !
+    CASE P_PROTOCOL_LEVEL.
+      WHEN CO_PLEVEL_ALL.
+        P_OUTPUT_FLAG = CO_TRUE.
+        WRITE /1(10) P_PRCTR COLOR COL_KEY INTENSIFIED ON INVERSE OFF.
+        WRITE 12(10) 'OK'(030)
+          COLOR COL_POSITIVE INTENSIFIED ON CENTERED.
+        ULINE.
+      WHEN CO_PLEVEL_CHANGED.
+      WHEN OTHERS.
+        MESSAGE X333(KM) WITH 'INVALID_PROTOCOL_LEVEL'.
+    ENDCASE.
+  ELSE.
+    P_OUTPUT_FLAG = CO_TRUE.
+    WRITE /1(10) P_PRCTR COLOR COL_KEY INTENSIFIED ON INVERSE OFF.
+    WRITE 12(10) 'Error'(040)
+      COLOR COL_NEGATIVE INTENSIFIED ON CENTERED.
+    WRITE /3 'old entries in CEPC_BUKRS'(050) COLOR COL_NORMAL
+    INTENSIFIED ON LEFT-JUSTIFIED.
+    SORT PT_CEPC_BUKRS_NEW.
+    SORT PT_CEPC_BUKRS_OLD.
+    LD_FLAG = CO_FALSE.
+    LOOP AT PT_CEPC_BUKRS_OLD INTO LD_CEPC_BUKRS.
+      LD_FLAG = CO_TRUE.
+      WRITE /6(50) LD_CEPC_BUKRS.
+      READ TABLE PT_CEPC_BUKRS_NEW INTO LD_CEPC_BUKRS_1
+        WITH KEY MANDT = LD_CEPC_BUKRS-MANDT
+                 KOKRS = LD_CEPC_BUKRS-KOKRS
+                 PRCTR = LD_CEPC_BUKRS-PRCTR
+                 BUKRS = LD_CEPC_BUKRS-BUKRS
+        BINARY SEARCH.
+      IF SY-SUBRC NE 0.
+        WRITE 51 '<<< deleted'(060)
+          COLOR COL_NORMAL INTENSIFIED ON CENTERED .
+      ENDIF.
+    ENDLOOP.
+    IF LD_FLAG EQ CO_FALSE.
+      WRITE /6(50) 'No entries'(070).
+    ENDIF.
+    WRITE /3 'new entries in CEPC_BUKRS'(080) COLOR COL_NORMAL
+    INTENSIFIED ON LEFT-JUSTIFIED.
+    LD_FLAG = CO_FALSE.
+    LOOP AT PT_CEPC_BUKRS_NEW INTO LD_CEPC_BUKRS.
+      LD_FLAG = CO_TRUE.
+      WRITE /6(50) LD_CEPC_BUKRS.
+      READ TABLE PT_CEPC_BUKRS_OLD INTO LD_CEPC_BUKRS_1
+        WITH KEY MANDT = LD_CEPC_BUKRS-MANDT
+                 KOKRS = LD_CEPC_BUKRS-KOKRS
+                 PRCTR = LD_CEPC_BUKRS-PRCTR
+                 BUKRS = LD_CEPC_BUKRS-BUKRS
+        BINARY SEARCH.
+      IF SY-SUBRC NE 0.
+        WRITE 51 '<<< inserted'(090)
+          COLOR COL_NORMAL INTENSIFIED ON CENTERED .
+      ENDIF.
+    ENDLOOP.
+    IF LD_FLAG EQ CO_FALSE.
+      WRITE /6(50) 'No entries'(070).
+    ENDIF.
+    ULINE.
+  ENDIF.
+ENDFORM.                               " WRITE_RESULT
+*&---------------------------------------------------------------------*
+*&      Form  UPDATE_CEPC_BUKRS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_G_KOKRS  text                                              *
+*      -->P_LD_PRCTR  text                                             *
+*      -->P_LT_CEPC_BUKRS_NEW  text                                    *
+*----------------------------------------------------------------------*
+FORM UPDATE_CEPC_BUKRS USING  P_KOKRS TYPE TY_KOKRS
+                              P_PRCTR TYPE TY_PRCTR
+                              PT_CEPC_BUKRS_NEW TYPE TY_CEPC_BUKRS_TAB
+                       CHANGING P_RC TYPE TY_RETURNCODE.
+
+  P_RC = CO_FAILED.
+
+  CALL FUNCTION 'ENQUEUE_EKCEPCE'
+       EXPORTING
+            PRCTR          = P_PRCTR
+       EXCEPTIONS
+            FOREIGN_LOCK   = 1
+            SYSTEM_FAILURE = 2
+            OTHERS         = 3.
+
+  IF SY-SUBRC NE 0. EXIT. ENDIF.
+
+  DELETE FROM CEPC_BUKRS WHERE KOKRS = P_KOKRS
+                         AND   PRCTR = P_PRCTR.
+
+  INSERT CEPC_BUKRS FROM TABLE PT_CEPC_BUKRS_NEW. "empty insert is
+                                       "possible
+  CALL FUNCTION 'DEQUEUE_EKCEPCE'
+       EXPORTING
+            PRCTR = P_PRCTR.
+
+  P_RC = CO_SUCCESS.
+
+ENDFORM.                               " UPDATE_CEPC_BUKRS
+*&---------------------------------------------------------------------*
+*&      Form  WRITE_LOCK_ERROR
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_G_KOKRS  text                                              *
+*      -->P_LD_PRCTR  text                                             *
+*----------------------------------------------------------------------*
+FORM WRITE_LOCK_ERROR USING    P_KOKRS TYPE TY_KOKRS
+                               P_PRCTR TYPE TY_PRCTR. "#EC *
+
+  DATA: MESSAGE(200) TYPE C.
+
+  MESSAGE =
+  'Locking: Profit Center & could not be changed.'(100).
+
+  REPLACE '&' WITH P_PRCTR INTO MESSAGE.
+
+  WRITE /3 message COLOR COL_NEGATIVE INTENSIFIED ON .
+  ULINE.
+
+ENDFORM.                               " WRITE_LOCK_ERROR
+
+*---------------------------------------------------------------------*
+*       FORM READ_TKA01                                               *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+*  -->  P_KOKRS                                                       *
+*  -->  P_TKA01                                                       *
+*---------------------------------------------------------------------*
+FORM READ_TKA01 USING    P_KOKRS TYPE TY_KOKRS
+                CHANGING P_TKA01 LIKE TKA01.
+* buffered read of tka01
+
+  DATA: LD_TABIX LIKE SY-TABIX.
+  STATICS: BEGIN OF LT_CACHE_TKA01 OCCURS 0,
+             KOKRS LIKE P_KOKRS,
+             TKA01 LIKE P_TKA01,
+           END OF LT_CACHE_TKA01.
+
+  READ TABLE LT_CACHE_TKA01 WITH KEY KOKRS = P_KOKRS
+    BINARY SEARCH.
+
+  IF SY-SUBRC EQ 0.
+    P_TKA01 = LT_CACHE_TKA01-TKA01.
+  ELSE.
+    LD_TABIX = SY-TABIX.
+    LT_CACHE_TKA01-KOKRS = P_KOKRS.
+    SELECT SINGLE * FROM TKA01 INTO LT_CACHE_TKA01-TKA01
+      WHERE KOKRS = LT_CACHE_TKA01-KOKRS.
+    IF SY-SUBRC NE 0.
+      CLEAR LT_CACHE_TKA01-TKA01.
+    ENDIF.
+    INSERT LT_CACHE_TKA01 INDEX LD_TABIX.
+    P_TKA01 = LT_CACHE_TKA01-TKA01.
+  ENDIF.
+
+ENDFORM.                               " READ_TKA01
+*&---------------------------------------------------------------------*
+*&      Form  GET_DUMMY_PRCTR
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_LD_KOKRS_STORED  text                                      *
+*      <--P_LD_DPRCT  text                                             *
+*----------------------------------------------------------------------*
+FORM GET_DUMMY_PRCTR USING    P_KOKRS TYPE TY_KOKRS
+                     CHANGING P_PRCTR TYPE TY_PRCTR.
+  DATA LD_TKA01 LIKE TKA01.
+  PERFORM READ_TKA01 USING P_KOKRS
+                     CHANGING LD_TKA01.
+  P_PRCTR = LD_TKA01-DPRCT.
+ENDFORM.                               " GET_DUMMY_PRCTR
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_AND_CHANGE_ASSIGNMENT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_G_KOKRS  text                                              *
+*      -->P_LD_PRCTR  text                                             *
+*      <--P_LT_CEPC_BUKRS_NEW  text                                    *
+*      <--P_LD_FLAG  text                                              *
+*----------------------------------------------------------------------*
+FORM CHECK_AND_CHANGE_ASSIGNMENT USING    P_KOKRS TYPE TY_KOKRS
+                                          P_PRCTR TYPE TY_PRCTR
+                         CHANGING PT_CEPC_BUKRS TYPE TY_CEPC_BUKRS_TAB
+                                  P_CHANGED_FLAG TYPE TY_BOOLEAN.
+
+  DATA: LD_FLAG TYPE TY_BOOLEAN,
+        LD_CEPC_BUKRS TYPE TY_CEPC_BUKRS_TABLINE.
+
+  LOOP AT PT_CEPC_BUKRS INTO LD_CEPC_BUKRS.  "unnecessary within this
+    IF LD_CEPC_BUKRS-KOKRS NE P_KOKRS OR     "report, but now this form
+       LD_CEPC_BUKRS-PRCTR NE P_PRCTR. "can be used externally !
+      MESSAGE X333(KM) WITH 'CALLED_WITH_INCONSISTENT_DATA'.
+    ENDIF.
+  ENDLOOP.
+
+  PERFORM DELETE_NON_EXISTING_BUKRS
+    CHANGING PT_CEPC_BUKRS
+             LD_FLAG.
+
+  IF LD_FLAG EQ CO_TRUE. P_CHANGED_FLAG = CO_TRUE. ENDIF.
+
+  PERFORM DELETE_NON_EXISTING_PRCTR
+    CHANGING PT_CEPC_BUKRS
+             LD_FLAG.
+
+  IF LD_FLAG EQ CO_TRUE. P_CHANGED_FLAG = CO_TRUE. ENDIF.
+
+  PERFORM CHECK_ALL_BUKRS_ASSIGNED
+    USING    P_KOKRS
+    CHANGING PT_CEPC_BUKRS
+             LD_FLAG.
+
+  IF LD_FLAG EQ CO_TRUE. P_CHANGED_FLAG = CO_TRUE. ENDIF.
+
+  PERFORM CHECK_DPRCT_ASSIGNMENT
+    USING P_KOKRS
+          P_PRCTR
+    CHANGING PT_CEPC_BUKRS
+             LD_FLAG.
+
+  IF LD_FLAG EQ CO_TRUE. P_CHANGED_FLAG = CO_TRUE. ENDIF.
+
+ENDFORM.                               " CHECK_AND_CHANGE_ASSIGNMENT
+*&---------------------------------------------------------------------*
+*& Report  ZPCA40B_CHECK_CEPC_BUKRS                                    *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+*&                                                                     *
+*&                                                                     *
+*&---------------------------------------------------------------------*

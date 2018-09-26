@@ -1,0 +1,754 @@
+*&---------------------------------------------------------------------*
+*& Report  YAM_HR_REFORMAT
+*&
+*&---------------------------------------------------------------------*
+* Program ID        : YAM_HR_REFORMAT
+* Program Title        : Reformat the data (from YAM_HR_DOWNLOADAFRU)                            	
+* Author               : Rosa Maria Revuelta Moran
+* Date                 : 07/11/2007                               	
+* Change Request Number:CD1K924694                                	
+* Description         : The purpose of this program is to translate the
+*                       file from ZK1 into valid attendance and absence
+*                       types
+*
+*======================================================================*
+* Copied From         : (Cloned Program)
+* Title               : (Program Title)                          	
+* Other Related obj   : (Object names)                 		
+*======================================================================*
+* Change History Log                                             	*
+*----------------------------------------------------------------------*
+* Date   Name        Change
+* 200901 B.DeBruyne  When arbpl is not found, set pernr blank to avoid
+*                    that hrs are added by previous person
+*----------------------------------------------------------------------*
+
+REPORT YAM_HR_REFORMAT_2 NO STANDARD PAGE HEADING
+                         message-ID YAM_AFRU
+                         LINE-SIZE 164
+                         LINE-COUNT 65(2).
+
+*----------------------------------------------------------------------*
+*  TYPES DEFINITIONS                                                   *
+*----------------------------------------------------------------------*
+TYPES: BEGIN OF ty_inp_file,
+         arbpl(8),          " work center
+         isdd(8),           " execution date
+         aufnr(12),         " order
+         learr(6),          " activity type
+         grund(4),          " reason
+         isdz(6),           " start time
+         ismnw(9).          " number of hours
+TYPES: END OF ty_inp_file.
+
+TYPES: BEGIN OF ty_input,
+         arbpl TYPE crhd-arbpl,  " work center
+         isdd TYPE afru-isdd,    " execution date
+         aufnr TYPE afru-aufnr,  " order
+         learr TYPE afru-learr,  " activity type
+         grund TYPE afru-grund,  " reason
+         isdz TYPE afru-isdz,    " start time
+         ismnw TYPE p decimals 2.  " number of hours
+TYPES: END OF ty_input.
+
+TYPES: BEGIN OF ty_aux,
+         arbpl TYPE crhd-arbpl,         " work center
+         isdd TYPE afru-isdd,           " execution date
+         aufnr TYPE afru-aufnr,         " order
+         subty1 TYPE pa2001-subty,      " absence-type
+         subty2 TYPE pa2002-subty,      " attendance-type
+         ismnw TYPE p decimals 2.       " number of hours
+TYPES: END OF ty_aux.
+
+TYPES: BEGIN OF ty_output,
+         pernr TYPE pa0105-pernr,       " personnel number
+         isdd TYPE afru-isdd,           " execution date
+         aufnr TYPE afru-aufnr,         " order
+         subty1 TYPE pa2001-subty,      " absence-type
+         subty2 TYPE pa2002-subty,      " attendance-type
+         start_time TYPE afru-isdz,     " start time
+         end_time TYPE afru-isdz,       " end time
+         duration TYPE p decimals 2.      " duration
+TYPES: END OF ty_output.
+
+TYPES: BEGIN OF ty_file,
+         pernr(8),                      " personnel number
+         isdd(8),                       " execution date
+         aufnr(12),                     " order
+         subty1(4),                     " absence-type
+         subty2(4),                     " attendance-type
+         start_time(6),                 " start time
+         end_time(6),                   " end time
+         duration(9).                   " duration
+TYPES: END OF ty_file.
+
+TYPES: BEGIN OF ty_error,
+         arbpl TYPE crhd-arbpl,         " work center
+         isdd TYPE afru-isdd,           " execution date
+         aufnr TYPE afru-aufnr,         " order
+         learr TYPE afru-learr,         " activity type
+         ismnw TYPE p decimals 2,       " duration
+         txt(80).                       " error
+TYPES: END OF ty_error.
+
+*----------------------------------------------------------------------*
+*  Declaration of SYSTEM TABLES                                        *
+*----------------------------------------------------------------------*
+TABLES: crhd,       " Work Center Header
+        afru,       " Orden Confirmations
+        pa2001,     " HR Time Record: Infotype 2001 (Absences)
+        pa2002,     " HR Time Record: Infotype 2002 (Attendances)
+        pa0105,     " HR Master Record: Infotype 0105 (Communications)
+        sscrfields. " Fields on selection screens
+
+*----------------------------------------------------------------------*
+*  Declaration of INTERNAL TABLES                                      *
+*----------------------------------------------------------------------*
+DATA:
+* Store the input file (alphanumeric characters)
+ i_inp_file TYPE STANDARD TABLE OF ty_inp_file WITH HEADER LINE,
+* Store the input file
+ i_input TYPE STANDARD TABLE OF ty_input WITH HEADER LINE,
+* It is used to get the absence and the attendance types
+ i_aux TYPE STANDARD TABLE OF ty_aux WITH HEADER LINE,
+* Store the merger of the records of i_aux
+ i_sum TYPE STANDARD TABLE OF ty_aux WITH HEADER LINE,
+* Store the output file
+ i_output TYPE STANDARD TABLE OF ty_output WITH HEADER LINE,
+* Store the output file (alphanumeric characters)
+ i_file TYPE STANDARD TABLE OF ty_file WITH HEADER LINE,
+* Error log
+ i_error TYPE STANDARD TABLE OF ty_error WITH HEADER LINE.
+
+* Work areas
+DATA: wa_aux TYPE ty_aux,
+      wa_sum TYPE ty_aux,
+      wa_output TYPE ty_output.
+
+*----------------------------------------------------------------------*
+*  Declaraci¨®n de CAMPOS CONSTANTES                                    *
+*----------------------------------------------------------------------*
+CONSTANTS: input_file TYPE sy-repid VALUE 'YAM_HR_DOWNLOADAFRU'.
+
+*----------------------------------------------------------------------*
+*  Declaration of VARIABLES                                            *
+*----------------------------------------------------------------------*
+DATA: v_horas TYPE p decimals 2,
+      v_sum_horas TYPE p decimals 2,
+      v_pernr tYPE pa0105-pernr.
+
+DATA: day_start_time TYPE afru-isdz VALUE '0600',
+      night_start_time TYPE afru-isdz VALUE '2000'.
+
+DATA: v_aux TYPE f,
+      v_time TYPE syuzeit,
+      v_endtime TYPE syuzeit,
+      v_last_endtime TYPE syuzeit,
+      duration TYPE syuzeit,
+      day_duration TYPE p decimals 2,
+      night_duration TYPE p decimals 2.
+
+DATA: v_order_format(12) TYPE C.
+
+DATA: v_subtype LIKE p2002-subty VALUE '0830'.
+
+DATA: v_path TYPE string,
+      l_inp_file TYPE string,
+      l_out_file TYPE string,
+      l_error_file type string.
+
+DATA: g_directory(25) TYPE c VALUE '/var/load/xxx/UK/read/'.
+
+DATA: v_error(1),
+      v_error_flag(1).
+
+DATA: v_endda TYPE pa0105-endda.
+
+CONSTANTS: v_day TYPE afru-isdz VALUE '0600',
+           v_night TYPE afru-isdz VALUE '2000'.
+
+*----------------------------------------------------------------------*
+*  SELECTION SCREEN definition                                         *
+*----------------------------------------------------------------------*
+SELECTION-SCREEN BEGIN OF BLOCK 1 WITH FRAME.
+PARAMETERS: p_input TYPE rlgrap-filename,
+            p_output TYPE rlgrap-filename.
+SELECTION-SCREEN END OF BLOCK 1.
+
+*----------------------------------------------------------------------*
+* AT SELECTION-SCREEN                                                  *
+*----------------------------------------------------------------------*
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_input.
+
+  PERFORM get_file_name CHANGING p_input.
+
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_output.
+
+  PERFORM get_file_name CHANGING p_output.
+
+AT SELECTION-SCREEN.
+  IF ( p_input IS INITIAL or p_output IS INITIAL ) AND sscrfields-ucomm = 'ONLI'
+     AND sy-batch = ' '.
+    MESSAGE e003.
+  ENDIF.
+
+*----------------------------------------------------------------------*
+*  MAIN PROCESS                                                        *
+*----------------------------------------------------------------------*
+*----------------------------------------------------------------------*
+*                    START - OF - SELECTION                            *
+*----------------------------------------------------------------------*
+START-OF-SELECTION.
+******************
+
+  IF sy-batch = ' '.
+    PERFORM move_file_to_table_local.
+  ELSE.
+    PERFORM move_file_to_table_server.
+  ENDIF.
+
+  SORT i_input BY arbpl isdd aufnr learr grund isdz ismnw.
+
+  LOOP AT i_input.
+
+    i_aux-arbpl = i_input-arbpl.
+    i_aux-isdd = i_input-isdd.
+    i_aux-aufnr = i_input-aufnr.
+    i_aux-ismnw = i_input-ismnw.
+
+    CASE i_input-learr.
+      WHEN 'ZNP003'.
+        i_aux-subty2 = '0812'.
+      WHEN 'ZNP006'.
+        i_aux-subty1 = '0100'.
+      WHEN 'ZNP007'.
+        i_aux-subty1 = '0200'.
+      WHEN 'ZNP008'.
+        i_aux-subty1 = '0900'.
+      WHEN OTHERS.
+
+        IF i_input-learr CP 'ZNP*'.
+          IF i_input-grund BETWEEN '0005' AND '0009'.
+            i_aux-subty2 = '0820'.
+          ELSE.
+            i_aux-subty2 = '0810'.
+          ENDIF.
+
+        ELSEIF i_input-learr CP 'ZAM*'.
+
+          IF i_input-grund BETWEEN '0005' AND '0009'.
+            i_aux-subty2 = '0821'.
+          ELSE.
+            i_aux-subty2 = '0811'.
+          ENDIF.
+
+        ELSE.
+* Error1.
+          i_error-arbpl = i_input-arbpl.
+          i_error-isdd = i_input-isdd.
+*         replace the first 2 characters of the order by 'OR'
+          CONCATENATE 'OR' wa_sum-aufnr+2(10) INTO v_order_format.
+*          i_error-aufnr = i_input-aufnr.
+          i_error-aufnr = v_order_format.
+          i_error-learr = i_input-learr.
+          i_error-ismnw = i_input-ismnw.
+          CONCATENATE text-009 i_input-learr INTO i_error-txt SEPARATED BY SPACE.
+          APPEND i_error.
+          CLEAR i_error.
+        ENDIF.
+
+    ENDCASE.
+
+    APPEND i_aux.
+    CLEAR i_aux.
+
+  ENDLOOP.
+
+  SORT i_aux BY arbpl isdd aufnr subty1 subty2.
+
+  LOOP AT i_aux.
+
+    wa_aux = i_aux.
+
+    AT NEW subty2.
+      v_horas = 0.
+    ENDAT.
+
+    v_horas = v_horas + wa_aux-ismnw.
+
+    AT END OF subty2.
+*      IF v_horas > 0.
+        wa_aux-ismnw = v_horas.
+        APPEND wa_aux TO i_sum.
+        CLEAR wa_aux.
+*      ENDIF.
+    ENDAT.
+
+  ENDLOOP.
+
+
+LOOP AT i_sum.
+    wa_sum = i_sum.
+
+    AT NEW arbpl.
+      CLEAR v_endda.
+*     if not initialized, will add hrs to prev.pernr          "BDB 200901
+      CLEAR v_pernr.                                          "BDB 200901
+    ENDAT.
+
+    IF ( v_endda IS INITIAL OR wa_sum-isdd > v_endda ).
+      SELECT SINGLE pernr endda
+      INTO (v_pernr, v_endda)
+      FROM pa0105
+      WHERE subty = 'WCTR' AND
+            usrid = wa_sum-arbpl AND
+            begda <= wa_sum-isdd AND
+            endda >= wa_sum-isdd.
+
+      IF NOT sy-subrc = 0.
+*       Error 2
+        i_error-arbpl = wa_sum-arbpl.
+        i_error-isdd = wa_sum-isdd.
+*       replace the first 2 characters of the order by 'OR'
+        CONCATENATE 'OR' wa_sum-aufnr+2(10) INTO v_order_format.
+*        i_error-aufnr = wa_sum-aufnr.
+        i_error-aufnr = v_order_format.
+        i_error-ismnw = wa_sum-ismnw.
+        concatenate text-007 wa_sum-arbpl into i_error-txt separated by space.
+        append i_error.
+        clear i_error.
+      ENDIF.
+    ENDIF.
+
+    AT NEW isdd.
+      day_start_time = '0600'.
+      night_start_time = '2000'.
+      CLEAR v_error_flag.
+      day_duration = 0.
+      night_duration = 0.
+      v_last_endtime = '0600'.
+    ENDAT.
+
+ IF v_pernr IS NOT INITIAL.                                   "BDB 200901
+    IF v_error_flag IS INITIAL.
+* Day work
+      IF wa_sum-subty2 < 0820.
+
+        day_duration = day_duration + wa_sum-ismnw.
+
+        v_aux = day_duration * 60 * 60.
+        move v_aux to v_time.
+        v_endtime = v_day + v_time.
+
+        if ( day_duration > 14  OR v_endtime > '2000' ).
+*       error.
+          v_error_flag = 'X'.
+
+          v_aux = '0.02'.
+          v_aux = v_aux * 60 * 60.
+          MOVE v_aux TO duration.
+          v_endtime = v_last_endtime + duration.
+
+          i_output-pernr = v_pernr.
+          i_output-isdd = wa_sum-isdd.
+          i_output-aufnr = wa_sum-aufnr.
+*         i_output-subty1 = wa_sum-subty1.                    "BDB 200901
+          i_output-subty1 = ''.                               "BDB 200901
+          i_output-subty2 = v_subtype.
+          i_output-start_time = v_last_endtime.
+          i_output-duration = '0.02'.
+          i_output-end_time = v_endtime.
+
+          APPEND i_output.
+          CLEAR i_output.
+
+        ELSE.
+          i_output-start_time = day_start_time.
+          day_start_time = v_endtime.
+
+        ENDIF.
+
+      ELSE.
+* Night work
+        night_duration = night_duration + wa_sum-ismnw.
+        v_aux = night_duration * 60 * 60.
+        move v_aux to v_time.
+        v_endtime = v_night + v_time.
+
+        IF ( wa_sum-ismnw > 10  OR ( v_endtime > '0600' AND v_endtime < '2000' ) ).
+*       error.
+          v_error_flag = 'X'.
+
+          v_aux = '0.02'.
+          v_aux = v_aux * 60 * 60.
+          MOVE v_aux TO duration.
+          v_endtime = night_start_time + duration.
+
+          i_output-pernr = v_pernr.
+          i_output-isdd = wa_sum-isdd.
+          i_output-aufnr = wa_sum-aufnr.
+*         i_output-subty1 = wa_sum-subty1.                    "BDB 200901
+          i_output-subty1 = ''.                               "BDB 200901
+          i_output-subty2 = v_subtype.
+          i_output-start_time = v_last_endtime.
+          i_output-duration = '0.02'.
+          i_output-end_time = v_endtime.
+
+          APPEND i_output.
+          CLEAR i_output.
+
+        ELSE.
+          i_output-start_time = night_start_time.
+          night_start_time = v_endtime.
+        ENDIF.
+      ENDIF.
+
+      IF v_error_flag IS INITIAL.
+        i_output-pernr = v_pernr.
+        i_output-isdd = wa_sum-isdd.
+        i_output-aufnr = wa_sum-aufnr.
+        i_output-subty1 = wa_sum-subty1.
+        i_output-subty2 = wa_sum-subty2.
+        i_output-duration = wa_sum-ismnw.
+        i_output-end_time = v_endtime.
+
+*       store only when absence or attendance code is filled, "BDB 200901
+*       both blank can be absences on PH-day                  "BDB 200901
+        if i_output-subty1 > '' OR i_output-subty2 > ''.      "BDB 200901
+           APPEND i_output.
+        endif.                                                "BDB 200901
+        CLEAR i_output.
+
+      ENDIF.
+    ENDIF.
+    v_last_endtime = v_endtime.
+  ENDIF.    "if v_pernr is not initial                        "BDB 200901
+
+ENDLOOP.
+
+  LOOP AT i_output.
+*   replace the first 2 characters of the order by 'OR'
+    CONCATENATE 'OR' i_output-aufnr+2(10) INTO v_order_format.
+    i_file-pernr = i_output-pernr.
+    i_file-isdd = i_output-isdd.
+    i_file-aufnr = v_order_format.
+    i_file-subty1 = i_output-subty1.
+    i_file-subty2 = i_output-subty2.
+    i_file-start_time = i_output-start_time.
+    i_file-end_time = i_output-end_time.
+    i_file-duration = i_output-duration.
+
+*    MOVE-CORRESPONDING i_output TO i_file.
+    APPEND i_file.
+    CLEAR i_file.
+  ENDLOOP.
+
+  PERFORM show_log TABLES i_error.
+  IF sy-batch = ' '.
+    PERFORM save_table_to_file_local TABLES i_file.
+  ELSE.
+    PERFORM save_table_to_file_server TABLES i_file.
+  ENDIF.
+
+*&---------------------------------------------------------------------*
+*&      Form  get_file_name
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_FNAME:   Store the file's name
+*----------------------------------------------------------------------*
+FORM get_file_name CHANGING p_fname             TYPE rlgrap-filename.
+
+* File table and number of selected files
+
+  DATA:
+  t_tabfich TYPE filetable,
+  l_rc TYPE i.
+
+  DATA: l_extension TYPE string,
+        l_nombre TYPE string,
+        l_directorio TYPE string.
+
+* Initialization
+  REFRESH t_tabfich.
+  CLEAR t_tabfich.
+
+* Open a dialog to choose a file
+  CALL METHOD cl_gui_frontend_services=>file_open_dialog
+    EXPORTING
+*      window_title      = p_window_title
+      default_extension = l_extension
+      default_filename  = l_nombre
+      initial_directory = l_directorio
+      multiselection    = space
+    CHANGING
+      file_table        = t_tabfich
+      rc                = l_rc.
+*      file_encoding     = l_encoding.
+
+  IF sy-subrc <> 0.
+    MESSAGE w003.
+  ELSE.
+* Multiple selection are not allowed so only one
+* file could be selected
+    READ TABLE t_tabfich INDEX l_rc INTO p_fname.
+    v_path = p_fname.
+  ENDIF.
+
+ENDFORM.                    " get_file_name
+*&---------------------------------------------------------------------*
+*&      Form  move_file_to_table_local
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM move_file_to_table_local.
+
+  v_path = p_input.
+
+  CALL FUNCTION 'GUI_UPLOAD'
+    EXPORTING
+      filename                      = v_path
+      filetype                      = 'ASC'
+      has_field_separator           = 'X'
+*   HEADER_LENGTH                 = 0
+*   READ_BY_LINE                  = 'X'
+*   DAT_MODE                      = ' '
+*   CODEPAGE                      = ' '
+*   IGNORE_CERR                   = ABAP_TRUE
+*   REPLACEMENT                   = '#'
+*   CHECK_BOM                     = ' '
+*   VIRUS_SCAN_PROFILE            =
+*   NO_AUTH_CHECK                 = ' '
+* IMPORTING
+*   FILELENGTH                    =
+*   HEADER                        =
+    TABLES
+      data_tab                      = i_inp_file
+* EXCEPTIONS
+*   FILE_OPEN_ERROR               = 1
+*   FILE_READ_ERROR               = 2
+*   NO_BATCH                      = 3
+*   GUI_REFUSE_FILETRANSFER       = 4
+*   INVALID_TYPE                  = 5
+*   NO_AUTHORITY                  = 6
+*   UNKNOWN_ERROR                 = 7
+*  BAD_DATA_FORMAT               = 8
+*   HEADER_NOT_ALLOWED            = 9
+*   SEPARATOR_NOT_ALLOWED         = 10
+*   HEADER_TOO_LONG               = 11
+*   UNKNOWN_DP_ERROR              = 12
+*   ACCESS_DENIED                 = 13
+*   DP_OUT_OF_MEMORY              = 14
+*   DISK_FULL                     = 15
+*   DP_TIMEOUT                    = 16
+*   OTHERS                        = 17
+            .
+  IF sy-subrc <> 0.
+* MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*         WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+  ENDIF.
+
+  LOOP AT i_inp_file.
+    MOVE-CORRESPONDING i_inp_file TO i_input.
+    APPEND i_input.
+  ENDLOOP.
+
+ENDFORM.                    " move_file_to_table_local
+
+*&---------------------------------------------------------------------*
+*&      Form  save_table_to_file_local
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_T_FILE  text
+*----------------------------------------------------------------------*
+FORM save_table_to_file_local TABLES   i_file STRUCTURE i_file.
+
+  v_path = p_output.
+
+  CALL FUNCTION 'GUI_DOWNLOAD'
+    EXPORTING
+*       BIN_FILESIZE                    =
+      filename                        = v_path
+     filetype                        = 'ASC'
+*       APPEND                          = ' '
+     write_field_separator           = 'X'
+*       HEADER                          = '00'
+*       TRUNC_TRAILING_BLANKS           = ' '
+*       WRITE_LF                        = 'X'
+*       COL_SELECT                      = ' '
+*       COL_SELECT_MASK                 = ' '
+*       DAT_MODE                        = ' '
+*       CONFIRM_OVERWRITE               = ' '
+*       NO_AUTH_CHECK                   = ' '
+*       CODEPAGE                        = ' '
+*       IGNORE_CERR                     = ABAP_TRUE
+*       REPLACEMENT                     = '#'
+*       WRITE_BOM                       = ' '
+*       TRUNC_TRAILING_BLANKS_EOL       = 'X'
+*       WK1_N_FORMAT                    = ' '
+*       WK1_N_SIZE                      = ' '
+*       WK1_T_FORMAT                    = ' '
+*       WK1_T_SIZE                      = ' '
+*       WRITE_EOL                       = ABAP_TRUE
+*     IMPORTING
+*       FILELENGTH                      =
+    TABLES
+      data_tab                        = i_file
+*       FIELDNAMES                      =
+*     EXCEPTIONS
+*       FILE_WRITE_ERROR                = 1
+*       NO_BATCH                        = 2
+*       GUI_REFUSE_FILETRANSFER         = 3
+*       INVALID_TYPE                    = 4
+*       NO_AUTHORITY                    = 5
+*       UNKNOWN_ERROR                   = 6
+*       HEADER_NOT_ALLOWED              = 7
+*       SEPARATOR_NOT_ALLOWED           = 8
+*       FILESIZE_NOT_ALLOWED            = 9
+*       HEADER_TOO_LONG                 = 10
+*       DP_ERROR_CREATE                 = 11
+*       DP_ERROR_SEND                   = 12
+*       DP_ERROR_WRITE                  = 13
+*       UNKNOWN_DP_ERROR                = 14
+*       ACCESS_DENIED                   = 15
+*       DP_OUT_OF_MEMORY                = 16
+*       DISK_FULL                       = 17
+*       DP_TIMEOUT                      = 18
+*       FILE_NOT_FOUND                  = 19
+*       DATAPROVIDER_EXCEPTION          = 20
+*       CONTROL_FLUSH_ERROR             = 21
+*       OTHERS                          = 22
+            .
+  IF sy-subrc <> 0.
+* MESSAGE ID SY-MSGD TYPE SY-MSGTY NUMBER SY-MSGNO
+*         WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+  ENDIF.
+
+ENDFORM.                    " save_table_to_file_local
+
+*&---------------------------------------------------------------------*
+*&      Form  move_file_to_table_server
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM move_file_to_table_server .
+
+  REPLACE 'xxx' IN g_directory WITH sy-sysid.
+  CONCATENATE g_directory input_file INTO l_inp_file.
+
+  OPEN DATASET l_inp_file FOR INPUT IN TEXT MODE ENCODING DEFAULT.
+
+  IF sy-subrc NE 0.
+    MESSAGE e000 WITH l_inp_file.
+    EXIT.
+  ENDIF.
+
+  DO.
+    READ DATASET l_inp_file INTO i_inp_file.
+    IF sy-subrc NE 0.
+      EXIT.
+    ENDIF.
+    APPEND i_inp_file.
+  ENDDO.
+
+  CLOSE DATASET l_inp_file.
+
+  IF sy-subrc NE 0.
+    MESSAGE e001 WITH l_inp_file.
+    EXIT.
+  ENDIF.
+
+  LOOP AT i_inp_file.
+    MOVE-CORRESPONDING i_inp_file TO i_input.
+    APPEND i_input.
+  ENDLOOP.
+
+ENDFORM.                    " move_file_to_table_server
+*&---------------------------------------------------------------------*
+*&      Form  save_table_to_file_server
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_T_FILE  text
+*----------------------------------------------------------------------*
+FORM save_table_to_file_server  TABLES  i_file STRUCTURE i_file.
+
+  REPLACE 'xxx' IN g_directory WITH sy-sysid.
+  CONCATENATE g_directory sy-repid INTO l_out_file.
+
+  OPEN DATASET l_out_file FOR OUTPUT IN TEXT MODE ENCODING DEFAULT.
+
+  IF sy-subrc NE 0.
+    MESSAGE e000 WITH l_out_file.
+    EXIT.
+  ENDIF.
+
+  LOOP AT i_file.
+    TRANSFER i_file TO l_out_file.
+    IF sy-subrc <> 0.
+      EXIT.
+    ENDIF.
+  ENDLOOP.
+
+  IF sy-subrc = 8.
+    sy-subrc = 3. EXIT.
+  ENDIF.
+
+  CLOSE DATASET l_out_file.
+
+  IF sy-subrc NE 0.
+    MESSAGE e001 WITH l_out_file.
+    EXIT.
+  ENDIF.
+
+ENDFORM.                    " save_table_to_file_server
+*&---------------------------------------------------------------------*
+*&      Form  show_log
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->I_ERROR  text
+*----------------------------------------------------------------------*
+FORM show_log  TABLES   i_error STRUCTURE i_error.
+
+  IF i_error[] IS NOT INITIAL.
+
+    SORT i_error BY txt.
+    data: v_horas(12).
+    WRITE: / text-002,
+            15 text-003,
+            32 text-004,
+            45 text-012,
+            65 text-006.
+    WRITE: / sy-uline.
+    LOOP AT i_error.
+      v_horas = i_error-ismnw.
+      WRITE: / i_error-arbpl UNDER text-002,
+               i_error-isdd UNDER text-003,
+               i_error-aufnr UNDER text-004,
+               v_horas UNDER text-012,
+               i_error-txt UNDER text-006.
+    ENDLOOP.
+
+  ENDIF.
+
+ENDFORM.                    " show_log
+
+*Text symbol text£º
+*001:Employee
+*002:Work Center
+*003:Execution Date
+*004:Order
+*005:Subtype
+*006:Error
+*007:Error 2: Personnel number not found for
+*008:Begda
+*009:Error 1: Attendance Type not found for
+*010:Endda
+*011:Error
+
+*012:Total hours
+*Selection text£º
+*P_INPUT:        Input File
+*P_OUTPUT:        Output File

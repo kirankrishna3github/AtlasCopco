@@ -1,0 +1,178 @@
+*----------------------------------------------------------------------*
+***INCLUDE YSE_SD_DTC_AUTOMATION_02_F01 .
+*----------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  get_sernrs_of_so_stock
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM get_sernrs_of_so_stock .
+  DATA: lv_equi TYPE i.
+*Get sales order stock
+
+  SELECT SINGLE lgort kalab
+    INTO (<fs_to_do>-lgort, <fs_to_do>-kalab)
+    FROM mska
+      WHERE vbeln = <fs_to_do>-vbeln
+       AND  posnr = <fs_to_do>-posnr.
+*Get sernr profile from material master
+  IF NOT <fs_to_do>-sernp IS INITIAL.  "If a serialnr profile exists, get sernrs from sales order stock
+    IF sy-subrc EQ 0.
+      SELECT equi~equnr equi~matnr equi~sernr
+        INTO CORRESPONDING FIELDS OF TABLE gt_sales_sernr
+        FROM eqbs INNER JOIN equi
+        ON eqbs~equnr = equi~equnr
+       WHERE eqbs~kdauf = <fs_to_do>-vbeln
+         AND eqbs~kdpos = <fs_to_do>-posnr.
+    ENDIF.
+
+    IF sy-subrc EQ 0 AND NOT gt_sales_sernr[] IS INITIAL.
+      lv_equi = 1.
+      DO <fs_to_do>-kalab TIMES.
+        READ TABLE gt_sales_sernr ASSIGNING <fs_sales_equ> INDEX lv_equi.
+
+        gs_sernr-rfbel = <fs_to_do>-vbeln.
+        gs_sernr-rfpos = <fs_to_do>-posnr.
+        gs_sernr-sernr = <fs_sales_equ>-sernr.
+
+        APPEND gs_sernr TO gt_sernr.
+        ADD 1 TO lv_equi.
+      ENDDO.
+
+    ENDIF.
+  ENDIF.
+ENDFORM.                    " get_sernrs_of_so_stock
+*&---------------------------------------------------------------------*
+*&      Form  fill_processing_tables
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM fill_processing_tables .
+
+  gt_request-document_numb = <fs_to_do>-vbeln.
+  gt_request-document_item = <fs_to_do>-posnr.
+
+  gt_request-plant = <fs_to_do>-werks.
+  gt_request-stge_loc = <fs_to_do>-lgort.
+
+  gt_request-material = <fs_to_do>-matnr.
+  gt_request-delivery_date = <fs_to_do>-ledat.
+
+  gt_request-quantity_base__uom = <fs_to_do>-kalab.
+  gt_request-quantity_sales_uom = <fs_to_do>-kalab.
+
+  gt_request-document_type = 'A'. "Delivery
+
+  gt_request-document_type_delivery = 'LF'.
+
+
+  APPEND gt_request.
+
+
+
+
+ENDFORM.                    " fill_processing_tables
+*  ******BEGIN OF CR3993 - FIX BUG -INSERT 20160718
+*&---------------------------------------------------------------------*
+*&      Form  PROCESS_PGI
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM process_pgi .
+  DATA: lv_guid TYPE cats_cproject_objguid,
+      lv_erdat  TYPE sy-datum,
+      lv_erzet  TYPE sy-uzeit.
+  IF sy-batch IS NOT INITIAL.
+    IF sy-datum < '20161231'.
+      WAIT UP TO 1 SECONDS.
+      lv_erdat = sy-datum.
+      lv_erzet = sy-uzeit.
+      WRITE: / <fs_sales>-vbeln, '|',
+                gs_vbkok-vbeln_vl, '-2,Before Picking'.
+      CALL FUNCTION 'YSE_LOG_AUTOMATION_02'
+        EXPORTING
+          iv_guid  = lv_guid
+          iv_erdat = lv_erdat
+          iv_erzet = lv_erzet
+          gs_vbkok = gs_vbkok
+        TABLES
+          gt_items = gt_items
+          gt_sernr = gt_sernr
+          gt_vbpok = gt_vbpok.
+    ENDIF.
+  ENDIF.
+
+  CALL FUNCTION 'SD_DELIVERY_UPDATE_PICKING_1'
+    EXPORTING
+      vbkok_wa        = gs_vbkok
+      it_sernr_update = gt_sernr
+    TABLES
+      vbpok_tab       = gt_vbpok.
+  IF sy-subrc EQ 0.                                         "#EC *
+    COMMIT WORK AND WAIT.
+  ELSE.
+    WRITE: / 'Error during picking, no goods issue'.        "#EC *
+    EXIT.
+  ENDIF.
+  CLEAR: gv_del, gs_header-deliv_numb, gs_control-deliv_numb,
+         gs_control-post_gi_flg.
+  MOVE: gs_items_2-document_numb TO gv_del,"insert
+        gs_items_2-document_numb TO gs_header-deliv_numb,"insert
+        gs_items_2-document_numb TO gs_control-deliv_numb,"insert
+        'X' TO gs_control-post_gi_flg.  "insert
+
+  CLEAR: gt_return,gv_wadat.
+
+*...... Check posting date in valid period
+
+  CONCATENATE sy-datum <fs_sales>-bukrs INTO gv_input.
+
+  CALL FUNCTION 'CONVERSION_EXIT_YPSTD_INPUT'
+    EXPORTING
+      input     = gv_input
+    IMPORTING
+      output    = gv_wadat
+    EXCEPTIONS
+      not_found = 1
+      OTHERS    = 2.
+
+  CLEAR: gt_return[], ls_deadlines, lt_deadlines[].
+  ls_deadlines-deliv_numb = gv_del.
+  ls_deadlines-timetype = 'WSHDRWADTI '.
+  CONVERT DATE gv_wadat TIME sy-uzeit
+             INTO TIME STAMP ls_deadlines-timestamp_utc TIME ZONE sy-zonlo.
+  APPEND ls_deadlines TO lt_deadlines.
+
+  REFRESH: gt_return.
+  CALL FUNCTION 'BAPI_OUTB_DELIVERY_CONFIRM_DEC'
+    EXPORTING
+      header_data      = gs_header
+      header_control   = gs_control
+      delivery         = gv_del
+    TABLES
+      return           = gt_return
+      header_deadlines = lt_deadlines.
+
+*Check if any erros occured
+  LOOP AT gt_return ASSIGNING <fs_return>
+    WHERE type = 'E'.
+
+    WRITE: / <fs_sales>-vbeln, <fs_sales>-posnr, <fs_return>-message.
+
+  ENDLOOP.
+
+  IF sy-subrc EQ 0.  "If errors, exit current loop
+    EXIT.
+  ELSE.  "Delivery create, picking and goods issue was succesfull
+    WRITE: / 'Delivery creation, picking and goods issue was succesfull for sales order ',<fs_sales>-vbeln. "#EC *
+  ENDIF.
+
+  COMMIT WORK AND WAIT.
+ENDFORM.                    " PROCESS_PGI
+*  ******END OF CR3993 - FIX BUG -INSERT 20160718

@@ -1,0 +1,376 @@
+REPORT ztest_rm06enbe NO STANDARD PAGE HEADING MESSAGE-ID me.
+************************************************************************
+*  #berwachen Best#tigungen                                            *
+************************************************************************
+TYPE-POOLS: slis.
+*----------------------------------------------------------------------*
+*  Tabellen                                                            *
+*----------------------------------------------------------------------*
+TABLES: ekko,                          "Einkaufsbelegkopf
+        ekpo,                          "Einkaufsbelegposition
+        eket,                          "Einkaufsbelegeinteilung
+        ekes,                          "Einkaufsbelegeinteilung
+        t163f.                         "Best#tigungstypbezeichnung
+
+*----------------------------------------------------------------------*
+*  Parameter                                                           *
+*----------------------------------------------------------------------*
+PARAMETERS: s_ebtyp LIKE ekes-ebtyp OBLIGATORY VALUE CHECK.
+
+*----------------------------------------------------------------------*
+*  Select-Options                                                      *
+*----------------------------------------------------------------------*
+SELECT-OPTIONS: s_bsart FOR ekko-bsart,
+                s_ekgrp FOR ekko-ekgrp,
+                s_lifnr FOR ekko-lifnr MATCHCODE OBJECT kred,
+                s_bedat FOR ekko-bedat,
+                s_eindt FOR eket-eindt.
+
+*----------------------------------------------------------------------*
+*  Interne Tabellen                                                    *
+*----------------------------------------------------------------------*
+
+* Tabelle der Best#tigungen -------------------------------------------*
+DATA: BEGIN OF ets OCCURS 10.
+        INCLUDE STRUCTURE ekes.
+DATA: END OF ets.
+
+* Tabelle der Einteilungen --------------------------------------------*
+DATA: BEGIN OF ett OCCURS 10.
+        INCLUDE STRUCTURE eket.
+DATA: END OF ett.
+
+* Tabelle der Best#tigungssteuerschl¨¹ssel -----------------------------*
+DATA: BEGIN OF xt163g OCCURS 10.
+        INCLUDE STRUCTURE t163g.
+DATA: END OF xt163g.
+
+* Tabelle des ALV Grids -----------------------------------------------*
+DATA: BEGIN OF gt_outtab OCCURS 0.
+        INCLUDE STRUCTURE mere_outtab_me2a.
+DATA: END OF gt_outtab.
+
+*----------------------------------------------------------------------*
+*  Hilfsfelder                                                         *
+*----------------------------------------------------------------------*
+DATA: datum     LIKE rv45a-etdat,      "Hilfsfeld Datum
+      periode   LIKE eket-lpein,       "Ausgabe Periode
+      k_menge   LIKE eket-menge,       "kumulierte Menge
+      teilmenge LIKE eket-menge,       "teilbest#tigte Menge
+      termin    LIKE eket-eindt,       "Mahndatum
+      not_found(1),                    "keine Ausgabe
+      g_callback_program     TYPE sy-repid,
+      g_exit_caused_by_caller,
+      gs_exit_caused_by_user TYPE slis_exit_by_user.
+
+*----------------------------------------------------------------------*
+*  Intitialisierung                                                    *
+*----------------------------------------------------------------------*
+INITIALIZATION.
+  CLEAR en_selkk.                      "keine Kontrakte
+  CLEAR en_selka.                      "keine Anfragen
+  g_callback_program = sy-repid.
+  SELECT * FROM t163g INTO TABLE xt163g.
+
+*----------------------------------------------------------------------*
+*  Beginn der Selektion                                                *
+*----------------------------------------------------------------------*
+START-OF-SELECTION.
+  not_found = 'X'.
+  SELECT * FROM ekes INTO TABLE ets
+    WHERE ebeln IN en_ebeln AND
+          ebtyp EQ s_ebtyp.
+  SET PF-STATUS 'LIST'.
+  SELECT SINGLE * FROM t163f WHERE spras EQ sy-langu
+                               AND ebtyp EQ s_ebtyp.
+  SET TITLEBAR '001' WITH t163f-ebtxt.
+  PERFORM aktivitaet_setzen(sapfm06d) USING '04'.
+
+*----------------------------------------------------------------------*
+*  Lesen Belegkopf                                                     *
+*----------------------------------------------------------------------*
+GET ekko.
+  CHECK ekko-bstyp NE 'K'.             "kein Kontrakt
+  CHECK ekko-bstyp NE 'A'.             "keine Anfrage
+  CHECK ekko-loekz EQ space.
+  CHECK: s_bsart,                      "Selekt-Options pr¨¹fen
+         s_ekgrp,
+         s_lifnr,
+         s_bedat.
+
+*----------------------------------------------------------------------*
+*  Lesen Belegposition                                                 *
+*----------------------------------------------------------------------*
+GET ekpo.
+  CHECK ekpo-loekz EQ space.           "falls gerade gel#scht
+  CHECK ekpo-elikz EQ space.           "oder Endlieferung gesetzt
+  CHECK ekpo-bstae NE space.           "Best#tigungssteuerschl¨¹ssel
+  CLEAR xt163g.
+  CLEAR ett. REFRESH ett.
+  LOOP AT xt163g WHERE bstae EQ ekpo-bstae    "Bezugsdatum bestimmen
+                 AND   ebtyp EQ s_ebtyp.
+    EXIT.
+  ENDLOOP.
+  CHECK NOT ( xt163g IS INITIAL ).
+
+  IF xt163g-wddat EQ '1'.              "falls Bestelldatum
+    termin = ekko-bedat + xt163g-wdvor."ausschlaggebend -->
+  ENDIF.                               "TERMIN = krit. Datum
+  CLEAR k_menge.
+  CLEAR teilmenge.
+  LOOP AT ets WHERE   ebeln EQ ekpo-ebeln     "kumulierte best#tigte
+                AND   ebelp EQ ekpo-ebelp     "Mengen berechnen
+                AND   ebtyp EQ s_ebtyp.
+    k_menge = k_menge + ets-menge.
+  ENDLOOP.
+  CHECK k_menge <  ekpo-menge.         "mehr best#tigt als bestel
+
+*----------------------------------------------------------------------*
+*  Lesen Einteilungen                                                  *
+*----------------------------------------------------------------------*
+GET eket.
+  MOVE eket TO ett.
+  APPEND ett.
+
+*----------------------------------------------------------------------*
+*  Lesen Einteilungen                                                  *
+*----------------------------------------------------------------------*
+GET ekpo LATE.
+  SORT ett BY ebeln ebelp eindt etenr.
+  LOOP AT ett.
+    CHECK: ett-eindt IN s_eindt.
+    IF xt163g-wddat = '1'.               "bzgl. Bestelldatum
+      IF termin LE sy-datlo.             "wenn krit. Dat ¨¹berschritt
+        IF k_menge > 0.                  "Best#tigung liegt vor
+          k_menge = k_menge - ett-menge. "Best#tigungen abbauen
+          IF k_menge < 0.                "Teilbetrag best#tigt
+            teilmenge = k_menge + ett-menge.
+            PERFORM ausgabe_kopf.
+            PERFORM ausgabe_position.
+            PERFORM ausgabe_einteilung.
+            CLEAR teilmenge.
+          ENDIF.
+        ELSEIF  k_menge LE 0.            "noch nicht best#tigt
+          PERFORM ausgabe_kopf.
+          PERFORM ausgabe_position.
+          PERFORM ausgabe_einteilung.
+        ENDIF.
+      ENDIF.
+    ELSEIF xt163g-wddat = '2'.           "bzgl. Lieferdatum
+      termin = ett-eindt - xt163g-wdvor. "krit. Datum
+      IF termin LE sy-datlo.             "krit. Dat. ¨¹berschritten
+        IF k_menge > 0.                  "Best#tigungen vorhanden
+          k_menge = k_menge - ett-menge.
+          IF k_menge < 0.                "Teilbetrag
+            teilmenge = k_menge + ett-menge.
+            PERFORM ausgabe_kopf.
+            PERFORM ausgabe_position.
+            PERFORM ausgabe_einteilung.
+            CLEAR teilmenge.
+          ENDIF.
+        ELSEIF k_menge LE 0.             "noch nicht best#tigt
+          PERFORM ausgabe_kopf.
+          PERFORM ausgabe_position.
+          PERFORM ausgabe_einteilung.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+*----------------------------------------------------------------------*
+*  Kopfdaten in Ausgabetabelle                                         *
+*----------------------------------------------------------------------*
+FORM ausgabe_kopf.
+  CLEAR not_found.
+  MOVE ekko-ebeln TO gt_outtab-ekko_ebeln.
+  MOVE ekko-bstyp TO gt_outtab-ekko_bstyp.
+  MOVE ekko-bsart TO gt_outtab-ekko_bsart.
+  IF ekko-bsakz NE 'T'.              "falls keine Umlagerung
+    MOVE ekko-lifnr TO gt_outtab-ekko_lifnr.
+  ELSE.                              "falls Umlagerung
+    MOVE text-001    TO gt_outtab-ekko_lifnr.
+    MOVE ' '         TO gt_outtab-ekko_lifnr+5.
+    MOVE ekko-reswk  TO gt_outtab-ekko_lifnr+6.
+  ENDIF.
+* Lieferantennamen
+  CALL FUNCTION 'MM_ADDRESS_GET'
+    EXPORTING
+      i_ekko  = ekko
+    IMPORTING
+      e_name1 = gt_outtab-ekko_name1
+    EXCEPTIONS
+      OTHERS  = 1.
+  IF sy-subrc > 0.
+    CLEAR gt_outtab-ekko_name1.
+  ENDIF.
+  MOVE ekko-ekgrp TO gt_outtab-ekko_ekgrp.
+  MOVE ekko-bedat TO gt_outtab-ekko_bedat.
+ENDFORM.                    "AUSGABE_KOPF
+
+*----------------------------------------------------------------------*
+*  Positionsdaten in Ausgabetabelle                                    *
+*----------------------------------------------------------------------*
+FORM ausgabe_position.
+  MOVE ekpo-ebelp TO gt_outtab-ekpo_ebelp.
+  MOVE ekpo-ematn TO gt_outtab-ekpo_ematn.
+  MOVE ekpo-txz01 TO gt_outtab-ekpo_txz01.
+ENDFORM.                    "AUSGABE_POSITION
+
+*----------------------------------------------------------------------*
+*  Einteilungen in Ausgabetabelle                                      *
+*----------------------------------------------------------------------*
+FORM ausgabe_einteilung.
+  CALL FUNCTION 'VBEP_EDATU_AUSGEBEN'  "Datumsformat anpassen
+       EXPORTING
+            int_edatu = ett-eindt
+            int_periode = ett-lpein
+       IMPORTING
+            ext_edatu = datum
+            ext_periode = periode.
+  MOVE periode    TO gt_outtab-eket_periode.
+  MOVE ett-eindt  TO gt_outtab-eket_datum.                       "995173
+  MOVE ett-menge  TO gt_outtab-eket_menge.
+  MOVE ekpo-meins TO gt_outtab-eket_meins.
+  MOVE teilmenge  TO gt_outtab-eket_teilmenge.
+  MOVE termin     TO gt_outtab-eket_termin.
+  MOVE 1          TO gt_outtab-azpos.
+  APPEND gt_outtab.
+ENDFORM.                    "AUSGABE_EINTEILUNG
+
+*----------------------------------------------------------------------*
+*  Ende der Selektion                                                  *
+*----------------------------------------------------------------------*
+END-OF-SELECTION.
+  IF not_found NE space.                "mindestens eine Ausgabe
+    IF sy-msgid EQ 'ME' AND sy-msgno EQ '235'.
+      MESSAGE s235(me).
+    ELSE.
+      MESSAGE s260.
+    ENDIF.
+    IF sy-calld NE space.
+      LEAVE.
+    ELSE.
+      LEAVE TO TRANSACTION sy-tcode.
+    ENDIF.
+  ENDIF.
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+    EXPORTING
+*     i_interface_check                 = ' '
+*     i_bypassing_buffer                = ' '
+      i_buffer_active                   = ' '
+      i_callback_program                = g_callback_program
+      i_callback_pf_status_set          = 'SET_PF_STATUS'
+      i_callback_user_command           = 'USER_COMMAND'
+*     i_callback_top_of_page            = ' '
+*     i_callback_html_top_of_page       = ' '
+*     i_callback_html_end_of_list       = ' '
+      i_structure_name                  = 'MERE_OUTTAB_ME2A'
+      i_background_id                   = 'ALV_BACKGROUND'
+*     i_grid_title                      =
+*     i_grid_settings                   =
+*     is_layout                         =
+*     it_fieldcat                       =
+*     it_excluding                      =
+*     it_special_groups                 =
+*     it_sort                           =
+*     it_filter                         =
+*     is_sel_hide                       =
+*     i_default                         = 'X'
+      i_save                            = 'A'
+*     is_variant                        =
+*     it_events                         =
+*     it_event_exit                     =
+*     is_print                          =
+*     is_reprep_id                      =
+*     i_screen_start_column             = 0
+*     i_screen_start_line               = 0
+*     i_screen_end_column               = 0
+*     i_screen_end_line                 = 0
+*     i_html_height_top                 = 0
+*     i_html_height_end                 = 0
+*     it_alv_graphics                   =
+*     it_hyperlink                      =
+*     it_add_fieldcat                   =
+*     it_except_qinfo                   =
+*     ir_salv_fullscreen_adapter        =
+    IMPORTING
+      e_exit_caused_by_caller           = g_exit_caused_by_caller
+      es_exit_caused_by_user            = gs_exit_caused_by_user
+    TABLES
+      t_outtab                          = gt_outtab
+    EXCEPTIONS
+      program_error                     = 1
+      OTHERS                            = 2.
+  IF sy-subrc = 0.
+*"  Forced Exit by calling program or
+*"  user left list via F3, F12 or F15
+    IF   g_exit_caused_by_caller       = 'X'
+      OR gs_exit_caused_by_user-back   = 'X'     "F3
+      OR gs_exit_caused_by_user-exit   = 'X'     "F15
+      OR gs_exit_caused_by_user-cancel = 'X'.    "F12
+      LEAVE TO TRANSACTION sy-tcode.
+    ENDIF.
+  ELSE.
+*"Fatal error callin ALV
+*   Systemfehler beim Aufruf von &: Returncode &
+    MESSAGE e813 WITH 'REUSE_ALV_GRID_DISPLAY' sy-subrc.
+  ENDIF.
+
+*&---------------------------------------------------------------------*
+*&      Form  set_pf_status
+*&---------------------------------------------------------------------*
+FORM set_pf_status USING rt_extab TYPE slis_t_extab.        "#EC CALLED
+  SET PF-STATUS 'ALV_GRID' EXCLUDING rt_extab.
+ENDFORM.                               " set_pf_status
+
+*&---------------------------------------------------------------------*
+*&      Form  user_command
+*&---------------------------------------------------------------------*
+FORM user_command  USING r_ucomm LIKE sy-ucomm              "#EC CALLED
+                         rs_selfield TYPE slis_selfield.
+  CASE r_ucomm.
+    WHEN '&IC1'.
+      PERFORM beleg_anzeigen USING rs_selfield.
+    WHEN 'MEDIDETAIL'.
+      PERFORM beleg_anzeigen USING rs_selfield.
+  ENDCASE.
+ENDFORM.                               " user_command
+
+*&--------------------------------------------------------------------*
+*&      Form  beleg_anzeigen
+*&--------------------------------------------------------------------*
+FORM beleg_anzeigen USING l_selfield TYPE slis_selfield.
+
+  DATA l_outtab LIKE LINE OF gt_outtab.
+
+  READ TABLE gt_outtab INTO l_outtab INDEX l_selfield-tabindex.
+  IF sy-subrc = 0.
+    CALL FUNCTION 'ME_DISPLAY_PURCHASE_DOCUMENT'
+      EXPORTING
+        i_ebeln              = l_outtab-ekko_ebeln
+        i_ebelp              = l_outtab-ekpo_ebelp
+        i_enjoy              = 'X'
+      EXCEPTIONS
+        not_found            = 1
+        no_authority         = 2
+        invalid_call         = 3
+        preview_not_possible = 4
+        OTHERS               = 5.
+    IF sy-subrc <> 0.
+      MESSAGE ID sy-msgid TYPE 'S' NUMBER sy-msgno
+        WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    "beleg_anzeigen
+
+*Text symbol text£º
+
+*001:Plant
+*Selection text£º
+*S_BEDAT:        Document Date
+*S_BSART:        Document Type
+*S_EBTYP:        Confirmation category
+*S_EINDT:        Delivery Date
+*S_EKGRP:        Purchasing Group
+*S_LIFNR:        Vendor

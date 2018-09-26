@@ -1,0 +1,282 @@
+*&---------------------------------------------------------------------*
+*&  Include           YRD_RM08RELEASE_F0R
+*&---------------------------------------------------------------------*
+
+*---------------------------------------------------------------------*
+*      Form  ITEM_DATA_READ                                           *
+*---------------------------------------------------------------------*
+*      Reads item information. Two cases:                             *
+*      1. Selection with MRM_ZLSPR = A                                *
+*      2. Selection with MRM_ZLSPR = M (manually blocked) or S        *
+*         (stochastic blocked)                                        *
+*      When user selects with purchasing group pure 'direct posting'  *
+*      documents will not be listed (i.e. deleted from T_ARBKP)       *
+*---------------------------------------------------------------------*
+FORM item_data_read TABLES   ti_arbkp TYPE mrm_tab_arbkp
+                             te_arseg TYPE mrm_tab_arseg
+                    USING    i_ekgrp_selection TYPE boole-boole
+                    CHANGING te_incomplete TYPE t_incomplete.
+
+  DATA: tab_ekbel LIKE ekbel OCCURS 10 WITH HEADER LINE.
+
+  DATA: BEGIN OF tab_rseg OCCURS 1.
+          INCLUDE STRUCTURE rseg.
+  DATA: END OF tab_rseg.
+
+  DATA: BEGIN OF tab_rbco OCCURS 1.
+          INCLUDE STRUCTURE rbco.
+  DATA: END OF tab_rbco.
+
+  DATA: BEGIN OF tab_rbma OCCURS 1.
+          INCLUDE STRUCTURE rbma.
+  DATA: END OF tab_rbma.
+
+  DATA: tab_arseg_temp TYPE mrm_tab_arseg.
+
+  DATA: s_vfkred TYPE vf_kred,
+        s_arbkp  TYPE mrm_arbkp,
+        s_arseg  TYPE mrm_arseg,
+        s_rseg   TYPE rseg,
+        s_rbco   TYPE rbco,
+        s_rbma   TYPE rbma,
+        enh_switch_active  TYPE sfw_switchpos,
+        f_bukrs  LIKE s_arseg-bukrs.
+
+  DATA: f_delete_arbkp_without_arseg TYPE c.
+  DATA: l_process TYPE char1. "Req133493 Ench_MRBR
+
+*----- Initialization ------------------------------------------------*
+  REFRESH te_arseg.
+  REFRESH tab_ekbel.
+  REFRESH: tab_rseg.
+
+*----- Specific selects depending from mrm_zlspr ---------------------*
+ENHANCEMENT-SECTION     item_data_read_03 SPOTS es_rm08release.
+  CASE f_mrm_zlspr.
+
+*----- Automatically blocked invoices --------------------------------*
+    WHEN c_mrm_zlspr_a.
+
+*----- ... lines with connection to a PO -----------------------------*
+      SELECT * FROM rseg INTO CORRESPONDING FIELDS OF TABLE tab_rseg
+                 FOR ALL ENTRIES IN ti_arbkp
+                 WHERE gjahr  = ti_arbkp-gjahr
+                 AND   belnr  = ti_arbkp-belnr
+                 AND (  spgrp = c_x
+                     OR spgrm = c_x
+                     OR spgrt = c_x
+                     OR spgrg = c_x
+                     OR spgrq = c_x
+                     OR spgrs = c_x
+                     OR spgrc = c_x
+                     or spgrext = c_x ).                        "NCF IV
+      LOOP AT tab_rseg INTO s_rseg.
+        CLEAR s_arseg.
+        MOVE-CORRESPONDING s_rseg TO s_arseg.
+        s_arseg-spgrp_new = s_arseg-spgrp.
+        s_arseg-spgrm_new = s_arseg-spgrm.
+        s_arseg-spgrt_new = s_arseg-spgrt.
+        s_arseg-spgrg_new = s_arseg-spgrg.
+        s_arseg-spgrq_new = s_arseg-spgrq.
+        s_arseg-spgrs_new = s_arseg-spgrs.
+        s_arseg-spgrc_new = s_arseg-spgrc.
+        s_arseg-spgrext_new = s_arseg-spgrext.                  "NCF IV
+        s_arseg-koart = c_koart_b.
+        APPEND s_arseg TO tab_arseg_temp.
+      ENDLOOP.
+
+*----- manually or stochastically blocked invoices -------------------*
+    WHEN OTHERS.
+
+*----- ... only lines with connection to a PO ------------------------*
+      SELECT * FROM rseg INTO CORRESPONDING FIELDS OF TABLE tab_rseg
+                  FOR ALL ENTRIES IN ti_arbkp
+                  WHERE gjahr  = ti_arbkp-gjahr
+                  AND   belnr  = ti_arbkp-belnr.
+      LOOP AT tab_rseg INTO s_rseg.
+        CLEAR s_arseg.
+        MOVE-CORRESPONDING s_rseg TO s_arseg.
+        s_arseg-koart = c_koart_b.
+        APPEND s_arseg TO tab_arseg_temp.
+      ENDLOOP.
+
+  ENDCASE.
+END-ENHANCEMENT-SECTION.
+
+ENHANCEMENT-POINT item_data_read_01 SPOTS es_rm08release.
+*----- add data, prepare prefetch PO history -------------------------*
+  CLEAR s_vfkred-name1.
+  LOOP AT ti_arbkp INTO s_arbkp.
+    IF    s_vfkred-bukrs NE s_arbkp-bukrs
+       OR s_vfkred-lifnr NE s_arbkp-lifnr.
+      CALL FUNCTION 'FI_VENDOR_DATA'
+        EXPORTING
+          i_bukrs = s_arbkp-bukrs
+          i_lifnr = s_arbkp-lifnr
+        IMPORTING
+          e_kred  = s_vfkred.
+    ENDIF.
+    MOVE s_vfkred-name1 TO s_arbkp-name1_lifnr.
+    MODIFY ti_arbkp FROM s_arbkp.
+
+    LOOP AT tab_arseg_temp INTO s_arseg
+          WHERE gjahr  = s_arbkp-gjahr
+            AND belnr  = s_arbkp-belnr.
+      f_bukrs = s_arseg-bukrs.
+      MOVE-CORRESPONDING s_arbkp TO s_arseg.
+      s_arseg-bukrs = f_bukrs.
+      MODIFY tab_arseg_temp FROM s_arseg.
+      IF s_arseg-ebeln IS INITIAL AND
+         s_arseg-koart = c_koart_b.    " only if PO connected
+        MESSAGE e373 WITH s_arseg-belnr s_arseg-gjahr.
+      ENDIF.
+      IF NOT s_arseg-ebeln IS INITIAL.
+        tab_ekbel-ebeln = s_arseg-ebeln.
+        COLLECT tab_ekbel.
+      ENDIF.
+    ENDLOOP.
+  ENDLOOP.
+
+
+*----- prefetch PO history -------------------------------------------*
+  PERFORM prefetch_ekbe_ekbz TABLES tab_ekbel.
+
+*----- read ivext data -----------------------------------------------*
+  PERFORM ivext_data_read CHANGING tab_arseg_temp[].            "NCF IV
+
+*----- read PO data, authority check ---------------------------------*
+  PERFORM po_data_read  TABLES  ti_arbkp
+                                  tab_arseg_temp
+                        CHANGING  te_incomplete.
+
+*----- selection with purchasing group --> delete T_ARBKP entries
+*      without PO related items (i.e. docs only with direct posting)
+  IF i_ekgrp_selection = c_x.
+
+*----- ...delete ARBKP items without RSEG items with blocking reasons *
+    LOOP AT ti_arbkp INTO s_arbkp.
+      READ TABLE tab_arseg_temp TRANSPORTING NO FIELDS WITH KEY
+                     gjahr  = s_arbkp-gjahr
+                     belnr  = s_arbkp-belnr.
+      CHECK sy-subrc NE 0.
+      DELETE ti_arbkp.
+    ENDLOOP.
+  ENDIF.
+
+*----- add lines with manual G/L postings ----------------------------*
+  IF NOT ti_arbkp[] IS INITIAL.
+    SELECT * FROM rbco INTO CORRESPONDING FIELDS OF TABLE tab_rbco
+               FOR ALL ENTRIES IN ti_arbkp
+               WHERE gjahr  = ti_arbkp-gjahr
+               AND   belnr  = ti_arbkp-belnr
+               AND   buzei  = c_buzei_undef
+               AND spgrs = c_x.
+    LOOP AT tab_rbco INTO s_rbco.
+      READ TABLE ti_arbkp INTO s_arbkp
+        WITH KEY gjahr = s_rbco-gjahr
+                 belnr = s_rbco-belnr.
+      IF sy-subrc NE 0.
+        MESSAGE e607 WITH 'ITEM_DATA_READ'.
+      ENDIF.
+      CLEAR s_arseg.
+      MOVE-CORRESPONDING s_rbco TO s_arseg.
+      s_arseg-buzei     = s_rbco-cobl_nr.
+      s_arseg-spgrs_new = s_arseg-spgrs.
+      s_arseg-koart     = c_koart_s.
+      MOVE-CORRESPONDING s_arbkp TO s_arseg.
+      CLEAR s_arseg-ekgrp.
+*---- read IVEXT data ------------------------------------------------*
+      perform ivext_data_read_g changing s_arseg.               "NCF IV
+*-----Req133493 Ench_MRBR
+*       Check Status of Value Pack Switch
+* Check Status of EnhPack Switch
+      CALL METHOD cl_sfw_get_jfmipsw_status=>get_switch_status
+        IMPORTING
+          status = enh_switch_active.
+      IF enh_switch_active = 'T'.
+*        IF pa_xmanu IS INITIAL.
+*          l_process = 'X'.
+*        ENDIF.
+        PERFORM vpack_mrmbadi_block_delete IN PROGRAM saplvpack_mrmbadi IF FOUND
+                        USING l_process
+                              s_arseg
+                              'G'
+                        CHANGING s_arseg.
+      ENDIF.
+      CALL FUNCTION 'MRMBADI_BLOCKREASON_DELETE'                "NCF IV
+        EXPORTING
+          im_process            = l_process
+          im_arseg              = s_arseg
+          im_posting_type       = 'G'
+        IMPORTING
+          EX_ARSEG              = s_arseg
+        CHANGING
+          ch_ivext_changed      = gv_ivext_changed.             "NCF IV
+*--------------------------------
+      APPEND s_arseg TO tab_arseg_temp.
+    ENDLOOP.
+  ENDIF.
+
+*----- add lines with manual postings to material --------------------*
+  IF NOT ti_arbkp[] IS INITIAL.
+    SELECT * FROM rbma INTO CORRESPONDING FIELDS OF TABLE tab_rbma
+               FOR ALL ENTRIES IN ti_arbkp
+               WHERE gjahr  = ti_arbkp-gjahr
+               AND   belnr  = ti_arbkp-belnr
+               AND spgrs = c_x.
+    LOOP AT tab_rbma INTO s_rbma.
+      READ TABLE ti_arbkp INTO s_arbkp
+        WITH KEY gjahr = s_rbma-gjahr
+                 belnr = s_rbma-belnr.
+      IF sy-subrc NE 0.
+        MESSAGE e607 WITH 'ITEM_DATA_READ'.
+      ENDIF.
+      CLEAR s_arseg.
+      MOVE-CORRESPONDING s_rbma TO s_arseg.
+      s_arseg-spgrs_new = s_arseg-spgrs.
+      s_arseg-koart     = c_koart_m.
+      MOVE-CORRESPONDING s_arbkp TO s_arseg.
+      CLEAR s_arseg-ekgrp.
+*-----Req133493 Ench_MRBR
+*       Check Status of Value Pack Switch
+* Check Status of EnhPack Switch
+      CALL METHOD cl_sfw_get_jfmipsw_status=>get_switch_status
+        IMPORTING
+          status = enh_switch_active.
+      IF enh_switch_active = 'T'.
+*        IF pa_xmanu IS INITIAL.
+*          l_process = 'X'.
+*        ENDIF.
+        PERFORM vpack_mrmbadi_block_delete IN PROGRAM saplvpack_mrmbadi IF FOUND
+                        USING l_process
+                              s_arseg
+                              'M'
+                        CHANGING s_arseg.
+      ENDIF.
+      CALL FUNCTION 'MRMBADI_BLOCKREASON_DELETE'                "NCF IV
+        EXPORTING
+          im_process            = l_process
+          im_arseg              = s_arseg
+          im_posting_type       = 'M'
+        IMPORTING
+          EX_ARSEG              = s_arseg
+        CHANGING
+          ch_ivext_changed      = gv_ivext_changed.             "NCF IV
+*--------------------------------
+      APPEND s_arseg TO tab_arseg_temp.
+    ENDLOOP.
+  ENDIF.
+
+*----- fill te_arseg, depending from mrm_zlspr ------------
+  CASE f_mrm_zlspr.
+    WHEN c_mrm_zlspr_a.
+      te_arseg[] = tab_arseg_temp[].
+    WHEN OTHERS.
+      CLEAR te_arseg.
+      REFRESH te_arseg.
+      PERFORM arseg_items_add TABLES tab_arbkp
+                                     te_arseg.
+  ENDCASE.
+
+ENDFORM.                               " ITEM_DATA_READ
+ENHANCEMENT-POINT item_data_read_02 SPOTS es_rm08release STATIC.

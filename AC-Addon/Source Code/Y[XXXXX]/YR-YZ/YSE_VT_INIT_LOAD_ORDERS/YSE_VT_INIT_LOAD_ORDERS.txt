@@ -1,0 +1,285 @@
+**-------------------------------------------------------------------*
+** Program ID          : YSE_VT_INIT_LOAD_ORDERS
+** Program Title       : VisiTour: Initial load
+** Author              : Luc Mertens
+** Date                : 14.08.2009
+** Change Request      : CD1K949783
+** Description         : CR0969: Initial load programs
+**===================================================================*
+** Change History Log
+**-------------------------------------------------------------------*
+**Mod. no.|  Date    | Name                  | Corr. Nr   | Change   *
+**-------------------------------------------------------------------*
+**MOD-001 |01/04/2011| Lakshmi Reddy         | CD1K964057 | CR1993   *
+**-------------------------------------------------------------------*
+**MOD-002 |04/12/2012| Jules Smets           | CD1K974104 |          *
+**-------------------------------------------------------------------*
+REPORT yse_vt_init_load_orders.
+
+TABLES: viauf_afvc.
+
+CONSTANTS : c_stat_cnf(5) TYPE c VALUE 'I0009'.
+DATA:
+  gt_viauf_afvc TYPE STANDARD TABLE OF viauf_afvc,
+  gv_flag,
+  gv_objnr LIKE jest-objnr,
+  wa_jest TYPE jest,
+  gv_lin TYPE i,
+  wa_viauf_afvc LIKE LINE OF gt_viauf_afvc.
+
+DATA: BEGIN OF gt_aufnr OCCURS 0,
+        aufnr TYPE aufnr,
+        iwerk TYPE iwerk,        "insert MOD-001
+        ingpr TYPE ingrp,        "insert MOD-001
+      END OF gt_aufnr.
+
+DATA: BEGIN OF gt_output OCCURS 0,
+        aufnr TYPE aufnr,
+        vornr TYPE vornr,
+      END OF gt_output.
+
+*Begin of insert MOD-001
+TYPES: BEGIN OF ty_aufk,
+        aufnr TYPE aufnr,
+        bemot TYPE bemot,
+        objnr TYPE j_objnr,
+       END OF ty_aufk.
+TYPES: BEGIN OF ty_vtstatus,
+        iwerk TYPE iwerk,
+        ingpr TYPE ingrp,
+        zzpod TYPE zzpod,
+*        zequcr TYPE zequcr,                      "MOD-002
+        zequac TYPE zequac,                       "MOD-002
+        zecnok TYPE zecnok,
+       END OF ty_vtstatus.
+TYPES: BEGIN OF ty_jest,
+        objnr TYPE j_objnr,
+        stat  TYPE j_status,
+        inact TYPE j_inact,
+       END OF ty_jest.
+TYPES: BEGIN OF ty_afvu,
+         aufpl TYPE co_aufpl,
+         aplzl TYPE co_aplzl,
+         usr03 TYPE usrchar10,
+       END OF ty_afvu.
+DATA: gt_aufk TYPE STANDARD TABLE OF ty_aufk,
+      wa_aufk TYPE ty_aufk.
+DATA: gt_vtstatus TYPE STANDARD TABLE OF ty_vtstatus,
+      wa_vtstatus TYPE ty_vtstatus.
+DATA: gt_jest  TYPE STANDARD TABLE OF ty_jest,
+      wa_jest1 TYPE ty_jest.
+DATA: gt_afvu  TYPE STANDARD TABLE OF ty_afvu,
+      wa_afvu  TYPE ty_afvu.
+DATA: lv_donotsendvt TYPE char1.
+*End of insert MOD-001
+
+PARAMETERS:
+  p_iwerk TYPE iwerk OBLIGATORY.
+
+SELECT-OPTIONS:
+  s_plgrp  FOR viauf_afvc-ingpr,
+  s_aufnr  FOR viauf_afvc-aufnr.
+
+*-------------------------------------------------------------------*
+START-OF-SELECTION.
+
+  REFRESH: gt_aufnr.
+
+*  SELECT aufnr INTO TABLE gt_aufnr FROM afih                   "comment MOD-001
+  SELECT aufnr iwerk ingpr INTO TABLE gt_aufnr FROM afih        "insert MOD-001
+    WHERE aufnr IN s_aufnr
+                AND ingpr IN s_plgrp
+                AND iwerk EQ p_iwerk.
+
+  IF gt_aufnr[] IS INITIAL.
+    MESSAGE e001(00) WITH 'No orderdata selected'.
+    EXIT.
+  ENDIF.
+
+  REFRESH gt_output.
+
+*Begin of insert MOD-001
+  REFRESH: gt_vtstatus.
+  SELECT iwerk
+         ingpr
+         zzpod
+*         zequcr                                  "MOD-002
+         zequac                                   "MOD-002
+         zecnok
+  FROM   yse_vt_sel
+  INTO   TABLE gt_vtstatus
+  WHERE  iwerk EQ p_iwerk
+  AND    ingpr IN s_plgrp.
+
+  REFRESH: gt_aufk.
+  IF NOT gt_aufnr[] IS INITIAL.
+    SELECT aufnr
+           bemot
+           objnr
+    FROM   aufk
+    INTO   TABLE gt_aufk
+    FOR    ALL ENTRIES IN gt_aufnr
+    WHERE  aufnr EQ gt_aufnr-aufnr.
+  ENDIF.
+
+  REFRESH: gt_jest.
+  IF NOT gt_aufk IS INITIAL.
+    SELECT objnr
+           stat
+           inact
+    FROM   jest
+    INTO   TABLE gt_jest
+    FOR    ALL ENTRIES IN gt_aufk
+    WHERE  objnr EQ gt_aufk-objnr
+    AND    ( stat  EQ 'I0413' OR stat EQ 'I0396' )
+    AND    inact EQ ' '.
+  ENDIF.
+*Eng of insert MOD-001
+
+  LOOP AT gt_aufnr.
+    CLEAR: lv_donotsendvt.                         "insert MOD-001
+    CONCATENATE 'OR' gt_aufnr-aufnr INTO gv_objnr.
+
+* status may not be CNF (see remark in CR0969)
+    SELECT SINGLE * INTO wa_jest FROM jest
+      WHERE objnr = gv_objnr
+        AND stat = c_stat_cnf
+        AND inact = ' '.
+
+    IF NOT sy-subrc = 0.
+
+*Begin of insert MOD-001
+      CLEAR: wa_jest1,
+             wa_aufk,
+             wa_vtstatus.
+      READ TABLE gt_aufk INTO wa_aufk WITH KEY aufnr = gt_aufnr-aufnr.
+      IF sy-subrc EQ 0.
+*Check if the order has status CNOK
+        READ TABLE gt_jest INTO wa_jest1 WITH KEY objnr = wa_aufk-objnr
+                                                  stat  = 'I0413'
+                                                  inact = ' '.
+        IF sy-subrc EQ 0.
+*Check if field Excl CNOK is checked in table YSE_VT_SEL
+          READ TABLE gt_vtstatus INTO wa_vtstatus WITH KEY iwerk = gt_aufnr-iwerk
+                                                           ingpr = gt_aufnr-ingpr.
+          IF sy-subrc EQ 0              AND
+             wa_vtstatus-zecnok EQ 'X'.
+*Orders having CNOK status should not be sent to VisiTour
+            lv_donotsendvt = 'X'.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+
+*Check if the order is Fixed Price
+      CLEAR: wa_aufk.
+      READ TABLE gt_aufk INTO wa_aufk WITH KEY aufnr = gt_aufnr-aufnr
+                                               bemot = 'FP'.
+      IF sy-subrc EQ 0.
+        READ TABLE gt_aufk INTO wa_aufk WITH KEY aufnr = gt_aufnr-aufnr.
+        IF sy-subrc EQ 0.
+*Check if the order has status QUAC
+          READ TABLE gt_jest INTO wa_jest1 WITH KEY objnr = wa_aufk-objnr
+                                                    stat  = 'I0396'
+                                                    inact = ' '.
+          IF sy-subrc NE 0.
+*Check if field Excl QUCR is checked in table YSE_VT_SEL
+            READ TABLE gt_vtstatus INTO wa_vtstatus WITH KEY iwerk = gt_aufnr-iwerk
+                                                             ingpr = gt_aufnr-ingpr.
+            IF sy-subrc EQ 0              AND
+*               wa_vtstatus-zequcr EQ 'X'.        "MOD-002
+               wa_vtstatus-zequac EQ 'X'.         "MOD-002
+*A fixed price order should not be sent to VisiTour before the quotation is accepted
+              lv_donotsendvt = 'X'.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+*End of insert MOD-001
+      REFRESH gt_viauf_afvc.
+      SELECT * INTO TABLE gt_viauf_afvc
+         FROM viauf_afvc
+         WHERE aufnr EQ gt_aufnr-aufnr.
+
+*Begin of insert MOD-001
+      REFRESH: gt_afvu.
+      SELECT aufpl
+             aplzl
+             usr03
+      FROM   afvu
+      INTO   TABLE gt_afvu
+      FOR    ALL ENTRIES IN gt_viauf_afvc
+      WHERE  aufpl EQ gt_viauf_afvc-aufpl
+      AND    aplzl EQ gt_viauf_afvc-aplzl.
+*End of insert MOD-001
+
+      LOOP AT gt_viauf_afvc INTO wa_viauf_afvc WHERE steus = 'ZCO3'
+                                                 AND iphas < '3'.
+*Being of insert MOD-001
+        CLEAR: wa_afvu.
+        READ TABLE gt_afvu INTO wa_afvu WITH KEY aufpl = wa_viauf_afvc-aufpl
+                                                 aplzl = wa_viauf_afvc-aplzl.
+        IF wa_afvu-usr03 IS INITIAL.
+          IF lv_donotsendvt = 'X'.
+*          do not send to VT
+          ELSE.
+            CALL FUNCTION 'YSE_VT_OUT_CALL'
+              EXPORTING
+                im_trtyp = 'H'
+                im_aufnr = wa_viauf_afvc-aufnr
+                im_vornr = wa_viauf_afvc-vornr
+                im_plant = p_iwerk              "air23640 - 09/09/2010
+              IMPORTING
+                ex_flag  = gv_flag.
+
+            IF gv_flag = 'X'.
+              MOVE wa_viauf_afvc-aufnr TO gt_output-aufnr.
+              MOVE wa_viauf_afvc-vornr TO gt_output-vornr.
+              APPEND gt_output.
+              CLEAR gt_output.
+            ENDIF.
+          ENDIF.
+        ELSE.
+*End of insert MOD-001
+          CALL FUNCTION 'YSE_VT_OUT_CALL'
+            EXPORTING
+              im_trtyp = 'H'
+              im_aufnr = wa_viauf_afvc-aufnr
+              im_vornr = wa_viauf_afvc-vornr
+              im_plant = p_iwerk              "air23640 - 09/09/2010
+            IMPORTING
+              ex_flag  = gv_flag.
+
+          IF gv_flag = 'X'.
+            MOVE wa_viauf_afvc-aufnr TO gt_output-aufnr.
+            MOVE wa_viauf_afvc-vornr TO gt_output-vornr.
+            APPEND gt_output.
+            CLEAR gt_output.
+          ENDIF.
+        ENDIF.               "read table gt_afvu into wa_afvu with key aufpl = wa_viauf_afvc-aufpl
+      ENDLOOP.
+    ENDIF.
+  ENDLOOP.
+
+*-------------------------------------------------------------------*
+END-OF-SELECTION.
+
+  DESCRIBE TABLE gt_output LINES gv_lin.
+
+  WRITE: text-001, gv_lin.
+
+  CHECK gv_lin > 0.
+
+  SKIP 2.
+
+  LOOP AT gt_output.
+    WRITE: /2 gt_output-aufnr,
+              gt_output-vornr.
+  ENDLOOP.
+
+*Text symbol text£º
+
+*001:Number of orders selected to be send to Visitour :
+*Selection text£º
+*P_IWERK:D       .
+*S_AUFNR:D       .
+*S_PLGRP:D       .

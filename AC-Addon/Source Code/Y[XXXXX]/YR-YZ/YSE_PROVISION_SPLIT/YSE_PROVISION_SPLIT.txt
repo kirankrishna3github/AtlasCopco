@@ -1,0 +1,573 @@
+*----------------------------------------------------------------------
+* PROGRAM ID           : YSE_PROVISION_SPLIT                           *
+* PROGRAM TITLE        : Split ST and LT provisions                    *
+* AUTHOR               : Luc Mertens                                   *
+* DATE                 : 18/11/2008                                    *
+* DEVELOPMENT ID       : DXXX-FICO                                     *
+* CHANGE REQUEST NUMBER: CD1K944588                                    *
+* PROGRAM DESCRIPTION  : Split short-term and long-term provisions     *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME            |CORRECT.NR| CHANGE REFERENCE # *
+*----------------------------------------------------------------------*
+*                                                                      *
+*----------------------------------------------------------------------*
+REPORT YSE_PROVISION_SPLIT no standard page heading
+                             line-size 150.
+
+TABLES: BSIS.
+
+*----------------------------------------------------------------------*
+* global data                                                          *
+*----------------------------------------------------------------------*
+* selected accounting documents
+data: begin of gt_acc occurs 0,
+        bukrs          like bsis-bukrs,
+        shkzg          like bsis-shkzg,
+        dmbtr          like bsis-dmbtr,
+        zuonr          like bsis-zuonr,
+        hkont          like bsis-hkont,
+        prctr          like bsis-prctr,
+      end of gt_acc.
+
+* provisions
+data: begin of gt_prov occurs 0,
+        bukrs          like bsis-bukrs,
+        hkont          like bsis-hkont,
+        prctr          like bsis-prctr,
+        vbeln(10)      type n,
+        posnr          type posnr_va,
+        prov_tot       type DMBTR_KQST,
+        endat          type fpla-endat,
+        month_tot(5)   type n,
+        month_st(5)    type n,
+        amount_st      type dmbtr_kqst,
+        month_lt(5)    type n,
+        amount_lt      type dmbtr_kqst,
+        zuonr          like bsis-zuonr,
+      end of gt_prov.
+
+DATA: bdcdata LIKE bdcdata OCCURS 0 WITH HEADER LINE,
+      struct_bdcdata TYPE bdcdata,
+      gt_err    LIKE BDCMSGCOLL occurs 0 with header line.
+
+data: gv_mode(1)        type c  value 'N',
+      gv_waers          like t001-waers,
+      gv_tot_prov_prctr type DMBTR_KQST,
+      gv_tot_st_prctr   type DMBTR_KQST,
+      gv_tot_lt_prctr   type DMBTR_KQST,
+      gv_str1           type vbeln_va,
+      gv_tot_prov_vbeln type DMBTR_KQST,
+      gv_tot_st_vbeln   type DMBTR_KQST,
+      gv_tot_lt_vbeln   type DMBTR_KQST,
+      gv_tot_prov_hkont type DMBTR_KQST,
+      gv_tot_st_hkont   type DMBTR_KQST,
+      gv_tot_lt_hkont   type DMBTR_KQST,
+      gv_tot_prov_bukrs type DMBTR_KQST,
+      gv_tot_st_bukrs   type DMBTR_KQST,
+      gv_tot_lt_bukrs   type DMBTR_KQST,
+      gv_str2           type string,
+      gv_fplnr          type fplnr,
+      gv_mestx          LIKE t100-text,
+      wa_acc            like gt_acc.
+
+
+*- SELECTION SCREEN---------------------------------------------------
+SELECTION-SCREEN BEGIN OF BLOCK B1 WITH FRAME TITLE TEXT-001.
+PARAMETERS:     p_bukrs    type bukrs obligatory memory id BUK.
+select-options: s_zuonr    for  bsis-zuonr.
+parameters:     p_budat    type bsis-budat obligatory,
+                p_stac1    type hkont default '0002295901' obligatory,
+                p_ltac1    type hkont default '0002291901' obligatory,
+                p_stac2    type hkont default '0002295902' obligatory,
+                p_ltac2    type hkont default '0002291902' obligatory,
+                p_test     AS CHECKBOX DEFAULT 'X'.
+SELECTION-SCREEN END OF BLOCK B1.
+
+
+*----------------------------------------------------------------------*
+* at selection-screen on company code                                  *
+*----------------------------------------------------------------------*
+AT SELECTION-SCREEN ON p_bukrs.
+
+  AUTHORITY-CHECK OBJECT 'YAM_BUKRS'
+           ID 'BUKRS' FIELD p_bukrs.
+
+  IF sy-subrc NE 0.
+*.... No authorization for company code
+    MESSAGE E001(00) WITH text-e01 p_bukrs.
+  ENDIF.
+
+
+*-START OF SELECTION----------------------------------------------------
+START-OF-SELECTION.
+
+* Select company currency
+  select single waers into gv_waers
+     from T001 where bukrs = p_bukrs.
+
+* Select accounting documents
+  PERFORM select_acc.
+
+  if gt_acc[] is initial.
+    MESSAGE s047(ih).
+    exit.
+  ENDIF.
+
+* Get contract data based on assignment field
+  loop at gt_acc.
+    move-corresponding gt_acc to gt_prov.
+
+    split gt_acc-zuonr at '/' into gv_str1 gv_str2.
+    move gv_str1 to gt_prov-vbeln.
+    move gv_str2 to gt_prov-posnr.
+
+    select single fplnr into gv_fplnr
+      from VBKD where vbeln = gt_prov-vbeln
+                  and posnr = gt_prov-posnr.
+
+    if sy-subrc = 0.
+      select single endat into gt_prov-endat
+        from FPLA where fplnr = gv_fplnr.
+    endif.
+
+    if gt_acc-shkzg = 'H'.
+      gt_prov-prov_tot = gt_acc-dmbtr * -1.
+    else.
+      gt_prov-prov_tot = gt_acc-dmbtr.
+    endif.
+
+    collect gt_prov.
+    clear gt_prov.
+  endloop.
+
+* Calculate the ST and LT provisions
+  loop at gt_prov.
+    if gt_prov-prov_tot = 0 or gt_prov-endat is initial.
+      delete gt_prov.
+      continue.
+    endif.
+
+    CALL FUNCTION 'MONTHS_BETWEEN_TWO_DATES'
+      EXPORTING
+        I_DATUM_BIS   = gt_prov-endat
+        I_DATUM_VON   = p_budat
+        I_KZ_INCL_BIS = 'X'
+      IMPORTING
+        E_MONATE      = gt_prov-month_tot.
+
+    if gt_prov-month_tot > 12.
+      gt_prov-month_st = 12.
+      gt_prov-month_lt = gt_prov-month_tot - 12.
+      gt_prov-amount_st = gt_prov-prov_tot * 12 / gt_prov-month_tot.
+      gt_prov-amount_lt = gt_prov-prov_tot - gt_prov-amount_st.
+    else.
+      gt_prov-month_st = gt_prov-month_tot.
+      gt_prov-month_lt = 0.
+      gt_prov-amount_st = gt_prov-prov_tot.
+      gt_prov-amount_lt = 0.
+    endif.
+
+    modify gt_prov.
+  endloop.
+
+*-----------------------------------------------------------------------
+END-OF-SELECTION.
+
+  sort gt_prov by bukrs hkont prctr vbeln.
+
+* Process lines
+  if p_test = ' '.
+    loop at gt_prov.
+
+*.... Post document by transaction FB01
+      gv_tot_prov_prctr = gv_tot_prov_prctr + gt_prov-prov_tot.
+      gv_tot_st_prctr   = gv_tot_st_prctr   + gt_prov-amount_st.
+      gv_tot_lt_prctr   = gv_tot_lt_prctr   + gt_prov-amount_lt.
+
+      at end of prctr.
+        if gv_tot_lt_prctr = 0.
+          continue.
+        endif.
+
+        perform prepare_fi_posting.
+        CALL TRANSACTION 'FBS1' USING bdcdata
+                 mode gv_mode update 'S' messages into gt_err.
+
+        clear: gv_tot_prov_prctr,
+               gv_tot_st_prctr,
+               gv_tot_lt_prctr.
+        CLEAR bdcdata.
+        REFRESH bdcdata.
+      endat.
+
+    endloop.
+  endif.
+
+* Print selection screen
+  write: / '--------------------------------------------------------------------------'.
+  write: / text-002, 35 p_bukrs,
+         / text-014, 35 s_zuonr-low, '-', s_zuonr-high,
+         / text-015, 35 p_budat,
+         / text-016, 35 p_stac1,
+         / text-017, 35 p_ltac1,
+         / text-018, 35 p_stac2,
+         / text-019, 35 p_ltac2,
+         / text-020, 35 p_test.
+  write: / '--------------------------------------------------------------------------'.
+  new-page.
+
+* Show internal table, totals per company, account, profit center and contract
+  loop at gt_prov.
+
+    format intensified off.
+
+    perform write_line.
+    gv_tot_prov_vbeln = gv_tot_prov_vbeln + gt_prov-prov_tot.
+    gv_tot_st_vbeln   = gv_tot_st_vbeln   + gt_prov-amount_st.
+    gv_tot_lt_vbeln   = gv_tot_lt_vbeln   + gt_prov-amount_lt.
+
+    gv_tot_prov_prctr = gv_tot_prov_prctr + gt_prov-prov_tot.
+    gv_tot_st_prctr   = gv_tot_st_prctr   + gt_prov-amount_st.
+    gv_tot_lt_prctr   = gv_tot_lt_prctr   + gt_prov-amount_lt.
+
+    gv_tot_prov_hkont = gv_tot_prov_hkont + gt_prov-prov_tot.
+    gv_tot_st_hkont   = gv_tot_st_hkont   + gt_prov-amount_st.
+    gv_tot_lt_hkont   = gv_tot_lt_hkont   + gt_prov-amount_lt.
+
+    gv_tot_prov_bukrs = gv_tot_prov_bukrs + gt_prov-prov_tot.
+    gv_tot_st_bukrs   = gv_tot_st_bukrs   + gt_prov-amount_st.
+    gv_tot_lt_bukrs   = gv_tot_lt_bukrs   + gt_prov-amount_lt.
+
+    at end of vbeln.
+      perform write_tot_contract.
+      clear: gv_tot_prov_vbeln,
+             gv_tot_st_vbeln,
+             gv_tot_lt_vbeln.
+    endat.
+
+    at end of prctr.
+      format intensified on.
+      perform write_tot_prctr.
+      clear: gv_tot_prov_prctr,
+             gv_tot_st_prctr,
+             gv_tot_lt_prctr.
+      format intensified off.
+    endat.
+
+    at end of hkont.
+      format intensified on.
+      perform write_tot_account.
+      clear: gv_tot_prov_hkont,
+             gv_tot_st_hkont,
+             gv_tot_lt_hkont.
+      format intensified off.
+    endat.
+
+    at end of bukrs.
+      perform write_tot_comp.
+      clear: gv_tot_prov_bukrs,
+             gv_tot_st_bukrs,
+             gv_tot_lt_bukrs.
+    endat.
+
+  endloop.
+
+* write log
+  if p_test = ' '.
+    skip 3.
+    write: / '******* U P D A T E S *******'.
+    LOOP AT gt_err.
+
+      CALL FUNCTION 'RH_MESSAGE_GET'
+        EXPORTING
+*          SPRSL                   = SY-LANGU
+          arbgb                   = gt_err-msgid
+          msgnr                   = gt_err-msgnr
+          msgv1                   = gt_err-msgv1
+          msgv2                   = gt_err-msgv2
+          msgv3                   = gt_err-msgv3
+          msgv4                   = gt_err-msgv4
+        IMPORTING
+          msgtext                 = gv_mestx
+        EXCEPTIONS
+          message_not_found       = 1
+          OTHERS                  = 2.
+
+      write: / gv_mestx.
+    ENDLOOP.
+  endif.
+
+*-----------------------------------------------------------------------
+TOP-OF-PAGE.
+
+  write: /1  text-002,
+          6  text-003,
+          15 text-004,
+          30 text-005,
+          41 text-006,
+          51 text-007,
+          72 text-008,
+          85 text-009,
+         100 text-010,
+         116 text-011,
+         126 text-012,
+         141 text-013.
+  uline.
+  skip.
+
+
+*- SUBROUTINES---------------------------------------------------------
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_ACC
+*&---------------------------------------------------------------------*
+*       select data from the db
+*----------------------------------------------------------------------*
+FORM select_acc.
+
+* Select open items
+  SELECT bukrs hkont prctr zuonr dmbtr shkzg
+    FROM bsis INTO corresponding fields of TABLE gt_acc
+      WHERE bukrs EQ p_bukrs
+        and augbl eq space
+        and zuonr in s_zuonr
+        and budat le p_budat
+        AND hkont in (p_stac1, p_stac2).
+
+* Add items cleared after posting date of selection screen
+  SELECT bukrs hkont prctr zuonr dmbtr shkzg
+    FROM bsas appending corresponding fields of TABLE gt_acc
+      WHERE bukrs EQ p_bukrs
+        and zuonr in s_zuonr
+        and budat le p_budat
+        and augdt gt p_budat
+        AND hkont in (p_stac1, p_stac2).
+
+ENDFORM.                               " SELECT_ACC
+
+*&---------------------------------------------------------------------*
+*&      Form  prepare_fi_posting
+*&---------------------------------------------------------------------*
+*       Prepare FI posting
+*----------------------------------------------------------------------*
+FORM prepare_fi_posting.
+
+  data: lv_date         type d,
+        lv_date2        type d,
+        lv_revdate      like sy-datum,
+        lv_zuonr        like bsis-zuonr,
+        lv_copa         like ce11000,
+        lv_diff(13)     type c,
+        lv_diff_pos(7)  type p decimals 2.
+
+  write p_budat to lv_date.
+  lv_revdate = p_budat + 1.
+  write lv_revdate to lv_date2.
+
+* Header
+  PERFORM bdc_dynpro      USING 'SAPMF05A' '0100'.
+  PERFORM bdc_field       USING 'BDC_OKCODE' '/00'.
+  PERFORM bdc_field       USING 'BKPF-BLDAT' lv_date.
+  PERFORM bdc_field       USING 'BKPF-BLART' 'SA'.
+  PERFORM bdc_field       USING 'BKPF-BUKRS' p_bukrs.
+  PERFORM bdc_field       USING 'BKPF-BUDAT' lv_date.
+  PERFORM bdc_field       USING 'BKPF-WAERS' gv_waers.
+  PERFORM bdc_field       USING 'BKPF-XBLNR' 'ST-LT PROV'.
+  PERFORM bdc_field       USING 'BKPF-STGRD' '02'.
+  PERFORM bdc_field       USING 'BKPF-STODT' lv_date2.
+
+  if gv_tot_lt_prctr < 0.
+    lv_diff_pos = gv_tot_lt_prctr * -1.
+    PERFORM bdc_field       USING 'RF05A-NEWBS' '40'.
+  else.
+    lv_diff_pos = gv_tot_lt_prctr.
+    PERFORM bdc_field       USING 'RF05A-NEWBS' '50'.
+  endif.
+  PERFORM bdc_field       USING 'RF05A-NEWKO' gt_prov-hkont.
+
+* Item 1
+  PERFORM bdc_dynpro      USING 'SAPMF05A' '0300'.
+  PERFORM bdc_field       USING 'BDC_OKCODE' '=ZK'.
+  write lv_diff_pos to lv_diff currency gv_waers.
+  PERFORM bdc_field       USING 'BSEG-WRBTR' lv_diff.
+  PERFORM bdc_field       USING 'BSEG-ZUONR' 'ST-LT PROV'.
+  PERFORM bdc_field       USING 'DKACB-FMORE' 'X'.
+
+* Item 1: more date
+  PERFORM bdc_dynpro      USING 'SAPLKACB' '0002'.
+  PERFORM bdc_field       USING 'BDC_OKCODE' 'ENTE'.
+  PERFORM bdc_field       USING 'COBL-PRCTR' gt_prov-prctr.
+
+* Item 2
+  PERFORM bdc_dynpro      USING 'SAPMF05A' '0330'.
+  PERFORM bdc_field       USING 'BDC_OKCODE' '/00'.
+
+  if gv_tot_lt_prctr < 0.
+    PERFORM bdc_field       USING 'RF05A-NEWBS' '50'.
+  else.
+    PERFORM bdc_field       USING 'RF05A-NEWBS' '40'.
+  endif.
+
+  if gt_prov-hkont = p_stac1.
+    PERFORM bdc_field       USING 'RF05A-NEWKO' p_ltac1.
+  else.
+    PERFORM bdc_field       USING 'RF05A-NEWKO' p_ltac2.
+  endif.
+
+* Save
+  PERFORM bdc_dynpro      USING 'SAPMF05A' '0300'.
+  PERFORM bdc_field       USING 'BDC_OKCODE' '=BU'.
+  PERFORM bdc_field       USING 'BSEG-WRBTR' lv_diff.
+  PERFORM bdc_field       USING 'BSEG-ZUONR' 'ST-LT PROV'.
+*  PERFORM bdc_field       USING 'DKACB-FMORE' 'X'.
+
+* Item 2: more date
+  PERFORM bdc_dynpro      USING 'SAPLKACB' '0002'.
+  PERFORM bdc_field       USING 'BDC_OKCODE' '=ENTE'.
+  PERFORM bdc_field       USING 'COBL-PRCTR' gt_prov-prctr.
+
+ENDFORM.                    " prepare_fi_posting
+
+*----------------------------------------------------------------------*
+*        Start new screen                                              *
+*----------------------------------------------------------------------*
+FORM bdc_dynpro USING program dynpro.
+
+  CLEAR bdcdata.
+  bdcdata-program  = program.
+  bdcdata-dynpro   = dynpro.
+  bdcdata-dynbegin = 'X'.
+  APPEND bdcdata.
+
+ENDFORM.                    "BDC_DYNPRO
+
+*----------------------------------------------------------------------*
+*        Insert field                                                  *
+*----------------------------------------------------------------------*
+FORM bdc_field USING fnam fval.
+
+*  IF fval <> '/'.
+  CLEAR bdcdata.
+  bdcdata-fnam = fnam.
+  bdcdata-fval = fval.
+  APPEND bdcdata.
+*  ENDIF.
+
+ENDFORM.                    "bdc_field
+
+*&---------------------------------------------------------------------*
+*&      Form  write_line
+*&---------------------------------------------------------------------*
+FORM write_line.
+
+  write: /1 gt_prov-bukrs,
+          6 gt_prov-hkont,
+         15 gt_prov-prctr,
+         30 gt_prov-vbeln no-zero,
+         42 gt_prov-posnr,
+         48 gt_prov-prov_tot currency gv_waers,
+         72 gt_prov-endat,
+         89 gt_prov-month_tot no-zero,
+        102 gt_prov-month_st no-zero,
+        108 gt_prov-amount_st no-zero,
+        126 gt_prov-month_lt no-zero,
+        134 gt_prov-amount_lt no-zero.
+
+ENDFORM.                    " write_line
+
+*&---------------------------------------------------------------------*
+*&      Form  write_tot_contract
+*&---------------------------------------------------------------------*
+FORM write_tot_contract.
+
+  write: /1 gt_prov-bukrs,
+          6 gt_prov-hkont,
+         15 gt_prov-prctr,
+         30 gt_prov-vbeln no-zero,
+         48 gv_tot_prov_vbeln currency gv_waers,
+        108 gv_tot_st_vbeln no-zero,
+        134 gv_tot_lt_vbeln no-zero.
+
+ENDFORM.                    " write_tot_contract
+
+*&---------------------------------------------------------------------*
+*&      Form  write_tot_prctr
+*&---------------------------------------------------------------------*
+FORM write_tot_prctr.
+
+  write: /1 gt_prov-bukrs,
+          6 gt_prov-hkont,
+         15 gt_prov-prctr,
+         48 gv_tot_prov_prctr currency gv_waers,
+        108 gv_tot_st_prctr no-zero,
+        134 gv_tot_lt_prctr no-zero.
+
+ENDFORM.                    " write_tot_prctr
+
+*&---------------------------------------------------------------------*
+*&      Form  write_tot_account
+*&---------------------------------------------------------------------*
+FORM write_tot_account.
+
+  write: /1 gt_prov-bukrs,
+          6 gt_prov-hkont,
+         48 gv_tot_prov_hkont currency gv_waers,
+        108 gv_tot_st_hkont no-zero,
+        134 gv_tot_lt_hkont no-zero.
+
+ENDFORM.                    " write_tot_account
+
+*&---------------------------------------------------------------------*
+*&      Form  write_tot_comp
+*&---------------------------------------------------------------------*
+FORM write_tot_comp.
+
+  write: /1 gt_prov-bukrs,
+         48 gv_tot_prov_bukrs currency gv_waers,
+        108 gv_tot_st_bukrs no-zero,
+        134 gv_tot_lt_bukrs no-zero.
+
+ENDFORM.                    " write_tot_comp
+
+*Text symbol text£º
+*001:Selection screen input
+*002:Comp
+*003:Account
+*004:Profit Center
+*005:Contract
+*006:Item
+*007:Total Provision
+*008:Contract End
+*009:Total Months
+*010:ST Months
+*011:ST Amount
+*012:LT Months
+*013:LT Amount
+*014:Assignment
+*015:Open at key date
+*016:Short term provision account 1
+*017:Long term provision account 1
+*018:Short term provision account 2
+*019:Long term provision account 2
+*020:Test Mode (no update)
+*700:
+*701:Wollen Sie die Verarbeitung f¨¹r
+*702:
+*703:selektierten Objekte abbrechen?
+*704:
+*705:
+*706:Ja
+*ANZ:Number
+*E01:No authorisation for company code &1
+
+*SON:
+*Selection text£º
+*P_BUDAT:        Open at key date
+*P_BUKRS:D       .
+*P_LTAC1:        Long term provision account 1
+*P_LTAC2:        Long term provision account 2
+*P_STAC1:        Short term provision account 1
+*P_STAC2:        Short term provision account 2
+*P_TEST:        Test Mode (no update)
+*S_ZUONR:D       .

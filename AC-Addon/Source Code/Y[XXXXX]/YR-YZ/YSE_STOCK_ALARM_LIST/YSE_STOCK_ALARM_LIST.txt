@@ -1,0 +1,1597 @@
+*&---------------------------------------------------------------------*
+*& Report  YSE_STOCK_ALARM_LIST                                        *
+*----------------------------------------------------------------------*
+* PROGRAM ID           : YSE_STOCK_ALARM_LIST                          *
+* PROGRAM TITLE        : List of stocked items with unsufficient stock
+*                        level        *
+* DATE                 : 19/02/2007                                    *
+* DEVELOPMENT ID       : D089-Stock alarm list
+* CHANGE REQUEST NUMBER: CD1K910691                                    *
+* Program Description:  ALV list of stock materials  with unsifficient
+*                       stock in the chosen central warehouse
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME     |CORRECTION NUMBER| CHANGE REFERENCE # *
+*----------------------------------------------------------------------*
+* MOD-016 |12/04/2007| Pieter Jespers | CD1K913810        | 017        *
+* Description: Authorisation check                                     *
+************************************************************************
+* MOD-017 |21/08/2007| Christophe Geerts | CD1K919251        | 018     *
+* Description: New fields and modification of existing fields          *
+************************************************************************
+REPORT  yse_stock_alarm_list  MESSAGE-ID yse_sales_log.
+
+INCLUDE:
+  yse_class_definitions,
+  yse_stock_alarm_list_top.
+
+******************
+* SELECTION SCREEN
+******************
+SELECTION-SCREEN BEGIN OF BLOCK 1 WITH FRAME TITLE text-001.
+PARAMETERS p_vkorg LIKE vbak-vkorg OBLIGATORY MEMORY ID vko.
+SELECT-OPTIONS s_vtweg FOR vbak-vtweg NO INTERVALS.
+PARAMETERS p_werks LIKE marc-werks OBLIGATORY MEMORY ID wrk.
+" central plants
+SELECTION-SCREEN BEGIN OF LINE.
+PARAMETERS p_eisbe AS CHECKBOX.
+SELECTION-SCREEN COMMENT 15(50) text-002 FOR FIELD p_eisbe.
+SELECTION-SCREEN END OF LINE.
+SELECT-OPTIONS s_pstyv FOR vbap-pstyv.
+SELECTION-SCREEN END OF BLOCK 1.
+
+SELECTION-SCREEN BEGIN OF BLOCK 2 WITH FRAME TITLE text-003.
+PARAMETERS: p_var   LIKE disvariant-variant.
+SELECTION-SCREEN END OF BLOCK 2.
+
+*SELECTION-SCREEN BEGIN OF BLOCK 3 WITH FRAME TITLE text-021.
+*PARAMETERS: P_MATNR   TYPE MATNR.
+*SELECTION-SCREEN END OF BLOCK 3.
+********************
+AT SELECTION-SCREEN.
+********************
+  PERFORM check_authorization.
+
+*************************************************
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_werks.
+*************************************************
+* Initialize table with plants to choose from
+  FREE it_plant.
+* Select appropriate plants into internal table
+  SELECT      yse_em_plant~werks whtype whstdes name1
+         INTO TABLE it_plant
+         FROM yse_em_plant
+        INNER JOIN t001w
+           ON yse_em_plant~werks = t001w~werks
+        WHERE whtype EQ 'C'.
+*         AND T001W~SPRAS EQ 'E'.
+
+* Prompt the list of plants to the user
+  CALL FUNCTION 'F4IF_INT_TABLE_VALUE_REQUEST'
+    EXPORTING
+      retfield        = 'WERKS'
+      window_title    = 'Plants'(005)
+      value_org       = 'S'
+    TABLES
+      value_tab       = it_plant
+      return_tab      = it_return_tab
+    EXCEPTIONS
+      parameter_error = 1
+      no_values_found = 2
+      OTHERS          = 3.
+* Process result
+  IF sy-subrc EQ 0.
+    READ TABLE it_return_tab INDEX 1.
+    p_werks = it_return_tab-fieldval.
+  ENDIF.
+
+*******************************
+AT SELECTION-SCREEN ON p_werks.
+*******************************
+* If plant and salesorg are provided (both are mandatory)
+  IF NOT p_vkorg IS INITIAL AND NOT p_werks IS INITIAL.
+
+*   Get plant data
+    SELECT SINGLE yse_em_plant~werks whtype whstdes name1 bwkey vkorg
+             INTO CORRESPONDING FIELDS OF wa_plant
+             FROM yse_em_plant
+            INNER JOIN t001w
+               ON yse_em_plant~werks = t001w~werks
+            WHERE yse_em_plant~werks EQ p_werks.
+*             AND T001W~SPRAS EQ 'E'
+*   If not found
+    IF sy-subrc NE 0.
+      MESSAGE e045 WITH p_werks.
+*If found but responsible salesorg for the provided plant does not match
+*user input
+    ELSEIF wa_plant-vkorg NE p_vkorg.
+      MESSAGE e018 WITH p_werks p_vkorg.
+*   If found but plant is not central
+    ELSEIF wa_plant-whtype NE 'C'.
+      MESSAGE e106 WITH p_werks.
+    ENDIF.
+
+  ENDIF.
+
+***********************************************
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_var.
+***********************************************
+  PERFORM variant_inputhelp USING p_var.
+
+*******************
+START-OF-SELECTION.
+*******************
+
+* Get the parameters of the warehousetype for the chosen plant
+  PERFORM find_stock_parameters.
+
+* If s'th went wrong, restart program
+  IF sy-subrc NE 0.
+    MESSAGE s006 WITH 'yse_em_whstypar'.
+    SUBMIT yse_stock_alarm_list VIA SELECTION-SCREEN.
+  ENDIF.
+
+* Get 12 month period
+  PERFORM find_12_month_period.
+
+* The report is for all materials with stock policy = Z5
+  PERFORM get_materials.
+
+* Don't continue if no lines selected from MARC
+  DESCRIBE TABLE it_marc LINES sy-tfill.
+  CHECK sy-tfill NE 0.
+
+*Get sales history for the selected materials (using the resp plant
+*logic)
+  PERFORM find_stock_history.
+
+* Get weighted average forecast
+  PERFORM get_waf.
+
+* Find EM: Material/Sales Organisation parameters
+  PERFORM find_mat_sales_org_parms.
+
+* Collect stock qtys in table it_stock and allocations in table it_alloc
+
+* FILL TABLE IT_MATNR
+  LOOP AT it_sohist.
+    it_matnr-matnr = it_sohist-matnr.
+    APPEND it_matnr.
+  ENDLOOP.
+
+  LOOP AT s_vtweg.
+    wa_vtweg-vtweg = s_vtweg-low.
+    APPEND wa_vtweg TO it_vtweg.
+  ENDLOOP.
+
+  CALL FUNCTION 'YSE_GET_ALLOCATIONS'
+    EXPORTING
+      werks          = p_werks
+      vkorg          = p_vkorg
+*     EKORG          =
+      eisbe          = p_eisbe
+      lgort          = '1000'
+    TABLES
+      it_alloc       = it_alloc2
+      it_matnr       = it_matnr
+      it_vtweg       = it_vtweg
+      r_pstyv        = s_pstyv.
+
+  PERFORM find_material_stock.
+  PERFORM find_material_info.
+  PERFORM find_supplier.
+  PERFORM find_open_poi.
+
+*****************
+END-OF-SELECTION.
+*****************
+  PERFORM fill_output_table.
+
+  IF sy-batch EQ space.
+    CALL SCREEN 200.
+  ELSE.
+    PERFORM send2spool.
+  ENDIF.
+
+*&---------------------------------------------------------------------*
+*&      Form  find_materials
+*&---------------------------------------------------------------------*
+FORM find_material_stock.
+
+  SELECT      b~eisbe  c~matnr  c~werks c~labst c~lgort
+         INTO CORRESPONDING FIELDS OF TABLE it_mard
+         FROM marc AS b
+        INNER JOIN mard AS c
+           ON b~werks = c~werks
+          AND b~matnr = c~matnr
+          FOR ALL ENTRIES IN it_sohist
+        WHERE b~matnr = it_sohist-matnr
+          AND b~werks = p_werks
+          AND b~dismm EQ 'Z5'
+          AND c~lgort EQ '1000'.
+
+  SORT it_mard BY matnr.  " Plant and StLoc are a constant in the table
+
+  LOOP AT it_mard.
+    it_stock-matnr = it_mard-matnr.
+    it_stock-qty = it_mard-labst.
+    COLLECT it_stock.
+  ENDLOOP.
+* it_stock is implicitly sorted by material number
+
+ENDFORM.                    " find_materials
+
+*&---------------------------------------------------------------------*
+*&      Form  find_stock_parameters
+*&---------------------------------------------------------------------*
+FORM find_stock_parameters.
+
+* Local data
+  DATA: lv_whtype(1).
+
+  SELECT SINGLE whtype
+           INTO lv_whtype
+           FROM yse_em_plant
+          WHERE werks EQ p_werks.
+
+  SELECT SINGLE *
+           FROM yse_em_whstypar
+           INTO wa_em_whstypar
+          WHERE vkorg EQ p_vkorg
+            AND whtype EQ lv_whtype.
+
+ENDFORM.                    " find_stock_parameters
+*&---------------------------------------------------------------------*
+*&      Form  FIND_OPEN_SALES_ORDERS
+*&---------------------------------------------------------------------*
+FORM find_open_sales_orders  TABLES   p_it_sohist   STRUCTURE wa_sohist
+                                      p_it_alloc STRUCTURE wa_alloc.
+
+  SELECT b~vbeln b~posnr b~matnr b~kwmeng b~werks
+  INTO CORRESPONDING FIELDS OF TABLE  it_vbap
+  FROM vbak AS a
+  INNER JOIN vbap AS b
+  ON a~vbeln = b~vbeln
+  FOR ALL ENTRIES IN p_it_sohist
+  WHERE b~matnr = p_it_sohist-matnr
+  AND b~werks = p_werks
+  AND a~vkorg = p_vkorg
+  AND a~vbtyp EQ 'C' .           "only orders.
+
+
+
+  CHECK sy-subrc EQ 0.
+
+  SORT  p_it_alloc.
+
+* ADD ENTRIES TO ALLOCATION TABLE
+
+  LOOP AT it_vbap.
+    p_it_alloc-matnr = it_vbap-matnr.
+    p_it_alloc-qty = it_vbap-kwmeng.
+    COLLECT p_it_alloc.
+
+  ENDLOOP.
+
+* GET ALL DELIVERED ITEMS
+  SELECT a~vbelv a~posnv b~lfimg b~matnr
+  INTO CORRESPONDING FIELDS OF TABLE it_deliveries
+  FROM vbfa AS a
+  INNER JOIN lips AS b
+  ON a~vbeln = b~vbeln
+  FOR ALL ENTRIES IN it_vbap
+  WHERE a~vbelv = it_vbap-vbeln
+  AND   a~posnv = it_vbap-posnr
+  AND a~vbtyp_n = 'J'. "DELIVERIES
+
+  SORT it_vbap.
+  SORT it_deliveries.
+
+
+* ADD ENTRIES TO STOCK TABLE
+
+  LOOP AT it_deliveries.
+
+    p_it_alloc-matnr = it_deliveries-matnr.
+    p_it_alloc-qty = it_deliveries-lfimg * ( -1 ).
+    COLLECT p_it_alloc.
+
+  ENDLOOP.
+
+ENDFORM.                    " FIND_OPEN_SALES_ORDERS
+
+*&---------------------------------------------------------------------*
+*&      Form  find_12_month_period
+*&---------------------------------------------------------------------*
+FORM find_12_month_period.
+
+  DATA: lv_end_date LIKE sy-datum,
+        lv_begin_date LIKE sy-datum,
+        lv_n2(4)         TYPE c.
+
+  MOVE sy-datum TO lv_end_date .
+  MOVE '01' TO lv_end_date+6.
+  lv_end_date = lv_end_date - 1.
+  wa_end_period = lv_end_date(6).
+
+  lv_n2 = '-11'.
+
+  CALL FUNCTION 'MONTH_PLUS_DETERMINE'
+    EXPORTING
+      months  = lv_n2
+      olddate = lv_end_date
+    IMPORTING
+      newdate = lv_begin_date.
+
+  MOVE lv_begin_date(6) TO  wa_begin_period.
+
+ENDFORM.                    " find_12_month_period
+
+*&---------------------------------------------------------------------*
+*&      Form  find_stock_history
+*&---------------------------------------------------------------------*
+FORM find_stock_history.
+
+  CLEAR: it_tvkwz.
+  REFRESH: it_tvkwz.
+
+*   Selection of sales organisation/plant combinations
+  SELECT      vkorg vtweg werks
+         FROM tvkwz
+         INTO TABLE it_tvkwz
+        WHERE vkorg EQ p_vkorg
+          AND vtweg IN s_vtweg.
+
+* Select all plants for which chosen plant is responsible
+  SELECT * INTO TABLE it_em_pl_centr
+                 FROM yse_em_pl_centr
+   FOR ALL ENTRIES IN it_tvkwz
+                WHERE cwerks = p_werks
+                  AND cwerks = it_tvkwz-werks.
+
+* If any subsid. plants found
+  IF sy-subrc EQ 0.
+*   Get all sales districts for subs. plants
+    SELECT      *
+           INTO TABLE it_em_pl_distr
+           FROM yse_em_pl_distr
+            FOR ALL ENTRIES IN it_em_pl_centr
+          WHERE werks = it_em_pl_centr-bwerks.
+
+*>>>In comment AIR22296: We should also include the sub plants.
+*   Selection of sales organisation/plant combinations
+*    CLEAR: it_tvkwz.
+*    REFRESH: it_tvkwz.
+*    SELECT      vkorg vtweg werks
+*           FROM tvkwz
+*           INTO TABLE it_tvkwz
+*          WHERE vkorg EQ p_vkorg
+*            AND vtweg IN s_vtweg.
+*<<<AIR22296:
+
+    CLEAR: r_bzirk.
+    REFRESH: r_bzirk.
+*   Check if the dependend plant is allowed for sales org/dist channel
+    LOOP AT  it_em_pl_distr.
+*      READ TABLE it_tvkwz WITH KEY werks = it_em_pl_distr-werks.
+      "check is done higher
+*      CHECK sy-subrc EQ 0.
+      CLEAR: r_bzirk.
+      r_bzirk-sign   = 'I'.
+      r_bzirk-option = 'EQ'.
+      r_bzirk-low    = it_em_pl_distr-bzirk.
+      APPEND r_bzirk.
+    ENDLOOP.
+  ENDIF.
+
+* Add history for dependant sales districts
+  READ TABLE r_bzirk INDEX 1.
+
+  IF sy-subrc EQ 0.
+    SELECT *
+     INTO TABLE it_yse_em_sohist
+     FROM yse_em_sohist
+     WHERE vkorg EQ p_vkorg
+     AND vtweg IN s_vtweg
+     AND bzirk IN r_bzirk
+     AND period
+     BETWEEN wa_begin_period AND wa_end_period.
+    SELECT * FROM yse_em_sohistmig WHERE period LE wa_end_period
+                                    AND period GE wa_begin_period
+                                    AND vkorg  EQ p_vkorg
+                                    AND vtweg  IN s_vtweg
+                                    AND bzirk IN r_bzirk.
+      it_yse_em_sohist = yse_em_sohistmig.
+      COLLECT it_yse_em_sohist.
+    ENDSELECT.
+  ENDIF.
+
+  SORT it_yse_em_sohist.
+
+* Set history for materials without history to 0.01
+  LOOP AT it_marc.
+    LOOP AT it_yse_em_sohist WHERE matnr EQ it_marc-matnr.
+*                             AND WERKS EQ IT_MARC-WERKS.
+      CLEAR it_sohist.
+      MOVE-CORRESPONDING it_yse_em_sohist TO it_sohist.
+
+      PERFORM round_value CHANGING it_sohist-zmeng.
+
+      COLLECT it_sohist.
+    ENDLOOP.
+
+    IF sy-subrc NE 0.
+      CLEAR it_sohist.
+      MOVE-CORRESPONDING it_marc TO it_sohist.
+      it_sohist-zmeng = '0.01'.
+      COLLECT it_sohist.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    " find_stock_history
+
+*&---------------------------------------------------------------------*
+*&      Form  find_open_reservations
+*&---------------------------------------------------------------------*
+FORM find_open_reservations  TABLES  p_it_sohist STRUCTURE wa_sohist
+                                     p_it_alloc STRUCTURE wa_alloc.
+
+  SELECT matnr bdmng enmng
+    INTO CORRESPONDING FIELDS OF TABLE it_resb
+    FROM resb
+   FOR ALL ENTRIES IN p_it_sohist
+   WHERE matnr = p_it_sohist-matnr
+   AND xloek EQ space
+   AND xwaok EQ 'X'.
+
+  LOOP AT it_resb.
+
+    p_it_alloc-matnr = it_resb-matnr.
+    p_it_alloc-qty = it_resb-bdmng - it_resb-enmng.
+    COLLECT p_it_alloc.
+
+  ENDLOOP.
+
+ENDFORM.                    " find_open_reservations
+
+*&---------------------------------------------------------------------*
+*&      Form  find_open_TRANSPORT_REQUIS
+*&---------------------------------------------------------------------*
+FORM find_open_transport_requis  TABLES  p_it_sohist STRUCTURE wa_sohist
+                                         p_it_alloc STRUCTURE wa_alloc.
+
+
+
+  SELECT matnr menge
+   INTO CORRESPONDING FIELDS OF TABLE it_eban
+      FROM eban
+     FOR ALL ENTRIES IN p_it_sohist
+     WHERE matnr EQ p_it_sohist-matnr
+     AND bsart = 'ZNB1'
+     AND pstyp = '7'      "stock transfer
+     AND loekz EQ space
+     AND ebakz EQ space
+     AND statu EQ 'N'    " not edited
+     AND reswk EQ p_werks.
+
+  SORT p_it_alloc.
+
+  LOOP AT it_eban.
+
+
+    p_it_alloc-matnr = it_eban-matnr.
+    p_it_alloc-qty = it_eban-menge.
+    COLLECT p_it_alloc.
+
+  ENDLOOP.
+
+ENDFORM.                    " find_open_TRANSPORT_REQUIS
+
+*&---------------------------------------------------------------------*
+*&      Form  find_open_transport_orders
+*&---------------------------------------------------------------------*
+FORM find_open_transport_orders  TABLES p_it_sohist STRUCTURE wa_sohist
+                                     p_it_alloc STRUCTURE wa_alloc.
+
+  SELECT b~ebeln b~ebelp b~matnr b~menge
+   INTO CORRESPONDING FIELDS OF TABLE it_ekpo
+      FROM ekko AS a
+      INNER JOIN ekpo AS b
+      ON  a~ebeln = b~ebeln
+     FOR ALL ENTRIES IN p_it_sohist
+     WHERE b~matnr EQ p_it_sohist-matnr
+     AND ( a~bsart = 'ZUB1' OR
+           a~bsart = 'ZNB4' )
+     AND a~reswk EQ p_werks
+     AND b~loekz EQ space.
+
+  CHECK sy-subrc EQ 0.
+
+* SELECT RECEIPT ITEMS
+  SELECT matnr menge bwart
+    INTO CORRESPONDING FIELDS OF TABLE it_ekbe
+   FROM ekbe
+  FOR ALL ENTRIES IN it_ekpo
+  WHERE   ebeln EQ it_ekpo-ebeln
+  AND ebelp EQ it_ekpo-ebelp
+  AND vgabe = '6'         " GOODS ISSUED
+  AND ( bwart = '641'      " MOVEMENT TYPE
+       OR bwart = '642' ).
+
+* ADD TRANSPORT ORDERS TO ALLOC TABLE
+  LOOP AT it_ekpo.
+
+    p_it_alloc-matnr = it_ekpo-matnr.
+    p_it_alloc-qty = it_ekpo-menge.
+    COLLECT p_it_alloc.
+
+  ENDLOOP.
+
+* SUBSTRACT ISSUED QTYS FROM ALLOC TABLE
+  LOOP AT it_ekbe .
+
+    p_it_alloc-matnr = it_ekbe-matnr.
+
+    IF it_ekbe-bwart EQ '641'.
+      p_it_alloc-qty = it_ekbe-menge.
+    ELSEIF it_ekbe-bwart EQ '642'.
+      p_it_alloc-qty = it_ekbe-menge * ( -1 ).
+    ENDIF.
+
+    COLLECT p_it_alloc.
+
+  ENDLOOP.
+
+ENDFORM.                    " find_open_transport_orders
+
+*&---------------------------------------------------------------------*
+*&      Form  find_material_info
+*&---------------------------------------------------------------------*
+FORM find_material_info.
+
+*  SELECT      a~matnr b~maktx a~prdha c~mtpos c~mvgr4
+*         INTO TABLE it_material
+*         FROM mara AS a
+*        INNER JOIN makt AS b
+*           ON a~matnr = b~matnr
+*        INNER JOIN mvke AS c
+*           ON a~matnr = c~matnr
+*          FOR ALL ENTRIES IN  it_sohist
+*        WHERE a~matnr =  it_sohist-matnr
+*          AND b~spras = 'E'
+*          AND c~vkorg EQ p_vkorg
+*          AND c~vtweg IN s_vtweg.
+*
+*  SORT IT_MATERIAL BY MATNR.
+
+  SELECT      a~matnr b~maktx a~prdha
+         INTO TABLE it_material
+         FROM mara AS a
+        INNER JOIN makt AS b
+           ON a~matnr = b~matnr
+          FOR ALL ENTRIES IN  it_sohist
+        WHERE a~matnr =  it_sohist-matnr
+          AND b~spras = 'E'.
+
+  SORT it_material BY matnr.
+
+  SELECT      matnr vkorg vtweg mtpos mvgr4
+         INTO TABLE it_mvke
+         FROM mvke
+          FOR ALL ENTRIES IN it_sohist
+        WHERE matnr =  it_sohist-matnr
+          AND vkorg EQ p_vkorg
+          AND vtweg EQ '01'.
+
+  SORT it_mvke BY matnr vkorg vtweg.
+
+ENDFORM.                    " find_material_info
+
+*&---------------------------------------------------------------------*
+*&      Form  find_supplier
+*&---------------------------------------------------------------------*
+FORM find_supplier.
+
+  SELECT      matnr lifnr flifn
+         INTO TABLE it_eord
+         FROM eord
+          FOR ALL ENTRIES IN it_sohist
+        WHERE matnr EQ it_sohist-matnr
+          AND werks EQ p_werks.
+
+ENDFORM.                    " find_supplier
+
+*&---------------------------------------------------------------------*
+*&      Module  STATUS_0200  OUTPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE status_0200 OUTPUT.
+  SET PF-STATUS '200'.
+  SET TITLEBAR '200'.
+
+ENDMODULE.                 " STATUS_0200  OUTPUT
+
+*&---------------------------------------------------------------------*
+*&      Module  PREPARE_ALV  OUTPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE prepare_alv OUTPUT.
+
+  PERFORM prepare_alv.
+
+ENDMODULE.                 " PREPARE_ALV  OUTPUT
+
+*&---------------------------------------------------------------------*
+*&      Form  prepare_alv
+*&---------------------------------------------------------------------*
+FORM prepare_alv .
+
+  IF my_container IS INITIAL.
+*create the container
+    CREATE OBJECT my_container
+      EXPORTING
+          repid           =  sy-repid
+          dynnr           =  sy-dynnr
+          lifetime        =  cntl_lifetime_dynpro
+*          ratio           =  90.
+          extension       =  5000.
+
+*create the ALV control
+    CREATE OBJECT my_alv
+      EXPORTING
+        i_parent = my_container.
+
+* CREATE THE HANDLER OBJECT
+    CREATE OBJECT obj_event_handler1.
+* SET  HANDLER FOR ALV
+    SET HANDLER obj_event_handler1->handle_hotspot_click FOR my_alv.
+
+*Set parameters regarding layout, etc.
+    wa_variant-report = sy-cprog.
+    wa_layout-no_toolbar = ' '.
+*create the fieldcatalog e.g. which fields to display
+    PERFORM create_fieldcat.
+*display the data in the ALV control
+    my_alv->set_table_for_first_display(
+                EXPORTING
+                    i_save        =  'A'
+                    is_variant    =  wa_variant
+                    is_layout     =  wa_layout
+                CHANGING
+                    it_outtab         =  it_output
+                    it_fieldcatalog   =  it_fieldcat
+                 EXCEPTIONS
+        invalid_parameter_combination = 1
+        program_error                 = 2
+        too_many_lines                = 3
+        OTHERS                        = 4 ).
+
+    WRITE:/ 'SUBRC',  sy-subrc.
+
+**Set thet event handler
+**    set handler lcl_event_handler=>on_hotspot_click
+**                    for my_alv.
+
+  ELSE.
+*If ALV control already exists, refresh data without changing the layout
+*-> 'soft'
+    my_alv->refresh_table_display(
+      EXPORTING
+          i_soft_refresh  =  'X' ).
+  ENDIF.
+
+ENDFORM.                    " prepare_alv
+
+*&---------------------------------------------------------------------*
+*&      Form  create_fieldcat
+*&---------------------------------------------------------------------*
+FORM create_fieldcat .
+
+  CLEAR wa_fieldcat.
+  wa_fieldcat-fieldname = 'PGC'.
+  wa_fieldcat-outputlen = 4.
+  wa_fieldcat-coltext = 'PGC'.
+  wa_fieldcat-fix_column = 'X'.
+  wa_fieldcat-emphasize = 'X'.
+  APPEND wa_fieldcat TO it_fieldcat.
+
+  CLEAR wa_fieldcat.
+  wa_fieldcat-fieldname = 'MATNR'.
+  wa_fieldcat-hotspot = 'X'.
+  wa_fieldcat-outputlen = 22.
+  wa_fieldcat-coltext = 'Material'(004).
+  wa_fieldcat-fix_column = 'X'.
+  wa_fieldcat-emphasize = 'X'.
+  APPEND wa_fieldcat TO it_fieldcat.
+
+  CLEAR wa_fieldcat.
+  wa_fieldcat-fieldname = 'MAKTX'.
+  wa_fieldcat-outputlen = 35.
+  wa_fieldcat-coltext = 'Material Description'(008).
+  wa_fieldcat-fix_column = 'X'.
+  wa_fieldcat-emphasize = 'X'.
+  APPEND wa_fieldcat TO it_fieldcat.
+
+  CLEAR wa_fieldcat.
+  wa_fieldcat-fieldname = 'DIST_MODE'.
+  wa_fieldcat-outputlen = 4.
+  wa_fieldcat-coltext = 'Dist_mode'(006).
+  wa_fieldcat-fix_column = 'X'.
+  wa_fieldcat-emphasize = 'X'.
+  APPEND wa_fieldcat TO it_fieldcat.
+
+  CLEAR wa_fieldcat.
+  wa_fieldcat-fieldname = 'LIFNR'.
+  wa_fieldcat-outputlen = 10.
+  wa_fieldcat-coltext = 'Supplier'(007).
+  wa_fieldcat-fix_column = 'X'.
+  wa_fieldcat-emphasize = 'X'.
+  APPEND wa_fieldcat TO it_fieldcat.
+
+  CLEAR wa_fieldcat.
+  wa_fieldcat-fieldname = 'WERKS'.
+  wa_fieldcat-outputlen = 4.
+  wa_fieldcat-coltext = 'Plant'(009).
+  wa_fieldcat-fix_column = 'X'.
+  wa_fieldcat-emphasize = 'X'.
+  APPEND wa_fieldcat TO it_fieldcat.
+
+  CLEAR wa_fieldcat.
+  wa_fieldcat-fieldname = 'ZMENG'.
+  wa_fieldcat-outputlen = 17.
+  wa_fieldcat-coltext = 'History quantity'(010).
+  wa_fieldcat-fix_column = 'X'.
+  wa_fieldcat-emphasize = 'X'.
+  APPEND wa_fieldcat TO it_fieldcat.
+
+  CLEAR wa_fieldcat.
+  wa_fieldcat-fieldname = 'ZLINE'.
+  wa_fieldcat-outputlen = 17.
+  wa_fieldcat-coltext = 'History lines'(011).
+  wa_fieldcat-fix_column = 'X'.
+  wa_fieldcat-emphasize = 'X'.
+  APPEND wa_fieldcat TO it_fieldcat.
+
+  CLEAR wa_fieldcat.
+  wa_fieldcat-fieldname = 'CONFC'.
+  wa_fieldcat-outputlen = 17.
+  wa_fieldcat-coltext = 'Weighted Annual Forecast'(012).
+  wa_fieldcat-fix_column = 'X'.
+  wa_fieldcat-emphasize = 'X'.
+  wa_fieldcat-decimals_o = 0.
+  APPEND wa_fieldcat TO it_fieldcat.
+
+  CLEAR wa_fieldcat.
+  wa_fieldcat-fieldname = 'LABST'.
+  wa_fieldcat-outputlen = 17.
+  wa_fieldcat-coltext = 'Stock quantity'(013).
+  wa_fieldcat-fix_column = 'X'.
+  wa_fieldcat-emphasize = 'X'.
+  APPEND wa_fieldcat TO it_fieldcat.
+
+  CLEAR wa_fieldcat.
+  wa_fieldcat-fieldname = 'ALL_QTY'.
+  wa_fieldcat-outputlen = 17.
+  wa_fieldcat-coltext = 'Allocated Qty'(019).
+  wa_fieldcat-fix_column = 'X'.
+  wa_fieldcat-emphasize = 'X'.
+  wa_fieldcat-decimals_o = 0.
+  APPEND wa_fieldcat TO it_fieldcat.
+
+  CLEAR wa_fieldcat.
+  wa_fieldcat-fieldname = 'STOCK_AVL'.
+  wa_fieldcat-outputlen = 14.
+  wa_fieldcat-coltext = 'Stock Availability'(020).
+  wa_fieldcat-fix_column = 'X'.
+  wa_fieldcat-emphasize = 'X'.
+  wa_fieldcat-decimals_o = 0.
+  APPEND wa_fieldcat TO it_fieldcat.
+
+  CLEAR wa_fieldcat.
+  wa_fieldcat-fieldname = 'STCKDYS'.
+  wa_fieldcat-outputlen = 12.
+  wa_fieldcat-coltext = 'Stock (in days)'(014).
+  wa_fieldcat-quantity = 'X'.
+  wa_fieldcat-fix_column = 'X'.
+  wa_fieldcat-emphasize = 'X'.
+  APPEND wa_fieldcat TO it_fieldcat.
+
+  CLEAR wa_fieldcat.
+  wa_fieldcat-fieldname = 'DELIVERY_COMMENT'.
+  wa_fieldcat-outputlen = 60.
+  wa_fieldcat-coltext = 'Delivery comment'(015).
+  wa_fieldcat-fix_column = 'X'.
+  wa_fieldcat-emphasize = 'X'.
+  APPEND wa_fieldcat TO it_fieldcat.
+
+  CLEAR wa_fieldcat.
+  wa_fieldcat-fieldname = 'PO_NUMBER'.
+  wa_fieldcat-outputlen = 9.
+  wa_fieldcat-coltext = 'PO number'(016).
+  wa_fieldcat-fix_column = 'X'.
+  wa_fieldcat-emphasize = 'X'.
+
+  APPEND wa_fieldcat TO it_fieldcat.
+
+  CLEAR wa_fieldcat.
+  wa_fieldcat-fieldname = 'EINDT'.
+  wa_fieldcat-outputlen = 23.
+  wa_fieldcat-coltext = 'Confirmed delivery date'(017).
+  wa_fieldcat-fix_column = 'X'.
+  wa_fieldcat-emphasize = 'X'.
+  APPEND wa_fieldcat TO it_fieldcat.
+
+  CLEAR wa_fieldcat.
+  wa_fieldcat-fieldname = 'MENGE'.
+  wa_fieldcat-outputlen = 14.
+  wa_fieldcat-coltext = 'Qty in transit'(018).
+  wa_fieldcat-fix_column = 'X'.
+  wa_fieldcat-emphasize = 'X'.
+  wa_fieldcat-decimals_o = 0.
+  APPEND wa_fieldcat TO it_fieldcat.
+
+ENDFORM.                    " create_fieldcat
+
+*&---------------------------------------------------------------------*
+*&      Module  EXIT_O200  INPUT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+MODULE exit_o200 INPUT.
+
+  MOVE ok_code TO save_ok_code.
+  CLEAR ok_code.
+
+  CASE save_ok_code.
+    WHEN 'BACK' OR 'CANCEL' OR 'EXIT'.
+      LEAVE TO SCREEN 0.
+  ENDCASE.
+
+ENDMODULE.                 " EXIT_O200  INPUT
+
+*&---------------------------------------------------------------------*
+*&      Form  fill_output_table
+*&---------------------------------------------------------------------*
+FORM fill_output_table.
+
+  DATA: l_ebeln TYPE ebeln,
+        l_eindt TYPE eindt,
+        l_menge TYPE bbmng.
+
+* For every line of sales history selected
+  LOOP AT it_sohist.
+
+*   Clear output structure
+    CLEAR wa_output.
+
+*   Find storage location information
+    READ TABLE it_mard WITH KEY matnr = it_sohist-matnr
+                       BINARY SEARCH.
+*   When found
+    IF sy-subrc EQ 0.
+*     Copy unr. stock
+      wa_output-labst = it_mard-labst.
+*   When not found, skip the current SOHIST line
+    ELSE.
+      CONTINUE.
+    ENDIF.
+
+*   Find stock forecast
+    CLEAR it_fchdr.
+    READ TABLE it_fchdr WITH KEY matnr = it_sohist-matnr
+                        BINARY SEARCH.
+    IF sy-subrc EQ 0.
+      wa_output-confc = it_fchdr-confc.
+    ELSE.
+      CLEAR wa_output-confc.
+    ENDIF.
+
+*   dist_mode
+    READ TABLE it_mvke WITH KEY matnr = it_sohist-matnr.
+    IF sy-subrc EQ 0.
+      CASE it_mvke-mtpos.
+        WHEN 'ZDTC'.
+          wa_output-dist_mode = 'DTC'.
+        WHEN 'NORM'.
+          IF it_mvke-mvgr4 = 'LCL'.
+            wa_output-dist_mode = 'LCL'.
+          ELSEIF it_mvke-mvgr4 EQ space.
+            wa_output-dist_mode = 'NDTC'.
+          ENDIF.
+      ENDCASE.
+    ENDIF.
+
+*   Enough stock ?
+    CLEAR: it_stock,
+           it_alloc2,
+           it_material,
+           enough_stock.
+*   Assume IT_STOCK line will be found (MARD was the basis for IT_STOCK
+*   and that table was already checked)
+    READ TABLE it_stock    WITH KEY matnr = it_sohist-matnr
+                           BINARY SEARCH.
+    READ TABLE it_alloc2   WITH KEY matnr = it_sohist-matnr
+                           BINARY SEARCH.
+    READ TABLE it_material WITH KEY matnr = it_sohist-matnr
+                           BINARY SEARCH.
+*   If material data not found, skip the sales hist line (should never occur)
+    IF sy-subrc NE 0.
+      CONTINUE.
+    ENDIF.
+    PERFORM calculate_days_of_stock.
+
+*   insert air22296.
+    wa_output-all_qty = it_alloc2-alloc_quantity.
+    wa_output-stock_avl = wa_output-labst - it_alloc2-alloc_quantity.
+*   Fill ALV with materials with not enough stock
+    CHECK enough_stock IS INITIAL.
+*   Stock in days in output table
+    wa_output-stckdys = p_days.
+*   Plant
+    wa_output-werks = p_werks.
+*   pgc(4)
+    wa_output-pgc   = it_material-prdha+4(4).
+*   matnr
+    wa_output-matnr = it_material-matnr.
+*   maktx
+    wa_output-maktx = it_material-maktx.
+*   dist_mode
+*    CASE it_material-mtpos.
+*      WHEN 'ZDTC'.
+*        wa_output-dist_mode = 'DTC'.
+*      WHEN 'NORM'.
+*        IF it_material-mvgr4 = 'LCL'.
+*          wa_output-dist_mode = 'LCL'.
+*        ELSEIF it_material-mvgr4 EQ space.
+*          wa_output-dist_mode = 'NDTC'.
+*        ENDIF.
+*    ENDCASE.
+
+*   Vendor
+    READ TABLE it_eord WITH KEY matnr = it_sohist-matnr
+                                flifn = c_x.
+    IF sy-subrc EQ 0.
+      wa_output-lifnr = it_eord-lifnr.
+    ENDIF.
+
+    wa_output-zmeng = it_sohist-zmeng.
+    wa_output-zline = it_sohist-zline.
+
+*   Delivery comment
+    CLEAR it_yse_em_matso.
+    READ TABLE it_yse_em_matso WITH KEY matnr = it_sohist-matnr.
+    wa_output-delivery_comment =  it_yse_em_matso-delcom.
+
+**   For every line of the table (key = material and plant)
+**   we will get the earliest confirmed PO number
+*    REFRESH it_ekpo_1.
+**   First select all the possible PO and their lines
+*    SELECT a~ebeln a~ebelp a~elikz a~erekz a~menge INTO
+*           TABLE it_ekpo_1 FROM ekpo AS a INNER JOIN ekko AS b
+*                     ON a~ebeln = b~ebeln
+*             WHERE a~matnr EQ wa_output-matnr
+*               AND a~werks EQ wa_output-werks
+*               AND a~loekz NE 'L'   "air22296 on 128
+*               AND b~bsart EQ 'ZNB1'.
+**   Now check EKES to see if we have matches
+*    REFRESH it_ekes_1.
+*    LOOP AT it_ekpo_1 INTO wa_ekpo_1.
+*      CLEAR lv_open.
+**     Check that the PO line is still open and not closed
+*      IF NOT wa_ekpo_1-elikz IS INITIAL.
+**       Item is closed
+*      ELSE.
+**       Could be open
+*        REFRESH it_ekbe_1.
+*        SELECT vgabe menge shkzg FROM ekbe INTO TABLE it_ekbe_1
+*                         WHERE ebeln EQ wa_ekpo_1-ebeln AND
+*                               ebelp EQ wa_ekpo_1-ebelp.
+**1). Check GR complete
+*        PERFORM check_ekbe USING ct_gr     "1
+*                                 wa_ekpo_1
+*                           CHANGING lv_open.
+*      ENDIF.
+**===========================
+**Calculation is over
+*      IF lv_open EQ 'X'.
+*        SELECT           ebeln eindt menge
+*               APPENDING TABLE it_ekes_1
+*                    FROM ekes
+*                    JOIN VBUK
+*                      ON EKES~VBELN EQ VBUK~VBELN
+*                   WHERE ebeln EQ wa_ekpo_1-ebeln
+*                     AND ebelp EQ wa_ekpo_1-ebelp
+*                     AND ebtyp = 'LA'
+*                     AND WBSTK NE 'C'.
+*      ENDIF .
+*    ENDLOOP.
+*
+**We need the earliest date issue 1997.
+*    SORT it_ekes_1 BY eindt ASCENDING.  "AIR22296 1/2
+**If there is more than one delivery for this po on the same date, sum
+**them.
+*    CLEAR: it_ekes_1, l_ebeln, l_eindt, l_menge.
+*    READ TABLE it_ekes_1 INTO wa_ekes_1 INDEX 1.
+*
+*
+*    IF sy-subrc EQ 0.
+*      l_ebeln = wa_ekes_1-ebeln.
+*      l_eindt = wa_ekes_1-eindt.
+*      LOOP AT it_ekes_1 INTO wa_ekes_1
+*        WHERE ebeln = l_ebeln
+*          AND eindt = l_eindt.
+*        ADD wa_ekes_1-menge TO l_menge.
+*      ENDLOOP.
+*
+*      wa_output-po_number = l_ebeln.
+*      wa_output-eindt = l_eindt.
+*      wa_output-menge = l_menge.
+*    ENDIF.
+
+*    Get latest Z001 PO Item for this material
+    READ TABLE it_ekes WITH KEY matnr = wa_output-matnr BINARY SEARCH.
+    IF sy-subrc EQ 0.
+      wa_output-po_number = it_ekes-ebeln.
+      wa_output-eindt     = it_ekes-eindt.
+      wa_output-menge     = it_ekes-menge.
+    ENDIF.
+*    Get earliest *not* Z001 PO Item for this material
+    READ TABLE it_eket WITH KEY matnr = wa_output-matnr BINARY SEARCH.
+    IF sy-subrc EQ 0 AND ( it_eket-eindt < wa_output-eindt OR wa_output-eindt IS INITIAL ).
+      wa_output-po_number = it_eket-ebeln.
+      wa_output-eindt     = it_eket-eindt.
+      wa_output-menge     = it_eket-menge.
+    ENDIF.
+
+    APPEND wa_output TO it_output.
+    CLEAR wa_output.
+
+  ENDLOOP.
+
+  SORT it_output BY zline DESCENDING.
+
+ENDFORM.                    " fill_output_table
+
+*&---------------------------------------------------------------------*
+*&      Form  calculate_days_of_stock
+*&---------------------------------------------------------------------*
+FORM calculate_days_of_stock.
+
+  DATA: lv_days TYPE p.
+  DATA: lv_n LIKE yse_em_whstypar-brkperc.
+
+* Stock in days = (stock ¨C allocations) / (history/240*N)
+
+* Calculate N
+*  IF it_material-mtpos EQ 'ZDTC'.
+  IF wa_output-dist_mode = 'DTC'.
+    lv_n = wa_em_whstypar-brkperc.
+  ELSE.
+    lv_n = 1.
+  ENDIF.
+
+  CLEAR lv_days.
+
+  TRY.
+      lv_days = ( ( it_stock-qty - it_alloc2-alloc_quantity ) ) /
+      ( it_fchdr-confc / 240 * lv_n ) .
+    CATCH cx_sy_zerodivide.
+  ENDTRY.
+
+  p_days = lv_days.
+
+  IF lv_days > wa_em_whstypar-stckdys.
+    enough_stock = 'X'.
+  ENDIF.
+
+ENDFORM.                    " calculate_days_of_stock
+
+*&---------------------------------------------------------------------*
+*&      Form  find_mat_sales_org_parms
+*&---------------------------------------------------------------------*
+FORM find_mat_sales_org_parms.
+
+  SELECT      *
+         INTO TABLE it_yse_em_matso
+         FROM yse_em_matso
+          FOR ALL ENTRIES IN it_sohist
+        WHERE matnr = it_sohist-matnr
+          AND vkorg = p_vkorg.
+
+
+
+ENDFORM.                    " find_mat_sales_org_parms
+
+*&---------------------------------------------------------------------*
+*&      Form  get_materials
+*&---------------------------------------------------------------------*
+FORM get_materials .
+  RANGES: r_matnr FOR marc-matnr.
+
+*  IF NOT P_MATNR IS INITIAL.
+*    R_MATNR-SIGN   = 'I'.
+*    R_MATNR-OPTION = 'EQ'.
+*    R_MATNR-LOW    = P_MATNR.
+*    APPEND R_MATNR.
+*  ENDIF.
+
+  SELECT      matnr werks dismm
+         FROM marc
+         INTO TABLE it_marc
+        WHERE matnr IN r_matnr  "addition air22296.
+          AND werks EQ p_werks
+          AND dismm EQ 'Z5'.
+
+ENDFORM.                    " get_materials
+
+*&---------------------------------------------------------------------*
+*&      Form  view_material
+*&---------------------------------------------------------------------*
+FORM view_material  USING    p_e_row_id.
+
+  READ TABLE it_output INTO wa_output INDEX p_e_row_id.
+
+  SET PARAMETER ID 'MAT' FIELD wa_output-matnr.
+  CALL TRANSACTION 'MM03' AND SKIP FIRST SCREEN.
+
+
+ENDFORM.                    " view_material
+
+*&---------------------------------------------------------------------*
+*&      Form  variant_inputhelp
+*&---------------------------------------------------------------------*
+FORM variant_inputhelp  USING    var.
+
+  DATA: lv_variant_save TYPE c VALUE 'U',
+   lv_exit.
+
+  CLEAR lv_exit.
+  wa_variant-report    = sy-repid.
+
+  CALL FUNCTION 'REUSE_ALV_VARIANT_F4'
+    EXPORTING
+      is_variant    = wa_variant
+      i_save        = lv_variant_save
+    IMPORTING
+      e_exit        = lv_exit
+      es_variant    = wa_variant
+    EXCEPTIONS
+      not_found     = 1
+      program_error = 2
+      OTHERS        = 3.
+
+  IF sy-subrc IS INITIAL AND lv_exit IS INITIAL.
+    wa_variant-variant = wa_variant-variant.
+    var               = wa_variant-variant.
+  ENDIF.
+
+ENDFORM.                    " variant_inputhelp
+
+*&---------------------------------------------------------------------*
+*&      Form  Check_Authorization
+*&---------------------------------------------------------------------*
+FORM check_authorization .
+
+  AUTHORITY-CHECK OBJECT 'M_MATE_WRK'
+           ID 'ACTVT' DUMMY
+           ID 'WERKS' FIELD p_werks.
+
+  IF sy-subrc = 4.
+*   No authorisation to display data from Sales Organisation p_vkorg
+    MESSAGE ID 'YSE_GENERAL' TYPE 'E' NUMBER '008' WITH p_werks.
+  ELSEIF sy-subrc <> 0.
+*   Error checking authorization.
+    MESSAGE ID 'YSE_GENERAL' TYPE 'E' NUMBER '004'.
+  ENDIF.
+
+ENDFORM.                    " Check_Authorization
+
+*&---------------------------------------------------------------------*
+*&      Form  check_ekbe
+*&---------------------------------------------------------------------*
+FORM check_ekbe  USING    p_gr
+                          p_ekpo LIKE it_ekpo_1
+                 CHANGING p_lv_open.
+
+  CLEAR lv_tot_qty.
+  LOOP AT it_ekbe_1 INTO wa_ekbe_1
+                WHERE vgabe EQ p_gr.    "all GR
+    IF wa_ekbe_1-shkzg EQ 'S'.
+      lv_tot_qty = lv_tot_qty + wa_ekbe_1-menge.
+    ELSE.   " = 'H'
+      lv_tot_qty = lv_tot_qty - wa_ekbe_1-menge.
+    ENDIF.
+  ENDLOOP.
+
+  IF lv_tot_qty >= p_ekpo-menge.
+*Closed
+  ELSE.
+*Open
+    lv_open = 'X'.
+  ENDIF.
+
+ENDFORM.                    " check_ekbe
+
+*&---------------------------------------------------------------------*
+*&      Form  round_value
+*&---------------------------------------------------------------------*
+FORM round_value  CHANGING number.
+
+  CALL FUNCTION 'ROUND'
+    EXPORTING
+      decimals      = 0
+      input         = number
+*     sign          = ' '
+    IMPORTING
+      output        = number
+    EXCEPTIONS
+      input_invalid = 1
+      overflow      = 2
+      type_invalid  = 3
+      OTHERS        = 4.
+  IF sy-subrc <> 0.
+*   message id sy-msgid type sy-msgty number sy-msgno
+*           with sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+ENDFORM.                    " round_value
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_WAF
+*&---------------------------------------------------------------------*
+FORM get_waf.
+
+  REFRESH it_fchdr.
+
+  SELECT      *
+         FROM yse_em_fchdr
+         INTO TABLE it_fchdr
+          FOR ALL ENTRIES IN it_marc
+        WHERE matnr EQ it_marc-matnr
+          AND werks EQ p_werks.
+
+  SORT it_fchdr BY matnr. " plant is a constant in the int table
+
+ENDFORM.                    " GET_WAF
+
+*&---------------------------------------------------------------------*
+*&      Form  SEND2SPOOL
+*&---------------------------------------------------------------------*
+FORM send2spool .
+
+  DATA:
+    fnam             LIKE rlgrap-filename,
+    it_dd03l         LIKE dd03l OCCURS 0 WITH HEADER LINE,
+    it_dd04t         LIKE dd04t OCCURS 0 WITH HEADER LINE,
+    it_outxls(4096)  TYPE c OCCURS 0,
+    wa_outxls(4096)  TYPE c,
+    v_dat            LIKE sy-datum,
+    v_tim            LIKE sy-uzeit,
+    user_name        LIKE sy-uname.
+
+  CONSTANTS:
+    c_tab TYPE c VALUE cl_abap_char_utilities=>horizontal_tab.
+
+* Get fields of structure 'YSE_SL_STALM_OUT'
+  SELECT *
+         FROM dd03l
+         INTO TABLE it_dd03l
+        WHERE tabname = 'YSE_SL_STALM_OUT'.
+
+* Get the descriptions of the fields in the structure
+  SELECT *
+         FROM dd04t
+         INTO TABLE it_dd04t
+          FOR ALL ENTRIES IN it_dd03l
+        WHERE rollname EQ it_dd03l-rollname
+          AND ddlanguage EQ 'EN'.
+
+* Build filename
+  v_dat = sy-datum.
+  v_tim = sy-uzeit.
+  user_name = sy-uname.
+  CONCATENATE '/var/load/' sy-sysid '/UK/original/YSE_STALM_'
+              user_name '_' v_dat '_' v_tim '.TXT'
+         INTO fnam.
+
+* Make the output table ; delimited
+  CALL FUNCTION 'SAP_CONVERT_TO_TEX_FORMAT'
+    EXPORTING
+      i_field_seperator    = '¡ì'
+    TABLES
+      i_tab_sap_data       = it_output
+    CHANGING
+      i_tab_converted_data = it_outxls
+    EXCEPTIONS
+      conversion_failed    = 1
+      OTHERS               = 2.
+*  CALL FUNCTION 'SAP_CONVERT_TO_CSV_FORMAT'
+*    EXPORTING
+*      I_FIELD_SEPERATOR    = '¡ì'
+*    TABLES
+*      I_TAB_SAP_DATA       = IT_OUTPUT
+*    CHANGING
+*      I_TAB_CONVERTED_DATA = IT_OUTXLS
+*    EXCEPTIONS
+*      CONVERSION_FAILED    = 1
+*      OTHERS               = 2.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+* Open file
+  OPEN DATASET fnam FOR OUTPUT IN TEXT MODE ENCODING DEFAULT.
+  IF sy-subrc <> 0.
+    WRITE 'Error opening file. Action aborted.'.
+    EXIT.
+  ENDIF.
+
+* Write header line
+  CLEAR wa_outxls.
+  SORT it_dd03l BY position.
+  LOOP AT it_dd03l.
+    READ TABLE it_dd04t WITH KEY rollname = it_dd03l-rollname.
+    IF wa_outxls IS INITIAL.
+      wa_outxls = it_dd04t-reptext.
+    ELSE.
+      CONCATENATE wa_outxls c_tab it_dd04t-reptext INTO wa_outxls.
+    ENDIF.
+  ENDLOOP.
+  TRANSFER wa_outxls TO fnam.
+
+* Process lines
+  LOOP AT it_outxls INTO wa_outxls.
+    REPLACE ALL OCCURRENCES OF '¡ì' IN wa_outxls WITH c_tab.
+    TRANSFER wa_outxls TO fnam.
+  ENDLOOP.
+
+  CLOSE DATASET fnam.
+
+  WRITE: 'Report output written to file: ',
+         fnam.
+
+ENDFORM.                    " SEND2SPOOL
+
+*&---------------------------------------------------------------------*
+*&      Form  FIND_OPEN_POI
+*&---------------------------------------------------------------------*
+FORM find_open_poi .
+
+  DATA:
+    lv_prev_ebeln LIKE ekpo-ebeln,
+    lv_prev_ebelp LIKE ekpo-ebelp,
+    BEGIN OF lt_matnr OCCURS 0,
+      matnr LIKE ekpo-matnr,
+    END OF lt_matnr,
+    BEGIN OF lt_ekbe OCCURS 0,
+      ebeln LIKE ekbe-ebeln,
+      ebelp LIKE ekbe-ebelp,
+      zekkn LIKE ekbe-zekkn,
+      vgabe LIKE ekbe-vgabe,
+      gjahr LIKE ekbe-gjahr,
+      belnr LIKE ekbe-belnr,
+      buzei LIKE ekbe-buzei,
+      menge LIKE ekbe-menge,
+      shkzg LIKE ekbe-shkzg,
+    END OF lt_ekbe,
+    BEGIN OF lt_poi_delivered OCCURS 0,
+      ebeln LIKE ekbe-ebeln,
+      ebelp LIKE ekbe-ebelp,
+      menge LIKE ekbe-menge,
+    END OF lt_poi_delivered,
+    BEGIN OF lt_poi_for_ekes OCCURS 0,
+      ebeln LIKE ekpo-ebeln,
+      ebelp LIKE ekpo-ebelp,
+    END OF lt_poi_for_ekes,
+    BEGIN OF lt_poi_for_eket OCCURS 0,
+      ebeln LIKE ekpo-ebeln,
+      ebelp LIKE ekpo-ebelp,
+    END OF lt_poi_for_eket,
+    BEGIN OF lt_ekpo_cr67 OCCURS 0,
+      ebeln LIKE ekpo-ebeln,
+      ebelp LIKE ekpo-ebelp,
+      bsart LIKE ekko-bsart,
+      bstae LIKE ekpo-bstae,
+      elikz LIKE ekpo-elikz,
+      menge LIKE ekpo-menge,
+      matnr LIKE ekpo-matnr,
+      werks LIKE ekpo-werks,
+    END OF lt_ekpo_cr67.
+
+  RANGES:
+    lr_ebelp FOR lt_ekbe-ebelp,
+    lr_zekkn FOR lt_ekbe-zekkn.
+
+* Don't do this if no materials selected
+  CHECK NOT it_material[] IS INITIAL.
+
+* Build list of unique material number which are about to be displayed (dropping plant, is fixed anyway)
+  SORT it_material BY matnr.
+  LOOP AT it_material.
+    lt_matnr-matnr = it_material-matnr.
+    APPEND lt_matnr.
+  ENDLOOP.
+  DELETE ADJACENT DUPLICATES FROM lt_matnr.
+
+* Get PO items with the materials in them which are about to be displayed
+  SELECT      ekpo~ebeln ebelp bsart bstae elikz menge matnr werks
+         FROM ekpo
+         JOIN ekko
+           ON ekko~ebeln EQ ekpo~ebeln
+         INTO TABLE lt_ekpo_cr67
+          FOR ALL ENTRIES IN lt_matnr
+        WHERE matnr EQ lt_matnr-matnr
+          AND werks EQ p_werks
+          AND bsart EQ 'ZNB1'
+          AND ekpo~loekz EQ space.
+  SORT lt_ekpo_cr67 BY ebeln ebelp.
+* Only keep those which don't have the "fully delivered" flag set
+  LOOP AT lt_ekpo_cr67.
+    IF lt_ekpo_cr67-elikz NE space.
+      DELETE lt_ekpo_cr67.
+    ENDIF.
+  ENDLOOP.
+
+* Don't continue if no PO Items found
+  CHECK NOT lt_ekpo_cr67[] IS INITIAL.
+
+* Get delivery history for *all* items of prev sel orders
+  SELECT      ebeln ebelp zekkn vgabe gjahr belnr buzei menge shkzg
+         INTO TABLE lt_ekbe
+         FROM ekbe
+          FOR ALL ENTRIES IN lt_ekpo_cr67
+        WHERE ebeln EQ lt_ekpo_cr67-ebeln
+          AND ebelp IN lr_ebelp    " Range is empty, so all items will be returned, but this will be more performant
+          AND zekkn IN lr_zekkn
+          AND vgabe EQ '1'.
+
+* Loop over PO item history to come up with 1 delivered qty per PO item
+  CLEAR: lt_poi_delivered, lt_poi_delivered[].
+  SORT lt_ekbe BY ebeln ebelp vgabe shkzg.
+* Loop over PO item history
+  LOOP AT lt_ekbe.
+*   If we reached a new PO item
+    IF lt_poi_delivered-ebeln NE lt_ekbe-ebeln OR lt_poi_delivered-ebelp NE lt_ekbe-ebelp.
+*     If a line has already been prepared
+      IF NOT lt_poi_delivered-ebeln IS INITIAL AND NOT lt_poi_delivered-ebelp IS INITIAL.
+*       First save the total for the previous PO item
+        APPEND lt_poi_delivered.
+*       Initialise the totalling header line for a new po
+        CLEAR lt_poi_delivered.
+      ENDIF.
+*     Put the PO item identifiers in the totalling header line
+      lt_poi_delivered-ebeln = lt_ekbe-ebeln.
+      lt_poi_delivered-ebelp = lt_ekbe-ebelp.
+    ENDIF.
+*   Now process the quantity
+    IF lt_ekbe-shkzg = 'S'.
+      lt_poi_delivered-menge = lt_poi_delivered-menge + lt_ekbe-menge.
+    ELSEIF lt_ekbe-shkzg = 'H'.
+      lt_poi_delivered-menge = lt_poi_delivered-menge - lt_ekbe-menge.
+    ENDIF.
+  ENDLOOP.
+* Save the totalling lines if they are not initial (in that case, they contain the total for the last processed PO item history.
+  IF NOT lt_poi_delivered-ebeln IS INITIAL AND NOT lt_poi_delivered-ebelp IS INITIAL.
+    APPEND lt_poi_delivered.
+  ENDIF.
+
+* Loop over PO items and keep only those which are not fully delivered from quantity point of view.
+* Also copy the PO items which are kept to either of the 2 tables which will be later used to select from appropriate table (EKES / EKET)
+  LOOP AT lt_ekpo_cr67.
+
+*   Find delivered qty
+    READ TABLE lt_poi_delivered WITH KEY ebeln = lt_ekpo_cr67-ebeln
+                                         ebelp = lt_ekpo_cr67-ebelp
+                                BINARY SEARCH.
+*   When delivered qty found and equal to ordered quantity
+    IF sy-subrc EQ 0 AND lt_poi_delivered-menge = lt_ekpo_cr67-menge.
+*     Don't keep PO item (since it's closed)
+      DELETE lt_ekpo_cr67.
+*   Otherwise PO item is still open, so either EKES or EKET will have to be read ...
+    ELSE.
+*     If confirmation control key = "Z001"
+      IF lt_ekpo_cr67-bstae = 'Z001'.
+        lt_poi_for_ekes-ebeln = lt_ekpo_cr67-ebeln.
+        lt_poi_for_ekes-ebelp = lt_ekpo_cr67-ebelp.
+        APPEND lt_poi_for_ekes.
+      ELSE.
+        lt_poi_for_eket-ebeln = lt_ekpo_cr67-ebeln.
+        lt_poi_for_eket-ebelp = lt_ekpo_cr67-ebelp.
+        APPEND lt_poi_for_eket.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+* Select from EKES
+  IF NOT lt_poi_for_ekes[] IS INITIAL.
+    SELECT      ekes~ebeln ekes~ebelp ekes~etens ekes~eindt ekpo~matnr ekes~menge
+           FROM ekes
+           JOIN ekpo
+             ON ekes~ebeln EQ ekpo~ebeln
+            AND ekes~ebelp EQ ekpo~ebelp
+           INTO TABLE it_ekes
+            FOR ALL ENTRIES IN lt_poi_for_ekes
+          WHERE ekes~ebeln EQ lt_poi_for_ekes-ebeln
+            AND ekes~ebelp EQ lt_poi_for_ekes-ebelp
+            AND ekes~ebtyp EQ 'LA'
+            AND ekpo~loekz EQ space.
+  ENDIF.
+* Select from EKET
+  IF NOT lt_poi_for_eket[] IS INITIAL.
+    SELECT      eket~ebeln eket~ebelp eket~etenr eket~eindt ekpo~matnr ekpo~menge
+           FROM eket
+           JOIN ekpo
+             ON eket~ebeln EQ ekpo~ebeln
+            AND eket~ebelp EQ ekpo~ebelp
+           INTO TABLE it_eket
+            FOR ALL ENTRIES IN lt_poi_for_eket
+          WHERE eket~ebeln EQ lt_poi_for_eket-ebeln
+            AND eket~ebelp EQ lt_poi_for_eket-ebelp
+            AND ekpo~loekz EQ space.
+  ENDIF.
+
+* Sort the dates per material number and descending date
+  SORT:
+    it_ekes BY matnr ASCENDING eindt ASCENDING,
+    it_eket BY matnr ASCENDING eindt ASCENDING.
+
+* Loop over the Z001 PO items
+  CLEAR: lv_prev_ebeln, lv_prev_ebelp.
+  LOOP AT it_ekes.
+*   First entry for an item is the most recent one (thanks to sorting), so delete if this is not the first line for a PO item
+    IF it_ekes-ebeln EQ lv_prev_ebeln AND it_ekes-ebelp EQ lv_prev_ebelp.
+      DELETE it_ekes.
+    ELSE.
+      lv_prev_ebeln = it_ekes-ebeln.
+      lv_prev_ebelp = it_ekes-ebelp.
+    ENDIF.
+  ENDLOOP.
+* Loop over the *not* Z001 PO items
+  CLEAR: lv_prev_ebeln, lv_prev_ebelp.
+  LOOP AT it_eket.
+*   First entry for an item is the earliest one (thanks to sorting), so delete if this is not the first line for a PO item
+    IF it_eket-ebeln EQ lv_prev_ebeln AND it_eket-ebelp EQ lv_prev_ebelp.
+      DELETE it_eket.
+    ELSE.
+      lv_prev_ebeln = it_eket-ebeln.
+      lv_prev_ebelp = it_eket-ebelp.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    " FIND_OPEN_POI
+
+*Text symbol text£º
+*001:Selections
+*002:Include Safety Stock in Calculation of Allocations
+*003:ALV
+*004:Material
+*005:Plants
+*006:Dist_mode
+*007:Supplier
+*008:Material Description
+*009:Plant
+*010:History quantity
+*011:History lines
+*012:Weighted Annual Forecast
+*013:Stock quantity
+*014:Stock (in days)
+*015:Delivery comment
+*016:PO number
+*017:Confirmed delivery date
+*018:Qty in transit
+*019:Allocated Qty
+*020:Stock Availability
+
+*021:Temporary selection parameters !!
+*Selection text£º
+*P_EISBE:        Include Safety Stock
+*P_MATNR:D       .
+*P_VAR:        ALV variant
+*P_VKORG:D       .
+*P_WERKS:D       .
+*S_PSTYV:D       .
+*S_VTWEG:D       .

@@ -1,0 +1,461 @@
+************************************************************************
+* Program ID           : YSE_REN_LOST_ORDER                            *
+* Program Title        : REN: Lost order report                        *
+* Author               : Erik Walravens                                *
+* Date                 : 20.11.2006                                    *
+* Development number   : D034                                          *
+* Change Request Number: CD1K907770                                    *
+* Description          : Overview of lost orders with reason code      *
+************************************************************************
+* Notes: NAICS code will need to be copied too, but it isn't yet       *
+*        implemented.                                                  *
+************************************************************************
+* Change History Log                                                   *
+*----------------------------------------------------------------------*
+* Mod. no.|  Date    | Name           | Correction Number | Change Ref *
+*----------------------------------------------------------------------*
+* MOD-001 |22/03/2007| Erik Walravens | CD1K912933        | 001        *
+* Description: Added Customer nr, customer name, item net value.       *
+*----------------------------------------------------------------------*
+* MOD-002 |29/03/2007| Erik Walravens | CD1K913364        | 002        *
+* Description: Changed Net Value for Item Credit Price.                *
+************************************************************************
+REPORT  yse_ren_lost_order.
+
+************************************************************************
+* TABLES                                                               *
+************************************************************************
+TABLES: veda.
+
+************************************************************************
+* TYPE-POOLS                                                           *
+************************************************************************
+TYPE-POOLS slis.
+
+************************************************************************
+* CONSTANTS                                                            *
+************************************************************************
+CONSTANTS:
+  lc_vbtyp_quot  TYPE c           VALUE 'B',
+  LC_AUART_RENQ  TYPE AUART       VALUE 'ZQT', " Rental Quotations
+  lc_soldto      TYPE vbpa-parvw  VALUE 'AG',  " SoldTo partner
+  lc_true        TYPE c           VALUE 'X',
+  LC_PCB         TYPE KVGR2       VALUE 'PCB', " Calculated billing
+  LC_PCM         TYPE KVGR2       VALUE 'PCM', " Monthly billing
+  lc_spras_en    LIKE tvagt-spras VALUE 'E'.
+
+************************************************************************
+* DATA                                                                 *
+************************************************************************
+* Own data
+DATA:
+  lv_vkorg        TYPE vbak-vkorg,      " Sales organisation
+  lv_vkbur        TYPE vbak-vkbur.      " Sales office
+* Process
+DATA:
+  lv_ctr_lost     TYPE i,               " number of lost orders
+  lv_vbeln        TYPE vbak-vbeln,
+  gv_repid        LIKE sy-repid.
+* ALV
+DATA:
+    lv_layout     TYPE slis_layout_alv. " ALV grid layout.
+
+************************************************************************
+* INTERNAL TYPES                                                       *
+************************************************************************
+TYPES:
+  BEGIN OF STR_LOST,
+    VBELN        TYPE VBAK-VBELN,
+    VKORG        TYPE VBAK-VKORG,
+    VTWEG        LIKE VBAK-VTWEG,
+    VKBUR        TYPE VBAK-VKBUR,
+    YYSE_HITRATE LIKE VBAK-YYSE_HITRATE,
+    KVGR2        LIKE VBAK-KVGR2,
+    POSNR        TYPE VBAP-POSNR,
+    MATNR        TYPE VBAP-MATNR,
+    NETPR        TYPE VBAP-NETPR,      " VBAP-NETWR,
+    WAERK        TYPE VBAP-WAERK,
+    ABGRU        TYPE VBAP-ABGRU,
+    VKAUS        TYPE VBAP-VKAUS,
+    VBEGDAT      TYPE VEDA-VBEGDAT,
+    VENDDAT      TYPE VEDA-VENDDAT,
+    KUNNR        TYPE VBPA-KUNNR,
+    NAME1        TYPE KNA1-NAME1,
+    MAKTX        TYPE MAKT-MAKTX,
+    BEZEI        TYPE TVAGT-BEZEI,
+  END OF STR_LOST,
+
+  BEGIN OF str_vbpa,
+   vbeln        TYPE vbpa-vbeln,
+   posnr        TYPE vbpa-posnr,
+   kunnr        TYPE vbpa-kunnr,
+   name1        TYPE kna1-name1,         " Name
+  END OF str_vbpa.
+
+************************************************************************
+* INTERNAL TABLES                                                      *
+************************************************************************
+DATA: it_lost_orders  TYPE TABLE OF str_lost WITH HEADER LINE,
+      it_lost_orders2 TYPE TABLE OF str_lost WITH HEADER LINE,
+      it_partners     TYPE TABLE OF str_vbpa WITH HEADER LINE,
+      it_veda         TYPE TABLE OF veda     WITH HEADER LINE,
+      it_makt         TYPE TABLE OF makt     WITH HEADER LINE,
+      it_tvagt        TYPE TABLE OF tvagt    WITH HEADER LINE.
+
+************************************************************************
+* SELECTION SCREEN                                                     *
+************************************************************************
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE text-s01.
+PARAMETERS: p_vkorg LIKE vbak-vkorg OBLIGATORY MEMORY ID VKO,
+            P_VTWEG LIKE VBAK-VTWEG OBLIGATORY DEFAULT '21',
+            p_vkbur LIKE vbak-vkbur OBLIGATORY MEMORY ID VKB,
+            p_start LIKE vbak-erdat OBLIGATORY,
+            p_end   LIKE vbak-erdat OBLIGATORY.
+SELECT-OPTIONS:
+  SO_ABGRU FOR IT_LOST_ORDERS-ABGRU.
+SELECTION-SCREEN END OF BLOCK b1.
+************************************************************************
+* AT SELECTION SCREEN                                                  *
+************************************************************************
+AT SELECTION-SCREEN.
+
+  PERFORM check_authorization.
+
+************************************************************************
+* INITIALIZATION                                                       *
+************************************************************************
+INITIALIZATION.
+
+  gv_repid = sy-repid.
+
+  P_END = SY-DATUM.
+
+  CALL FUNCTION 'RE_ADD_MONTH_TO_DATE'
+    EXPORTING
+      MONTHS        = -6
+      OLDDATE       = SY-DATUM
+    IMPORTING
+      NEWDATE       = P_START.
+
+************************************************************************
+* START OF SELECTION                                                   *
+************************************************************************
+START-OF-SELECTION.
+
+  DATA:
+    LV_USE,
+    LV_FAKCA TYPE FAKCA,
+    LV_TAGE      TYPE ANZ_TAGE,
+    LV_MTH_F     TYPE ANZ_MONATE,
+    LV_MTH_I     TYPE TFMATAGE,
+    LV_TEMP_DATE TYPE DATUM.
+
+* Note: During initial meetings it was decided that the creation date
+*       of the quotation (vbak-erdat) determines which document fall
+*       within the selected period.
+* Read all rejected quotations within user parameters.
+  CLEAR SO_ABGRU.
+  SO_ABGRU-SIGN   = 'E'.
+  SO_ABGRU-OPTION = 'EQ'.
+  APPEND SO_ABGRU.
+  SELECT b~vbeln b~vkorg B~VTWEG b~vkbur B~YYSE_HITRATE
+         B~KVGR2
+         a~posnr a~matnr a~netpr a~waerk a~abgru
+         A~VKAUS
+      INTO CORRESPONDING FIELDS OF TABLE it_lost_orders
+      FROM vbap AS a
+     INNER JOIN vbak AS b
+        ON a~vbeln EQ b~vbeln
+     WHERE B~AUART   EQ LC_AUART_RENQ
+       AND b~vkorg   EQ p_vkorg
+       AND B~VTWEG   EQ P_VTWEG
+       AND b~vkbur   EQ p_vkbur
+       AND b~erdat   GE p_start            "  creation
+       AND b~erdat   LE p_end              "  date
+       AND b~vbtyp   EQ lc_vbtyp_quot
+       AND a~abgru   IN SO_ABGRU.
+
+* Count lost orders
+  it_lost_orders2[] = it_lost_orders[].
+  DELETE ADJACENT DUPLICATES FROM it_lost_orders2 COMPARING vbeln.
+  DESCRIBE TABLE it_lost_orders2 LINES lv_ctr_lost.
+
+* if any records
+  IF lv_ctr_lost NE 0.
+
+*   Read contract start and end for header data
+    SELECT *
+        FROM veda
+        INTO TABLE it_veda
+         FOR ALL ENTRIES IN it_lost_orders
+       WHERE vbeln EQ it_lost_orders-vbeln
+         AND vposn EQ space.               " vposn = '' -> header
+
+*   Read rejection code descriptions
+    SELECT *
+        FROM tvagt
+        INTO TABLE it_tvagt
+       WHERE spras EQ lc_spras_en.         "English exception codes
+
+*   Get material descriptions
+    SELECT matnr maktx
+        FROM makt
+        INTO CORRESPONDING FIELDS OF TABLE it_makt
+       WHERE spras = lc_spras_en.
+
+*   Get sold-to partners
+    SELECT vbpa~vbeln vbpa~posnr vbpa~kunnr kna1~name1
+        INTO CORRESPONDING FIELDS OF TABLE it_partners
+        FROM vbpa
+        JOIN kna1
+          ON kna1~kunnr EQ vbpa~kunnr
+         FOR ALL entries IN it_lost_orders
+       WHERE vbpa~vbeln EQ it_lost_orders-vbeln
+       AND ( vbpa~posnr EQ it_lost_orders-posnr
+        OR   vbpa~posnr EQ space )
+         AND vbpa~parvw EQ lc_soldto.
+
+*   Put data in displaying table
+    LOOP AT it_lost_orders.
+*     Get contract dates
+      READ TABLE it_veda WITH KEY vbeln = it_lost_orders-vbeln.
+      IF SY-SUBRC EQ 0.
+        it_lost_orders-vbegdat = it_veda-vbegdat.
+        it_lost_orders-venddat = it_veda-venddat.
+      ENDIF.
+*     Get soldto (can be simplified taking KUNNR from VBAK?)
+      READ TABLE it_partners WITH KEY vbeln = it_lost_orders-vbeln
+                                      posnr = it_lost_orders-posnr.
+      IF sy-subrc <> 0.
+        READ TABLE it_partners WITH KEY vbeln = it_lost_orders-vbeln
+                                        posnr = space.
+      ENDIF.
+      IF SY-SUBRC EQ 0.
+        it_lost_orders-kunnr = it_partners-kunnr.
+        it_lost_orders-name1 = it_partners-name1.
+      ENDIF.
+*     Get material description
+      READ TABLE it_makt WITH KEY matnr = it_lost_orders-matnr.
+      IF SY-SUBRC EQ 0.
+        it_lost_orders-maktx = it_makt-maktx.
+      ENDIF.
+*     Get description for the reason for rejection
+      READ TABLE it_tvagt WITH KEY abgru = it_lost_orders-abgru.
+      IF SY-SUBRC EQ 0.
+        it_lost_orders-bezei = it_tvagt-bezei.
+      ENDIF.
+
+*     Recalculate net value... for Calculated (daily) billing
+      CLEAR: LV_TAGE, LV_MTH_I, LV_MTH_F, LV_TEMP_DATE.
+      IF IT_LOST_ORDERS-KVGR2 EQ LC_PCB.
+*       If 5/7 regime, don't count the weekends/holidays
+        IF IT_LOST_ORDERS-VKAUS(1) = '5'.
+          LV_USE   = 'B'.
+          LV_FAKCA = '99'.
+*       If 7/7 regime, count all days
+        ELSE.
+          LV_USE   = 'A'.
+          LV_FAKCA = SPACE.
+        ENDIF.
+        CALL FUNCTION 'YSE_REN_CALC_DAYS'
+          EXPORTING
+            I_FKDAT               = IT_LOST_ORDERS-VENDDAT
+            I_NFDAT               = IT_LOST_ORDERS-VBEGDAT
+            I_FAKCA               = LV_FAKCA
+            I_USE                 = LV_USE
+          CHANGING
+            E_ANZ_TAGE            = LV_TAGE
+          EXCEPTIONS
+            FAKCA_NOT_FOUND       = 1
+            OTHERS                = 2.
+        IT_LOST_ORDERS-NETPR = IT_LOST_ORDERS-NETPR * LV_TAGE.
+
+*     Recalculate net value... for Monthly billing
+      ELSEIF IT_LOST_ORDERS-KVGR2 EQ LC_PCM.
+
+*       Get number of full months
+        CALL FUNCTION 'FIMA_DAYS_AND_MONTHS_AND_YEARS'
+          EXPORTING
+            I_DATE_FROM          = IT_LOST_ORDERS-VBEGDAT
+            I_DATE_TO            = IT_LOST_ORDERS-VENDDAT
+            I_FLG_SEPARATE       = 'X'
+          IMPORTING
+            E_MONTHS             = LV_MTH_I.
+
+*       Get temporary date: start date + full months
+        CALL FUNCTION 'RE_ADD_MONTH_TO_DATE'
+          EXPORTING
+            MONTHS        = LV_MTH_I
+            OLDDATE       = IT_LOST_ORDERS-VBEGDAT
+          IMPORTING
+            NEWDATE       = LV_TEMP_DATE.
+
+*       Get remaining days in number of months (should be < 1)
+        LV_USE   = 'A'.
+        LV_FAKCA = SPACE.
+        CALL FUNCTION 'YSE_REN_CALC_DAYS'
+          EXPORTING
+            I_FKDAT               = IT_LOST_ORDERS-VENDDAT
+            I_NFDAT               = LV_TEMP_DATE
+            I_USE                 = LV_USE
+          CHANGING
+            E_ANZ_MONATE          = LV_MTH_F
+          EXCEPTIONS
+            FAKCA_NOT_FOUND       = 1
+            OTHERS                = 2.
+
+        LV_MTH_F = LV_MTH_F + LV_MTH_I.
+
+        IT_LOST_ORDERS-NETPR = IT_LOST_ORDERS-NETPR * LV_MTH_F.
+
+      ENDIF.
+
+      MODIFY it_lost_orders.
+    ENDLOOP.
+
+*   Display data in alv grid
+    PERFORM build_alv.
+  ENDIF.          " If no data, don't display anything.
+
+*&---------------------------------------------------------------------*
+*&      Form  BUILD_ALV                                                *
+*&---------------------------------------------------------------------*
+FORM build_alv.
+
+  lv_layout-colwidth_optimize = lc_true.
+
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+    EXPORTING
+         i_background_id          = 'ALV_BACKGROUND'
+         i_callback_program       = gv_repid
+         I_CALLBACK_USER_COMMAND  = 'ALV_USER_COMMAND'
+         i_callback_top_of_page   = 'TOP-OF-PAGE'
+         i_structure_name         = 'YSE_REN_LOST_ORDERS'
+         is_layout                = lv_layout
+         i_save                   = 'A'
+    TABLES
+         t_outtab = it_lost_orders
+    EXCEPTIONS
+         program_error = 1
+         OTHERS        = 2.
+
+  IF sy-subrc <> 0.
+*   MESSAGE ...
+  ENDIF.
+
+ENDFORM.                    "build_alv
+
+*-------------------------------------------------------------------*
+* Form  TOP-OF-PAGE                                                 *
+*-------------------------------------------------------------------*
+* ALV Report Header                                                 *
+*-------------------------------------------------------------------*
+FORM top-of-page.
+
+*ALV Header declarations
+DATA: lt_header     TYPE slis_t_listheader,
+      wa_header     TYPE slis_listheader,
+      lt_line1      LIKE wa_header-info,
+      lt_line2      LIKE wa_header-info.
+
+* Sales organisation
+  wa_header-typ  = 'S'.
+  wa_header-key = 'Sales org: '.
+  wa_header-info = p_vkorg.
+  APPEND wa_header TO lt_header.
+  CLEAR wa_header.
+
+* Sales office
+  wa_header-typ  = 'S'.
+  wa_header-key = 'Sales off: '.
+  wa_header-info = p_vkbur.
+  APPEND wa_header TO lt_header.
+  CLEAR wa_header.
+
+* Period
+  wa_header-typ  = 'S'.
+  wa_header-key = 'Period: '.
+  CONCATENATE  p_start+6(2) '.'
+               p_start+4(2) '.'
+               p_start(4)
+         INTO  lt_line1.
+
+  CONCATENATE  p_end+6(2) '.'
+               p_end+4(2) '.'
+               p_end(4)
+         INTO lt_line2.
+
+  CONCATENATE lt_line1 'until' lt_line2
+         INTO wa_header-info
+    SEPARATED BY space.
+
+  APPEND wa_header TO lt_header.
+  CLEAR: wa_header.
+
+* Lost orders
+  wa_header-typ  = 'S'.
+  wa_header-key = 'Lost orders: '.
+  wa_header-info = lv_ctr_lost.
+  APPEND wa_header TO lt_header.
+  CLEAR wa_header.
+
+* Blank line
+  wa_header-typ  = 'S'.
+  wa_header-key = space.
+  wa_header-info = space.
+  APPEND wa_header TO lt_header.
+  CLEAR wa_header.
+
+  CALL FUNCTION 'REUSE_ALV_COMMENTARY_WRITE'
+       EXPORTING
+            it_list_commentary = lt_header.
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  check_authorization
+*&---------------------------------------------------------------------*
+form check_authorization .
+
+  AUTHORITY-CHECK OBJECT 'V_VBAK_VKO'
+                      ID 'VKORG' FIELD p_vkorg
+                      ID 'VTWEG' DUMMY
+                      ID 'SPART' DUMMY
+                      ID 'ACTVT' DUMMY.
+
+  IF sy-subrc = 4.
+*   No authorisation to display data from Sales Organisation p_vkorg
+    MESSAGE ID 'YSE_RENTAL' TYPE 'E' NUMBER '049' WITH p_vkorg.
+  ELSEIF sy-subrc <> 0.
+*   Error checking authorization.
+    MESSAGE ID 'YSE_RENTAL' TYPE 'E' NUMBER '046'.
+  ENDIF.
+
+endform.                    " check_authorization
+
+*&---------------------------------------------------------------------*
+*&      Form  ALV_USER_COMMAND
+*&---------------------------------------------------------------------*
+FORM ALV_USER_COMMAND
+        USING R_UCOMM     LIKE SY-UCOMM
+              RS_SELFIELD TYPE SLIS_SELFIELD.
+
+  CASE R_UCOMM.
+    WHEN 'PICK' OR '&IC1'.
+      READ TABLE IT_LOST_ORDERS INDEX RS_SELFIELD-TABINDEX.
+      IF SY-SUBRC EQ 0.
+        SET PARAMETER ID 'AGN' FIELD IT_LOST_ORDERS-VBELN.
+        CALL TRANSACTION 'VA23' AND SKIP FIRST SCREEN.
+      ENDIF.
+  ENDCASE.
+
+ENDFORM. "ALV_USER_COMMAND
+
+*Text symbol text£º
+
+*S01:Overview Lost Orders
+*Selection text£º
+*P_END:        Until date
+*P_START:        From date
+*P_VKBUR:D       Sales office
+*P_VKORG:D       Sales Organization
+*P_VTWEG:D       Distribution Channel
+*SO_ABGRU:D       Reason for rejection

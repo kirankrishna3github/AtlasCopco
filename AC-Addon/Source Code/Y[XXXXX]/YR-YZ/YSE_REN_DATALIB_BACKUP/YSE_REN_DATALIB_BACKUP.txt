@@ -1,0 +1,1106 @@
+***********************************************************************
+* Program ID           : YSE_REN_DATALIB                              *
+* Program Title        : Rental - Data Library                        *
+* Author               : Erik Walravens                               *
+* Date                 : 11.12.2006                                   *
+* Development Number   : D029                                         *
+* Change Request Number: CD1K908495                                   *
+* Description          : A data library gives an historical overview  *
+*                        the status and location of an equipment and  *
+*                        rental contracts.                            *
+***********************************************************************
+* Notes:                                                              *
+***********************************************************************
+* MOD-001 |22/03/2007| Erik Walravens | CD1K912911        | 001       *
+* Description: Fix model selection parameter.                         *
+*---------------------------------------------------------------------*
+* MOD-002 |27/03/2007| Erik Walravens | CD1K913225        | 002       *
+* Description: Disregard sales documents without serial numbers.      *
+*              Fix negative start period error (Case A after case C). *
+*---------------------------------------------------------------------*
+* MOD-003 |30/03/2007| Erik Walravens | CD1K913429        | 003       *
+* Description: Include ZRIB as Sales Documents Type.                  *
+*---------------------------------------------------------------------*
+* MOD-004 |02/04/2007| Erik Walravens | CD1K913491        | 004       *
+* Description: Include ZMIL as Sales Documents Type.                  *
+*              Check scrapping date similar to acquisition date.      *
+*              Fix double usage errors.                               *
+*              Check regime to calculate usage in rental contracts.   *
+*              Add regime on output.                                  *
+*---------------------------------------------------------------------*
+* MOD-005 |04/04/2007| Erik Walravens | CD1K913676        | 005       *
+* Description: Correct equipment's closing availability record.       *
+*              Check Acquisition date and Deactivation date and       *
+*              adjust start and end dates accordingly.                *
+*---------------------------------------------------------------------*
+* MOD-006 |04/04/2007| Erik Walravens | CD1K913692        | 006       *
+* Description: Correct 1 days duration contracts error.               *
+*              Correct non initial deactivation dates error.          *
+*---------------------------------------------------------------------*
+* MOD-007 |04/04/2007| Erik Walravens | CD1K913699        | 007       *
+* Description: Correct missing and nil Acquisition date records.      *
+***********************************************************************
+REPORT yse_ren_datalib.
+
+***********************************************************************
+* TABLES                                                              *
+***********************************************************************
+TABLES: yse_rent_sme, mara, mvke, equi.
+
+***********************************************************************
+* TYPE-POOLS                                                          *
+***********************************************************************
+TYPE-POOLS slis.
+
+***********************************************************************
+* FIELD-SYMBOLS                                                       *
+***********************************************************************
+FIELD-SYMBOLS:
+  <fieldcat> TYPE LINE OF slis_t_fieldcat_alv. " lvc_s_fcat.
+
+***********************************************************************
+* INTERNAL TYPES                                                      *
+***********************************************************************
+TYPES:
+  BEGIN OF str_datalib,
+    angdt        TYPE yse_rent_sme-angdt,    " start date
+    bnddt        TYPE yse_rent_sme-bnddt,    " end date
+    gac          TYPE zgac,          " gac
+    pgc          TYPE zpgc,          " pgc
+    model        TYPE makt-maktx,    " model description
+    mater        TYPE makt-maktx,    " material description
+    sernr        TYPE yse_rent_sme-zzsernr,  " serial nr
+    status       TYPE text15,        " status description
+    regime       TYPE vbap-vkaus,    " regime 5/7 or 7/7
+    period       TYPE int4,          " # days in this status
+    vbeln        TYPE vbak-vbeln,    " document nr
+    soldto       TYPE kna1-name1,    " name sold-to party
+    bukrs        TYPE vbak-bukrs_vf, " company code
+    werks        TYPE vbap-werks,    " Rental depot plant
+    country      TYPE t005t-landx,   " country plant
+    location     TYPE zse_rent_pb_location,
+    shipto       TYPE t005t-landx,   " country ship-to party
+    linecolor(4) TYPE c,             " Line color
+  END OF str_datalib.
+
+TYPES:
+  BEGIN OF str_makt,
+    matnr        TYPE makt-matnr,
+    maktx        TYPE makt-maktx,
+  END OF str_makt.
+
+TYPES:
+  BEGIN OF str_vbap,
+    vbeln        TYPE vbap-vbeln,
+    posnr        TYPE vbap-posnr,
+    prodh        TYPE vbap-prodh,
+    werks        TYPE vbap-werks,
+    vkaus        TYPE vbap-vkaus,
+  END OF str_vbap.
+
+TYPES:
+  BEGIN OF str_vbak,
+    vbeln        TYPE vbak-vbeln,
+    bukrs_vf     TYPE vbak-bukrs_vf,
+  END OF str_vbak.
+
+TYPES:
+  BEGIN OF str_vbpa,
+    vbeln        TYPE vbpa-vbeln,
+    posnr        TYPE vbpa-posnr,
+    parvw        TYPE vbpa-parvw,
+    kunnr        TYPE vbpa-kunnr,
+    name1        TYPE kna1-name1,
+    landx        TYPE t005t-landx,
+  END OF str_vbpa.
+
+TYPES:
+  BEGIN OF str_t001w,
+    werks        TYPE t001w-werks,
+    land1        TYPE t001w-land1,
+  END OF str_t001w.
+
+TYPES:
+  BEGIN OF str_t005t,
+    land1        TYPE t005t-land1,
+    landx        TYPE t005t-landx,
+  END OF str_t005t.
+
+TYPES:
+  BEGIN OF str_eq,
+    equnr        TYPE equi-equnr,
+  END OF str_eq,
+
+  BEGIN OF str_anla,
+        equnr     TYPE equz-equnr,          " Equipment number
+        zugdt     TYPE anla-zugdt,          " Acquisition date
+        deakt     TYPE anla-deakt,          " Deactivation date
+  END OF str_anla.
+
+
+***********************************************************************
+* LOCAL VARIABLES                                                     *
+***********************************************************************
+* User's own data
+DATA:
+  lv_bukrs        TYPE bukrs,               " company code
+  lv_vkorg        TYPE vbak-vkorg,          " sales org
+  lv_vtweg        TYPE vbak-vtweg,          " distr chan
+  lv_matnr        TYPE vbap-matnr,          " material nr
+  lv_equnr        TYPE equi-equnr.          " equipment
+* ALV
+DATA:
+  lv_layout       TYPE slis_layout_alv.    " ALV grid layout
+* Process
+DATA:
+  lv_records      TYPE f,
+  gv_date         TYPE dats,
+  gv_bnddt        TYPE dats,   " Previous record's end date
+  gv_tmp          TYPE dats,   " Intermediary date variable
+  lv_serial       TYPE yse_rent_sme-zzsernr,
+  gv_even         TYPE c,      " Odd / even output line
+  lv_gap_11       TYPE c,      " Gap before 1st doc of 1st eq
+  lv_gap_12       TYPE c,      " Gap before 1st doc of new eq
+  lv_gap_2        TYPE c,      " Gap between 2 docs of same eq
+  lv_sesme_idx LIKE sy-tabix,  " table index it_sesme
+  lv_sesme_rec TYPE p,         " Records in it_sesme
+  pa_angdt        TYPE dats,   " Par start date adj by acq date
+  pa_bnddt        TYPE dats,   " Par end date adj by scrap date
+  cl_angdt        TYPE dats,   " Equipment's closing start date
+  cl_bnddt        TYPE dats,   " Equipment's closing end date
+  lv_angdt        TYPE dats,   " Intermediary start date
+  lv_bnddt        TYPE dats.   " Intermediary end date
+
+*  lv_gap_3        TYPE c,      " Gap after last doc of this eq
+*  lv_gap_31       TYPE c,      " Gap after last doc of this eq
+*  lv_gap_32       TYPE c.      " Gap after last doc of table
+
+***********************************************************************
+* LOCAL CONSTANTS                                                     *
+***********************************************************************
+CONSTANTS:
+  lc_english TYPE spras      VALUE 'E',
+  lc_true    TYPE c          VALUE 'X',
+  lc_factid  TYPE tkevs-fcalid VALUE '99',
+  lc_ctr1    TYPE vbak-auart VALUE 'ZQP',  " rental contract
+  lc_ctr2    TYPE vbak-auart VALUE 'ZQP1', " rental contract
+  lc_ctr3    TYPE vbak-auart VALUE 'ZQP2', " rental contract
+  lc_ctr4    TYPE vbak-auart VALUE 'ZRIB', " rental contract
+  lc_deli    TYPE vbak-auart VALUE 'LR',   " inbound delivery
+  lc_delo    TYPE vbak-auart VALUE 'ZLF',  " outbound delivery
+  lc_serv    TYPE vbak-auart VALUE 'ZSM2', " service order
+  lc_wkndoff TYPE char1 VALUE '5',         " usage 5/7
+  lc_soldto  TYPE vbpa-parvw VALUE 'AG',   " SoldTo partner
+  lc_shipto  TYPE vbpa-parvw VALUE 'WE',   " ShipTo partner
+  lc_bluish(4) TYPE c        VALUE 'C400',
+  lc_blue(4)   TYPE c        VALUE 'C100'.
+
+
+***********************************************************************
+* INTERNAL TABLES                                                     *
+***********************************************************************
+DATA:
+  it_sme      TYPE TABLE OF yse_rent_sme WITH HEADER LINE,
+  it_sesme    TYPE TABLE OF yse_rent_sme WITH HEADER LINE,
+  it_pgc      TYPE TABLE OF yse_pgc_gac  WITH HEADER LINE,
+  it_t001w    TYPE TABLE OF str_t001w    WITH HEADER LINE,
+  it_t005t    TYPE TABLE OF str_t005t    WITH HEADER LINE,
+  it_vbap     TYPE TABLE OF str_vbap     WITH HEADER LINE,
+  it_vbak     TYPE TABLE OF str_vbak     WITH HEADER LINE,
+  it_vbpa     TYPE TABLE OF str_vbpa     WITH HEADER LINE,
+  it_datalib  TYPE TABLE OF str_datalib  WITH HEADER LINE,
+  it_makt     TYPE TABLE OF str_makt     WITH HEADER LINE,
+  it_dat      TYPE TABLE OF rke_dat,
+  it_eq       TYPE TABLE OF str_eq       WITH HEADER LINE,
+  it_anla     TYPE TABLE OF str_anla     WITH HEADER LINE,
+  it_fieldcat TYPE slis_t_fieldcat_alv,      " ALV grid field catalog
+
+  BEGIN OF it_matnr OCCURS 0,
+    matnr     TYPE matnr,
+  END OF it_matnr,
+  wa_matnr LIKE LINE OF it_matnr,
+
+  BEGIN OF it_models OCCURS 0,
+    matnr     TYPE matnr,
+    model     TYPE matnr,
+  END OF it_models.
+
+***********************************************************************
+* SELECTION SCREEN                                                    *
+***********************************************************************
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE text-s01.
+PARAMETERS:
+  p_angdt TYPE dats OBLIGATORY,     " date start period
+  p_bnddt TYPE dats OBLIGATORY,     " date end period
+  p_bukrs TYPE bukrs MEMORY ID BUK.               " company code
+SELECT-OPTIONS:
+  so_vkorg FOR yse_rent_sme-vkorg MEMORY ID VKO,  " sales org
+  so_vtweg FOR yse_rent_sme-vtweg MEMORY ID VTW,  " distr chan
+  so_model FOR mvke-pmatn,          " model
+  so_matnr FOR mara-matnr         MEMORY ID MAT,  " material nr
+  so_equnr FOR equi-equnr         MEMORY ID EQN.  " equipment
+SELECTION-SCREEN END OF BLOCK b1.
+
+* *******************************************************
+* At selection screen
+* *******************************************************
+AT SELECTION-SCREEN.
+
+  PERFORM Check_Authorization.
+
+***********************************************************************
+* START OF SELECTION                                                  *
+***********************************************************************
+START-OF-SELECTION.
+
+  PERFORM preselect_material.
+
+* Get all yse_rent_sme records related to chosen material
+  SELECT *
+      FROM yse_rent_sme
+      INTO TABLE it_sme
+     WHERE   matnr   IN so_matnr
+       AND   zzequnr IN so_equnr    " Equipment nr
+       AND   zzequnr NE space       " extra check
+       AND   vkorg   IN so_vkorg    " Sales org
+       AND   vtweg   IN so_vtweg    " Distr chan
+       AND ( ( angdt GE p_angdt     " Begin within selected period
+       AND     angdt LE p_bnddt )
+        OR (   bnddt GE p_angdt     " End within selected period
+       AND     bnddt LE p_bnddt )
+        OR (   angdt LT p_angdt     " Completely overlapping period
+       AND     bnddt GT p_bnddt ) )
+       AND (   auart EQ lc_ctr1     " Rental contracts
+        OR     auart EQ lc_ctr2
+        OR     auart EQ lc_ctr3
+        OR     auart EQ lc_ctr4
+        OR     auart EQ lc_deli     " Inbound deliveries
+        OR     auart EQ lc_delo     " Outbound deliveries
+        OR     auart EQ lc_serv ).  " Service orders
+
+* Count selected records
+  DESCRIBE TABLE it_sme LINES lv_records.
+  IF lv_records > 0.
+
+*   Create list of unique material numbers
+    LOOP AT it_sme WHERE NOT zzsernr IS INITIAL.
+      wa_matnr-matnr = it_sme-matnr.
+      APPEND wa_matnr TO it_matnr.
+    ENDLOOP.
+    SORT it_matnr BY matnr.
+    DELETE ADJACENT DUPLICATES FROM it_matnr.
+
+*   Get material description for selected documents
+    SELECT matnr maktx
+        INTO TABLE it_makt
+        FROM makt
+         FOR ALL ENTRIES IN it_matnr
+       WHERE matnr = it_matnr-matnr
+         AND spras = lc_english.
+
+*   Determine set of models
+    SELECT matnr pmatn
+        INTO TABLE it_models
+        FROM mvke
+        FOR ALL ENTRIES IN it_sme
+       WHERE matnr = it_sme-matnr
+         AND vkorg = it_sme-vkorg
+         AND vtweg = it_sme-vtweg.
+
+    SORT it_models.
+    DELETE ADJACENT DUPLICATES FROM it_models.
+
+*   Get material description for selected models
+    SELECT matnr maktx
+        APPENDING TABLE it_makt
+        FROM makt
+         FOR ALL ENTRIES IN it_models
+       WHERE matnr = it_models-model
+         AND spras = lc_english.
+
+*   Get all VBAP records related to yse_rent_sme documents
+    SELECT vbeln posnr prodh werks vkaus
+        FROM vbap
+        INTO TABLE it_vbap
+         FOR ALL ENTRIES IN it_sme
+       WHERE vbeln = it_sme-vbeln
+         AND posnr = it_sme-posnr.
+
+*   Get all VBAK records related to yse_rent_sme documents
+    SELECT vbeln bukrs_vf
+        FROM vbak
+        INTO CORRESPONDING FIELDS OF TABLE it_vbak
+         FOR ALL ENTRIES IN it_sme
+       WHERE vbeln = it_sme-vbeln.
+
+    SORT it_vbak.
+    DELETE ADJACENT DUPLICATES FROM it_vbak.
+
+*   Fill table with PGC codes
+    SORT it_vbap BY prodh.
+    LOOP AT it_vbap.
+      IF it_vbap-prodh <> it_pgc-pgc.
+        it_pgc-pgc = it_vbap-prodh.
+        APPEND it_pgc.
+      ENDIF.
+    ENDLOOP.  " it_vbap
+
+*   Get the corresponding GAC codes for the PGC codes
+    CALL FUNCTION 'YSE_CONVERT_PGC_GAC'
+      TABLES
+        it_pgc_gac       =  it_pgc.
+    SORT it_pgc BY pgc.
+
+*   Prepare partner information
+    SELECT vbpa~vbeln vbpa~posnr vbpa~parvw
+           vbpa~kunnr kna1~name1 t005t~landx
+        INTO CORRESPONDING FIELDS OF TABLE it_vbpa
+        FROM vbpa
+       INNER JOIN kna1
+          ON vbpa~kunnr = kna1~kunnr
+       INNER JOIN t005t
+          ON kna1~land1 = t005t~land1
+         FOR ALL entries IN it_sme
+       WHERE vbpa~vbeln = it_sme-vbeln
+         AND ( vbpa~parvw = lc_soldto
+          OR   vbpa~parvw = lc_shipto )
+         AND t005t~spras = lc_english.
+
+*   Load plants
+    SELECT werks land1
+        FROM t001w
+        INTO CORRESPONDING FIELDS OF TABLE it_t001w.
+
+*   Load country names
+    SELECT land1 landx
+        FROM t005t
+        INTO CORRESPONDING FIELDS OF TABLE it_t005t
+       WHERE spras = lc_english.
+
+*   Sort yse_rent_sme data primary by serial
+*   and secondary by start date
+    SORT it_sme BY zzsernr angdt.
+
+*   Initialize period end date for first record
+    gv_bnddt = p_angdt.
+
+*   Prepare equipment loop
+    PERFORM loop_init_eq.
+
+    LOOP AT it_eq.
+
+*     Fill sesme table with single equipment records.
+      PERFORM loop_init_sesme.
+
+***********************************************************************
+* START OF PRESENTATION LOOP                                          *
+***********************************************************************
+      LOOP AT it_sesme.
+*       Store index
+        lv_sesme_idx = sy-tabix.
+*       Save period between previous doc and actual doc
+        IF lv_serial <> it_sesme-zzsernr.    " first doc of equipment
+          IF lv_serial IS INITIAL.           " = space.
+            IF pa_angdt < it_sesme-angdt.
+              lv_gap_11 = lc_true.      " Gap befor 1st doc of table
+            ENDIF.
+*            lv_period = it_sme-angdt - p_angdt.
+          ELSE.
+            IF pa_angdt < it_sesme-angdt.
+              lv_gap_12 = lc_true.      " Gap before 1st doc of new eq
+            ENDIF.
+*           Previous record was equipment's last document  - CASE C
+*           Check for closing availability period
+            IF gv_bnddt < cl_bnddt.            "  pa_bnddt.
+*              lv_gap_31 = lc_true.      " Gap after prev eq's last doc
+
+*             Determine period in between
+              it_datalib-angdt = gv_bnddt + 1.
+              it_datalib-bnddt = cl_bnddt.          " pa_bnddt.
+*             Calculate period while checking overlapping intervals
+              PERFORM check_overlap
+                USING
+                  it_datalib-angdt
+                  it_datalib-bnddt
+                CHANGING
+                  it_datalib-period.
+*it_datalib-period = it_datalib-bnddt - it_datalib-angdt + 1.
+              it_datalib-status = 'Available'(001).
+
+*             Clear non-generic data
+              CLEAR it_datalib-shipto.
+              CLEAR it_datalib-vbeln.
+              CLEAR it_datalib-soldto.
+              CLEAR it_datalib-location.
+              CLEAR it_datalib-regime.
+
+*             Write record = gap at end of previous equipment's last doc
+              APPEND it_datalib.
+*             Save new previous end date
+              IF it_datalib-bnddt > gv_bnddt.
+                gv_bnddt = it_datalib-bnddt.
+              ENDIF.
+*             Save new read record's period
+*            ELSE.
+*              CLEAR lv_gap_3.       " No gap after prev eq's last doc
+            ENDIF.                                       " - CASE C
+*           Restart from beginning
+            gv_bnddt = p_angdt.
+          ENDIF.    " lv_serial IS INITIAL
+*         Swap color
+          IF gv_even = lc_true.
+            it_datalib-linecolor = lc_bluish.
+            gv_even = space.
+          ELSE.
+            it_datalib-linecolor = lc_blue.
+            gv_even = lc_true.
+          ENDIF.
+        ELSE.    " lv_serial = it_sesme-zzernr
+          gv_tmp = gv_bnddt + 1.
+          IF it_sesme-angdt > gv_tmp.
+            lv_gap_2 = lc_true.
+            " Gap in between two doc's of same eq.
+          ENDIF.
+        ENDIF.    " lv_serial <> it_sesme-zzsernr
+
+************************************************************************
+*     First collect generic data                                       *
+*     i.e. data that's not related to a document type.                 *
+************************************************************************
+*       Hierarchy and description
+        SORT it_vbap.
+
+        READ TABLE it_vbap
+          WITH KEY vbeln = it_sesme-vbeln
+                   posnr = it_sesme-posnr
+          BINARY SEARCH.
+        READ TABLE it_pgc
+          WITH KEY pgc    = it_vbap-prodh
+          BINARY SEARCH.
+        it_datalib-gac    = it_pgc-gac.
+        it_datalib-pgc    = it_pgc-pgc.
+
+*       Rental plant
+        it_datalib-werks  = it_vbap-werks.
+
+*       Country rental plant
+        READ TABLE it_t001w
+          WITH KEY werks = it_vbap-werks.
+        READ TABLE it_t005t
+          WITH KEY land1 = it_t001w-land1.
+        it_datalib-country = it_t005t-landx.
+
+*       Model description
+        READ TABLE it_models
+          WITH KEY matnr = it_sesme-matnr.
+        READ TABLE it_makt
+          WITH KEY matnr = it_models-model.
+        it_datalib-model = it_makt-maktx.
+
+*       Material description
+        READ TABLE it_makt
+          WITH KEY matnr = it_sme-matnr.
+        it_datalib-mater = it_makt-maktx.
+
+*       Equipment's Serial number
+        it_datalib-sernr = it_sesme-zzsernr.
+
+*       Company code asset
+*       Note: will probably change. To check with biz
+        READ TABLE it_vbak
+          WITH KEY vbeln = it_sesme-vbeln.
+        it_datalib-bukrs = it_vbak-bukrs_vf.
+
+*       New document, new equipment   - CASE A
+        IF lv_gap_11 = lc_true OR lv_gap_12 = lc_true.
+*         Determine period from start of selection til start of doc
+          it_datalib-angdt  = pa_angdt.
+          it_datalib-bnddt  = it_sesme-angdt - 1.
+          it_datalib-period = it_datalib-bnddt - it_datalib-angdt + 1.
+          it_datalib-status = 'Available'(001).
+
+*         Clear non-generic data
+          CLEAR it_datalib-shipto.
+          CLEAR it_datalib-vbeln.
+          CLEAR it_datalib-soldto.
+          CLEAR it_datalib-location.
+          CLEAR it_datalib-regime.
+
+*         Write record
+          APPEND it_datalib.
+*         Save new previous end date
+          IF it_datalib-bnddt > gv_bnddt.
+            gv_bnddt = it_datalib-bnddt.
+          ENDIF.
+*         Clear gap records
+          CLEAR lv_gap_11.
+          CLEAR lv_gap_12.
+        ENDIF.    " same equipment    - CASE A
+
+*       New document, same equipment  - CASE B
+        IF lv_gap_2 = lc_true.
+*         Determine period end prev until start actual
+          it_datalib-angdt  = gv_bnddt + 1.
+          it_datalib-bnddt  = it_sesme-angdt - 1.
+          it_datalib-period = it_datalib-bnddt - it_datalib-angdt + 1.
+          it_datalib-status = 'Available'(001).
+
+*         Clear non-generic data
+          CLEAR it_datalib-shipto.
+          CLEAR it_datalib-vbeln.
+          CLEAR it_datalib-soldto.
+          CLEAR it_datalib-location.
+          CLEAR it_datalib-regime.
+
+*         Write record
+          APPEND it_datalib.
+*         Save new previous end date
+          gv_bnddt = it_datalib-bnddt.
+*         Clear gap record.
+          CLEAR lv_gap_2.
+        ENDIF.    " new equipment     - CASE B
+
+*       Determine status according to document type
+        CLEAR it_datalib-regime.
+        CASE it_sesme-auart.
+          WHEN lc_deli OR lc_delo.
+            it_datalib-status = 'In transport'(002).
+          WHEN lc_ctr1 OR lc_ctr2 OR lc_ctr3 OR lc_ctr4.
+            it_datalib-status = 'On rent'(003).
+            it_datalib-regime = it_vbap-vkaus.
+          WHEN lc_serv.
+            it_datalib-status = 'Service'(004).
+        ENDCASE.    " auart
+
+***********************************************************************
+*     Second: collect document related data                           *
+***********************************************************************
+
+*       Register this document's dates
+        IF lv_serial <> it_sesme-zzsernr AND    " new equipment
+           it_sesme-angdt < pa_angdt.
+           " start date before selection
+          it_datalib-angdt = pa_angdt.
+        ELSE.
+          it_datalib-angdt = it_sesme-angdt.
+        ENDIF.
+
+        IF it_sesme-bnddt < pa_bnddt.
+          it_datalib-bnddt = it_sesme-bnddt.
+        ELSE.
+          it_datalib-bnddt = pa_bnddt.
+        ENDIF.
+
+*       Check if previous docs have overlapping interval
+        lv_angdt = it_datalib-angdt.
+        lv_bnddt = it_datalib-bnddt.
+        LOOP AT it_sesme.
+*         Only check previous records -> they have priority
+          IF sy-tabix GE lv_sesme_idx.
+            EXIT.
+          ENDIF.
+*         If start date lies within previous record's interval...
+          IF lv_angdt GE it_sesme-angdt AND
+             lv_angdt LE it_sesme-bnddt.
+*           then start date starts after previous record's end date
+            lv_angdt = it_sesme-bnddt + 1.
+          ENDIF.
+*         If necessary test zugdt 2DO
+
+*         If end date lies within previous record's end date...
+          IF lv_bnddt GE it_sesme-angdt AND
+             lv_bnddt LE it_sesme-bnddt.
+*           then end date must start before previous records start date.
+*           If that would create an impossible interval, then it will
+*           be discarded in period > 0 test.
+            CALL FUNCTION 'RP_CALC_DATE_IN_INTERVAL'
+              EXPORTING
+                date            = it_sesme-angdt
+                days            = 1
+                months          = 0
+                signum          = '-'
+                years           = 0
+              IMPORTING
+                calc_date       = lv_bnddt.
+          ENDIF.
+        ENDLOOP.
+
+        IF lv_bnddt GE lv_angdt.
+
+*         # days
+          IF it_vbap-vkaus(1) = lc_wkndoff.         " usage 5/7
+            CALL FUNCTION 'RKE_SELECT_FACTDAYS_FOR_PERIOD'
+              EXPORTING
+                i_datab      = lv_angdt
+                i_datbi      = lv_bnddt
+                i_factid     = lc_factid
+              TABLES
+                eth_dats     = it_dat
+              EXCEPTIONS
+                date_conversion_error  = 1
+                OTHERS                 = 2.
+
+            IF sy-subrc <> 0.
+*             MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*                     WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+            ENDIF.
+
+*           Count factory days within period
+            DESCRIBE TABLE it_dat LINES lv_records.
+            it_datalib-period = lv_records.
+          ELSE.
+            it_datalib-period = lv_bnddt - lv_angdt + 1.
+          ENDIF.
+        ELSE.
+          it_datalib-period = 0.
+        ENDIF.  " lv_bnddt > lv_angdt
+
+*       Re-read sesme at stored index
+        READ TABLE it_sesme INDEX lv_sesme_idx.
+
+*       Document Nr
+        it_datalib-vbeln = it_sesme-vbeln.
+
+*       Name Sold-to party
+        READ TABLE it_vbpa
+          WITH KEY vbeln = it_sesme-vbeln
+                   posnr = it_sesme-posnr    " item level
+                   parvw = lc_soldto.
+        IF sy-subrc <> 0.
+          READ TABLE it_vbpa
+            WITH KEY vbeln = it_sesme-vbeln
+                     posnr = space          " header level
+                     parvw = lc_soldto.
+        ENDIF.
+        it_datalib-soldto = it_vbpa-name1.
+
+*       Functional location
+*       Note: this will probably change for some document types
+        it_datalib-location = it_sesme-zzse_loc.
+
+*       Country Ship-to party
+        READ TABLE it_vbpa
+          WITH KEY vbeln = it_sesme-vbeln
+                   posnr = it_sesme-posnr     " item level
+                   parvw = lc_shipto.
+        IF sy-subrc <> 0.
+          READ TABLE it_vbpa
+            WITH KEY vbeln = it_sesme-vbeln
+                     posnr = space           " header level
+                     parvw = lc_shipto.
+        ENDIF.
+        it_datalib-shipto = it_vbpa-landx.
+
+        APPEND it_datalib.
+*       Save previous serial number
+        lv_serial = it_datalib-sernr.
+*       Save previous end date
+        IF it_datalib-bnddt > gv_bnddt.
+          gv_bnddt = it_datalib-bnddt.
+        ENDIF.
+      ENDLOOP.  " it_sesme
+*     Save this equipment's last sesme record's end date
+      IF NOT it_sesme[] IS INITIAL.
+        cl_angdt = it_sesme-bnddt + 1.
+        cl_bnddt = pa_bnddt.
+      ENDIF.
+    ENDLOOP.  " it_eq
+*   previous record sme table's last (sorted) document  - CASE D
+*    IF it_datalib-bnddt < p_bnddt.
+    IF gv_bnddt < cl_bnddt.         " pa_bnddt.
+*     Determine period in between
+      it_datalib-angdt = gv_bnddt + 1.
+      " cl_angdt.      " it_sesme-bnddt + 1.
+      it_datalib-bnddt = cl_bnddt.       " pa_bnddt.
+      it_datalib-period = it_datalib-bnddt - it_datalib-angdt + 1.
+      it_datalib-status = 'Available'(001).
+
+*     Clear non-generic data
+      CLEAR it_datalib-shipto.
+      CLEAR it_datalib-vbeln.
+      CLEAR it_datalib-soldto.
+      CLEAR it_datalib-location.
+      CLEAR it_datalib-regime.
+
+*     Write record
+      APPEND it_datalib.
+    ENDIF.                                       "  - CASE D
+
+*   Display results
+    PERFORM build_alv.
+
+  ENDIF.    " lv_records > 0
+
+*-------------------------------------------------------------------*
+* Form  preselect_models                                            *
+*-------------------------------------------------------------------*
+* ALV Report Header                                                 *
+*-------------------------------------------------------------------*
+FORM preselect_material.
+
+  DATA: BEGIN OF lt_matnr OCCURS 0,
+          matnr TYPE matnr,
+        END OF lt_matnr.
+
+  IF NOT so_model IS INITIAL.
+*   Note: if materials in so_matnr should also be included, remove
+*         next CLEAR and append materials from model instead.
+    CLEAR so_matnr.
+
+*   Get all material numbers for selected models...
+    SELECT matnr
+        INTO TABLE lt_matnr
+        FROM mvke
+       WHERE pmatn IN so_model
+         AND vkorg IN so_vkorg
+         AND vtweg IN so_vtweg.
+
+    SORT lt_matnr.
+    DELETE ADJACENT DUPLICATES FROM lt_matnr.
+
+    so_matnr-sign = 'I'.
+    so_matnr-option = 'EQ'.
+    so_matnr-high = space.
+
+*   and add them to the list of selected materials.
+    LOOP AT lt_matnr.
+      so_matnr-low = lt_matnr-matnr.
+      APPEND so_matnr.
+    ENDLOOP.
+
+    SORT so_matnr.
+    DELETE ADJACENT DUPLICATES FROM so_matnr.
+  ENDIF.    " so_model NOT INITIAL
+
+ENDFORM.
+
+
+************************************************************************
+**
+*Form LOOP_INIT_EQ                                                    *
+************************************************************************
+**
+*Prepare internal table with all equipments used in the rental sales   *
+*documents.                                                            *
+*Also load Acquisition date and Deactivation date for all equipments.  *
+************************************************************************
+**
+FORM loop_init_eq.
+
+* Load list of unique equipments
+  SELECT equnr
+      INTO TABLE it_eq
+      FROM equi
+       FOR ALL ENTRIES IN it_sme
+     WHERE equnr EQ it_sme-zzequnr.
+
+  SORT it_eq.
+  DELETE ADJACENT DUPLICATES FROM it_eq.
+
+  IF NOT it_eq[] IS INITIAL.
+*   Retrieve Acquisition dates and Desactivation dates
+    SELECT equz~equnr anla~zugdt anla~deakt
+        INTO TABLE it_anla
+        FROM equz
+        JOIN iloa
+          ON equz~iloan EQ iloa~iloan
+        JOIN anla
+          ON iloa~anlnr EQ anla~anln1
+       FOR ALL entries IN it_eq
+      WHERE equz~equnr EQ it_eq-equnr
+         AND anla~bukrs EQ p_bukrs.
+*        AND equz~equzn EQ '000'
+  ENDIF.  " it_eq not empty
+
+ENDFORM.  " loop_init_eq
+
+
+************************************************************************
+**
+*Form LOOP_INIT_SESME                                                 *
+************************************************************************
+**
+*Prepare internal table with all Rental documents sorted by type.      *
+*rental Contracts have priority over Service Orders.                   *
+*Service Orders have priority over Deliveries.                         *
+************************************************************************
+**
+FORM loop_init_sesme.
+
+  CLEAR it_sesme.
+  CLEAR it_sesme[].
+
+* Get Acquisition date and Deactivation date
+  CLEAR it_anla.
+  READ TABLE it_anla WITH KEY equnr = it_eq-equnr.
+* Determine latest start date
+  IF sy-subrc <> 0.
+*   If no record found...
+    pa_angdt = p_angdt.
+    pa_bnddt = p_bnddt.
+  ELSE.
+    IF it_anla-zugdt IS INITIAL.
+*     if acquisition date is '00000000'...
+      pa_angdt = p_angdt.
+    ELSE.
+      IF p_angdt > it_anla-zugdt.
+        pa_angdt = p_angdt.
+      ELSE.
+        pa_angdt = it_anla-zugdt.
+      ENDIF.
+    ENDIF.
+    IF it_anla-deakt IS INITIAL.
+*     if deactivation date is '00000000'...
+      pa_bnddt = p_bnddt.
+    ELSE.
+*     Determine earliest end date
+      IF p_bnddt < it_anla-deakt.
+        pa_bnddt = p_bnddt.
+      ELSE.
+        pa_bnddt = it_anla-deakt.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+* First copy Rental Contracts
+  LOOP AT it_sme
+    WHERE zzequnr EQ it_eq-equnr AND
+      NOT zzsernr IS INITIAL     AND
+        ( auart EQ lc_ctr1 OR
+          auart EQ lc_ctr2 OR
+          auart EQ lc_ctr3 OR
+          auart EQ lc_ctr4 ).
+    IF it_sme-angdt > pa_bnddt OR
+       it_sme-bnddt < pa_angdt.
+*     Discard records that lie out of selected period
+    ELSE.
+      MOVE it_sme TO it_sesme.
+      APPEND it_sesme.
+    ENDIF.
+  ENDLOOP.
+* Next add Service Orders
+  LOOP AT it_sme
+    WHERE zzequnr EQ it_eq-equnr AND
+      NOT zzsernr IS INITIAL     AND
+          auart EQ lc_serv.
+    IF it_sme-angdt > pa_bnddt OR
+       it_sme-bnddt < pa_angdt.
+*     Discard records that lie out of selected period
+    ELSE.
+      MOVE it_sme TO it_sesme.
+      APPEND it_sesme.
+    ENDIF.
+  ENDLOOP.
+* And finally add deliveries
+  LOOP AT it_sme
+    WHERE zzequnr EQ it_eq-equnr AND
+      NOT zzsernr IS INITIAL     AND
+        ( auart EQ lc_deli OR
+          auart EQ lc_delo ).
+    IF it_sme-angdt > pa_bnddt OR
+       it_sme-bnddt < pa_angdt.
+*     Discard records that lie out of selected period
+    ELSE.
+      MOVE it_sme TO it_sesme.
+      APPEND it_sesme.
+    ENDIF.
+  ENDLOOP.
+
+* Count number of records in it_sesme
+  DESCRIBE TABLE it_sesme LINES lv_sesme_rec.
+
+ENDFORM.    " loop_init_sesme
+
+
+***********************************************************************
+*  Form CHECK_OVERLAP                                                 *
+*---------------------------------------------------------------------*
+*  Arguments:                                                         *
+*    ARG_ANGDT    Start date                                          *
+*    ARG_BNDDT    End date                                            *
+*  Return value:                                                      *
+*    RET_PERIOD   Period between dates, adjusted by previous records  *
+*---------------------------------------------------------------------*
+* Checks whether a previous document has overlapping dates. Since the *
+* documents have been sorted by priority, only earlier doculents in   *
+* the table need to be checked. And only the period is changed. Not   *
+* the start or end date.                                              *
+***********************************************************************
+FORM check_overlap
+  USING
+    arg_angdt     LIKE sy-datum
+    arg_bnddt     LIKE sy-datum
+  CHANGING
+    ret_period    LIKE it_datalib-period.
+
+  DATA:
+    lv_angdt      TYPE dats,
+    lv_bnddt      TYPE dats.
+
+  lv_angdt = arg_angdt.
+  lv_bnddt = arg_bnddt.
+
+* Check if previous docs have overlapping interval
+  LOOP AT it_sesme.
+*   Only check previous records -> they have priority
+    IF sy-tabix GE lv_sesme_idx.
+      EXIT.
+    ENDIF.
+*   If start date lies within previous record's interval...
+    IF lv_angdt GE it_sesme-angdt AND
+       lv_angdt LE it_sesme-bnddt.
+*     then start date starts after previous record's end date
+      lv_angdt = it_sesme-bnddt + 1.
+    ENDIF.
+*   If end date lies within previous record's end date...
+    IF lv_bnddt GE it_sesme-angdt AND
+       lv_bnddt LE it_sesme-bnddt.
+*     then end date must start before previous records start date.
+*     If that would create an impossible interval, then it will
+*     be discarded in period > 0 test.
+      CALL FUNCTION 'RP_CALC_DATE_IN_INTERVAL'
+        EXPORTING
+          date            = it_sesme-angdt
+          days            = 1
+          months          = 0
+          signum          = '-'
+          years           = 0
+        IMPORTING
+          calc_date       = lv_bnddt.
+    ENDIF.
+  ENDLOOP.
+
+* Calculate number of days in the period
+  ret_period = lv_bnddt - lv_angdt + 1.
+
+ENDFORM.  " check_overlap
+
+
+*&---------------------------------------------------------------------*
+*&      Form  BUILD_ALV
+*&---------------------------------------------------------------------*
+FORM build_alv.
+
+  lv_layout-colwidth_optimize = lc_true.
+  lv_layout-info_fieldname = 'LINECOLOR'.   " Color field name
+
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+    EXPORTING
+         i_background_id          = 'ALV_BACKGROUND'
+         i_callback_program       = SY-repid
+         i_callback_top_of_page   = 'TOP-OF-PAGE'
+         i_structure_name         = 'YSE_REN_ALV_DATALIB'
+         is_layout                = lv_layout
+*         it_fieldcat              = it_fieldcat
+    TABLES
+         t_outtab                 = it_datalib
+    EXCEPTIONS
+         program_error            = 1
+         OTHERS                   = 2.
+
+  IF sy-subrc <> 0.
+*   MESSAGE ...
+  ENDIF.
+
+ENDFORM.                    "build_alv
+
+*-------------------------------------------------------------------*
+* Form  TOP-OF-PAGE                                                 *
+*-------------------------------------------------------------------*
+* ALV Report Header                                                 *
+*-------------------------------------------------------------------*
+FORM top-of-page.
+
+*ALV Header declarations
+DATA: lt_header     TYPE slis_t_listheader,
+      wa_header     TYPE slis_listheader,
+      lt_line1      LIKE wa_header-info,
+      lt_line2      LIKE wa_header-info.
+
+* Company Code
+  wa_header-typ  = 'S'.
+  wa_header-key = 'Company code: '(005).
+  wa_header-info = p_bukrs.
+  APPEND wa_header TO lt_header.
+  CLEAR wa_header.
+
+** Plant
+*  wa_header-typ  = 'S'.
+*  wa_header-key = 'Plant: '.
+*  wa_header-info = p_werks.
+*  APPEND wa_header TO lt_header.
+*  CLEAR wa_header.
+
+* Period
+  wa_header-typ  = 'S'.
+  wa_header-key = 'Period:'(006).
+  CONCATENATE  p_angdt+6(2) '.'
+               p_angdt+4(2) '.'
+               p_angdt(4)
+         INTO  lt_line1.
+
+  CONCATENATE  p_bnddt+6(2) '.'
+               p_bnddt+4(2) '.'
+               p_bnddt(4)
+         INTO lt_line2.
+
+  CONCATENATE lt_line1 'until' lt_line2
+         INTO wa_header-info
+    SEPARATED BY space.
+
+  APPEND wa_header TO lt_header.
+  CLEAR: wa_header.
+
+* Blank line
+  wa_header-typ  = 'S'.
+  wa_header-key = space.
+  wa_header-info = space.
+  APPEND wa_header TO lt_header.
+  CLEAR wa_header.
+
+  CALL FUNCTION 'REUSE_ALV_COMMENTARY_WRITE'
+       EXPORTING
+            it_list_commentary = lt_header.
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  Check_Authorization
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+form Check_Authorization .
+
+  AUTHORITY-CHECK OBJECT 'F_KNA1_BUK'
+                      ID 'BUKRS' FIELD p_BUKRS
+                      ID 'ACTVT' DUMMY.
+
+  IF sy-subrc = 4.
+*   No authorisation to display the data
+    MESSAGE ID 'YSE_RENTAL' TYPE 'E' NUMBER '040' WITH p_bukrs.
+  ELSEIF sy-subrc <> 0.
+*   Error checking authorization.
+    MESSAGE ID 'YSE_RENTAL' TYPE 'E' NUMBER '046'.
+  ENDIF.
+
+endform.                    " Check_Authorization
+
+*Text symbol text£º
+*001:Available
+*002:In transport
+*003:On rent
+*004:Service
+*005:Company code:
+*006:Period:
+
+*S01:Parameters
+*Selection text£º
+*P_ANGDT:        Start date
+*P_BNDDT:        End date
+*P_BUKRS:        Company code
+*SO_EQUNR:        Equipment
+*SO_MATNR:        Material
+*SO_MODEL:        Model
+*SO_VKORG:        Sales organisation
+*SO_VTWEG:        Distribution channel

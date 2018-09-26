@@ -1,0 +1,264 @@
+*&---------------------------------------------------------------------*
+*&  INCLUDE           Z_FI_INTERNAL_INVOICE                            *
+*&---------------------------------------------------------------------*
+
+DATA: right_sgtxt.
+
+*RANGES: rmwskz   FOR  bseg-mwskz.
+*RANGES: rbktxt   FOR  bkpf-bktxt.
+DATA: BEGIN OF line_structure,
+      lp(3),
+      maktx LIKE makt-maktx,
+      pkwiu LIKE marc-steuc,
+      meins LIKE bseg-meins,
+      menge LIKE bseg-menge,
+      netpr LIKE bseg-dmbtr,
+      netwr LIKE bseg-dmbtr,
+      tax(2),
+      taxn(2) TYPE c,
+      taxn1(2) TYPE n,
+      vat LIKE bseg-dmbtr,
+      mwskz LIKE bseg-mwskz,
+      END OF line_structure.
+*&---------------------------------------------------------------------*
+*&      Form  validation
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM validation TABLES rbktxt rmwskz USING invalid_doc.
+*walidacja p¨®l bktxt oraz mwskz
+*BKTXT
+  CLEAR: invalid_doc, right_sgtxt.
+  IF bkpf-bktxt+10(7) = '-RFWERE'.
+    invalid_doc = 'R'.
+  ELSE.
+    IF bkpf-bktxt IN rbktxt.
+      invalid_doc =  'F'.
+    ELSE.
+      invalid_doc = 'X'.
+    ENDIF.
+  ENDIF.
+*MWSKZ
+  CASE invalid_doc.
+    WHEN 'F'.
+      SELECT *  FROM bseg WHERE bukrs = bkpf-bukrs AND
+                                belnr = bkpf-belnr AND
+                                gjahr = bkpf-gjahr AND
+                                buzid <> 'T' AND
+                                koart <> 'K' AND
+                                koart <> 'D' AND
+*                               sgtxt LIKE '##%' AND
+                                mwskz IN rmwskz.
+        IF bseg-sgtxt(2) = '##'.
+          right_sgtxt = 'X'.
+          EXIT.
+        ENDIF.
+      ENDSELECT.
+      IF sy-subrc <> 0 OR right_sgtxt IS INITIAL.
+        invalid_doc = 'X'.
+      ENDIF.
+    WHEN 'R'.
+      SELECT SINGLE *  FROM bseg WHERE bukrs = bkpf-bukrs AND
+                                belnr = bkpf-belnr AND
+                                gjahr = bkpf-gjahr AND
+                                buzid = 'T' AND
+*                                koart <> 'K' AND
+*                                koart <> 'D' AND
+                                mwskz IN rmwskz.
+      IF sy-subrc <> 0.
+        invalid_doc = 'X'.
+      ENDIF.
+  ENDCASE.
+ENDFORM.                    " validation
+*&---------------------------------------------------------------------*
+*&      Form  fi_selection
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM fi_selection TABLES rmwskz rbktxt gt_line STRUCTURE line_structure
+                                       gt_mwdat STRUCTURE rtax1u15
+                                      gt_totals STRUCTURE line_structure
+                  USING count dummy dot.
+
+  DATA: doc_type.
+  DATA: item_number TYPE i.
+  DATA: wa_ekpo LIKE ekpo.
+  DATA: wa_ekko LIKE ekko.
+*sprawdzenie czy dokument z RFWERE
+  IF bkpf-bktxt CS '-RFWERE'.
+    doc_type = 'R'.
+  ELSE.
+    doc_type = 'F'.
+  ENDIF.
+************************************
+  CLEAR: item_number.
+
+  CASE doc_type.
+    WHEN 'R'.
+*dokumenty J_1P_RFWERE (zak#adamy #e te dokumenty maj# zawsze tak# sam#
+*struktur#
+      SELECT SINGLE mwskz dmbtr FROM bseg
+                                INTO (gt_line-mwskz, gt_line-vat)
+                     WHERE bukrs = bkpf-bukrs AND
+                               belnr = bkpf-belnr AND
+                               gjahr = bkpf-gjahr AND
+                               buzid = 'T'.
+      CLEAR bseg.
+      SELECT SINGLE * FROM bseg INTO bseg
+                          WHERE bukrs = bkpf-bukrs AND
+                                belnr = bkpf-belnr AND
+                                gjahr = bkpf-gjahr AND
+                                mwskz = gt_line-mwskz AND
+                                buzid <> 'T'.
+
+      SELECT SINGLE * FROM ekpo INTO wa_ekpo
+                               WHERE ebeln = bseg-ebeln AND
+                                     ebelp = bseg-ebelp.
+
+*
+      gt_line-lp = '1'.
+      IF NOT wa_ekpo-matnr IS INITIAL.
+        SELECT SINGLE maktx FROM makt INTO gt_line-maktx WHERE matnr =
+        wa_ekpo-matnr AND spras = 'L'.
+      ELSE.
+        gt_line-maktx = wa_ekpo-txz01.
+      ENDIF.
+
+      SELECT SINGLE steuc FROM marc INTO gt_line-pkwiu
+                                   WHERE matnr = wa_ekpo-matnr AND
+                                         werks = wa_ekpo-werks.
+      gt_line-menge = wa_ekpo-menge.
+      gt_line-meins = wa_ekpo-meins.
+      gt_line-netwr = bseg-dmbtr.
+      IF gt_line-menge <> 0 .
+        gt_line-netpr = bseg-dmbtr / gt_line-menge.
+      ENDIF.
+
+*stawka podatku
+      CLEAR gt_mwdat. REFRESH gt_mwdat.
+      CALL FUNCTION 'CALCULATE_TAX_FROM_NET_AMOUNT'
+           EXPORTING
+                i_wrbtr                = gt_line-netwr
+                i_mwskz                = gt_line-mwskz
+                i_waers                = 'PLN'
+                i_bukrs                = bseg-bukrs
+           TABLES
+                t_mwdat                = gt_mwdat
+           EXCEPTIONS
+                multiple_mwdat_entries = 1
+                OTHERS                 = 2.
+
+
+      READ TABLE gt_mwdat INDEX 1.
+
+      dummy = abs( gt_mwdat-msatz ).
+      CONDENSE dummy.
+      SPLIT dummy AT dot INTO gt_line-tax dummy.
+
+
+      APPEND gt_line.
+
+      gt_totals-taxn = gt_line-tax.
+      gt_totals-taxn1 = gt_line-tax.
+      gt_totals-netwr = gt_line-netwr.
+    gt_totals-vat = gt_line-vat.
+      gt_totals-mwskz = gt_line-mwskz.
+      COLLECT gt_totals.
+
+*inne dokumenty z FI
+    WHEN OTHERS.
+*sprawdzenie ilo#ci wpis¨®w
+      SELECT COUNT(*) FROM bseg INTO count
+                     WHERE bukrs = bkpf-bukrs AND
+                                  belnr = bkpf-belnr AND
+                                  gjahr = bkpf-gjahr AND
+                                  buzid <> 'T' AND
+                                  koart <> 'K' AND
+                                  koart <> 'D' AND
+                                  mwskz IN rmwskz.
+*************
+      SELECT *  FROM bseg WHERE bukrs = bkpf-bukrs AND
+                                belnr = bkpf-belnr AND
+                                gjahr = bkpf-gjahr AND
+                                buzid <> 'T' AND
+                                koart <> 'K' AND
+                                koart <> 'D' AND
+                                mwskz IN rmwskz.
+        IF bseg-sgtxt(2) <> '##'.
+          CONTINUE.
+        ENDIF.
+        ADD 1 TO item_number.
+        gt_line-lp = item_number.
+        gt_line-maktx = bseg-sgtxt+36.
+        gt_line-pkwiu = bseg-sgtxt+19(17).
+        IF bseg-sgtxt+2(14) CA ','.
+          TRANSLATE bseg-sgtxt+2(14) USING ',.'.
+        ENDIF.
+        gt_line-menge = bseg-sgtxt+2(14).
+        gt_line-meins = bseg-sgtxt+16(3).
+        gt_line-netwr = bseg-dmbtr.
+        IF gt_line-menge <> 0 .
+          gt_line-netpr = bseg-dmbtr / gt_line-menge.
+        ENDIF.
+*podatek
+        CLEAR gt_mwdat. REFRESH gt_mwdat.
+
+        CALL FUNCTION 'CALCULATE_TAX_FROM_NET_AMOUNT'
+             EXPORTING
+                  i_wrbtr                = gt_line-netwr
+                  i_mwskz                = bseg-mwskz
+                  i_waers                = 'PLN'
+                  i_bukrs                = bseg-bukrs
+             TABLES
+                  t_mwdat                = gt_mwdat
+             EXCEPTIONS
+                  multiple_mwdat_entries = 1
+                  OTHERS                 = 2.
+
+
+        READ TABLE gt_mwdat INDEX 1.
+
+        dummy = abs( gt_mwdat-msatz ).
+        CONDENSE dummy.
+        SPLIT dummy AT dot INTO gt_line-tax dummy.
+        IF count = 1.
+          SELECT SINGLE dmbtr FROM bseg INTO gt_line-vat
+                             WHERE bukrs = bkpf-bukrs AND
+                                   belnr = bkpf-belnr AND
+                                   gjahr = bkpf-gjahr AND
+                                   buzid = 'T' AND
+                                   mwskz = bseg-mwskz.
+        ELSE.
+          gt_line-vat = gt_line-netwr * ( ABS( gt_mwdat-msatz ) / 100 ).
+        ENDIF.
+******************
+
+        APPEND gt_line.
+
+        gt_totals-taxn = gt_line-tax.
+        gt_totals-taxn1 = gt_line-tax.
+        gt_totals-netwr = gt_line-netwr.
+*    gt_totals-vat = gt_line-vat.
+        gt_totals-mwskz = bseg-mwskz.
+        COLLECT gt_totals.
+      ENDSELECT.
+
+      LOOP AT gt_totals.
+        SELECT SINGLE dmbtr FROM bseg INTO gt_totals-vat
+                           WHERE bukrs = bkpf-bukrs AND
+                                 belnr = bkpf-belnr AND
+                                 gjahr = bkpf-gjahr AND
+                                 buzid = 'T' AND
+                                 mwskz = gt_totals-mwskz.
+        MODIFY gt_totals.
+      ENDLOOP.
+  ENDCASE.
+*********
+
+ENDFORM.                    " fi_selection

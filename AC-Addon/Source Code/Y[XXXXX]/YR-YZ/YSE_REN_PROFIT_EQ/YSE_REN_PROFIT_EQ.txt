@@ -1,0 +1,774 @@
+***********************************************************************
+* Program ID           : YSE_REN_PROFIT_EQ                            *
+* Program Title        : Profit per Equipment                         *
+* Author               : Erik Walravens                               *
+* Date                 : 19.03.2007                                   *
+* Development Number   : D032                                         *
+* Change Request Number: CD1K910947                                   *
+* Description          : This report should give an overview of the   *
+*                        rental revenue (Gross Profit level - excl.   *
+*                        transport costs and income), service cost,   *
+*                        depreciation costs and other costs up to the *
+*                        equipment level.                             *
+***********************************************************************
+* Notes: Authorization check is commented out until Wouter Deplancke  *
+*        creates the appropriete roles.                               *
+***********************************************************************
+* MOD-001 |29/03/2007| Erik Walravens | CD1K913324        | 001       *
+* Description: cosmetic changes                                       *
+*---------------------------------------------------------------------*
+* MOD-002 |30/03/2007| Erik Walravens | CD1K913483        | 002       *
+* Description: Read correct fiscal period's COPA data.                *
+*---------------------------------------------------------------------*
+* MOD-003 |12/04/2007| Pieter Jespers | CD1K913921        | 003       *
+* Description: Authorisation check                                    *
+*         |21/06/2007| Erik Walravens |                               *
+* Description: Correction to include all deprecs from COPA table.     *
+***********************************************************************
+* MOD-004 |02/14/2008| Peter Dudas    | CD1K926384        | 004       *
+***********************************************************************
+
+
+REPORT  YSE_REN_PROFIT_EQ MESSAGE-ID YSE_RENTAL.
+
+***********************************************************************
+* OBJECTS                                                             *
+***********************************************************************
+DATA:
+  OBJ_CONTAINER     TYPE REF TO CL_GUI_DOCKING_CONTAINER,
+  OBJ_ALV           TYPE REF TO CL_GUI_ALV_GRID.
+
+***********************************************************************
+* TABLES                                                              *
+***********************************************************************
+TABLES:
+  ITOB,
+  YSE_PGC_GAC,
+  T179.
+
+***********************************************************************
+* INTERNAL TABLES                                                     *
+***********************************************************************
+DATA:
+  BEGIN OF IT_EQU_A    OCCURS 0,
+    EQUNR       TYPE EQUI-EQUNR,   " Equipment number
+  END OF IT_EQU_A,
+  BEGIN OF IT_EQU_B    OCCURS 0,
+    EQUNR TYPE EQUNR,
+    MATNR TYPE MATNR,
+    SERNR TYPE GERNR,
+    EQKTX TYPE KTX01,
+    ILOAN TYPE ILOAN,
+    BUKRS LIKE ILOA-BUKRS,
+    VKORG LIKE ILOA-VKORG,
+    VTWEG LIKE ILOA-VTWEG,
+  END OF IT_EQU_B,
+  BEGIN OF IT_EQ       OCCURS 0,
+    MATNR        TYPE EQUI-MATNR,  " Material nr
+    EQUNR        TYPE EQUI-EQUNR,  " Equipment nr
+    SERNR        TYPE EQUI-SERNR,  " Serial nr
+    PMATN        TYPE MVKE-PMATN,  " Model
+    PRODH        TYPE MVKE-PRODH,  " Product hierarchy
+  END OF IT_EQ,
+  BEGIN OF IT_MVKE     OCCURS 0,
+    MATNR     TYPE MVKE-MATNR,
+    VKORG     LIKE MVKE-VKORG,
+    VTWEG     LIKE MVKE-VTWEG,
+    PMATN     TYPE MVKE-PMATN,
+    PRODH     TYPE MVKE-PRODH,
+  END OF IT_MVKE,
+  BEGIN OF IT_MATNR    OCCURS 0,
+    MATNR TYPE MATNR,
+  END OF IT_MATNR,
+  BEGIN OF IT_MODEL    OCCURS 0,
+    MATNR     TYPE MATNR,
+    MODEL     TYPE MATNR,
+  END OF IT_MODEL,
+  BEGIN OF IT_MAKT     OCCURS 0,
+    MATNR     TYPE MAKT-MATNR,
+    MAKTX     TYPE MAKT-MAKTX,
+  END OF IT_MAKT,
+  IT_PGC      TYPE TABLE OF YSE_PGC_GAC           WITH HEADER LINE,  " Product hierarchy
+  IT_RESULT   TYPE YSE_REN_PROFIT_EQ_OUT OCCURS 0 WITH HEADER LINE,
+  IT_COPA_CO  TYPE YSE_RENT_COPA_CO      OCCURS 0 WITH HEADER LINE,  " Costs owned equipments
+  IT_COPA_RV  TYPE YSE_RENT_COPA_RV      OCCURS 0 WITH HEADER LINE,  " Revenues (all) equipments
+  IT_FIELDCAT TYPE LVC_T_FCAT                     WITH HEADER LINE.  " ALV grid field cat
+
+***********************************************************************
+* CONSTANTS                                                           *
+***********************************************************************
+CONSTANTS:
+  GC_TRUE   TYPE CHAR1       VALUE 'X',   " True
+  GC_ENGL   TYPE TVAGT-SPRAS VALUE 'E',   " English
+  GC_VTWEG  TYPE VTWEG       VALUE '21',  " Rental Distribution Channel
+  GC_CATX   TYPE EQUI-EQTYP  VALUE 'X',
+  GC_CATY   TYPE EQUI-EQTYP  VALUE 'Y'.
+
+***********************************************************************
+* VARIABLES                                                           *
+***********************************************************************
+DATA:
+  LV_BUKRS        TYPE ILOA-BUKRS,    " Company code
+  LV_WERKS        TYPE EQUI-WERK,     " Plant
+  LV_RECORDS      TYPE P,             " Record counter
+  OKCODE          LIKE SY-UCOMM,      " return param screen 100
+  GS_LAYOUT       TYPE LVC_S_LAYO,    " ALV grid layout
+  GS_VARIANT      TYPE DISVARIANT,    " ALV grid variant
+  O_BUKRS(4)      TYPE C,             " Output field Company Code
+  O_YEAR(4)       TYPE C,             " Output field Fiscal Year
+  O_PERIOD(3)     TYPE C.             " Output field Fiscal Period
+
+************************************************************************
+*RANGES
+************************************************************************
+RANGES:
+  R_VKORG   FOR TVKO-VKORG.           " Sales Organisations
+
+************************************************************************
+*SELECTION SCREEN
+************************************************************************
+SELECTION-SCREEN BEGIN OF BLOCK B1 WITH FRAME TITLE TEXT-S01.
+PARAMETERS:
+  P_BUKRS   TYPE BUKRS OBLIGATORY MEMORY ID BUK,     " Company code
+  P_GJAHR   TYPE GJAHR OBLIGATORY,                   " Fiscal year
+  P_PERBL   TYPE PERBL OBLIGATORY.                   " Fiscal period
+
+SELECT-OPTIONS:
+  SO_MATNR FOR ITOB-MATNR,                           " Material nr
+  SO_MODEL FOR ITOB-MATNR,                           " Model
+* SO_PRODH FOR CE41000_ACCT-PRODH,                   " Product hierarchy
+  SO_PGC   FOR T179-PRODH,                           " PGC
+  SO_GAC   FOR YSE_PGC_GAC-GAC,                      " GAC
+  SO_EQUNR FOR ITOB-EQUNR.                           " Equipment
+SELECTION-SCREEN END OF BLOCK B1.
+
+***********************************************************************
+* INITIALIZATION                                                      *
+***********************************************************************
+INITIALIZATION.
+
+  DATA:
+    LV_DATUM LIKE SY-DATUM.
+
+* Default year
+  P_GJAHR = SY-DATUM(4).
+
+* Calculate previous month as input for default fiscal period
+  LV_DATUM = SY-DATUM.
+  CALL FUNCTION 'RE_ADD_MONTH_TO_DATE'
+    EXPORTING
+      MONTHS        = -1
+      OLDDATE       = SY-DATUM
+    IMPORTING
+      NEWDATE       = LV_DATUM.
+
+* Default (fiscal) period
+  P_PERBL(1) = 0.
+  P_PERBL+1(2) = LV_DATUM+4(2).
+
+***********************************************************************
+* AT SELECTION SCREEN                                                 *
+***********************************************************************
+AT SELECTION-SCREEN.
+
+*  PERFORM CHECK_AUTHORIZATION.
+
+***********************************************************************
+* START OF SELECTION                                                  *
+***********************************************************************
+START-OF-SELECTION.
+
+* Load input data
+  PERFORM LOAD_DATA.
+
+* Process data
+  PERFORM PROCESS_DATA.
+
+* Display results
+  IF sy-batch = 'X'.
+    PERFORM BUILD_ALV.
+  ELSE.
+    CALL SCREEN 100.
+  ENDIF.
+
+***********************************************************************
+* FORM: LOAD_DATA                                                     *
+***********************************************************************
+* Select all equipments based on selection parameters.                *
+* Material, model, equipment and serial number in the selection       *
+* fields be entered exclusively. If more than one of these fields is  *
+* entered, only the equipments are loaded that correspond to all the  *
+* conditions. If some options are mutually exclusive, no equipment    *
+* will be found. If nothing is entered, then all equipments will be   *
+* loaded.                                                             *
+***********************************************************************
+FORM LOAD_DATA.
+
+  PERFORM LOAD_MATERIAL.
+
+  PERFORM LOAD_EQUIPMENT.
+
+  PERFORM LOAD_DESCRIPTIONS.
+
+ENDFORM.  " LOAD_DATA
+
+***********************************************************************
+* Form LOAD_MATERIAL                                                  *
+***********************************************************************
+* Load material numbers based on selection parameters.                *
+***********************************************************************
+* Notes:                                                              *
+*                                                                     *
+*   If a selection field is empty, all material numbers corresponding *
+*   to this field will be selected. If two or more fields contain     *
+*   mutually exclusive data, then no material number will be selected.*
+***********************************************************************
+FORM LOAD_MATERIAL.
+
+* Retrieve all Sales Org for selected Company Code
+  SELECT VKORG AS LOW
+      FROM TVKO
+      INTO CORRESPONDING FIELDS OF TABLE R_VKORG
+     WHERE BUKRS = P_BUKRS.
+* Complete the range
+  LOOP AT R_VKORG.
+    R_VKORG-SIGN   = 'I'.
+    R_VKORG-OPTION = 'EQ'.
+    MODIFY R_VKORG.
+  ENDLOOP.
+
+  IF NOT SO_MODEL IS INITIAL.
+*   Note: if materials in so_matnr should also be included, remove next
+*         CLEAR and append materials from model instead.
+    CLEAR SO_MATNR.
+
+*   Get all material numbers for selected models...
+    SELECT MATNR
+        INTO TABLE IT_MATNR
+        FROM MVKE
+       WHERE PMATN IN SO_MODEL
+         AND VKORG IN R_VKORG
+         AND VTWEG EQ GC_VTWEG.
+
+    SORT IT_MATNR.
+    DELETE ADJACENT DUPLICATES FROM IT_MATNR.
+
+    SO_MATNR-SIGN = 'I'.
+    SO_MATNR-OPTION = 'EQ'.
+    SO_MATNR-HIGH = SPACE.
+
+*   and add them to the list of selected materials.
+    LOOP AT IT_MATNR.
+      SO_MATNR-LOW = IT_MATNR-MATNR.
+      APPEND SO_MATNR.
+    ENDLOOP.
+
+    SORT SO_MATNR.
+    DELETE ADJACENT DUPLICATES FROM SO_MATNR.
+  ELSE.
+*   Copy material in selection parameters to obtain descriptions later
+*   Note: may be done more efficiently, to check
+    SELECT MATNR
+        FROM MVKE
+        INTO TABLE IT_MATNR
+       WHERE MATNR IN SO_MATNR
+         AND VKORG IN R_VKORG
+         AND VTWEG EQ GC_VTWEG.
+
+  ENDIF.    " SO_MODEL NOT INITIAL
+
+ENDFORM.       " LOAD_MATERIAL
+
+***********************************************************************
+* Form LOAD_EQUIPMENT                                                 *
+***********************************************************************
+FORM LOAD_EQUIPMENT.
+
+* First: select equipments with rental equipment categories
+  SELECT EQUNR
+      INTO TABLE IT_EQU_A
+      FROM EQUI
+     WHERE EQUNR IN SO_EQUNR  AND
+         ( EQTYP EQ GC_CATX   OR
+           EQTYP EQ GC_CATY ).
+
+* Second: obtain iloa data for selected equipments
+  SELECT      EQUI~EQUNR
+              EQUI~MATNR
+              EQUI~SERNR
+              EQKT~EQKTX
+              EQUZ~ILOAN
+              BUKRS
+              VKORG
+              VTWEG
+         FROM EQUI
+         JOIN EQUZ
+           ON EQUI~EQUNR = EQUZ~EQUNR
+         JOIN ILOA
+           ON EQUZ~ILOAN = ILOA~ILOAN
+         JOIN EQKT
+           ON EQUI~EQUNR = EQKT~EQUNR
+         INTO TABLE IT_EQU_B
+          FOR ALL ENTRIES IN IT_EQU_A
+        WHERE EQUI~EQUNR EQ IT_EQU_A-EQUNR
+          AND EQUZ~DATBI EQ '99991231'
+          AND EQUI~MATNR IN SO_MATNR
+          AND EQKT~SPRAS EQ 'EN'
+          AND ILOA~VKORG IN R_VKORG
+          AND ILOA~VTWEG EQ GC_VTWEG
+          AND ILOA~BUKRS EQ P_BUKRS.
+
+* Third: Load models and product hierarchies
+  IF NOT ( IT_EQU_B[] IS INITIAL ).
+    SELECT      MATNR VKORG VTWEG PMATN PRODH
+           INTO TABLE IT_MVKE
+           FROM MVKE
+            FOR ALL ENTRIES IN IT_EQU_B
+          WHERE MATNR EQ IT_EQU_B-MATNR
+            AND VKORG IN R_VKORG
+            AND VTWEG EQ GC_VTWEG.
+  ENDIF.
+
+  SORT IT_MVKE.
+  DELETE ADJACENT DUPLICATES FROM IT_MVKE.
+
+* Use IT_EQU_B and IT_MVKE to build internal table IT_EQ
+  LOOP AT IT_EQU_B.
+*   Copy equipment nr, material nr and serial nr
+    MOVE-CORRESPONDING IT_EQU_B TO IT_EQ.
+*   Copy model and product hierarchy
+    READ TABLE IT_MVKE WITH KEY MATNR = IT_EQU_B-MATNR
+                                VKORG = IT_EQU_B-VKORG
+                                VTWEG = IT_EQU_B-VTWEG.
+    IF SY-SUBRC NE 0.
+      CONTINUE.
+    ENDIF.
+    IT_EQ-PMATN = IT_MVKE-PMATN.
+    IT_EQ-PRODH = IT_MVKE-PRODH.
+*   Add record
+    APPEND IT_EQ.
+  ENDLOOP.  " IT_EQU_B
+
+  SORT IT_EQ.
+  DELETE ADJACENT DUPLICATES FROM IT_EQ.
+
+* Build PGC/GAC conversion table
+  PERFORM LOAD_PGC_GAC.
+
+* Check if PGC/GAC codes are as selected
+  LOOP AT IT_EQ.
+    READ TABLE IT_PGC WITH KEY PGC = IT_EQ-PRODH.
+    IF NOT ( IT_PGC-PGC IN SO_PGC ) OR
+       NOT ( IT_PGC-GAC IN SO_GAC ).
+      DELETE IT_EQ.
+    ENDIF.    " CHECK PGC GAC
+  ENDLOOP.  " IT_EQ
+
+* Count selected records
+  DESCRIBE TABLE IT_EQ LINES LV_RECORDS.
+  IF LV_RECORDS > 0.
+
+*   Retrieve all costs per equipment
+*   Note: Some COPA records saved in YSE_RENT_COPA have blank vkorg!
+    SELECT      *
+           INTO TABLE IT_COPA_CO
+           FROM YSE_RENT_COPA_CO
+            FOR ALL ENTRIES IN IT_EQ
+          WHERE EQUNR EQ IT_EQ-EQUNR
+            AND BUKRS EQ P_BUKRS
+*           AND VKORG IN R_VKORG
+            AND FYEAR EQ P_GJAHR
+            AND FPERD EQ P_PERBL.
+
+*   Retrieve all revenue per equipment
+*   Note: Some COPA records saved in YSE_RENT_COPA have blank vkorg!
+    SELECT      *
+           INTO TABLE IT_COPA_RV
+           FROM YSE_RENT_COPA_RV
+            FOR ALL ENTRIES IN IT_EQ
+          WHERE EQUNR EQ IT_EQ-EQUNR
+            AND BUKRS EQ P_BUKRS
+*           AND VKORG IN R_VKORG
+            AND FYEAR EQ P_GJAHR
+            AND FPERD EQ P_PERBL
+            AND OWNED EQ GC_TRUE.
+
+  ENDIF.  " RECORDS IN IT_EQ
+
+ENDFORM.       " LOAD_EQUIPMENT
+
+***********************************************************************
+* Form LOAD_DESCRIPTIONS                                              *
+***********************************************************************
+* Load material and model descriptions and stores them into one       *
+* internal table.                                                     *
+***********************************************************************
+FORM LOAD_DESCRIPTIONS.
+
+* Prepare material and model descriptions
+  DESCRIBE TABLE IT_MATNR LINES LV_RECORDS.
+  IF LV_RECORDS > 0.
+
+*   Get material description for selected documents
+    SELECT MATNR MAKTX
+        INTO TABLE IT_MAKT
+        FROM MAKT
+         FOR ALL ENTRIES IN IT_MATNR
+       WHERE MATNR = IT_MATNR-MATNR
+         AND SPRAS = GC_ENGL.
+  ENDIF.  " records in it_matnr
+
+* Determine set of models
+  SELECT MATNR PMATN
+      INTO TABLE IT_MODEL
+      FROM MVKE
+       FOR ALL ENTRIES IN IT_EQ
+     WHERE MATNR = IT_EQ-MATNR
+       AND VKORG IN R_VKORG
+       AND VTWEG EQ GC_VTWEG.
+
+  SORT IT_MODEL.
+  DELETE ADJACENT DUPLICATES FROM IT_MODEL.
+
+  DESCRIBE TABLE IT_MODEL LINES LV_RECORDS.
+  IF LV_RECORDS > 0.
+
+*   Get material description for selected models
+    SELECT MATNR MAKTX
+        APPENDING TABLE IT_MAKT
+       FROM MAKT
+        FOR ALL ENTRIES IN IT_MODEL
+      WHERE MATNR = IT_MODEL-MODEL
+        AND SPRAS = GC_ENGL.
+  ENDIF.    " records in it_models
+
+ENDFORM.    " load_description
+
+***********************************************************************
+* Form LOAD_PGC_GAC                                                   *
+***********************************************************************
+FORM LOAD_PGC_GAC.
+
+  DESCRIBE TABLE IT_EQ LINES LV_RECORDS.
+  IF LV_RECORDS > 0.
+
+*   Fill table with PGC codes from it_eq
+    SORT IT_EQ BY PRODH.
+    LOOP AT IT_EQ.
+      IF IT_EQ-PRODH <> IT_PGC-PGC.
+        IT_PGC-PGC = IT_EQ-PRODH.
+        APPEND IT_PGC.
+      ENDIF.
+    ENDLOOP.  " IT_VBAP
+
+*   Get the corresponding GAC codes for the PGC codes
+    CALL FUNCTION 'YSE_CONVERT_PGC_GAC'
+      TABLES
+        IT_PGC_GAC = IT_PGC.
+    SORT IT_PGC BY PGC.
+  ENDIF.    " RECORDS IN IT_EQ
+
+ENDFORM.    " LOAD_PGC_GAC
+
+***********************************************************************
+* Module STATUS_0100 OUTPUT                                           *
+***********************************************************************
+MODULE STATUS_0100 OUTPUT.
+
+  SET TITLEBAR 'TITLE100' .
+  SET PF-STATUS 'STATUS100'.
+
+ENDMODULE.                 " STATUS_0100  OUTPUT
+
+***********************************************************************
+* Module USER_COMMAND_0100 INPUT                                      *
+***********************************************************************
+MODULE USER_COMMAND_0100 INPUT.
+
+  CASE OKCODE.
+    WHEN 'BACK' OR 'EXIT'.
+      LEAVE TO SCREEN 0.
+  ENDCASE.
+
+ENDMODULE.  " USER_COMMAND_0100 INPUT
+
+***********************************************************************
+* Module PREPARE_SCREEN OUTPUT                                        *
+***********************************************************************
+MODULE PREPARE_SCREEN OUTPUT.
+
+* Set screen variables
+  O_BUKRS = P_BUKRS.
+  O_PERIOD = P_PERBL.
+  O_YEAR = P_GJAHR.
+
+
+  IF OBJ_CONTAINER IS INITIAL .
+     PERFORM BUILD_ALV.
+  ENDIF.
+
+ENDMODULE.                 " PREPARE_SCREEN  OUTPUT
+
+***********************************************************************
+* Form BUILD_ALV                                                      *
+***********************************************************************
+* No arguments                                                        *
+***********************************************************************
+* Builds the field catalog, sets display parameters and calls the     *
+* method to display the results on screen.                            *
+***********************************************************************
+FORM BUILD_ALV.
+
+ DATA:  lv_off TYPE INT4.
+ CALL METHOD cl_gui_alv_grid=>offline
+    RECEIVING
+    e_offline = lv_off.
+
+  IF lv_off IS INITIAL.                          "MOD-004
+    IF OBJ_CONTAINER IS INITIAL .
+    CREATE OBJECT OBJ_CONTAINER
+      EXPORTING
+          REPID           =  SY-REPID
+          DYNNR           =  SY-DYNNR
+          LIFETIME        =  CNTL_LIFETIME_DYNPRO
+*         RATIO           =  90.
+          EXTENSION       =  310
+          SIDE  = CL_GUI_DOCKING_CONTAINER=>DOCK_AT_BOTTOM.
+
+    ENDIF.                                     "MOD-004
+  ENDIF.                                       "MOD-004
+  IF obj_alv IS INITIAL.                     "MOD-004
+      CREATE OBJECT obj_alv
+                EXPORTING i_parent = OBJ_CONTAINER.
+
+  ENDIF.
+
+  CALL FUNCTION 'LVC_FIELDCATALOG_MERGE'
+    EXPORTING
+      I_BUFFER_ACTIVE  = SPACE
+      I_STRUCTURE_NAME = 'YSE_REN_PROFIT_EQ_OUT'
+    CHANGING
+      CT_FIELDCAT      = IT_FIELDCAT[].
+
+* Build layout, including default variant with subtotals
+  GS_VARIANT-REPORT = SY-REPID.
+  GS_VARIANT-VARIANT = '/SUB_TOTALS'.
+* GS_LAYOUT-NO_TOOLBAR = LC_TRUE.
+  GS_LAYOUT-SEL_MODE   = 'B'.        " single row selectable
+  GS_LAYOUT-CWIDTH_OPT = GC_TRUE.
+
+  CALL METHOD OBJ_ALV->SET_TABLE_FOR_FIRST_DISPLAY
+    EXPORTING
+      I_SAVE          = 'A'
+      IS_VARIANT      = GS_VARIANT
+      IS_LAYOUT       = GS_LAYOUT
+    CHANGING
+      IT_OUTTAB       = IT_RESULT[]
+      IT_FIELDCATALOG = IT_FIELDCAT[].
+
+* Notes:
+*- Comment out gs_variant-variant when the default variant
+*  doesn't exist yet or when the field catalog has changed.
+*  Create it at run-time and from then on include it as a
+*  parameter to the first display method.
+*- i_save parameter:
+*  U Only user specific layouts can be saved
+*  X Only global layouts can be saved
+*  A Both user specific and global layouts can be saved
+*  Space Layouts can not be saved
+
+ENDFORM.                    "build_alv
+
+*&---------------------------------------------------------------------*
+*&      Form  Check_Authorization
+*&---------------------------------------------------------------------*
+FORM check_authorization.
+
+  DATA: it_t001k TYPE STANDARD TABLE OF t001k WITH HEADER LINE.
+
+*get the plants for this company code.
+  SELECT        * FROM  t001k
+        INTO TABLE it_t001k
+         WHERE  bukrs  = p_bukrs.
+
+  LOOP AT it_t001k.
+    AUTHORITY-CHECK OBJECT 'I_SWERK'
+             ID 'TCD' DUMMY
+             ID 'SWERK' FIELD it_t001k-bwkey.
+
+    IF sy-subrc = 4.
+*   No authorisation to display data from Sales Organisation p_vkorg
+     MESSAGE ID 'YSE_GENERAL' TYPE 'E' NUMBER '008' WITH p_bukrs.
+      EXIT.
+    ELSEIF sy-subrc <> 0.
+*   Error checking authorization.
+      MESSAGE ID 'YSE_GENERAL' TYPE 'E' NUMBER '004'.
+      EXIT.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    " Check_Authorization
+
+*&---------------------------------------------------------------------*
+*&      Form  PROCESS_DATA
+*&---------------------------------------------------------------------*
+* Copies all required fields to the output table for display in the    *
+* ALV grid.                                                            *
+*&---------------------------------------------------------------------*
+FORM PROCESS_DATA .
+
+* Build table with revenue per equipment, based on IT_EQ and IT_COPA_RV
+  LOOP AT IT_EQ.
+
+    CLEAR IT_RESULT.
+
+*   Material GAC/PGC
+    READ TABLE IT_PGC WITH KEY PGC = IT_EQ-PRODH.
+    IT_RESULT-GAC   = IT_PGC-GAC.                " MACHINE GAC
+    IT_RESULT-PGC   = IT_PGC-PGC.                " MACHINE PGC
+*   Model description
+    READ TABLE IT_MODEL WITH KEY MATNR = IT_EQ-MATNR.
+    READ TABLE IT_MAKT WITH KEY MATNR  = IT_MODEL-MODEL.
+    IT_RESULT-MODEL = IT_MAKT-MAKTX.
+*   Material number
+    IT_RESULT-MATNR = IT_EQ-MATNR.
+*   Material description
+    READ TABLE IT_MAKT WITH KEY MATNR = IT_EQ-MATNR.
+    IT_RESULT-MATER = IT_MAKT-MAKTX.
+*   Equipment number
+    IT_RESULT-EQUNR = IT_EQ-EQUNR.
+*   Serial number
+    IT_RESULT-SERNR = IT_EQ-SERNR.
+
+*   Add revenue per rev GAC/PGC
+    LOOP AT IT_COPA_RV WHERE EQUNR EQ IT_EQ-EQUNR.
+
+*     Revenue GAC / PGC
+      IT_RESULT-WW006 = IT_COPA_RV-WW006.
+      IT_RESULT-WW007 = IT_COPA_RV-WW007.
+      IT_RESULT-VREVU = IT_COPA_RV-VREVU.
+
+**     Add costs for the equipment (remark: if revenue on 2 different rev GAC's,
+**     the costs will be repeated for those 2 lines in the output)
+*      IT_RESULT-ADEPR = 0.
+*      IT_RESULT-VSERV = 0.
+*      LOOP AT IT_COPA_CO WHERE EQUNR = IT_EQ-EQUNR.
+*        IT_RESULT-ADEPR = IT_RESULT-ADEPR + IT_COPA_CO-ADEPR.
+*        IT_RESULT-VSERV = IT_RESULT-VSERV + IT_COPA_CO-VSERV.
+*        IF IT_RESULT-WAERS IS INITIAL.
+*          IT_RESULT-WAERS = IT_COPA_CO-WAERS.
+*        ENDIF.
+*      ENDLOOP.  " IT_EQ
+*
+*      IT_RESULT-MARGIN = IT_RESULT-VREVU - IT_RESULT-ADEPR - IT_RESULT-VSERV.
+
+      COLLECT IT_RESULT.
+
+    ENDLOOP.
+
+  ENDLOOP.
+
+* Complete the output table with the costs and calculate margin
+  LOOP AT IT_EQ.
+
+*   Complete existing lines with correct costs
+    LOOP AT IT_RESULT WHERE EQUNR EQ IT_EQ-EQUNR.
+
+*     Add costs for the equipment (remark: if revenue on 2 different rev GAC's,
+*     the costs will be repeated for those 2 lines in the output)
+      IT_RESULT-ADEPR = 0.
+      IT_RESULT-VSERV = 0.
+      LOOP AT IT_COPA_CO WHERE EQUNR = IT_EQ-EQUNR.
+        IT_RESULT-ADEPR = IT_RESULT-ADEPR + IT_COPA_CO-ADEPR.
+        IT_RESULT-VSERV = IT_RESULT-VSERV + IT_COPA_CO-VSERV.
+        IF IT_RESULT-WAERS IS INITIAL.
+          IT_RESULT-WAERS = IT_COPA_CO-WAERS.
+        ENDIF.
+      ENDLOOP.  " IT_EQ
+*     Calculate margin
+      IT_RESULT-MARGIN = IT_RESULT-VREVU - IT_RESULT-ADEPR - IT_RESULT-VSERV.
+*     Modify table
+      MODIFY IT_RESULT.
+    ENDLOOP.
+
+*   If no entries found for this equipment, create new lines for the costs of this equip
+    IF SY-SUBRC NE 0.
+      CLEAR IT_RESULT.
+*     Material GAC/PGC
+      READ TABLE IT_PGC WITH KEY PGC = IT_EQ-PRODH.
+      IT_RESULT-GAC   = IT_PGC-GAC.                " MACHINE GAC
+      IT_RESULT-PGC   = IT_PGC-PGC.                " MACHINE PGC
+*     Model description
+      READ TABLE IT_MODEL WITH KEY MATNR = IT_EQ-MATNR.
+      READ TABLE IT_MAKT WITH KEY MATNR  = IT_MODEL-MODEL.
+      IT_RESULT-MODEL = IT_MAKT-MAKTX.
+*     Material number
+      IT_RESULT-MATNR = IT_EQ-MATNR.
+*     Material description
+      READ TABLE IT_MAKT WITH KEY MATNR = IT_EQ-MATNR.
+      IT_RESULT-MATER = IT_MAKT-MAKTX.
+*     Equipment number
+      IT_RESULT-EQUNR = IT_EQ-EQUNR.
+*     Serial number
+      IT_RESULT-SERNR = IT_EQ-SERNR.
+
+*     Add costs for the equipment (remark: if revenue on 2 different rev GAC's,
+*     the costs will be repeated for those 2 lines in the output)
+      IT_RESULT-ADEPR = 0.
+      IT_RESULT-VSERV = 0.
+      LOOP AT IT_COPA_CO WHERE EQUNR = IT_EQ-EQUNR.
+        IT_RESULT-ADEPR = IT_RESULT-ADEPR + IT_COPA_CO-ADEPR.
+        IT_RESULT-VSERV = IT_RESULT-VSERV + IT_COPA_CO-VSERV.
+        IF IT_RESULT-WAERS IS INITIAL.
+          IT_RESULT-WAERS = IT_COPA_CO-WAERS.
+        ENDIF.
+      ENDLOOP.  " IT_EQ
+*     Calculate margin
+      IT_RESULT-MARGIN = IT_RESULT-VREVU - IT_RESULT-ADEPR - IT_RESULT-VSERV.
+*     Append new line
+      APPEND IT_RESULT.
+
+    ENDIF.
+
+  ENDLOOP.
+
+ENDFORM.                    " PROCESS_DATA
+
+*Text symbol text£º
+*001:PGC
+*002:PGC Code
+*003:GAC
+*004:GAC code
+*005:Model
+*006:Model description
+*007:Material
+*008:Material number
+*009:Description
+*010:Material description
+*011:Equipment
+*012:Equipment number
+*013:Serial
+*014:Serial number
+*015:Revenue
+*016:Rental revenue
+*017:Depreciation
+*018:Depreciation costs
+*019:Service
+*020:Service costs
+*021:Other
+*022:Other costs
+*023:Margin
+*024:Margin (absolute)
+*025:Currency
+*026:Currency
+
+*S01:Parameters
+*Selection text£º
+*P_BUKRS:        Company code
+*P_GJAHR:        Fiscal year
+*P_PERBL:        Fiscal period
+*SO_EQUNR:        Equipment
+*SO_GAC:        GAC
+*SO_MATNR:        Material
+*SO_MODEL:        Model
+*SO_PGC:        PGC

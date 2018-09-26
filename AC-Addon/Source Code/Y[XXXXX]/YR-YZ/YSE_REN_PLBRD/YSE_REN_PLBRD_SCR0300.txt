@@ -1,0 +1,375 @@
+*&---------------------------------------------------------------------*
+*&  Include           YSE_RENT_PLBRD_SCR0300                            *
+*&---------------------------------------------------------------------*
+
+*&---------------------------------------------------------------------*
+*&      Module  BC_PBO  OUTPUT
+*&---------------------------------------------------------------------*
+* Pass the data to the barchart control
+*----------------------------------------------------------------------*
+MODULE 0300_PBO OUTPUT.  " BarChart Process Before Output
+
+* There used to be a Call Function 'BARC_GRAPHIC_PBO', but since there are
+* situations where we still have a BARC GRAPHIC (e.g. after returning from
+* the rental basket), calling the PBO FM resulted in problems. Therefore,
+* the FM is now called in
+*  START-OF-SELECTION   -> initial output
+*  REFRESH_CHARTS       -> refresh (but here we first destroy e'th)
+*  GET_LINES_SELECTED   -> is not for output but to fetch selected lines
+*  OK_CODE_300_ORIGINAL -> don't know ...
+
+ENDMODULE.                             " BC_PBO  OUTPUT
+
+*&---------------------------------------------------------------------*
+*&      Module  STATUS_0300  OUTPUT
+*&---------------------------------------------------------------------*
+*       CUA-Status, Fenstertitel setzen
+*----------------------------------------------------------------------*
+MODULE 0300_SET_PF-STATUS OUTPUT.
+
+* If not called as search help
+  IF GV_SH IS INITIAL.
+*   If user has full authorization or if he plans to just soft reserve
+    IF NOT GV_AUTHF IS INITIAL OR GV_ST = GC_ST_MD.
+      SET PF-STATUS 'RPBOARDF'.
+    ELSE.
+      SET PF-STATUS 'RPBOARD'.
+    ENDIF.
+* If called as search help, limit possibilities for the user
+  ELSE.
+*   If user has full atuhorization or if he plans to just soft reserve
+    IF NOT GV_AUTHF IS INITIAL OR GV_ST = GC_ST_MD.
+*     For contracts, show "with" and "without" delivery
+      IF GV_ST = GC_ST_EQ.
+        SET PF-STATUS 'RPBSHELPF'.
+      ELSE.
+        SET PF-STATUS 'RPBSHELPFQT'.
+      ENDIF.
+    ELSE.
+      SET PF-STATUS 'RPBSHELP'.
+    ENDIF.
+  ENDIF.
+
+  SET TITLEBAR '001'.
+
+ENDMODULE.                             " STATUS_0300  OUTPUT
+
+*&---------------------------------------------------------------------*
+*&      Module  USER_COMMAND_0300  INPUT
+*&---------------------------------------------------------------------*
+* OK-Code Processing
+*----------------------------------------------------------------------*
+MODULE 0300_OK_CODE INPUT.
+
+  DATA:
+    LV_LIFSK TYPE LIFSK.
+
+* When plbrd used as search help, first export OK_CODE to memory
+  IF GV_SH EQ GC_CHAR_X.
+    EXPORT OK_CODE FROM OK_CODE TO MEMORY ID GC_MID_OKCOD.
+  ENDIF.
+
+  CASE OK_CODE.
+    WHEN 'REFR'.
+      PERFORM REFRESH_CHARTS.
+    WHEN 'PBSB'.
+*     Check that user has sufficient authorization
+*     (Contracts can only be created when full auth hence no auth to open RBask when in restricted mode)
+      IF GV_ST EQ GC_ST_EQ AND GV_AUTHF IS INITIAL.
+        MESSAGE E052 WITH P_VKORG.
+      ENDIF.
+*     Initialize global variable "Doc created"
+      CLEAR GV_DOC_CREATED.
+*     Call the rental basket
+      CALL SCREEN 201.
+*     If new doc was created, go back to selection screen of planning board
+      IF NOT GV_DOC_CREATED IS INITIAL.
+        CLEAR GV_DOC_CREATED.
+        PERFORM EXIT_BC.
+      ENDIF.
+    WHEN 'EXIT'.
+      PERFORM EXIT_BC.                 " Delete control
+    WHEN 'QUIT'.
+      PERFORM EXIT_BC.                 " Delete control
+    WHEN 'BACK'.
+      PERFORM EXIT_BC.                 " Delete control
+    WHEN 'XFER'.
+      IF GV_ST = GC_ST_MD.
+        PERFORM SB_XFER2 USING GC_BCLT_MD.
+      ELSE.
+*       User can only create quotation (soft reservation), not contract when in restricted mode
+        IF GV_AUTHF IS INITIAL.
+          MESSAGE E053 WITH P_VKORG.
+*       If user has authorization, check delivery block
+        ELSE.
+          CLEAR LV_LIFSK.
+          SELECT SINGLE LIFSK
+                   INTO LV_LIFSK
+                   FROM VBAK
+                  WHERE VBELN EQ P_VBELN.
+          IF LV_LIFSK NE SPACE.
+            MESSAGE E002(YSE_AUT_BLOCK) WITH P_VBELN LV_LIFSK.
+          ENDIF.
+        ENDIF.
+        PERFORM SB_XFER2 USING GC_BCLT_EQ.
+      ENDIF.
+    WHEN 'USEINDOC' OR 'USEDEL' OR 'USENOD'.
+*     User can only use in doc for soft reservation, not contract when in restricted mode
+      IF GV_ST EQ GC_ST_EQ AND GV_AUTHF IS INITIAL.
+        MESSAGE E054 WITH P_VKORG.
+      ENDIF.
+      PERFORM SH_XFER2DOC.
+    WHEN 'OLOG'.
+      PERFORM BDC_LOAD_SLG1.
+    WHEN 'COLLEG'.
+      CALL SCREEN 202 STARTING AT 15  5
+                      ENDING   AT 45 10.
+    WHEN OTHERS.
+      IF OK_CODE(4) = SGRC_CONST-EVENT        " Event       = '%_GC'
+      OR OK_CODE(4) = SGRC_CONST-SHELL_EVENT. " Shell-Event = '%_GS'
+        PERFORM USER_COMMAND.
+      ELSE.                            " Function code
+        PERFORM OK_CODE_300_ORIGINAL.
+      ENDIF.
+  ENDCASE.
+
+ENDMODULE.                             " USER_COMMAND_0300  INPUT
+
+*&---------------------------------------------------------------------*
+*&      Form  EXIT_BC
+*&---------------------------------------------------------------------*
+* Destructor for control
+*----------------------------------------------------------------------*
+FORM EXIT_BC.
+
+  IF OK_CODE = 'BACK'.
+    PERFORM SB_SAVE.
+  ENDIF.
+  PERFORM DELETE_CHARTCONTROL.
+
+  SET SCREEN 0.
+  LEAVE SCREEN.
+
+ENDFORM.                                                    " EXIT_BC
+
+*---------------------------------------------------------------------*
+*       FORM USER_COMMAND                                             *
+*---------------------------------------------------------------------*
+*       Verprobungsmodul                                              *
+*---------------------------------------------------------------------*
+FORM user_command.
+
+* Get the BARC PAI information
+  CALL FUNCTION 'BARC_GRAPHIC_PAI'
+    EXPORTING
+      CONTROL_HANDLE = GV_BARC_OCX_HNDL  "F#R UMSTELLUNG AUF OCX
+    IMPORTING
+      GRAPH_CMD      = GRAPH_CMD
+      GRAPH_CMD_INFO = GRAPH_CMD_INFO
+      GR_SEL_FIELD   = GR_SEL_FIELD
+      LAYER_TYPE     = LAYER_KIND
+      SETTINGS       = SETTINGS
+      SYMBOLTYPE     = SYMBOLTYPE
+    TABLES
+      BOXES          = BOXES
+      BOX_VALS       = BOX_VALS
+      DELETIONS      = DELETIONS
+      LINKS          = LINKS
+      LINK_VALS      = LINK_VALS
+      NODES          = NODES
+      NODE_VALS      = NODE_VALS
+      POSITIONS      = POSITIONS
+    EXCEPTIONS
+      INV_WINID      = 1.
+
+  CLEAR: ABAP_CMD,
+         STATUS_TEXT.
+
+  STAT = SGRC_CONST-STAT_4.            " WAIT FOR INPUT
+
+*
+  CASE GRAPH_CMD.
+    WHEN BC_CONST-ASK_FOR_INSERT.      "EINF#GEN
+    WHEN BC_CONST-ASK_FOR_DUPLICATE.   "DUPLIZIEREN
+    WHEN BC_CONST-ASK_FOR_CONNECT.     "VERBINDEN
+    WHEN BC_CONST-ASK_FOR_MODIFY.      "MODIFIZIEREN
+    WHEN BC_CONST-DOUBLE_CLICK.        " DoubleClick
+*     ABAP_CMD  = BC_CONST-ASK_FOR_MODIFY.
+*     GRAPH_CMD = BC_CONST-ASK_FOR_MODIFY.
+      PERFORM 0300_DBLCLICK.
+
+    WHEN bc_const-ask_for_delete.      "l#schen
+    WHEN bc_const-ask_for_movelayer.   "Layer verschieben
+    WHEN bc_const-ask_for_movenode.    "Knoten verschieben
+    WHEN bc_const-ask_for_movemulti.   "mehrere Knoten verschieben
+    WHEN bc_const-ask_for_movebox.     "Box verschieben
+    WHEN bc_const-ask_for_scaleleft.   "skalieren links
+    WHEN bc_const-ask_for_scaleright.  "skalieren rechts
+    WHEN bc_const-ask_for_back.        "Zur¨¹ck
+    WHEN bc_const-ask_for_quit.        "Abbruch
+    WHEN bc_const-ask_for_exit.        "Ende
+    WHEN bc_const-get_selection.       "Selektionen ermittelt
+  ENDCASE.                             "case GRAPH_CMD
+
+* Objekttabellen aktualisieren
+  CALL FUNCTION 'BARC_LOGIC'
+    EXPORTING
+      graph_cmd     = graph_cmd
+    TABLES
+      all_boxes     = all_boxes
+      all_box_vals  = all_box_vals
+      all_links     = all_links
+      all_link_vals = all_link_vals
+      all_nodes     = all_nodes
+      all_node_vals = all_node_vals
+      all_positions = all_positions
+      boxes         = boxes
+      box_vals      = box_vals
+      deletions     = deletions
+      links         = links
+      link_vals     = link_vals
+      nodes         = nodes
+      node_vals     = node_vals
+      positions     = positions.
+
+ENDFORM.                               "user_command
+
+*---------------------------------------------------------------------*
+*       FORM GET_MAX_POS                                              *
+*---------------------------------------------------------------------*
+* maximale, belegte Position ermitteln
+*---------------------------------------------------------------------*
+FORM GET_MAX_POS TABLES ALL_POSITIONS STRUCTURE BCPOSITION
+                         POSITIONS STRUCTURE BCPOSITION
+                 USING   CHART_ID LIKE TMP_BOXES-CHART_ID
+                         MAX_POS LIKE BCPOSITION-ROW_NUMBER.
+
+  CLEAR MAX_POS.
+
+  LOOP AT ALL_POSITIONS WHERE CHART_ID = CHART_ID.
+    IF ALL_POSITIONS-ROW_NUMBER > MAX_POS.
+      MAX_POS = ALL_POSITIONS-ROW_NUMBER.
+    ENDIF.
+  ENDLOOP.                             "at ALL_POSITIONS
+
+  LOOP AT POSITIONS WHERE CHART_ID = CHART_ID.
+    IF POSITIONS-ROW_NUMBER > MAX_POS.
+      MAX_POS = POSITIONS-ROW_NUMBER.
+    ENDIF.
+  ENDLOOP.                             "at POSITIONS
+
+ENDFORM.                               " GET_MAX_POS
+
+*&---------------------------------------------------------------------*
+*&      Form  OK_CODE_300_ORIGINAL
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM OK_CODE_300_ORIGINAL .
+
+  DATA: RETVAL TYPE I.
+
+  SAVE_OK_CODE = OK_CODE.
+  CLEAR OK_CODE.
+
+* In other cases have the Function code executed on the barchart
+  CALL FUNCTION 'BARCHART_SET_FUNCTION_CODE'
+    EXPORTING
+      HANDLE        = GV_BARC_OCX_HNDL
+      FUNCTION_CODE = SAVE_OK_CODE
+    IMPORTING
+      RETURN        = RETVAL.
+  IF RETVAL = 0.
+* In case the function call was successfull, process the OK_CODE
+    PERFORM USER_COMMAND.        " Call form "USER_COMMAND" directly
+
+    IF ABAP_CMD = BC_CONST-GET_SELECTION
+    OR ABAP_CMD = BC_CONST-GET_OVERLAP
+    OR ABAP_CMD = BC_CONST-GET_SETTINGS
+    OR ABAP_CMD = BC_CONST-GET_COLOR.
+*   In case further data are to be processed, send the OK_CODE to the graphic
+      CALL FUNCTION 'BARC_GRAPHIC_PBO'
+        EXPORTING
+          ABAP_CMD       = ABAP_CMD
+          STAT           = STAT
+          CONTROL_HANDLE = GV_BARC_OCX_HNDL.
+*     Go get the data and process the command
+      PERFORM USER_COMMAND.
+    ENDIF.
+  ELSE.
+*   Function code could be processed immediately (Zoom in, ..)
+    STAT = SGRC_CONST-STAT_4.    " Wait for input
+  ENDIF.
+
+ENDFORM.                    " OK_CODE_300_ORIGINAL
+
+*&---------------------------------------------------------------------*
+*&      Form  0300_DBLCLICK
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM 0300_DBLCLICK .
+
+DATA: LV_AUART    TYPE AUART,
+      LV_VBELN    TYPE VBELN,
+      LV_LEVEL(2) TYPE C,
+      LV_SERNR    TYPE GERNR,
+      LV_MATNR    TYPE MATNR.
+
+* CHECK WHICH NODE WAS DOUBLECLICKED
+
+* When the view is models only
+  IF GV_ST = GC_ST_EQ.
+    DESCRIBE TABLE NODES LINES ANZ.  "NODE
+    IF ANZ = 1.
+*     Read the line
+      READ TABLE NODES INDEX 1.
+*     Get the hover value of the node (that is equal to the document number)
+      READ TABLE ALL_NODE_VALS WITH KEY ID = NODES-ID
+                                        FL = 0.
+      LV_VBELN = ALL_NODE_VALS-VAL.
+*     Get the document type of the node
+      READ TABLE ALL_NODE_VALS WITH KEY ID = NODES-ID
+                                        FL = 9.
+      LV_AUART = ALL_NODE_VALS-VAL.
+*     Depending on Document type, call other transaction
+      CASE LV_AUART.
+*       In case of contract
+        WHEN GC_AUART_CONT OR GC_AUART_XREN OR GC_AUART_CNDP OR GC_AUART_CNMB.
+          PERFORM BDC_LOAD_CONT USING LV_VBELN SPACE SPACE.
+*       In case of delivery
+        WHEN GC_AUART_DELV OR GC_AUART_DELR.
+          PERFORM BDC_LOAD_DELV USING LV_VBELN.
+*       In case of service order
+        WHEN GC_AUART_ZAM1 OR GC_AUART_ZAM2.
+          PERFORM BDC_LOAD_SVOR USING LV_VBELN.
+      ENDCASE.
+    ENDIF.                           "if not ANZ is initial.
+
+  ENDIF.
+
+  DESCRIBE TABLE BOXES LINES ANZ.
+  IF ANZ = 1.
+*   Read the line
+    READ TABLE BOXES INDEX 1.
+*   Get the hover value of the node (that is equal to the document number)
+    READ TABLE ALL_BOX_VALS WITH KEY ID = BOXES-ID
+                                     FL = 9.
+    LV_LEVEL = ALL_BOX_VALS-VAL.
+*   Get the document type of the node
+    READ TABLE ALL_BOX_VALS WITH KEY ID = BOXES-ID
+                                      FL = 10.
+    IF LV_LEVEL = 'EQ'.
+      LV_SERNR = ALL_BOX_VALS-VAL.
+      PERFORM BDC_LOAD_EQPT USING LV_SERNR.
+    ELSEIF LV_LEVEL = 'MT' OR LV_LEVEL = 'MD'.
+      LV_MATNR = ALL_BOX_VALS-VAL.
+      PERFORM BDC_LOAD_MATL USING LV_MATNR.
+    ENDIF.
+
+  ENDIF.                           "if not ANZ is initial.
+
+ENDFORM.                    " 0300_DBLCLICK

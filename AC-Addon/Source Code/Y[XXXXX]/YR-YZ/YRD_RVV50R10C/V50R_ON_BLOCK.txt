@@ -1,0 +1,395 @@
+*----------------------------------------------------------------------*
+*   INCLUDE V50R_ON_BLOCK                                              *
+*----------------------------------------------------------------------*
+
+*
+*--------------- Hauptblock -------------------------------------------*
+
+AT SELECTION-SCREEN ON BLOCK 0.
+
+PERFORM 1.
+   FORM 1.
+DATA:
+  lf_ledat_high_max          TYPE shp_vl10_ledat_high_max
+, lf_bezeichnung_profil(42)
+, lf_ledat_high              TYPE shp_vl10_ledat_high
+, ls_ledat_range             TYPE shp_ledat_range
+, lt_ledat                   TYPE shp_ledat_range_t
+.
+
+
+  IF gx_list_profil-ledat_rule <> p_lerul.
+
+*   Redetermine ledat for new ledat_rule.
+    MESSAGE s027(v50r) WITH gx_list_profil-ledat_rule
+                            p_lerul space space.
+
+    gx_list_profil-ledat_rule     = p_lerul.
+    gx_list_profil-ledat_high_max = p_le_max.
+
+    CLEAR:  st_ledat, gx_list_profil-ledat_high.
+    REFRESH st_ledat.
+    PERFORM determine_ledat CHANGING gx_list_profil
+                                     st_ledat[].
+
+    PERFORM save_ledat_against_def_var USING 'INI' CHANGING st_ledat[].
+    PERFORM save_ledat_against_def_var USING 'SET' CHANGING st_ledat[].
+
+    PERFORM ledat_high_determine
+            USING     p_le_max
+            CHANGING lt_ledat[]
+                     lf_ledat_high.
+
+  ELSE.
+
+    PERFORM ledat_high_determine
+            USING     p_le_max
+            CHANGING lt_ledat[]
+                     lf_ledat_high.
+
+  ENDIF.
+
+  READ TABLE st_ledat INDEX 1
+                      INTO ls_ledat_range.
+
+  IF  sy-subrc = 0
+  AND lf_ledat_high < ls_ledat_range-high.
+
+*   Maximales LEDAT-Bis wird reduziert
+    CONCATENATE '"' gx_list_profil-vtext '"'
+           INTO lf_bezeichnung_profil.
+
+    MESSAGE i014(v50r) WITH ls_ledat_range-high
+                            p_le_max
+                            lf_bezeichnung_profil
+                            gx_list_profil-create_profil.
+
+          gx_list_profil-ledat_high_max = p_le_max.
+    CLEAR gx_list_profil-ledat_high.
+
+    REFRESH st_ledat.
+    CLEAR   st_ledat.
+
+*   Redetermine ledat for new ledat_rule.
+    MESSAGE s030(v50r).
+
+  ELSEIF sy-subrc = 0                                       "v_n_695262
+  AND    lf_ledat_high < ls_ledat_range-low.
+
+*   LEDAT-from is reduced, LEDAT-to is set to space
+    CONCATENATE '"' gx_list_profil-vtext '"'
+           INTO lf_bezeichnung_profil.
+
+    MESSAGE i014(v50r) WITH ls_ledat_range-low
+                            p_le_max
+                            lf_bezeichnung_profil
+                            gx_list_profil-create_profil.
+
+          gx_list_profil-ledat_high_max = p_le_max.
+    CLEAR gx_list_profil-ledat_high.
+
+    st_ledat-low = lf_ledat_high.
+    CLEAR st_ledat-high.
+    MODIFY st_ledat INDEX 1.
+
+*   Redetermine ledat for new ledat_rule.
+    MESSAGE s030(v50r).                                     "^_n_695262
+
+  ENDIF.
+
+
+* Bestimmen Selektionskriterium f¨¹r Liefererstelldatum
+  PERFORM ledat_high_determine USING    gx_list_profil-ledat_high_max
+                               CHANGING st_ledat[]
+                                        gx_list_profil-ledat_high.
+
+
+ENDFORM.
+
+
+*
+*--------------- Partner-Block ---------------------------------------*
+*
+AT SELECTION-SCREEN ON BLOCK d.
+* Partnernummer zur Partnerrolle vorhanden ?
+  DESCRIBE TABLE st_kunn2 LINES gf_lines.
+  IF ( gf_lines = 0 )  AND  ( NOT p_parvw IS INITIAL ).
+    MESSAGE e531.              " Partnernummer zur Partnerrolle angeben
+  ENDIF.
+
+  REFRESH: gt_pernr, gt_parnr.
+
+  CASE p_parvw.
+*   Partnerrolle zur Partnernummer vorhanden ?
+    WHEN '  '.
+      IF  gf_lines > 0.
+        MESSAGE e532.         " Partnerrolle zur Partnernummer angeben
+      ENDIF.
+*   Sonderbehandlung f¨¹r Partner im Index
+    WHEN 'AG'.
+      PERFORM check_standard_partner TABLES st_kunnr.
+    WHEN 'WE'.
+      PERFORM check_standard_partner TABLES st_kunwe.
+    WHEN 'SP'.
+      PERFORM check_standard_partner TABLES st_spdnr.
+    WHEN OTHERS.
+
+      CALL FUNCTION 'SHP_TPAR_SELECT_01'
+           EXPORTING
+                if_parvw             = p_parvw
+           CHANGING
+                cs_tpar              = gs_tpar
+           EXCEPTIONS
+                OTHERS               = 1
+                .
+      IF sy-subrc <> 0.
+         sy-subrc  = 0.
+      ENDIF.
+        CASE gs_tpar-nrart.
+*         Umsetzung, da andere Typen von low/high je nach Partnerart
+          WHEN 'KU'. "alles ok.                         "Kunde
+          WHEN 'LI'. "alles ok.                         "Lieferant
+          WHEN 'PE'.                                    "Personalummer
+            REFRESH gt_pernr.
+            LOOP AT st_kunn2.
+              MOVE-CORRESPONDING st_kunn2 TO gt_pernr.
+              APPEND gt_pernr.
+            ENDLOOP.
+          WHEN 'AP'.                                    "Ansprechpartner
+            REFRESH gt_parnr.
+            LOOP AT st_kunn2.
+              MOVE-CORRESPONDING st_kunn2 TO gt_parnr.
+              APPEND gt_parnr.
+            ENDLOOP.
+          WHEN OTHERS.
+*           Partnerart &1 der Rolle &2 nicht unterst¨¹tzt
+            MESSAGE e540 WITH gs_tpar-nrart p_parvw.
+        ENDCASE.
+  ENDCASE.
+
+
+
+*
+*--------------- List-Profil -----------------------------------------*
+*
+AT SELECTION-SCREEN ON BLOCK f.
+
+* synchronize list_profil: p_prnam, p_profil, gx_list_profil
+  PERFORM synchronize_list_profil
+          CHANGING       p001        "use userrole-data
+                         p_prnam
+                         t_frame6    "text in frame userrole
+                   gx_list_profil.
+
+
+*
+*--------------- Lieferungen ------------------------------------------*
+*
+AT SELECTION-SCREEN ON BLOCK g.
+
+* set selection criteria for Status for goods movement
+* (Warenbewegungsstatus), if no entry yet and checkbox for
+* only open deliveries is set.
+
+  PERFORM synchronize_wbstk_lfop USING     p_lfop
+                                           p_unch
+                                 CHANGING st_wbstk[].
+  IF   p_unch = space.
+    IF p_nochek = 'X'.
+*     enter checkmode for deliveries to be selected
+      MESSAGE e032(v50r).
+    ELSE.
+*     only checked deliveries requested, Avoid selecting unchecked
+*     deliveries
+      REFRESH st_bestk.
+      st_bestk-sign   = 'I'.
+      st_bestk-option = 'EQ'.
+      st_bestk-low    = space.
+      st_bestk-high   = space.
+      APPEND st_bestk.
+    ENDIF.
+  ELSE.
+    IF p_nochek = 'X'.
+*     no checked deliveries, but unchecked deliveries requested
+      REFRESH st_bestk.
+      st_bestk-sign   = 'I'.
+      st_bestk-option = 'EQ'.
+      st_bestk-low    = 'A'.
+      st_bestk-high   = space.
+      APPEND st_bestk.
+    ELSE.
+*     both checked and unchecked are requested. i.e. no restriction on
+*     check mode
+      REFRESH st_bestk.
+      st_bestk-sign   = 'I'.
+      st_bestk-option = 'BT'.
+      st_bestk-low    = space.
+      st_bestk-high   = 'A'.
+      APPEND st_bestk.
+    ENDIF.
+  ENDIF.
+
+* SPE OUTB check release date for valid entries
+* as the time is filled with zeros, it is necessary to check for space
+  IF NOT p_rldat1 IS INITIAL AND p_rldat1 > p_rldat2
+    AND NOT p_rldat2 IS INITIAL
+    OR ( p_rldat1 = p_rldat2 AND p_rltim1 > p_rltim2
+    AND p_rltim2 NE space AND NOT p_rltim2 IS INITIAL ).
+*   Enter a valid-from date
+    MESSAGE e457(vr). "Fehlermeldung
+  ELSEIF p_rldat1 IS INITIAL AND p_rldat2 EQ space
+    AND ( NOT p_rltim2 IS INITIAL OR NOT p_rltim1 IS INITIAL
+          OR p_rltim2 NE space OR p_rltim1 NE space ).
+*   Enter time together with date only
+    MESSAGE e441(vl).
+  ELSEIF p_rldat1 IS INITIAL AND p_rltim1 NE space
+    AND NOT p_rltim1 IS INITIAL
+    OR ( p_rldat2 IS INITIAL AND p_rltim2 NE space
+    AND NOT p_rltim2 IS INITIAL ).
+*   Enter time together with date only
+    MESSAGE e441(vl).
+  ENDIF.
+
+
+*
+*--------------- T186, T186C, E, F -----------------------------------*
+*
+AT SELECTION-SCREEN ON BLOCK f0.
+
+DATA:
+  ls_t186 TYPE t186
+, ls_submit_info LIKE rssubinfo
+.
+  IF gx_list_profil-profilname <> p_prnam.
+
+    SELECT SINGLE * FROM     t186
+                    INTO  ls_t186
+                    WHERE profilname = p_prnam.
+
+    IF sy-subrc <> 0.
+      MESSAGE e031(v50r).
+
+    ELSE.
+*     Variant maintenance active?
+      CALL FUNCTION 'RS_SUBMIT_INFO'
+           IMPORTING  p_submit_info = ls_submit_info.
+
+      IF NOT ls_submit_info-mode_vari IS INITIAL.
+         MOVE ls_t186-fcode_profil TO p_prof1.
+         MOVE ls_t186-fcode_allow_prf TO p_prof2.
+         MOVE ls_t186-create_profil TO p_prof3.
+      ENDIF.
+
+    ENDIF.
+
+  ENDIF.
+
+AT SELECTION-SCREEN ON BLOCK f12.
+
+DATA:
+  ls_t186f TYPE                   t186f
+, lt_t186f TYPE STANDARD TABLE OF t186f
+.
+*   t186f: Fcode-profile for due list execution
+*   GET
+*   PREPARE
+*   DISPLAY
+    IF NOT p001                    IS INITIAL
+    OR gx_list_profil-fcode_profil <> p_prof1.
+
+      SELECT * FROM t186f INTO  TABLE lt_t186f[]
+                          WHERE profilname = p_prof1.
+      IF sy-subrc <> 0.
+*       Entry & & & does not exist - check your entry
+        MESSAGE e058(00) WITH p_prof1 '' '' 't186f'.
+      ENDIF.
+      SORT lt_t186f BY sort.
+      REFRESH gx_list_profil-fcodes.
+      LOOP AT lt_t186f INTO ls_t186f.
+        APPEND ls_t186f-fcode TO gx_list_profil-fcodes.
+      ENDLOOP.
+
+
+      PERFORM synch_fcodes_to___sel_opt TABLES   st_fcod1[]
+                                        USING    gx_list_profil-fcodes.
+  ELSE.
+
+      PERFORM synch_fcodes_from_sel_opt TABLES   st_fcod1[]
+                                        CHANGING gx_list_profil-fcodes.
+  ENDIF.
+
+
+
+AT SELECTION-SCREEN ON BLOCK f13.
+
+DATA:
+  ls_t186e                   TYPE t186e
+, ls_dialog_fcodes_ex        TYPE shp_vl10_fcodes_allow
+, lt_t186e                   TYPE STANDARD TABLE OF t186e
+.
+
+*   t186e: excluded dialog fcodes
+*   Dialog-Fcodes on Due List, which are in GUI-Status (t186-gui_status)
+*   but are dynamically to be excluded (set pf-status excluding....)
+    IF NOT p001 IS INITIAL
+    OR gx_list_profil-fcode_allow_prf <> p_prof2.
+
+      SELECT * FROM t186e INTO TABLE         lt_t186e
+                          WHERE profilname =  p_prof2.
+*     if sy-subrc <> 0.
+*       this is no error, it might just happen !
+*     endif.
+      REFRESH gx_list_profil-fcodes_allow.
+
+      LOOP AT lt_t186e INTO ls_t186e.
+        ls_dialog_fcodes_ex-fcode       = ls_t186e-fcode.
+        ls_dialog_fcodes_ex-fcode_allow = ls_t186e-allow.
+        APPEND ls_dialog_fcodes_ex TO gx_list_profil-fcodes_allow.
+      ENDLOOP.
+
+      PERFORM synch_fcodes_allo_to___sel_opt
+              TABLES st_fcod2[]
+              USING  gx_list_profil-fcodes_allow.
+   ELSE.
+
+      PERFORM synch_fcodes_allo_from_sel_opt
+              TABLES   st_fcod2[]
+              CHANGING gx_list_profil-fcodes_allow.
+
+   ENDIF.
+
+
+
+
+
+AT SELECTION-SCREEN ON BLOCK f14.
+
+DATA:
+  ls_t186c                   TYPE t186c
+, ls_t186c_data              TYPE t186c_data
+, lf_ledat_high              TYPE shp_vl10_ledat_high
+, ls_ledat_range             TYPE shp_ledat_range
+, lt_ledat                   TYPE shp_ledat_range_t
+.
+
+*   t186c: delivery creation profile
+*   parameters, which influence delivery creation directly in FCode SAMD
+    IF NOT p001 IS INITIAL
+    OR gx_list_profil-create_profil <> p_prof3.
+
+      SELECT SINGLE * FROM t186c INTO  ls_t186c
+                                 WHERE profilname =  p_prof3.
+      IF sy-subrc <> 0.
+*       Entry & & & does not exist - check your entry
+        MESSAGE e058(00) WITH p_prof3 '' '' 't186c'.
+      ENDIF.
+      MOVE-CORRESPONDING ls_t186c TO ls_t186c_data.
+      MOVE-CORRESPONDING             ls_t186c_data TO gx_list_profil.
+
+      PERFORM list_profil_set_t186c_to_par USING gx_list_profil.
+
+    ELSE.
+
+      PERFORM list_profil_get_t186c_from_p CHANGING gx_list_profil.
+
+    ENDIF.

@@ -1,0 +1,169 @@
+*&---------------------------------------------------------------------*
+*& Report  ZRALM_ME_EQUI_FULL_DOWNLOAD_SD                              *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+
+REPORT  zralm_me_equi_full_download_sd .
+
+* Pass all relevant equipment keys to the
+* server-driven SyncBOs on the middleware
+* for an initial download.
+
+* Selection screen
+PARAMETERS p_full  TYPE char01 AS CHECKBOX.
+SELECTION-SCREEN SKIP.
+PARAMETERS p_rfcd  TYPE rfcdest DEFAULT space.
+PARAMETERS p_mamver type ALM_ME_MAMVERSION. "MAM Version." 1034868
+PARAMETERS p_fdest AS CHECKBOX.
+SELECTION-SCREEN SKIP.
+PARAMETERS p_datum   TYPE sy-datum.
+PARAMETERS variant TYPE alm_me_c030prf-equi_sel_v_mass.
+
+* Data definition
+* Equipment list from report
+DATA: BEGIN OF ls_equi_list,
+      mandt TYPE mandt,
+      equnr TYPE equi-equnr,
+END OF ls_equi_list.
+DATA lt_equi_list      LIKE TABLE OF ls_equi_list.
+DATA lt_equi_full_list LIKE TABLE OF ls_equi_list.
+* Table for keys to pass to middleware
+DATA ls_equi_keys TYPE          alm_me_r3keys_sd.
+DATA lt_equi_keys TYPE TABLE OF alm_me_r3keys_sd.
+* Table for middleware systems to call
+DATA lt_rfchosts TYPE TABLE OF alm_me_dest_sd.
+DATA ls_rfchost  LIKE LINE OF lt_rfchosts.
+* General settings for master data
+DATA ls_master_data TYPE alm_me_c030prf.
+* Constants
+CONSTANTS gc_mam_031 TYPE char100 VALUE 'MAM_031'."BO 080326
+*CONSTANTS gc_mam_031 TYPE char100 VALUE 'ZMAM_031'.
+CONSTANTS lc_action_update  TYPE msgfn VALUE '018'.
+CONSTANTS lc_action_delete  TYPE msgfn VALUE '003'.
+
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR variant.
+  CONSTANTS lc_eq_m_report  TYPE rsvar-report
+    VALUE 'RALM_ME_EQUIPMENT_LIST'.
+  CONSTANTS lc_eq_dynnr     TYPE sy-dynnr       VALUE '1000' .
+
+  CALL FUNCTION 'RS_VARIANT_CATALOG'
+    EXPORTING
+      report      = lc_eq_m_report
+      dynnr       = lc_eq_dynnr
+    IMPORTING
+      sel_variant = variant
+    EXCEPTIONS
+      OTHERS      = 7.
+  IF sy-subrc NE 0.
+    CLEAR variant.
+  ENDIF.
+
+START-OF-SELECTION.
+* When a variant is given on the selection-screen, this variant
+* is used to do a (partial) update without change of customizing
+  IF NOT variant IS INITIAL.
+    MOVE variant TO ls_master_data-equi_sel_v_mass.
+  ELSE.
+* Get the variant from MAM customizing
+    CALL FUNCTION 'ALM_ME_CMASTER_DATA_GETDETAIL'
+      IMPORTING
+        master_data_selection = ls_master_data
+      EXCEPTIONS
+        entry_not_found       = 1
+        OTHERS                = 2.
+    IF sy-subrc NE 0.
+* Directly show an error message if entry does not exist
+      MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+              WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+    ENDIF.
+  ENDIF.
+
+
+* Call the selection report
+  SUBMIT ralm_me_equipment_list
+    USING SELECTION-SET ls_master_data-equi_sel_v_mass
+    WITH p_datum EQ p_datum
+    WITH dy_selm EQ 'D'
+    AND RETURN.
+
+* Get the result from the report
+  IMPORT lt_equi_list FROM MEMORY ID 'RALM_ME_EQUIPMENT_LIST'.
+  FREE MEMORY ID 'RALM_ME_EQUIPMENT_LIST'.
+
+  IF p_full NE space.
+* When full update is desired, also select all funclocs.
+    SUBMIT ralm_me_equipment_list
+      WITH dy_selm EQ 'D'
+      AND RETURN.
+    IMPORT lt_equi_list TO lt_equi_full_list
+      FROM MEMORY ID 'RALM_ME_EQUIPMENT_LIST'.
+    FREE MEMORY ID 'RALM_ME_EQUIPMENT_LIST'.
+    LOOP AT lt_equi_full_list INTO ls_equi_list.
+      MOVE ls_equi_list-equnr TO ls_equi_keys-r3key.
+* check the action
+* Table from report is read sorted from database
+      READ TABLE lt_equi_list
+        WITH KEY  equnr = ls_equi_list-equnr
+        BINARY SEARCH
+        TRANSPORTING NO FIELDS.
+      IF sy-subrc EQ 0.
+        MOVE lc_action_update TO ls_equi_keys-msgfn.
+      ELSE.
+* Not in customer selection
+        MOVE lc_action_delete TO ls_equi_keys-msgfn.
+      ENDIF.
+      APPEND ls_equi_keys TO lt_equi_keys.
+    ENDLOOP. "lt_equi_full_list
+
+  ELSE.
+    LOOP AT lt_equi_list INTO ls_equi_list.
+      MOVE ls_equi_list-equnr TO ls_equi_keys-r3key.
+      MOVE lc_action_update TO ls_equi_keys-msgfn.
+      APPEND ls_equi_keys TO lt_equi_keys.
+    ENDLOOP. "lt_equi_list
+  ENDIF. "p_full
+
+  FREE lt_equi_list.
+  FREE lt_equi_full_list.
+
+  IF p_fdest EQ space.
+* Set the default RFC destination, when the given is not
+* Marked as the unchangeable destination
+* prefill destination table (default value)
+    CALL FUNCTION 'ALM_ME_GET_SERVERDRIVEN_CUST'
+      TABLES
+        serverdriven = lt_rfchosts.
+  ENDIF.
+  IF NOT p_rfcd IS INITIAL.
+* Set the RFC destination from the selection screen
+    ls_rfchost-rfcdest = p_rfcd.
+    if NOT p_mamver is INITIAL.
+*     use the version provided by user
+      ls_rfchost-MAMVERSION = p_mamver.
+     endif.
+* when no version is provided then object type will be
+* version independent. do not expect version depebdet key entry in MEREP_DELTABO
+    APPEND ls_rfchost TO lt_rfchosts.
+  ENDIF.
+
+* Call the middleware system and pass all the keys
+  CALL FUNCTION 'YALM_ME_SERVER_DRIVEN_TRIGGER'"BO 080326
+    EXPORTING
+      objtyp             = gc_mam_031
+      fixed_destinations = p_fdest
+    TABLES
+      keys               = lt_equi_keys
+      destinations       = lt_rfchosts.
+
+* Execute the trigger (in background task)
+  CALL FUNCTION 'ALM_ME_UPDATE_DUMMY' IN UPDATE TASK.
+
+  COMMIT WORK.
+
+*Selection text£º
+*P_DATUM:        Changed/Created Since
+*P_FDEST:        Only Specified RFC Destination
+*P_FULL:        Full Update with Deletion
+*P_MAMVER:D       .
+*P_RFCD:D       .
+*VARIANT:D       .

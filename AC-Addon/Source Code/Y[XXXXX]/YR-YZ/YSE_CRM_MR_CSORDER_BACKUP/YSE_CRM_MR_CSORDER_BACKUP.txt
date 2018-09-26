@@ -1,0 +1,995 @@
+*----------------------------------------------------------------------*
+* PROGRAM ID    : YSE_CRM_MR_CSORDER                                   *
+* PROGRAM TITLE : MR CS Order Mass upload  tool requirement            *
+* AUTHOR        : Anda Wu                                              *
+* DATE          : 07/07/2014                                           *
+* DEVELOPMENT ID:                                                      *
+*                                                                      *
+* CHANGE REQUEST NUMBER:                                               *
+*                                                                      *
+* Program Description: MR CS Order Mass upload  tool requirement       *
+*                                                                      *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+*  DATE    | NAME     |TRANSPORT  | CR# and short Description          *
+*----------------------------------------------------------------------*
+*07/07/2014|Anda Wu   |CD1K982226 |CR3294: Initial version             *
+*----------------------------------------------------------------------*
+REPORT  yse_crm_mr_csorder_backup NO STANDARD PAGE HEADING LINE-SIZE 255.
+
+************************************************************************
+* TYPES                                                                *
+************************************************************************
+TYPES:
+  BEGIN OF ty_input_file,
+    qmart         TYPE qmel-qmart,    "Notification Type
+    qmtxt         TYPE qmel-qmtxt,    "Noti. description
+    equnr         TYPE equz-equnr,    "Equipment
+    bstkd         TYPE vbkd-bstkd,    "P0 Number
+    matnr         TYPE mara-matnr,    "Material
+    bemot         TYPE vbkd-bemot,    "Accounting indicator
+    ktext         TYPE caufvd-ktext,  "SEO description
+    dauno         TYPE afvgd-dauno,   "Work Plan hour
+    dauno2        TYPE afvgd-dauno,   "Work Plan expense
+  END OF ty_input_file,
+
+  BEGIN OF ty_equz_iloa,
+    equnr         TYPE equz-equnr,    "
+    datbi         TYPE equz-datbi,
+    eqlfn         TYPE equz-eqlfn,
+    iloan         TYPE equz-iloan,
+    vkorg         TYPE iloa-vkorg,    "Sales Organization
+    vtweg         TYPE iloa-vtweg,    "Distribution Channel
+    spart         TYPE iloa-spart,    "Division
+  END OF ty_equz_iloa,
+
+  BEGIN OF ty_order_flow,
+    bstkd         TYPE vbkd-bstkd,    "P0 Number
+    qmnum         TYPE qmel-qmnum,    "Notification No
+    aufnr         TYPE qmel-aufnr,    "Sevice Order No
+    vbeln         TYPE qmel-vbeln,    "Sales Order Number
+  END OF ty_order_flow.
+
+************************************************************************
+* WORKAREAS                                                            *
+************************************************************************
+DATA:
+  gs_update       TYPE ty_input_file.
+
+************************************************************************
+* INTERNAL TABLES                                                      *
+************************************************************************
+DATA:
+  gt_lfile        TYPE yse_t_lfile,                 "Local file name
+  gt_equz_iloa    TYPE STANDARD TABLE OF ty_equz_iloa,
+  gt_bdcdata      TYPE STANDARD TABLE OF bdcdata,
+  gt_order_flow   TYPE STANDARD TABLE OF ty_order_flow,
+  gt_update       TYPE STANDARD TABLE OF ty_input_file,"Update filedata
+  gt_update_log   TYPE STANDARD TABLE OF string.    "update process log
+
+************************************************************************
+* VARIABLES                                                            *
+************************************************************************
+DATA:
+"gv_obtab        TYPE tcla-obtab,    "Name of database table for object
+  gs_orderflow  TYPE ty_order_flow,
+  gv_tot_lines    TYPE i,                           "Process lines
+  gv_suc_lines    TYPE i,                           "Success Lines
+  gv_fai_lines    TYPE i.                           "Failed lines
+
+************************************************************************
+* CONSTANTS                                                            *
+************************************************************************
+CONSTANTS:
+  gc_tab          TYPE c VALUE cl_abap_char_utilities=>horizontal_tab,
+  gc_datbi_9999   TYPE sy-datum VALUE '99991231',
+  gc_qmart_x1     TYPE qmel-qmart VALUE 'X1',
+  gc_qmart_xb     TYPE qmel-qmart VALUE 'XB',
+  gc_type_e       TYPE c VALUE 'E',
+  gc_hifi         TYPE c VALUE '-',
+  gc_colon        TYPE c VALUE ':',
+  gc_x            TYPE c VALUE 'X'.
+
+************************************************************************
+* SELECTION-SCREEN                                                     *
+************************************************************************
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE text-t01.
+SELECTION-SCREEN BEGIN OF BLOCK b2 WITH FRAME TITLE text-t02.
+PARAMETERS: p_vkorg   TYPE vbak-vkorg OBLIGATORY DEFAULT 'CN02',
+            p_vtweg   TYPE vbak-vtweg OBLIGATORY DEFAULT '11',
+            p_spart   TYPE vbak-spart OBLIGATORY DEFAULT '01'.
+SELECTION-SCREEN END OF BLOCK b2.
+PARAMETERS:
+          p_file(1024) TYPE c LOWER CASE OBLIGATORY.  "Local File Path
+
+SELECTION-SCREEN BEGIN OF LINE.
+PARAMETERS: cb_hflg    AS CHECKBOX                    "Header text flag
+              DEFAULT 'X' MODIF ID m1.
+SELECTION-SCREEN END OF LINE.
+SELECTION-SCREEN END OF BLOCK b1.
+
+*&---------------------------------------------------------------------*
+*& INITIALIZATION                                                      *
+*&---------------------------------------------------------------------*
+INITIALIZATION.
+* Do initialization
+  PERFORM frm_do_init.
+
+*&---------------------------------------------------------------------*
+*& AT SELECTION-SCREEN OUTPUT                                          *
+*&---------------------------------------------------------------------*
+AT SELECTION-SCREEN OUTPUT.
+* Set selection screen
+  PERFORM set_screen.
+
+*&---------------------------------------------------------------------*
+*& AT SELECTION-SCREEN                                                 *
+*&---------------------------------------------------------------------*
+AT SELECTION-SCREEN.
+* Check if the file path and name exist
+  PERFORM check_filename.
+
+*&---------------------------------------------------------------------*
+*& AT SELECTION-SCREEN  ON VALUE-REQUEST                               *
+*&---------------------------------------------------------------------*
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_file.
+* Get local file path
+  PERFORM select_file.
+
+*&---------------------------------------------------------------------*
+*& START-OF-SELECTION                                                  *
+*&---------------------------------------------------------------------*
+START-OF-SELECTION.
+* Read local file into a internal table
+  PERFORM read_file.
+* Write entry to datebase table
+  PERFORM write_db.
+
+*&---------------------------------------------------------------------*
+*& END-OF-SELECTION                                                    *
+*&---------------------------------------------------------------------*
+END-OF-SELECTION.
+  IF gv_tot_lines > 0.
+*   WRITE process result message
+    PERFORM write_log.
+  ENDIF.
+
+*&---------------------------------------------------------------------*
+*&      Form  select_file
+*&---------------------------------------------------------------------*
+*       Get local file path
+*----------------------------------------------------------------------*
+FORM select_file .
+
+  DATA:
+    lv_title  TYPE string,     "Referrence title
+    lt_file   TYPE filetable,  "Internal table of dialog filenames
+    ls_file   TYPE file_table, "Working area for IT_FILE,
+    lv_rc     TYPE i.          "Return Code
+
+  lv_title = text-001.
+  CLEAR: lt_file[],
+         ls_file.
+
+* Open local file dialog
+  CALL METHOD cl_gui_frontend_services=>file_open_dialog
+    EXPORTING
+      window_title            = lv_title
+      with_encoding           = 'X'
+    CHANGING
+      file_table              = lt_file
+*      FILE_ENCODING           = lv_ENCODING
+      rc                      = lv_rc
+    EXCEPTIONS
+      file_open_dialog_failed = 1
+      cntl_error              = 2
+      error_no_gui            = 3
+      not_supported_by_gui    = 4
+      OTHERS                  = 5.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+              WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+  IF lv_rc = 1.
+    READ TABLE lt_file INDEX 1 INTO ls_file.
+    IF sy-subrc EQ 0.
+      p_file = ls_file-filename.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    " select_file
+*&---------------------------------------------------------------------*
+*&      Form  READ_FILE
+*&---------------------------------------------------------------------*
+*       Read local file into a internal table
+*----------------------------------------------------------------------*
+FORM read_file .
+
+  DATA: lv_filename TYPE string.
+
+* Read file entires
+  lv_filename = p_file.
+
+  PERFORM get_from_pres IN PROGRAM yam_common_routines
+                                    TABLES  gt_lfile
+                                    USING   lv_filename
+                                            ycl_se_utility=>c_ft_asc
+                                            ' '.
+
+* Delete the blank lines
+  DELETE gt_lfile
+    WHERE text IS INITIAL.
+
+* Gain update characteristic names
+  IF cb_hflg IS NOT INITIAL.
+    DELETE gt_lfile INDEX 1.
+  ENDIF.
+
+ENDFORM.                    " READ_FILE
+*&---------------------------------------------------------------------*
+*&      Form  WRITE_DB
+*&---------------------------------------------------------------------*
+*       Write entry to datebase table
+*----------------------------------------------------------------------*
+FORM write_db .
+
+  DATA: lv_mess_str   TYPE string,
+        ls_qmel       TYPE qmel,
+        ls_equz_iloa  TYPE ty_equz_iloa,
+"        lv_objectkey  TYPE bapi1003_key-object,
+        ls_option     TYPE ctu_params ,
+        ls_bdcmsg     TYPE bdcmsgcoll.
+
+  DATA: lt_bdcmsgcoll TYPE STANDARD TABLE OF bdcmsgcoll.
+  FIELD-SYMBOLS: <lfs_update> TYPE ty_input_file.
+
+* Get total process entires
+  DESCRIBE TABLE gt_lfile LINES gv_tot_lines.
+  PERFORM convert_to_struc.
+
+* Check if update entries is empty
+  IF gt_update IS INITIAL.
+    MESSAGE s000(yse_sales_log) DISPLAY LIKE gc_type_e
+      WITH text-002.
+    LEAVE LIST-PROCESSING.
+  ENDIF.
+
+** Make conversion of file equi-equnr
+  LOOP AT gt_update ASSIGNING <lfs_update>.
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+      EXPORTING
+        input  = <lfs_update>-equnr
+      IMPORTING
+        output = <lfs_update>-equnr.
+    CALL FUNCTION 'CONVERSION_EXIT_MATN1_INPUT'
+      EXPORTING
+        input        = <lfs_update>-matnr
+      IMPORTING
+        output       = <lfs_update>-matnr
+      EXCEPTIONS
+        length_error = 1
+        OTHERS       = 2.
+    IF sy-subrc <> 0.
+      MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+              WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+    ENDIF.
+  ENDLOOP.
+
+* Get Sales and Distribution info
+  PERFORM frm_get_sd.
+
+  ls_option-dismode   = 'N'.
+  ls_option-updmode   = 'S'.
+  ls_option-racommit  = 'X'.
+
+  LOOP AT gt_update INTO gs_update.
+    CLEAR:  gs_orderflow.
+    READ TABLE gt_equz_iloa INTO ls_equz_iloa
+        WITH KEY equnr = gs_update-equnr.
+    IF sy-subrc <> 0.
+      MESSAGE e000(yse_sales_log)
+        WITH 'Equipment not exist:'(014)
+             gs_update-equnr
+        INTO lv_mess_str.
+      APPEND lv_mess_str TO gt_update_log.
+      CONCATENATE gs_update-bstkd
+                  lv_mess_str
+                  INTO lv_mess_str
+                  SEPARATED BY gc_colon.
+      CLEAR: gs_update.
+      CONTINUE.
+    ELSE.
+      IF  NOT (   ls_equz_iloa-vkorg  = p_vkorg
+              AND ls_equz_iloa-vtweg  = p_vtweg
+              AND ls_equz_iloa-spart  = p_spart ).
+        CLEAR lv_mess_str.
+        MESSAGE e000(yse_sales_log)
+          WITH 'Equipment not fulfill the selection screen:'(015)
+               gs_update-equnr
+           INTO lv_mess_str.
+        APPEND lv_mess_str TO gt_update_log.
+        CONCATENATE gs_update-bstkd
+                    lv_mess_str
+                    INTO lv_mess_str
+                    SEPARATED BY gc_colon.
+        CLEAR: gs_update.
+        CONTINUE.
+      ENDIF.
+    ENDIF.
+    IF gs_update-qmart = gc_qmart_x1.
+      PERFORM frm_bdc_fill_x1.
+    ELSE.
+      PERFORM frm_bdc_fill_xb.
+    ENDIF.
+
+    CALL TRANSACTION 'IW51'
+      USING gt_bdcdata
+      OPTIONS FROM ls_option
+      MESSAGES INTO lt_bdcmsgcoll.
+    IF sy-subrc <> 0.
+      READ TABLE lt_bdcmsgcoll INTO ls_bdcmsg
+         INDEX 1.
+      IF sy-subrc = 0.
+        CLEAR: lv_mess_str.
+        MESSAGE ID ls_bdcmsg-msgid TYPE ls_bdcmsg-msgtyp
+          NUMBER ls_bdcmsg-msgnr
+          WITH ls_bdcmsg-msgv1 ls_bdcmsg-msgv2
+               ls_bdcmsg-msgv3 ls_bdcmsg-msgv4
+          INTO lv_mess_str.
+        APPEND lv_mess_str TO gt_update_log.
+        CONCATENATE gs_update-bstkd
+                    lv_mess_str
+                    INTO lv_mess_str
+                    SEPARATED BY gc_colon.
+        REFRESH: gt_bdcdata,lt_bdcmsgcoll.
+        CLEAR: gs_update.
+        CONTINUE.
+      ELSE.
+        CLEAR: lv_mess_str.
+        lv_mess_str = 'Some unexpected error happen in BDC processing.'(048).
+        CONCATENATE gs_update-bstkd
+                    lv_mess_str
+                    INTO lv_mess_str
+                    SEPARATED BY gc_colon.
+        APPEND lv_mess_str TO gt_update_log.
+        REFRESH: gt_bdcdata,lt_bdcmsgcoll.
+        CLEAR: gs_update.
+        CONTINUE.
+      ENDIF.
+    ENDIF.
+
+    READ TABLE lt_bdcmsgcoll INTO ls_bdcmsg
+        WITH KEY msgtyp = gc_type_e.
+    IF sy-subrc = 0.
+      CLEAR: lv_mess_str.
+      MESSAGE ID ls_bdcmsg-msgid TYPE ls_bdcmsg-msgtyp
+        NUMBER ls_bdcmsg-msgnr
+        WITH ls_bdcmsg-msgv1 ls_bdcmsg-msgv2
+             ls_bdcmsg-msgv3 ls_bdcmsg-msgv4
+        INTO lv_mess_str.
+      APPEND lv_mess_str TO gt_update_log.
+      CONCATENATE gs_update-bstkd
+                  lv_mess_str
+                  INTO lv_mess_str
+                  SEPARATED BY gc_colon.
+      REFRESH: gt_bdcdata,lt_bdcmsgcoll.
+      CLEAR: gs_update.
+      CONTINUE.
+    ELSE.
+      READ TABLE lt_bdcmsgcoll INTO ls_bdcmsg
+        WITH KEY msgid = 'IM'
+                 msgnr = '525'.
+      IF sy-subrc = 0.
+        gs_orderflow-qmnum  = ls_bdcmsg-msgv1.
+        gs_orderflow-bstkd = gs_update-bstkd.
+        CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+          EXPORTING
+            input  = gs_orderflow-qmnum
+          IMPORTING
+            output = gs_orderflow-qmnum.
+        SELECT SINGLE *
+          FROM qmel
+          INTO ls_qmel
+          WHERE qmnum = gs_orderflow-qmnum.
+        IF sy-subrc = 0.
+          gs_orderflow-vbeln  = ls_qmel-vbeln.
+          gs_orderflow-aufnr  = ls_qmel-aufnr.
+          PERFORM frm_change_seo.
+          APPEND  gs_orderflow TO gt_order_flow.
+          gv_suc_lines        = gv_suc_lines + 1.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+    REFRESH: gt_bdcdata,lt_bdcmsgcoll.
+    CLEAR: gs_update.
+  ENDLOOP.
+
+ENDFORM.                    " WRITE_DB
+
+*&---------------------------------------------------------------------*
+*&      Form  WRITE_LOG
+*&---------------------------------------------------------------------*
+*       WRITE process result message
+*----------------------------------------------------------------------*
+FORM write_log .
+
+  DATA: lv_mess_str     TYPE string,
+        lv_bstkd        TYPE string,
+        ls_order_flow   TYPE ty_order_flow.
+  gv_fai_lines = gv_tot_lines - gv_suc_lines.
+  WRITE: 'Total Process Entries:'(005) , AT 30(6) gv_tot_lines,
+         / 'Successful Process Entries:'(006), AT 30(6) gv_suc_lines,
+         / 'Failed Process Entries:'(007), AT 30(6) gv_fai_lines.
+  ULINE.
+
+  IF gv_tot_lines = gv_suc_lines.
+    MESSAGE s000(yse_sales_log)
+      WITH 'Successfully update all equipment'(008).
+  ENDIF.
+  IF gt_order_flow IS NOT INITIAL.
+    WRITE: 'Successfully processed entries:'(009), /.
+    LOOP AT gt_order_flow INTO ls_order_flow.
+      CLEAR: lv_bstkd.
+      lv_bstkd = ls_order_flow-bstkd.
+      CONDENSE: lv_bstkd.
+      WRITE:  lv_bstkd, ' :  Notification-'(031),
+             ls_order_flow-qmnum,'| Service-'(032),ls_order_flow-aufnr,
+             '|SO-'(033), ls_order_flow-vbeln, /.
+    ENDLOOP.
+    ULINE.
+  ENDIF.
+  IF gt_update_log IS NOT INITIAL.
+    WRITE: 'Failed processed entries:'(034), /.
+    LOOP AT gt_update_log INTO lv_mess_str.
+      WRITE: lv_mess_str , /.
+    ENDLOOP.
+    ULINE.
+  ENDIF.
+
+ENDFORM.                    " WRITE_LOG
+*&---------------------------------------------------------------------*
+*&      Form  CONVERT_TO_STRUC
+*&---------------------------------------------------------------------*
+*       Convert internal table to structure ty_input_file
+*----------------------------------------------------------------------*
+FORM convert_to_struc .
+
+  DATA:
+    ls_lfile TYPE yse_s_lfile,
+    lt_field TYPE TABLE OF string,
+    lv_field TYPE string,
+    lv_line  TYPE string,
+    lflg_suc TYPE c,
+    lv_mess_str  TYPE string.
+  FIELD-SYMBOLS:
+    <fs_tab> TYPE STANDARD TABLE,
+    <fs_wa> TYPE ANY,
+    <fs_field> TYPE ANY.
+  DATA: lo_wa TYPE REF TO data,
+        lo_itab TYPE REF TO data.
+  CREATE DATA:
+    lo_wa TYPE ty_input_file,
+    lo_itab TYPE TABLE OF ty_input_file INITIAL SIZE 1.
+
+  ASSIGN lo_wa->* TO <fs_wa>.
+  ASSIGN lo_itab->* TO <fs_tab>.
+  ASSIGN gt_update TO <fs_tab>.
+
+  LOOP AT gt_lfile INTO ls_lfile.
+    CLEAR: lt_field,
+           lflg_suc.
+    lv_line = ls_lfile-text.
+    SPLIT lv_line AT gc_tab INTO TABLE lt_field.
+    lv_mess_str = lv_line.
+    REPLACE ALL OCCURRENCES OF  gc_tab
+      IN lv_mess_str
+      WITH gc_hifi.
+    LOOP AT lt_field INTO lv_field.
+      ASSIGN COMPONENT sy-tabix OF STRUCTURE <fs_wa> TO <fs_field>.
+      TRY .
+          <fs_field> = lv_field.
+        CATCH cx_sy_conversion_no_number.
+          lflg_suc = gc_type_e.
+          CONCATENATE
+                text-012
+                lv_mess_str+4
+            INTO lv_mess_str.
+          APPEND lv_mess_str TO gt_update_log.
+          EXIT.
+      ENDTRY.
+    ENDLOOP.
+    IF lflg_suc IS NOT INITIAL.
+      CONTINUE.
+    ENDIF.
+    APPEND <fs_wa> TO <fs_tab>.
+    CLEAR  <fs_wa>.
+  ENDLOOP.
+
+ENDFORM.                    " CONVERT_TO_STRUC
+
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_FILENAME
+*&---------------------------------------------------------------------*
+*       Check if the file path and name exist
+*----------------------------------------------------------------------*
+FORM check_filename .
+
+  DATA:
+    lv_exist TYPE c.
+  CALL FUNCTION 'TMP_GUI_GET_FILE_EXIST'
+    EXPORTING
+      fname          = p_file
+    IMPORTING
+      exist          = lv_exist
+    EXCEPTIONS
+      fileinfo_error = 1
+      OTHERS         = 2.
+  IF sy-subrc <> 0 OR lv_exist IS INITIAL.
+    MESSAGE e000(yse_sales_log)
+      WITH 'Please enter an invaild filename'(010).
+  ENDIF.
+
+ENDFORM.                    " CHECK_FILENAME
+
+*&---------------------------------------------------------------------*
+*&      Form  FRM_DO_INIT
+*&---------------------------------------------------------------------*
+*       Do initialization
+*----------------------------------------------------------------------*
+FORM frm_do_init .
+
+  CLEAR: gs_update.
+
+  CLEAR:
+    gv_tot_lines    ,                           "Process lines
+    gv_suc_lines    ,                           "Success Lines
+    gv_fai_lines    .                           "Failed lines
+
+  REFRESH:
+    gt_lfile        ,                           "Local file name
+    gt_update       ,                           "Update file data
+    gt_update_log   .                           "update process log
+
+ENDFORM.                    " FRM_DO_INIT
+*&---------------------------------------------------------------------*
+*&      Form  SET_SCREEN
+*&---------------------------------------------------------------------*
+*       Set selection screen
+*----------------------------------------------------------------------*
+FORM set_screen .
+
+* Set editable for parameter [p_class],[p_charno],[p_hflg]
+  LOOP AT SCREEN.
+    IF screen-group1 = 'M1'.
+      screen-input = '0'.
+      screen-invisible = '1'.
+      MODIFY SCREEN.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    " SET_SCREEN
+*&---------------------------------------------------------------------*
+*&      Form  FRM_BDC_FILL_X1
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM frm_bdc_fill_x1 .
+
+  DATA: ls_bdcdata  TYPE   bdcdata .
+
+  CLEAR  ls_bdcdata.
+  PERFORM  fill_bdcdata IN PROGRAM yam_common_routines
+             USING    'SAPLIQS0'  '0100'  'X'  ''  ''
+             CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_CURSOR'  'RIWO00-QMART'
+          CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_OKCODE'  '/00'
+          CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'RIWO00-QMART'  gc_qmart_x1
+          CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM  fill_bdcdata IN PROGRAM yam_common_routines
+             USING    'SAPLIQS0'  '7200'  'X'  ''  ''
+             CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_OKCODE'  '=VA02'
+          CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'VIQMEL-QMTXT'  gs_update-qmtxt
+          CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_CURSOR'  'RIWO1-EQUNR'
+          CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'RIWO1-EQUNR'  gs_update-equnr
+          CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM  fill_bdcdata IN PROGRAM yam_common_routines
+             USING    'SAPMV45A'  '4001'  'X'  ''  ''
+             CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_OKCODE'  '/EBAC1'
+          CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'VBKD-BSTKD'  gs_update-bstkd
+          CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_CURSOR'  'RV45A-KWMENG(01)'
+          CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'RV45A-MABNR(01)'  gs_update-matnr
+          CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'RV45A-KWMENG(01)'  '1'
+          CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM  fill_bdcdata IN PROGRAM yam_common_routines
+             USING    'SAPLSPO4'  '0300'  'X'  ''  ''
+             CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_CURSOR'  'SVALD-VALUE(01)'
+          CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_OKCODE'  '=FURT'
+          CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'SVALD-VALUE(01)'  gs_update-bemot
+          CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM  fill_bdcdata IN PROGRAM yam_common_routines
+             USING    'SAPLIQS0'  '7200'  'X'  ''  ''
+             CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_OKCODE'  '=BUCH'
+          CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+ENDFORM.                    " FRM_BDC_FILL_X1
+*&---------------------------------------------------------------------*
+*&      Form  FRM_GET_SD
+*&---------------------------------------------------------------------*
+*       Get Sales and Distribution info
+*----------------------------------------------------------------------*
+FORM frm_get_sd .
+
+  SELECT    equz~equnr    "
+            equz~datbi
+            equz~eqlfn
+            equz~iloan
+            iloa~vkorg    "Sales Organization
+            iloa~vtweg    "Distribution Channel
+            iloa~spart    "Division
+    INTO  TABLE  gt_equz_iloa
+    FROM equz
+      INNER JOIN iloa
+      ON equz~iloan = iloa~iloan
+    FOR ALL entries IN gt_update
+    WHERE equz~equnr = gt_update-equnr
+      AND equz~datbi = gc_datbi_9999.
+  IF sy-subrc <> 0.
+    MESSAGE s000(yse_sales_log)
+      DISPLAY LIKE gc_type_e
+      WITH 'Please check the equipment No in the file!'(011).
+    LEAVE LIST-PROCESSING.
+  ENDIF.
+
+ENDFORM.                    " FRM_GET_SD
+*&---------------------------------------------------------------------*
+*&      Form  FRM_CHANGE_SEO
+*&---------------------------------------------------------------------*
+*       Maintain the head text and operation information
+*----------------------------------------------------------------------*
+FORM frm_change_seo .
+
+  DATA: lv_refnum  TYPE ifrefnum,
+        lt_operation TYPE STANDARD TABLE OF bapi_alm_order_operation_e,
+        ls_operation TYPE bapi_alm_order_operation_e,
+        lt_return  TYPE STANDARD TABLE OF bapiret2,
+        lt_header  TYPE STANDARD TABLE OF bapi_alm_order_headers_i,
+        ls_header  TYPE bapi_alm_order_headers_i,
+        lt_headup  TYPE STANDARD TABLE OF bapi_alm_order_headers_up,
+        ls_headup  TYPE bapi_alm_order_headers_up,
+        lt_method TYPE STANDARD TABLE OF bapi_alm_order_method,
+        ls_method   TYPE bapi_alm_order_method,
+        lt_oper   TYPE STANDARD TABLE OF bapi_alm_order_operation,
+        ls_oper   TYPE bapi_alm_order_operation,
+        lt_operup TYPE STANDARD TABLE OF  bapi_alm_order_operation_up,
+        ls_operup TYPE bapi_alm_order_operation_up.
+
+
+  CALL FUNCTION 'BAPI_ALM_ORDER_GET_DETAIL'
+    EXPORTING
+      number        = gs_orderflow-aufnr
+    TABLES
+      et_operations = lt_operation
+      return        = lt_return.
+
+  CLEAR: ls_method.
+  ls_method-refnumber  = '1'.
+  ls_method-objecttype = 'HEADER'.
+  ls_method-method     =  'CHANGE'.
+  ls_method-objectkey  = gs_orderflow-aufnr.
+  APPEND ls_method TO lt_method.
+
+  ls_header-orderid    = gs_orderflow-aufnr.
+  ls_header-short_text = gs_update-ktext.
+  APPEND ls_header TO lt_header.
+
+  ls_headup-orderid    = gs_orderflow-aufnr.
+  ls_headup-short_text = gc_x.
+  APPEND ls_headup TO lt_headup.
+
+  READ TABLE lt_operation INTO ls_operation
+    WITH KEY  acttype = 'ZAM001'.
+  IF sy-subrc = 0.
+    lv_refnum = lv_refnum + 1.
+    CLEAR: ls_method.
+    ls_method-refnumber  = lv_refnum .
+    ls_method-objecttype = 'OPERATION'.
+    ls_method-method    =  'CHANGE'.
+    CONCATENATE gs_orderflow-aufnr
+                ls_operation-activity
+          INTO  ls_method-objectkey .
+    APPEND ls_method TO lt_method.
+
+    ls_oper-work_activity = gs_update-dauno.
+    APPEND ls_oper TO lt_oper.
+
+    ls_operup-work_activity = gc_x.
+    APPEND ls_operup TO lt_operup.
+  ENDIF.
+
+  CLEAR: ls_operation.
+  READ TABLE lt_operation INTO ls_operation
+    WITH KEY  acttype = 'ZAM050'.
+  IF sy-subrc = 0.
+    lv_refnum = lv_refnum + 1.
+    CLEAR: ls_method.
+    ls_method-refnumber  = lv_refnum.
+    ls_method-objecttype = 'OPERATION'.
+    ls_method-method    =  'CHANGE'.
+    CONCATENATE gs_orderflow-aufnr
+                ls_operation-activity
+          INTO  ls_method-objectkey .
+    APPEND ls_method TO lt_method.
+
+    ls_oper-work_activity = gs_update-dauno2.
+    APPEND ls_oper TO lt_oper.
+
+    ls_operup-work_activity = gc_x.
+    APPEND ls_operup TO lt_operup.
+  ENDIF.
+
+  IF gs_update-qmart <> gc_qmart_xb.
+    CLEAR: ls_method.
+    ls_method-refnumber  = '1'.
+    ls_method-objecttype = 'HEADER'.
+    ls_method-method    =  'RELEASE'.
+    ls_method-objectkey =  gs_orderflow-aufnr.
+    APPEND ls_method TO lt_method.
+  ENDIF.
+
+
+  CLEAR: ls_method.
+  ls_method-refnumber  = '1'.
+  ls_method-method    =  'SAVE'.
+  ls_method-objectkey =  gs_orderflow-aufnr.
+  APPEND ls_method TO lt_method.
+
+  CALL FUNCTION 'BAPI_ALM_ORDER_MAINTAIN'
+    TABLES
+      it_methods      = lt_method
+      it_header       = lt_header
+      it_header_up    = lt_headup
+      it_operation    = lt_oper
+      it_operation_up = lt_operup
+      return          = lt_return.
+  READ TABLE lt_return TRANSPORTING NO FIELDS
+    WITH KEY type = gc_type_e.
+  IF sy-subrc <> 0.
+    CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+      EXPORTING
+        wait = 'X'.
+  ENDIF.
+
+ENDFORM.                    " FRM_CHANGE_SEO
+*&---------------------------------------------------------------------*
+*&      Form  FRM_BDC_FILL_XB
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM frm_bdc_fill_xb .
+  DATA: ls_bdcdata  TYPE   bdcdata .
+
+  CLEAR  ls_bdcdata.
+  PERFORM  fill_bdcdata IN PROGRAM yam_common_routines
+             USING    'SAPLIQS0'  '0100'  'X'  ''  ''
+             CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_CURSOR'  'RIWO00-QMART'
+          CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_OKCODE'  '/00'
+          CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'RIWO00-QMART'  gc_qmart_xb
+          CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM  fill_bdcdata IN PROGRAM yam_common_routines
+             USING    'SAPLIQS0'  '7200'  'X'  ''  ''
+             CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_OKCODE'  '=VA02'
+          CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'VIQMEL-QMTXT'  gs_update-qmtxt
+          CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_CURSOR'  'RIWO1-EQUNR'
+          CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'RIWO1-EQUNR'  gs_update-equnr
+          CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM  fill_bdcdata IN PROGRAM yam_common_routines
+             USING    'SAPMV45A'  '4001'  'X'  ''  ''
+             CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_OKCODE'  '/EBAC1'
+          CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'VBKD-BSTKD'  gs_update-bstkd
+          CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_CURSOR'  'RV45A-KWMENG(01)'
+          CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'RV45A-MABNR(01)'  gs_update-matnr
+          CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'RV45A-KWMENG(01)'  '1'
+          CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM  fill_bdcdata IN PROGRAM yam_common_routines
+             USING    'SAPLIQS0'  '7200'  'X'  ''  ''
+             CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+  CLEAR  ls_bdcdata.
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+          USING    ''  ''  ''  'BDC_OKCODE'  '=BUCH'
+          CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+
+ENDFORM.                    " FRM_BDC_FILL_XB
+
+*Text symbol text£º
+*001:Select a file for upload
+*002:[No Input Data] or [Error Happen On Converting]
+*005:Total Process Entries:
+*006:Successful Process Entries:
+*007:Failed Process Entries:
+*008:Successfully update all equipment
+*009:Successfully processed entries:
+*010:Please enter an invaild filename
+*011:Please check the equipment No in the file!
+*012:Error to convert record:
+*014:Equipment not exist:
+*015:Equipment not fulfill the selection screen:
+*031: :  Notification-
+*032:| Service-
+*033:|SO-
+*034:Failed processed entries:
+*048:Some unexpected error happen in BDC processing.
+*T01:Input
+
+*T02:Sales and Distribution
+*Selection text£º
+*CB_HFLG:        With Header Text
+*P_FILE:        Local File
+*P_SPART:D       .
+*P_VKORG:D       .
+*P_VTWEG:D       .

@@ -1,0 +1,271 @@
+*&---------------------------------------------------------------------*
+*&  Include           YSE_FICO_SDI_SETT_RRB_EV                         *
+*&---------------------------------------------------------------------*
+
+TYPES: BEGIN OF lty_matnr,
+         matnr TYPE matnr,
+         mtart TYPE mtart,
+       END OF lty_matnr,
+
+       BEGIN OF lty_parts,
+         matnr TYPE matnr,
+       END OF lty_parts.
+
+DATA: lt_matnr TYPE STANDARD TABLE OF lty_matnr,
+      ls_matnr TYPE lty_matnr,
+      lt_parts TYPE STANDARD TABLE OF lty_parts,
+      ls_parts TYPE lty_parts.
+
+*-------------------------------------------------------------------------------*
+*  START-OF-SELECTION                                                           *
+*-------------------------------------------------------------------------------*
+START-OF-SELECTION.
+  CLEAR: gt_dmr[], gt_rrb_repost[], gt_rrb_repost_canc[].
+*Get last day of period used
+  PERFORM get_last_date_of_period.
+
+*Get non taxable tax code of company code
+  SELECT SINGLE mwska FROM t001
+    INTO gv_tax_code
+      WHERE bukrs EQ p_bukrs.
+
+*Get the company code currency
+  CLEAR gv_waers.
+  SELECT SINGLE waers
+    INTO gv_waers
+    FROM t001
+    WHERE bukrs EQ p_bukrs.
+
+*Get all entries to process:
+**Either invoices that haven't been cancelled yet and need to be reposted
+
+  SELECT * FROM yse_rrb_repost INTO TABLE gt_rrb_repost
+    WHERE bukrs = p_bukrs
+      AND sales_order IN so_vbeln
+      AND no_repost_req = ' '  "This indicator is set when there is an invoice without parts, so no reposting required
+      AND  reposted = ' '     "Not yet reposted
+      AND cancel_doc = ' '.   "and not cancelled so repost required
+*      or ( reposted = 'X'      "Already reposted
+*      and cancel_doc <> ' ' ) ). "but cancelled so reversal required
+
+**Or
+**Invoices that have been reposted already and now need to be reversed.
+
+  SELECT * FROM yse_rrb_repost INTO TABLE gt_rrb_repost_canc
+    WHERE bukrs = p_bukrs
+      AND sales_order IN so_vbeln
+      AND no_repost_req = ' '  "This indicator is set when there is an invoice without parts, so no reposting required
+      AND reposted = 'X'     "Not yet reposted                        "MOD-001 EXTUVE
+*      AND CANCEL_DOC = ' '   "and not cancelled so repost required   "MOD-001 EXTUVE
+      AND cancel_doc <> ' '                                           "MOD-001 EXTUVE
+      AND repost_canceled = ' '.
+
+  IF gt_rrb_repost[] IS INITIAL. "No invoices to be processed found
+    WRITE: 'No invoices to be processed found'.
+  ELSE.
+
+*Get the materials of the invoices to see if any spare parts are used
+    SELECT * FROM vbrp INTO TABLE gt_vbrp
+      FOR ALL ENTRIES IN gt_rrb_repost
+        WHERE vbeln = gt_rrb_repost-invoice.
+
+    SORT gt_vbrp BY vbeln posnr.
+
+**Copy over all materials to local matnr table and select material types
+    LOOP AT gt_vbrp INTO gs_vbrp.
+      MOVE gs_vbrp-matnr TO ls_matnr-matnr.
+      COLLECT ls_matnr INTO lt_matnr.
+    ENDLOOP.
+
+*Get raw materials
+    SELECT matnr FROM mara INTO TABLE lt_parts
+      FOR ALL ENTRIES IN lt_matnr
+        WHERE matnr EQ lt_matnr-matnr
+          AND mtart EQ 'ZMAT'.
+
+
+    SORT lt_parts.
+    LOOP AT gt_rrb_repost ASSIGNING <fs_rrb_repost> WHERE reposted = ' ' AND cancel_doc = ' '.    "Only the to be reposted ones
+**First check if any parts to repost
+      LOOP AT gt_vbrp INTO gs_vbrp WHERE vbeln EQ <fs_rrb_repost>-invoice.
+        READ TABLE lt_parts INTO ls_parts
+          WITH KEY matnr = gs_vbrp-matnr.
+        IF sy-subrc NE 0.      "No spare part so no reposting for this item
+          DELETE gt_vbrp WHERE vbeln EQ gs_vbrp-vbeln
+                           AND posnr EQ gs_vbrp-posnr.
+        ENDIF.
+      ENDLOOP.
+    ENDLOOP.
+
+
+    LOOP AT gt_vbrp INTO gs_vbrp.    "Loop over all the to be reposted invoice items (are the same as dmr items)
+      CLEAR gs_dmr.
+      MOVE: p_bukrs         TO gs_dmr-bukrs,
+            gs_vbrp-vgbel   TO gs_dmr-vbeln,
+            gs_vbrp-vgpos   TO gs_dmr-posnr,
+            gs_vbrp-vbelv   TO gs_dmr-vgbel,
+            gs_vbrp-posnv   TO gs_dmr-vgpos,
+            gs_vbrp-werks   TO gs_dmr-werks,
+            gs_vbrp-matnr   TO gs_dmr-matnr.
+
+      SELECT SINGLE netwr wavwr stcur waerk FROM vbap INTO CORRESPONDING FIELDS OF gs_dmr
+        WHERE vbeln = gs_vbrp-vgbel
+          AND posnr = gs_vbrp-vgpos.
+
+      SELECT SINGLE objnr FROM vbap INTO CORRESPONDING FIELDS OF gs_dmr
+        WHERE vbeln = gs_dmr-vgbel
+          AND posnr = gs_dmr-vgpos.
+
+      SELECT SINGLE vkorg vtweg spart FROM vbak INTO CORRESPONDING FIELDS OF gs_dmr
+        WHERE vbeln EQ gs_dmr-vgbel.
+
+*Get the cobrb entry required
+      SELECT SINGLE paobjnr FROM cobrb
+          INTO gs_dmr-paobjnr
+          WHERE objnr EQ gs_dmr-objnr
+          AND letja EQ p_letja
+          AND letpe EQ p_letpe.
+      IF sy-subrc NE 0.
+        DELETE gt_vbrp WHERE vbeln EQ gs_vbrp-vbeln
+                         AND posnr EQ gs_vbrp-posnr.       "If no settlement entry found, delete the entry
+        CONTINUE.
+      ENDIF.
+
+*Get the serial number and the equipment from Maintenance order header via order master data
+      SELECT SINGLE afih~serialnr afih~equnr
+        FROM afih INNER JOIN aufk
+        ON afih~aufnr EQ aufk~aufnr
+        INTO CORRESPONDING FIELDS OF gs_dmr
+        WHERE aufk~kdauf EQ gs_dmr-vgbel
+        AND aufk~kdpos EQ gs_dmr-vgpos.
+*Check if the sales doc currency is the same as the company code currency
+      IF gs_dmr-waerk <> gv_waers.    "Sales doc currency <> company code currency
+        CALL FUNCTION 'CONVERT_TO_LOCAL_CURRENCY'
+          EXPORTING
+            date             = sy-datum
+            foreign_amount   = gs_dmr-netwr
+            foreign_currency = gs_dmr-waerk
+            local_currency   = gv_waers
+            rate             = gs_dmr-stcur
+            type_of_rate     = 'M'
+            read_tcurr       = ' '
+          IMPORTING
+            local_amount     = gs_dmr-netwr.
+      ENDIF.
+
+*Get the profit center
+      SELECT SINGLE prctr
+        FROM marc
+        INTO gs_dmr-prctr
+        WHERE matnr EQ gs_dmr-matnr
+        AND werks EQ gs_dmr-werks.
+
+*Get actual costs
+*** MOD-002 * begin ***
+*      SELECT SINGLE IN_WTGBTR
+      SELECT SUM( in_wtgbtr )
+*** MOD-002 * end ***
+        FROM ad01dlief
+        INTO gs_dmr-wavwr
+        WHERE vbeln EQ gs_dmr-vbeln
+        AND vbpos EQ gs_dmr-posnr.
+
+
+      MOVE gs_vbrp-vbeln TO gs_dmr-billing_doc.
+
+
+      APPEND gs_dmr TO gt_dmr.
+
+
+    ENDLOOP.
+
+
+*Now we have all the relevant DMR, loop over all DMR's, find the new PC, PLC, GAC and PGC
+*and post the adjustments against these new characteristics.
+
+*** MOD-002 * begin ***
+    DATA: lv_invoice_sv   TYPE vbeln_vf,
+          lv_paobjnr      TYPE rkeobjnr.
+*** MOD-002 * end ***
+
+    LOOP AT gt_dmr INTO gs_dmr.
+      MOVE gs_dmr TO gs_last_dmr.
+      READ TABLE gt_rrb_repost ASSIGNING <fs_rrb_repost>
+        WITH KEY invoice = gs_dmr-billing_doc.
+*    if <fs_rrb_repost>-reposted = 'X'      "Already reposted
+*    and <fs_rrb_repost>-cancel_doc <> ' '. "but cancelled so reversal required
+*      perform reverse_posting changing gv_subrc.
+*    else.
+
+      CLEAR: gs_ce41000, gt_criteria[], gt_valuefield[], gt_accountgl[], gt_currencyamount[], gs_documentheader,gt_return[], gt_ce11000[], gt_items[].
+
+*** MOD-002 * begin ***
+*     Profitability Segment (per invoice)
+      IF <fs_rrb_repost>-invoice NE lv_invoice_sv.
+        CLEAR lv_paobjnr.
+        SELECT SINGLE paobjnr INTO lv_paobjnr
+               FROM vbrp
+               WHERE vbeln   =  <fs_rrb_repost>-invoice
+                 AND aubel   =  <fs_rrb_repost>-sales_order
+                 AND paobjnr NE 0.
+        CHECK sy-subrc = 0.
+        lv_invoice_sv = <fs_rrb_repost>-invoice.
+      ENDIF.
+*** MOD-002 * end ***
+
+*Get copa ce4 key field
+      SELECT SINGLE ce4key                                  "#EC *
+        FROM ce41000_acct
+        INTO gs_dmr-ce4key
+*** MOD-002 * begin ***
+*        WHERE PAOBJNR EQ GS_DMR-PAOBJNR.
+        WHERE aktbo   = 'X'
+          AND paobjnr = lv_paobjnr
+          AND pasubnr = 1.
+*** MOD-002 * end ***
+      CHECK sy-subrc EQ 0.
+*Get the old characteristics from CE41000
+      SELECT SINGLE * FROM ce41000                          "#EC *
+        INTO gs_ce41000
+*** MOD-002 * begin ***
+*        WHERE PAOBJNR EQ GS_DMR-CE4KEY.
+        WHERE aktbo   = 'X'
+          AND paobjnr = gs_dmr-ce4key
+          AND pasubnr = 1.
+*** MOD-002 * end ***
+      CHECK sy-subrc EQ 0.
+
+*Copy all the characteristics to the bapi internal table.
+      PERFORM create_line_10.
+      PERFORM create_line_20.
+      PERFORM create_line_30.
+      PERFORM create_line_40.
+
+      PERFORM create_header.
+
+      PERFORM execute_repost.
+
+*      AT END OF VBELN.
+*        PERFORM EXECUTE_COPA_REPOST_SDI.
+*      ENDAT.
+*    endif.
+    ENDLOOP.
+  ENDIF.
+  IF gt_rrb_repost_canc[] IS INITIAL.
+    WRITE: / 'No cancellations to be processed found'.
+  ELSE.
+*Also cancel the required doc's
+    LOOP AT gt_rrb_repost_canc ASSIGNING <fs_rrb_repost>.
+      PERFORM reverse_posting.
+    ENDLOOP.
+  ENDIF.
+
+  IF NOT gt_rrb_repost[] IS INITIAL.
+    MODIFY yse_rrb_repost FROM TABLE gt_rrb_repost.
+    COMMIT WORK.
+  ENDIF.
+
+  IF NOT gt_rrb_repost_canc[] IS INITIAL.
+    MODIFY yse_rrb_repost FROM TABLE gt_rrb_repost_canc.
+    COMMIT WORK.
+  ENDIF.

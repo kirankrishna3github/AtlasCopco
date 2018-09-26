@@ -1,0 +1,276 @@
+***********************************************************************************
+* Program ID        : yse_change_conf_ctrl
+* Author            : Yang Lei
+* Date              : 23/06/2017
+***********************************************************************************
+* Description       :
+***********************************************************************************
+
+REPORT  yse_change_conf_ctrl NO STANDARD PAGE HEADING LINE-SIZE 255.
+
+
+TYPES: BEGIN OF ty_upload,
+         v_text(250)  TYPE c,            " FILE UPLOAD TEXT
+       END OF ty_upload.
+DATA: gt_upload TYPE TABLE OF ty_upload.
+
+TYPES: BEGIN OF ty_item,
+          ebeln TYPE ekko-ebeln,
+       END OF ty_item,
+
+       BEGIN OF ty_ekpo,
+         ebeln TYPE ekpo-ebeln,
+         ebelp TYPE ekpo-ebelp,
+       END OF ty_ekpo,
+
+       BEGIN OF ty_down2,
+         ebeln TYPE ekko-ebeln,
+         ebelp TYPE ekpo-ebelp,
+         ref1  TYPE char10,
+         ref2  TYPE char18,
+       END OF ty_down2,
+
+       BEGIN OF ty_err,
+         serno TYPE char5,
+         msg   TYPE char100,
+       END OF ty_err.
+DATA: gt_item_list TYPE TABLE OF ty_item,
+      gt_ekpo      TYPE TABLE OF ty_ekpo.
+
+
+DATA: gv_filename TYPE string.
+CONSTANTS: c_filetype(10)   TYPE c VALUE 'ASC',     " FILE TYPE
+           c_blanc          TYPE c VALUE ' ',
+    con_tab  TYPE c VALUE cl_abap_char_utilities=>horizontal_tab.
+
+
+PARAMETERS: p_file TYPE ibipparms-path LOWER CASE.
+
+*.................. Selection screen validations...................... *
+
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_file.
+  CALL FUNCTION 'F4_FILENAME'
+    IMPORTING
+      file_name = p_file.
+
+
+START-OF-SELECTION.
+  PERFORM get_item_list.
+  PERFORM create_po.
+
+TOP-OF-PAGE.
+  WRITE:
+    /001 'Purchase Order',
+     015 'Message'.
+
+*&---------------------------------------------------------------------*
+*&      Form  get_item_list
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM get_item_list .
+  DATA: ls_item TYPE ty_item,
+        lv_string TYPE string,
+        lv_qty(13) TYPE c,
+        LV_AMT(11) TYPE C.
+  "Upload the item list.
+  gv_filename = p_file.
+  PERFORM get_from_pres IN PROGRAM yam_common_routines
+                                    TABLES  gt_upload
+                                    USING   gv_filename
+                                            c_filetype
+                                            c_blanc.
+
+  LOOP AT gt_upload INTO lv_string.
+    ls_item-ebeln = lv_string.
+    APPEND ls_item TO gt_item_list.
+  ENDLOOP.
+
+  SORT gt_item_list
+    BY ebeln ASCENDING.
+
+  SELECT ebeln
+         ebelp
+    FROM ekpo
+    INTO TABLE gt_ekpo
+     FOR ALL ENTRIES IN gt_item_list
+   WHERE ebeln = gt_item_list-ebeln.
+
+ENDFORM.                    " get_item_list
+*&---------------------------------------------------------------------*
+*&      Form  create_po
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM create_po .
+  DATA: ls_ekpo  TYPE ty_ekpo,
+        ls_temp  TYPE ty_ekpo,
+        lt_return  TYPE STANDARD TABLE OF BAPIRET2 WITH HEADER LINE,
+        lt_poitem  TYPE STANDARD TABLE OF BAPIMEPOITEM,
+        ls_poitem  TYPE BAPIMEPOITEM,
+        lt_poitemx TYPE STANDARD TABLE OF BAPIMEPOITEMX,
+        ls_poitemx TYPE BAPIMEPOITEMX,
+        lv_msg   TYPE char100.
+  DATA:
+    lt_down TYPE STANDARD TABLE OF ty_item,
+    ls_down TYPE ty_item,
+    lv_len    TYPE i,
+    lv_path   TYPE string,
+    lt_string TYPE stringtab,
+    ls_string LIKE LINE OF lt_string.
+
+  SORT gt_ekpo
+    BY ebeln ASCENDING
+       ebelp ASCENDING.
+
+  LOOP AT gt_ekpo INTO ls_temp.
+    ls_ekpo = ls_temp.
+
+    ls_poitem-PO_ITEM = ls_ekpo-ebelp.
+    APPEND ls_poitem TO lt_poitem.
+    ls_poitemx-PO_ITEM = ls_ekpo-ebelp.
+    ls_poitemx-CONF_CTRL = 'X'.
+    APPEND ls_poitemx TO lt_poitemx.
+
+    AT END OF ebeln.
+
+      CALL FUNCTION 'BAPI_PO_CHANGE'
+        EXPORTING
+          purchaseorder                = ls_ekpo-ebeln
+        TABLES
+          return                       = lt_return
+          poitem                       = lt_poitem
+          poitemx                      = lt_poitemx.
+
+      LOOP AT lt_return WHERE TYPE = 'E'.
+        MESSAGE ID lt_return-ID
+              TYPE lt_return-TYPE
+            NUMBER lt_return-NUMBER
+              WITH lt_return-MESSAGE_V1
+                   lt_return-MESSAGE_V2
+                   lt_return-MESSAGE_V3
+                   lt_return-MESSAGE_V4
+              INTO lv_msg.
+
+        WRITE:
+          /001 ls_ekpo-ebeln,
+           015 lv_msg.
+      ENDLOOP.
+      IF sy-subrc <> 0.
+        READ TABLE lt_return WITH KEY TYPE = 'S'.
+        MESSAGE ID lt_return-ID
+              TYPE lt_return-TYPE
+            NUMBER lt_return-NUMBER
+              WITH lt_return-MESSAGE_V1
+                   lt_return-MESSAGE_V2
+                   lt_return-MESSAGE_V3
+                   lt_return-MESSAGE_V4
+              INTO lv_msg.
+
+        WRITE:
+          /001 ls_ekpo-ebeln,
+           015 lv_msg.
+
+        CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'.
+      ELSE.
+        CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+        ls_down-ebeln = ls_ekpo-ebeln.
+        APPEND ls_down TO lt_down.
+      ENDIF.
+
+      CLEAR:
+        lt_return,
+        lt_poitem,
+        lt_poitemx.
+    ENDAT.
+  ENDLOOP.
+
+  IF lt_down IS NOT INITIAL.
+    lv_len = strlen( p_file ).
+    lv_len = lv_len - 4.
+    lv_path = p_file+0(lv_len).
+
+    CONCATENATE lv_path
+                '_err.txt'
+           INTO lv_path.
+
+    LOOP AT lt_down INTO ls_down.
+      ls_string = ls_down-ebeln.
+      APPEND ls_string TO lt_string.
+    ENDLOOP.
+
+    CALL FUNCTION 'GUI_DOWNLOAD'
+      EXPORTING
+        filename                        = lv_path
+      TABLES
+        data_tab                        = lt_string
+      EXCEPTIONS
+        file_write_error                = 1
+        no_batch                        = 2
+        gui_refuse_filetransfer         = 3
+        invalid_type                    = 4
+        no_authority                    = 5
+        unknown_error                   = 6
+        header_not_allowed              = 7
+        separator_not_allowed           = 8
+        filesize_not_allowed            = 9
+        header_too_long                 = 10
+        dp_error_create                 = 11
+        dp_error_send                   = 12
+        dp_error_write                  = 13
+        unknown_dp_error                = 14
+        access_denied                   = 15
+        dp_out_of_memory                = 16
+        disk_full                       = 17
+        dp_timeout                      = 18
+        file_not_found                  = 19
+        dataprovider_exception          = 20
+        control_flush_error             = 21
+        OTHERS                          = 22
+              .
+    IF sy-subrc <> 0.
+       MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+               WITH SY-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    " create_po
+
+*Text symbol text£º
+*BK1:Header Information
+*E00:Error opening dataset, return code:
+*I01:Session name
+*I02:Open session
+*I03:Insert transaction
+*I04:Close Session
+*I05:Return code =
+*I06:Error session created
+*S01:Session name
+*S02:User
+*S03:Keep session
+*S04:Lock date
+*S05:Processing Mode
+*S06:Update Mode
+*S07:Generate session
+*S08:Call transaction
+*S09:Error sessn
+*S10:Nodata indicator
+
+*S11:Short log
+*Selection text£º
+*P_BSTKD:D       .
+*P_FILE:        Upload file
+*P_KUNNR1:D       .
+*P_KUNNR2:D       .
+*P_LINES:        Item lines
+*P_SPART:D       .
+*P_VKBUR:D       .
+*P_VKGRP:D       .
+*P_VKORG:D       .
+*P_VTWEG:D       .

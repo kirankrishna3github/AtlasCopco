@@ -1,0 +1,203 @@
+REPORT yam_kpi_update .
+
+*----------------------------------------------------------------------*
+* Author: Tim Volkaert                                                 *
+*                                                                      *
+* Description: This program will update the KPI figure table with the  *
+*              necessary data defined by the KPI customizing tables.   *
+*              Every KPI formula will return either a currency value,  *
+*              a quantity value or a number. This return value will    *
+*              then be updated in the corresonding figure table fields.*
+*----------------------------------------------------------------------*
+* Modification log.                                                    *
+*------------------                                                    *
+* MOD-001|2007.02.07|L. Mertens      |CD1K910274|Run after midnight    *
+* MOD-002|2007.07.10|L. Mertens      |CD1K917607|improve performance   *
+* MOD-003|2007.08.02|L. Mertens      |CD1K918549|replace join JEST/JCDS*
+* MOD-004|2008.12.16|G. Rutten       |CD1K945247|subtract QUCR from    *
+*                    open order, orders not released, orders backlog   *
+*----------------------------------------------------------------------*
+*.................. Includes.......................................... *
+INCLUDE yam_kpi_frm_incl.
+
+*.................. Tables............................................ *
+TABLES: t001,  " Company Codes
+        tvko.  " Organizational Unit: Sales Organizations
+
+*.................. Global variables.................................. *
+*.. Variables
+
+*.. Internal tables
+DATA: t_kpi_cus TYPE STANDARD TABLE OF yam_kpi_cus INITIAL SIZE 0
+                                                   WITH HEADER LINE,
+      t_tvko    TYPE STANDARD TABLE OF tvko INITIAL SIZE 0
+                                            WITH HEADER LINE.
+
+*.. Field symbols
+
+*.................. Constants......................................... *
+
+*.................. Selection screen.................................. *
+SELECTION-SCREEN BEGIN OF BLOCK b01.
+parameters: p_bukrs like t001-bukrs obligatory.
+SELECTION-SCREEN END   OF BLOCK b01.
+
+*.................. Events............................................ *
+
+*.................. Main program...................................... *
+START-OF-SELECTION.
+  PERFORM select_kpis.
+
+  PERFORM execute_kpis.
+
+*.................. Form routines.....................................
+*&---------------------------------------------------------------------*
+*&      Form  select_kpis
+*&---------------------------------------------------------------------*
+*       text: Select the relevant KPI's for the selected country/company
+*             code
+*----------------------------------------------------------------------*
+FORM select_kpis.
+*.. Get list of selected countries
+  SELECT *
+  FROM tvko
+  INTO TABLE t_tvko
+  WHERE bukrs eq p_bukrs.
+  SORT t_tvko BY vkorg.
+
+  SELECT single *
+  FROM t001
+  WHERE bukrs eq p_bukrs.
+
+*.. Select required KPI's based on sales org or list of company codes
+  SELECT *
+  INTO TABLE t_kpi_cus
+  FROM yam_kpi_cus
+  WHERE bukrs EQ p_bukrs.
+
+  IF NOT t_tvko[] IS INITIAL.
+    SELECT *
+    APPENDING TABLE t_kpi_cus
+    FROM yam_kpi_cus
+    FOR ALL ENTRIES IN t_tvko
+    WHERE vkorg EQ t_tvko-vkorg.
+  ENDIF.
+
+  SORT t_kpi_cus BY bukrs vkorg kpity kpifr.
+
+ENDFORM.                    " select_kpis
+
+*eject
+*&---------------------------------------------------------------------*
+*&      Form  execute_kpis
+*&---------------------------------------------------------------------*
+*       text: Execute every identified KPI for the relevant country/
+*             company code
+*----------------------------------------------------------------------*
+FORM execute_kpis.
+*.. Local variables
+  DATA: l_report   TYPE sy-repid,
+        l_form(30) TYPE c,
+        l_kpi_cus  TYPE yam_kpi_cus,
+        l_kpi_res  TYPE yam_kpi_res,
+        l_kpi_org_level TYPE yam_kpi_org_level.
+
+*.. Loop through the defined KPI's for the selected organizational level
+  LOOP AT t_kpi_cus INTO l_kpi_cus.
+    MOVE-CORRESPONDING l_kpi_cus TO l_kpi_org_level.
+
+*.... Build form and report name for every KPI
+    PERFORM build_report_and_form USING l_kpi_cus-kpity
+                                        l_kpi_cus-kpifr
+                                  CHANGING l_report
+                                           l_form.
+    PERFORM execute_and_update_kpi USING l_kpi_org_level
+                                         l_kpi_cus-kpity
+                                         l_report l_form
+                                   CHANGING l_kpi_res.
+    MOVE-CORRESPONDING l_kpi_cus TO l_kpi_res.
+*.... Update result lines with company code for Sales org levels
+    IF NOT l_kpi_res-vkorg IS INITIAL.
+      READ TABLE t_tvko WITH KEY vkorg = l_kpi_res-vkorg BINARY SEARCH.
+      l_kpi_res-bukrs = t_tvko-bukrs.
+    ENDIF.
+
+* begin of change MOD-001
+*   l_kpi_res-datum = sy-datlo.
+    l_kpi_res-datum = sy-datlo - 1.
+* end of change MOD-001
+    MODIFY yam_kpi_res FROM l_kpi_res.
+    CLEAR l_kpi_res.
+  ENDLOOP.
+ENDFORM.                    " execute_kpis
+
+*eject
+*&---------------------------------------------------------------------*
+*&      Form  build_report_and_form
+*&---------------------------------------------------------------------*
+*       text: Build the program and form routine name of the KPI
+*----------------------------------------------------------------------*
+*  -->  ip_kpity  text: KPI type (Currency, Quantity, Numeric)
+*  -->  ip_kpifr  text: KPI formula routine number
+*  <--  ep_report text: Program name in which KPI routine is stored
+*  <--  ep_form   text: Form routine name of KPI routine
+*----------------------------------------------------------------------*
+FORM build_report_and_form USING ip_kpity TYPE yam_kpity
+                                 ip_kpifr TYPE yam_kpifr
+                           CHANGING ep_report TYPE sy-repid
+                                    ep_form   TYPE c.
+  CASE ip_kpity.
+    WHEN 'Q'.
+*     concatenate 'YSC_KPIQ' ip_kpifr into ep_report.
+      CONCATENATE 'FRM_KPI_Q_' ip_kpifr INTO ep_form.
+    WHEN 'C'.
+*     concatenate 'YSC_KPIC' ip_kpifr into ep_report.
+      CONCATENATE 'FRM_KPI_C_' ip_kpifr INTO ep_form.
+    WHEN 'N'.
+*     concatenate 'YSC_KPIN' ip_kpifr into ep_report.
+      CONCATENATE 'FRM_KPI_N_' ip_kpifr INTO ep_form.
+  ENDCASE.
+
+  ep_report = sy-repid.
+ENDFORM.                    " build_report_and_form
+
+*eject
+*&---------------------------------------------------------------------*
+*&      Form  execute_and_update_kpi
+*&---------------------------------------------------------------------*
+*       text: Call the KPI form and calculate result
+*----------------------------------------------------------------------*
+*  -->  ip_org_level text: Organizational level of KPI
+*  -->  ip_kpity     text: KPI type
+*  -->  ip_report    text: KPI program name
+*  -->  ip_form      text: KPI form routine name
+*  <--  ep_kpi_res   text: KPI result
+*----------------------------------------------------------------------*
+FORM execute_and_update_kpi USING ip_org_level TYPE yam_kpi_org_level
+                                  ip_kpity  TYPE yam_kpity
+                                  ip_report TYPE sy-repid
+                                  ip_form   TYPE c
+                            CHANGING ep_kpi_res TYPE yam_kpi_res.
+
+*.. Execute dynamic form depending on KPI type to define interface
+  CASE ip_kpity.
+    WHEN 'Q'.
+      PERFORM (ip_form) IN PROGRAM (ip_report)
+                        USING ip_org_level
+                        CHANGING ep_kpi_res-menge
+                                 ep_kpi_res-kmein.
+    WHEN 'N'.
+      PERFORM (ip_form) IN PROGRAM (ip_report)
+                        USING ip_org_level
+                        CHANGING ep_kpi_res-numb.
+    WHEN 'C'.
+      PERFORM (ip_form) IN PROGRAM (ip_report)
+                        USING ip_org_level
+                        CHANGING ep_kpi_res-wert
+                                 ep_kpi_res-waers.
+  ENDCASE.
+
+ENDFORM.                    " execute_and_update_kpi
+
+*Selection text£º
+*P_BUKRS:D       Company Code

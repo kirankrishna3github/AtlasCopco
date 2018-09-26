@@ -1,0 +1,603 @@
+*----------------------------------------------------------------------
+* PROGRAM ID           : YSE_SD_RELSO_DELIVBLOCK                       *
+* PROGRAM TITLE        : Automatic release of blocked Sales Orders     *
+* AUTHOR               : LUC MERTENS                                   *
+* DATE                 : 02/02/2010                                    *
+* CHANGE REQUEST NUMBER: CR0961                                        *
+* PROGRAM DESCRIPTION  : This is a program to release sales orders     *
+*                        with a delivery block                         *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME                   |CORR.NR   | CHANGE REF. *
+*----------------------------------------------------------------------*
+* MOD-001 |2010.08.23|L. Mertens  USG Innotiv |CD1K958687| Bugfix      *
+*----------------------------------------------------------------------*
+* MOD-002 |2010.10.05|L. Mertens  USG Innotiv |CD1K959767| CR1637      *
+*       - add additional item category for Machine with options        *
+*----------------------------------------------------------------------*
+* MOD-003 |2011.01.27|Lakshmi R               |CD1K962609| CR1807      *
+************************************************************************
+REPORT YSE_SD_RELSO_DELIVBLOCK
+       NO STANDARD PAGE HEADING
+       LINE-SIZE 120.
+
+*---------------------------------------------------------------------*
+* TABLES DECLARATION
+*---------------------------------------------------------------------*
+TABLES: yse_relso_auart,     " credit control area - document type
+        yse_relso_payter,    " payment terms - DP values
+        vbkd,                " Sales document: business data
+        vbep,                " schedule lines
+        VBKRED,              " Work Struct.for Release of Credit Limit
+        V_OLR3_VBAX.         " SOrder, VBAK + VBUK: Consistency Check
+
+*---------------------------------------------------------------------*
+* INTERNAL TABLE DECLARATIONS                                         *
+*---------------------------------------------------------------------*
+data: begin of gt_acc_types occurs 0,
+        SOUR1_FROM   type RKEG_WW003,
+        TARGET1      type RKEG_WW001,
+      end of gt_acc_types.
+
+data: begin of gt_orders occurs 0,
+        vbeln        type vbak-vbeln,
+        vtweg        type vbak-vtweg,
+        kkber        type vbak-kkber,
+        bukrs_vf     type vbak-bukrs_vf,
+        auart        type vbak-auart,
+        kunnr        type vbak-kunnr,
+        netwr        type vbak-netwr,
+*        bestk        type vbuk-bestk,
+        waerk        type vbak-waerk,
+        vgbel        type vbak-vgbel,
+        kvgr4        type vbak-kvgr4,
+        autlf        type vbak-autlf,
+        knumv        type vbak-knumv,
+      end of gt_orders.
+
+data: begin of gt_items occurs 0,
+        vbeln        type vbak-vbeln,
+        posnr        type vbap-posnr,
+        pstyv        type vbap-pstyv,
+        kwmeng       type vbap-kwmeng,
+        cmpre        type vbap-cmpre,
+      end of gt_items.
+
+data: begin of gt_quant occurs 0,
+        bmeng        type vbep-bmeng,
+        wmeng        type vbep-wmeng,
+      end of gt_quant.
+
+data: begin of gt_bsid occurs 0,
+        bukrs        like bsid-bukrs,
+        belnr        like bsid-belnr,
+        gjahr        like bsid-gjahr,
+        buzei        like bsid-buzei,
+        waers        like bsid-waers,
+        bldat        like bsid-bldat,
+        wrbtr        like bsid-wrbtr,
+      end of gt_bsid,
+      wa_bsid like line of gt_bsid.
+
+data: gt_yse_relso_auart  like yse_relso_auart
+                          occurs 0 with header line.
+data: gt_yse_relso_payter like yse_relso_payter
+                          occurs 0 with header line.
+
+*---------------------------------------------------------------------*
+* VARIABLE DECLARATIONS                                               *
+*---------------------------------------------------------------------*
+data: gv_tabname   type dd03l-tabname,
+      gv_crblb     type knkk-crblb,
+      gv_klimk     type knkk-klimk,
+      gv_sauft     type knkk-sauft,
+      gv_oblig     like RF02L-OBLIG,
+      gv_skfor     type knkk-skfor,
+      gv_ssobl     type knkk-ssobl,
+      gv_knkli     type knkk-knkli,
+      gv_bemot     type vbkd-bemot,
+      gv_faktf     type vbkd-faktf,
+      gv_rfwrt     type vbfa-rfwrt,
+      gv_wrbtr     type bseg-wrbtr,
+      gv_budat     type bkpf-budat,
+      gv_val_doc   type bseg-wrbtr,
+      gv_st_av(1)  type c,
+      gv_bmeng     type vbep-bmeng,
+      gv_wmeng     type vbep-wmeng,
+      gv_totval    type vbak-netwr,
+      gv_kwert     type konv-kwert,
+      gv_tax       type konv-kwert,
+      gv_netwr     type vbak-netwr,
+* begin of insert MOD-001
+      gv_vbeln     TYPE vbak-vbeln,
+      gv_vgbel     TYPE vbak-vgbel,
+* end of insert MOD-001
+      gv_ctlpc     type knkk-ctlpc,
+      gv_zterm     type vbkd-zterm,
+      gv_calc_perc type yse_relso_payter-ycropl.
+
+data: ls_header  type BAPISDH1,
+      ls_headerx type BAPISDH1x,
+      lt_return  type STANDARD TABLE OF BAPIRET2.
+
+*---------------------------------------------------------------------*
+* CONSTANT DECLARATIONS                                               *
+*---------------------------------------------------------------------*
+CONSTANTS: c_tabname   TYPE tabname      VALUE 'K9RCD11%',
+           c_fieldname TYPE fieldname    VALUE 'SOUR1_FROM',
+           c_rollname  TYPE rollname     VALUE 'RKEG_WW003',
+           c_chara                       value 'A',
+           c_charb                       value 'B',
+           c_charc                       value 'C',
+           c_chard                       value 'D',
+           c_chari                       value 'I',
+           c_charx                       value 'X',
+           c_blank                       value ' ',
+           c_11(2)     type c            value '11',
+           c_99999(3)  TYPE p DECIMALS 2 VALUE '999.99'.
+
+FIELD-SYMBOLS: <fs_return>  type BAPIRET2.
+
+*---------------------------------------------------------------------*
+* PARAMETER DECLARATION
+*---------------------------------------------------------------------*
+SELECTION-SCREEN : BEGIN OF BLOCK b1 WITH FRAME TITLE text-F01.
+SELECT-OPTIONS: S_VBELN FOR VBKRED-VBELN,
+                s_vkorg for vbkred-vkorg obligatory MEMORY ID vko.
+SELECTION-SCREEN: END OF BLOCK b1.
+
+*---------------------------------------------------------------------*
+* INITIALIZATION
+*---------------------------------------------------------------------*
+INITIALIZATION.
+
+* Preselect accounting indicators with appropriate type (I/E)
+  SELECT tabname INTO gv_tabname
+                 FROM dd03l
+                 WHERE tabname LIKE c_tabname
+                   AND fieldname  = c_fieldname
+                   AND rollname   = c_rollname.
+  ENDSELECT.
+
+  SELECT sour1_from target1
+         INTO CORRESPONDING FIELDS OF TABLE gt_acc_types
+         FROM (gv_tabname).
+
+* Preselect selection entries
+  SELECT * from yse_relso_auart into table gt_yse_relso_auart.
+
+* Preselect payment terms with down payment values
+  SELECT * from yse_relso_payter into table gt_yse_relso_payter.
+
+
+*--------- S T A R T   O F   M A I N   P R O C E S S I N G -----------*
+*---------------------------------------------------------------------*
+* START-OF-SELECTION                                                  *
+*---------------------------------------------------------------------*
+START-OF-SELECTION.
+
+  CALL METHOD ycl_statistics=>record_transaction .
+
+* Select sales orders for which a credit block exist
+  select vbeln kkber auart kunnr vtweg netwr bestk bukrs_vf waerk
+         vgbel kvgr4 autlf knumv
+    into corresponding fields of table gt_orders
+    from V_OLR3_VBAX
+    where vbeln in s_vbeln
+      and vkorg in s_vkorg
+      and vbtyp eq c_charc              " Orders
+      and lfstk ne c_charc
+      and lifsk ne '  '                 " Delivery block
+      and gbstk in (c_chara, c_charb)   " Not yet/Partially processed
+      and cmgst in (c_chard, c_blank).  " Document Credit released/credit check was not executed
+
+  if gt_orders[] is INITIAL.
+    message S001(00) with text-i01.
+    exit.
+  endif.
+
+* Select items in order to be able to test on item attributes
+  SELECT vbeln posnr pstyv cmpre kwmeng
+    INTO CORRESPONDING FIELDS OF TABLE gt_items
+    FROM vbap
+    FOR ALL ENTRIES IN gt_orders
+    WHERE vbeln = gt_orders-vbeln.
+
+  SORT gt_items by vbeln posnr.
+
+* Check credit control area and ordertype in custom table
+  loop at gt_orders.
+    read table gt_yse_relso_auart WITH key kkber = gt_orders-kkber
+                                           auart = gt_orders-auart.
+
+    if sy-subrc <> 0.
+      delete gt_orders.
+    endif.
+  endloop.
+
+  if gt_orders[] is INITIAL.
+    message S001(00) with text-i01.
+    exit.
+  endif.
+
+* Now process selected orders in order to release credit block
+  loop at gt_orders.
+
+*.. Is sold-to customer blocked?
+    select single crblb klimk ctlpc knkli skfor ssobl
+      into (gv_crblb, gv_klimk, gv_ctlpc, gv_knkli, gv_skfor, gv_ssobl)
+      from knkk where kunnr = gt_orders-kunnr
+                  and kkber = gt_orders-kkber.
+
+    if sy-subrc = 0 and gv_crblb = c_charx.
+      continue.
+    endif.
+
+    clear: gv_zterm, gv_bemot, gv_faktf.
+*.. if ASSO, read with linked SSO
+    if gt_orders-auart = 'ZO03'.
+      SELECT zterm bemot faktf
+        into (gv_zterm, gv_bemot, gv_faktf)
+        up to 1 rows
+        from vbkd where vbeln eq gt_orders-vgbel
+                    and posnr ne '000000'.
+      ENDSELECT.
+    else.
+      SELECT zterm bemot faktf
+        into (gv_zterm, gv_bemot, gv_faktf)
+        up to 1 rows
+        from vbkd where vbeln eq gt_orders-vbeln
+                    and posnr ne '000000'.
+      ENDSELECT.
+    endif.
+
+*.. Is distribution channel = '11'?
+    if gt_orders-vtweg = c_11.
+*.... Check type of accounting indicator
+      READ TABLE gt_acc_types WITH key sour1_from = gv_bemot.
+
+      if sy-subrc = 0 and gt_acc_types-target1 = c_chari.
+*        and gv_bemot <> '1C'.
+        perform release_deliv_block using gt_orders-vbeln.
+        continue.
+      else.
+*        if gv_bemot = '1C'.
+*........ go to next step
+*        else.                " external
+          if ( gv_bemot = '1E' and gv_faktf = '01' ).
+*.......... go to next step
+          else.
+*.......... RRB flow, release delivery block !!
+            perform release_deliv_block using gt_orders-vbeln.
+            continue.
+          endif.
+*        endif.
+      endif.
+    endif.
+*Begin of comment MOD-003
+**.. Check partial delivery
+*    gv_st_av = 'X'.
+*    if gt_orders-kvgr4 <> 'PAR'.
+*      if gt_orders-kvgr4 <> '   '.
+**...... All goods available?
+*        PERFORM check_all_goods_available USING gt_orders-vbeln.
+**        if gt_orders-bestk <> 'C'.
+*        if gv_st_av = ' '.
+*          continue.
+*        endif.
+*      else.
+*        if gt_orders-autlf = 'X'.
+**........ All goods available?
+*          PERFORM check_all_goods_available USING gt_orders-vbeln.
+**          if gt_orders-bestk <> 'C'.
+*          if gv_st_av = ' '.
+*            continue.
+*          endif.
+*        endif.
+*      endif.
+*    endif.
+*End of comment MOD-003
+*.. Compare percentage with this from payment term custom table
+    READ TABLE gt_yse_relso_payter with key zterm = gv_zterm.
+
+    if sy-subrc = 0.
+*.... Check payment terms of the SO with the pre-payment value received
+*.... For ASSO: check DP's linked to Service Sales Order
+* begin of insert MOD-001
+      WRITE gt_orders-vgbel to gv_vgbel no-zero.
+      WRITE gt_orders-vbeln to gv_vbeln no-zero.
+* end of insert MOD-001
+      if gt_orders-auart = 'ZO03'.
+        SELECT belnr gjahr bukrs buzei waers bldat wrbtr
+          FROM bsid
+          INTO corresponding fields of TABLE gt_bsid
+            WHERE bukrs EQ gt_orders-bukrs_vf
+              and kunnr EQ gt_orders-kunnr
+              and umsks eq c_chara
+              AND umskz eq c_chara
+              and blart eq 'RU'
+* begin of change MOD-001
+*              and vbel2 eq gt_orders-vgbel.
+              and xref2 eq gv_vgbel.
+* end of change MOD-001
+
+        select single netwr knumv waerk
+          into (gt_orders-netwr, gt_orders-knumv, gt_orders-waerk)
+          FROM vbak WHERE vbeln = gt_orders-vgbel.
+      else.
+        SELECT belnr gjahr bukrs buzei waers bldat wrbtr
+          FROM bsid
+          INTO corresponding fields of TABLE gt_bsid
+            WHERE bukrs EQ gt_orders-bukrs_vf
+              and kunnr EQ gt_orders-kunnr
+              and umsks eq c_chara
+              AND umskz eq c_chara
+              and blart eq 'RU'
+* begin of change MOD-001
+*              and vbel2 eq gt_orders-vbeln.
+              and xref2 eq gv_vbeln.
+* end of change MOD-001
+      endif.
+
+      sort gt_bsid by bukrs belnr gjahr buzei.
+
+      clear gv_rfwrt.
+      loop at gt_bsid.
+        if gt_orders-waerk = gt_bsid-waers.
+          gv_rfwrt = gv_rfwrt + gt_bsid-wrbtr.
+        ELSE.
+*........ If not in document currency, convert the value
+*          CALL FUNCTION 'CONVERT_AMOUNT_TO_CURRENCY'
+*            EXPORTING
+*              date             = gt_bsid-bldat
+*              foreign_currency = gt_bsid-waers
+*              foreign_amount   = gt_bsid-wrbtr
+*              local_currency   = gt_orders-waerk
+*            IMPORTING
+*              local_amount     = gv_val_doc
+*            EXCEPTIONS
+*              error            = 1
+*              OTHERS           = 2.
+
+          CALL FUNCTION 'CONVERT_TO_FOREIGN_CURRENCY'
+            EXPORTING
+              date             = gt_bsid-bldat
+              local_amount     = gt_bsid-wrbtr
+              foreign_currency = gt_orders-waerk
+              local_currency   = gt_bsid-waers
+              type_of_rate     = 'DRU '
+            IMPORTING
+              foreign_amount   = gv_val_doc.
+
+          if sy-subrc = 0.
+            gv_rfwrt = gv_rfwrt + gv_val_doc.
+          endif.
+        ENDIF.
+      endloop.
+
+      if sy-subrc = 0.
+*...... Calculate percentage
+*...... first, get tax amount (to compare with total order amount including taxes)
+        clear gv_tax.
+        SELECT kwert into gv_kwert
+          FROM KONV WHERE knumv = gt_orders-knumv
+                      AND kappl = 'TX'.
+          gv_tax = gv_tax + gv_kwert.
+        ENDSELECT.
+
+        gv_totval = gt_orders-netwr + gv_tax.
+
+        CATCH SYSTEM-EXCEPTIONS arithmetic_errors = 1.
+          IF gv_totval <> 0.
+            gv_calc_perc = gv_rfwrt * 100 / gv_totval.
+          ENDIF.
+        ENDCATCH.
+        IF sy-subrc = 1.
+          gv_calc_perc = c_99999.
+        ENDIF.
+
+        if gv_calc_perc GE gt_yse_relso_payter-YCRSHC.
+*          perform release_deliv_block using gt_orders-vbeln.
+*          continue.
+*         go to next check
+        else.
+          continue.
+        endif.
+      else.
+        if gv_rfwrt GE gt_yse_relso_payter-YCRSHC.
+*          perform release_deliv_block using gt_orders-vbeln.
+*          continue.
+*         go to next check
+        else.
+          continue.
+        endif.
+      endif.
+    else.
+      continue.
+    endif.
+
+*.. Check credit limit/exceeded
+    if gv_klimk <> 0.
+      perform credit_exposure using gv_sauft.
+      gv_oblig = gv_sauft + gv_skfor + gv_ssobl.
+
+      if gv_OBLIG > gv_KLIMK.
+        continue.
+      else.
+**...... Payment term in custom table ?
+*        READ TABLE gt_yse_relso_payter with key zterm = gv_zterm.
+*        if sy-subrc <> 0.
+          perform release_deliv_block using gt_orders-vbeln.
+          continue.
+*        endif.
+      endif.
+    else.
+      perform release_deliv_block using gt_orders-vbeln.
+      continue.
+    endif.
+  endloop.
+
+*&---------------------------------------------------------------------*
+*&      Form  RELEASE_DELIV_BLOCK
+*&---------------------------------------------------------------------*
+*       SO delivery block release
+*----------------------------------------------------------------------*
+*  -->  r_vbeln        document to be released
+*----------------------------------------------------------------------*
+FORM RELEASE_DELIV_BLOCK using r_vbeln.
+
+  clear ls_header-dlv_block.
+  ls_headerx-dlv_block = 'X'.
+  ls_headerx-updateflag = 'U'.
+
+  refresh lt_return.
+
+  CALL FUNCTION 'BAPI_SALESORDER_CHANGE'
+    EXPORTING
+      SALESDOCUMENT    = r_vbeln
+      ORDER_HEADER_IN  = ls_header
+      ORDER_HEADER_INX = ls_headerx
+    TABLES
+      RETURN           = lt_return.
+
+  loop at lt_return ASSIGNING <fs_return> where type = 'E'.
+    write: / 'Errors for sales order ', r_VBELN,
+           / <fs_return>-MESSAGE.
+    continue.
+  endloop.
+  skip 1.
+
+  if SY-subrc ne 0.
+    commit work AND WAIT.
+    write: / 'Delivery block removed for sales order ', r_VBELN.
+  endif.
+
+ENDFORM.                    " RELEASE_CREDIT_BLOCK
+
+*&---------------------------------------------------------------------*
+*&      Form  CREDIT_EXPOSURE
+*&---------------------------------------------------------------------*
+*       Determine credit exposure
+*----------------------------------------------------------------------*
+*  <--  r_sauft
+*----------------------------------------------------------------------*
+FORM CREDIT_EXPOSURE using r_sauft.
+
+  DATA: lv_olikw LIKE s067-olikw,
+        lv_ofakw LIKE s067-ofakw,
+        lv_oeikw LIKE s066-oeikw,
+        lv_horda TYPE horda_f02l.
+
+  CLEAR: r_sauft.
+
+  CALL FUNCTION 'SD_CREDIT_HORIZON_DATE'
+    EXPORTING
+      i_kkber         = gt_orders-kkber
+      i_ctlpc         = gv_ctlpc
+      i_horizon_exist = 'X'
+    IMPORTING
+      e_horizon_date  = lv_horda.
+
+  IF lv_horda IS INITIAL.
+    lv_horda = '99991231'.
+  ENDIF.
+
+  CALL FUNCTION 'SD_CREDIT_EXPOSURE'
+     EXPORTING
+          flag_open_delivery = 'X'
+          flag_open_invoice  = 'X'
+          flag_open_order    = 'X'
+          horizon_date       = lv_horda
+*          HORIZON_DATE       = '99991231'
+          kkber              = gt_orders-kkber
+          knkli              = gv_knkli
+*          T014               = ' '
+     IMPORTING
+          open_delivery      = lv_olikw
+          open_invoice       = lv_ofakw
+          open_order         = lv_oeikw.
+
+  r_sauft = lv_olikw + lv_ofakw + lv_oeikw.
+
+ENDFORM.                    " CREDIT_EXPOSURE
+
+*Begin of comment MOD-003
+**&---------------------------------------------------------------------*
+**&      Form  CHECK_ALL_GOODS_AVAILABLE
+**&---------------------------------------------------------------------*
+**       Check all goods available
+**----------------------------------------------------------------------*
+**      --> R_VBELN  sales document
+**----------------------------------------------------------------------*
+*FORM CHECK_ALL_GOODS_AVAILABLE  USING r_VBELN.
+*
+*  data: lv_kalab type mska-kalab.
+*
+*  LOOP AT gt_items WHERE vbeln = r_vbeln.
+*    REFRESH gt_quant.
+*
+** begin of insert MOD-002
+*    IF gt_items-pstyv = 'ZP1'.    " Machine with options
+*      CONTINUE.
+*    ENDIF.
+** end of insert MOD-002
+*
+*    IF gt_items-pstyv = 'ZTAN' or
+*       gt_items-pstyv = 'ZAS1'.
+*
+**.... Check ordered quantity with confirmd quantity
+*      SELECT bmeng wmeng
+*        INTO (gv_bmeng, gv_wmeng)
+*        FROM vbep
+*        WHERE vbeln eq gt_items-vbeln
+*          AND posnr eq gt_items-posnr.
+*
+*        MOVE gv_bmeng to gt_quant-bmeng.
+*        MOVE gv_wmeng to gt_quant-wmeng.
+*        COLLECT gt_quant.
+*        CLEAR gt_quant.
+*      ENDSELECT.
+*
+*      LOOP AT gt_quant.
+*        IF gt_quant-bmeng <> gt_quant-wmeng.
+*          CLEAR gv_st_av.
+*          EXIT.
+*        ENDIF.
+*      ENDLOOP.
+*
+*      IF gv_st_av IS INITIAL.
+*        EXIT.
+*      ENDIF.
+*    ELSE.           "ZDTC or ZAS2
+*
+**.... Check ordered quantity with sales order stock
+*      CLEAR lv_kalab.
+*      SELECT SUM( kalab )
+*         FROM mska
+*         INTO lv_kalab
+*         WHERE vbeln = gt_items-vbeln
+*           AND posnr = gt_items-posnr.
+*
+*      IF sy-subrc EQ 0 AND lv_kalab > 0.
+*        IF lv_kalab <> gt_items-kwmeng.
+*          CLEAR gv_st_av.
+*          EXIT.
+*        endif.
+*      ELSE.
+*        CLEAR gv_st_av.
+*        EXIT.
+*      ENDIF.
+*    endif.
+*  ENDLOOP.
+*
+*ENDFORM.                    " CHECK_ALL_GOODS_AVAILABLE
+
+*End of comment MOD-003
+*Text symbol text£º
+*F01:SD document info
+
+*I01:No orders selected !
+*Selection text£º
+*S_VBELN:D       .
+*S_VKORG:D       .

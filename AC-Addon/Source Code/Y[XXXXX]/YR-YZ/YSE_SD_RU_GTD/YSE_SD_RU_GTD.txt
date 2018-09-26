@@ -1,0 +1,730 @@
+*----------------------------------------------------------------------*
+* PROGRAM ID           : YSE_UPDATE_INBDEL_GTD                         *
+* PROGRAM TITLE        : Update inbound delivery GTD number            *
+* AUTHOR               : LUC MERTENS                                   *
+* DATE                 : 31/08/2009                                    *
+* DEVELOPMENT ID       : CR0977                                        *
+* CHANGE REQUEST NUMBER: CD1K950032                                    *
+* PROGRAM DESCRIPTION  : This is a program to update the GTD number    *
+*                        of selected inbound deliveries                *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG
+*----------------------------------------------------------------------*
+* MOD.NR. |  DATE      | NAME            | CORR.NR.   | CHANGE REF.    *
+*----------------------------------------------------------------------*
+* MOD-001 | 07/04/2010 | J. Smets        | CD1K955833 | CR1091         *
+*         | Read characteristics to keep unchanged values              *
+*----------------------------------------------------------------------*
+* MOD-002 | 22/06/2010 | J. Smets        | CD1K957573 | CR1091         *
+*         | Check material type 'ZMAT'                                 *
+*----------------------------------------------------------------------*
+* MOD-003 | 23/11/2013 | D.Praveen       | CD1K978596 | CR3106         *
+*         | GTD field Updation in Batch                                *
+************************************************************************
+************************************************************************
+REPORT yse_sd_ru_gtd
+       NO STANDARD PAGE HEADING
+       LINE-SIZE 120.
+
+*---------------------------------------------------------------------*
+* INTERNAL TABLE DECLARATIONS                                         *
+*---------------------------------------------------------------------*
+DATA: BEGIN OF gt_likp OCCURS 0,
+        vbeln TYPE vbeln_vl,
+      END OF gt_likp.
+
+DATA: BEGIN OF gt_output OCCURS 0,
+        vbeln   TYPE vbeln_vl,
+        posnr   TYPE posnr_vl,
+        vgbel   TYPE vgbel,
+        type    LIKE bapiret2-type,
+        id      LIKE bapiret2-id,
+        number  LIKE bapiret2-number,
+        message LIKE bapiret2-message,
+      END OF gt_output.
+
+DATA: gt_return    TYPE STANDARD TABLE OF bapiret2,
+      wa_return    LIKE LINE OF gt_return,
+      gt_lips      LIKE lips OCCURS 0 WITH HEADER LINE,
+      wa_lips      LIKE LINE OF gt_lips,
+      gt_prot      LIKE prott OCCURS 0 WITH HEADER LINE,
+      gt_del_items LIKE lips OCCURS 100 WITH HEADER LINE,
+      gs_batchctrl LIKE bapibatchctrl,
+      gv_batch     LIKE bapibatchkey-batch,
+      gv_retcd     LIKE sy-subrc,
+      gv_wadat     LIKE rbkp-budat,
+      gv_mode(1)   TYPE c VALUE 'N',
+      gt_valnum    LIKE TABLE OF bapi1003_alloc_values_num,
+      wa_valnum    LIKE LINE OF gt_valnum,
+      gt_valchar   LIKE TABLE OF bapi1003_alloc_values_char,
+      wa_valchar   LIKE LINE OF gt_valchar,
+      gt_valcurr   LIKE TABLE OF bapi1003_alloc_values_curr,
+      wa_valcurr   LIKE LINE OF gt_valcurr.
+
+*---------------------------------------------------------------------*
+* VARIABLE DECLARATIONS                                               *
+*---------------------------------------------------------------------*
+DATA: gv_cnt(2)    TYPE n,
+      gv_cnt1      type i,"MOD-003
+      gv_bukrs     TYPE bukrs,
+      gv_wbstk     TYPE wbstk,
+      gv_vbeln     TYPE vbeln,
+      gv_mtart     TYPE mtart,                              "MOD-002
+      gv_text(50)  TYPE c,
+      gv_objkey    TYPE bapi1003_key-object.
+
+DATA: i_bdcdata LIKE bdcdata OCCURS 0 WITH HEADER LINE,
+      struct_bdcdata TYPE bdcdata,
+      gt_err    LIKE bdcmsgcoll OCCURS 0 WITH HEADER LINE,
+      wa_err    LIKE LINE OF gt_err.
+
+*---------------------------------------------------------------------*
+* CONSTANT DECLARATIONS                                               *
+*---------------------------------------------------------------------*
+CONSTANTS: c_class         TYPE klasse_d VALUE 'ZRU_BATCH',
+           c_gtdnumber     TYPE atnam    VALUE 'ZRU_GDTNUMBER',
+           c_country1      TYPE atnam    VALUE 'ZRU_COUNTRY1',
+           c_gtdlast       TYPE atnam    VALUE 'ZRU_GTDLAST',"MOD-003
+           c_mcha          TYPE tabelle  VALUE 'MCHA',
+           c_022(3)        TYPE c        VALUE '022',
+           c_x             TYPE c        VALUE 'X'."MOD-003
+
+*---------------------------------------------------------------------*
+* PARAMETER DECLARATION
+*---------------------------------------------------------------------*
+SELECTION-SCREEN : BEGIN OF BLOCK b1b.
+PARAMETERS: p_vbeln TYPE vbeln_vl.
+PARAMETERS: p_bolnr TYPE bolnr.
+
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT (15)  text-sc2 FOR FIELD p_lifex.
+PARAMETERS: p_lifex TYPE lifex.
+SELECTION-SCREEN COMMENT (06)  text-sc1 FOR FIELD p_lifnr.
+PARAMETERS: p_lifnr TYPE lifnr.
+SELECTION-SCREEN END OF LINE.
+
+PARAMETERS: p_traid TYPE traid.
+SELECTION-SCREEN END OF BLOCK b1b.
+
+SELECTION-SCREEN SKIP 1.
+PARAMETERS: p_gtdnr(30) TYPE c OBLIGATORY,
+            p_cntry(30) TYPE c OBLIGATORY,
+            p_wadat     TYPE wadat_ist_la OBLIGATORY.
+
+
+*-----------------------------------------------------------------*
+AT SELECTION-SCREEN ON BLOCK b1b.
+
+  IF ( p_vbeln IS INITIAL AND p_bolnr IS INITIAL AND
+       p_lifex IS INITIAL AND p_traid IS INITIAL ).
+    MESSAGE e001(00) WITH text-e24.
+  ELSE.
+    CLEAR gv_cnt.
+    IF NOT p_vbeln IS INITIAL.
+      ADD 1 TO gv_cnt.
+    ENDIF.
+    IF NOT p_bolnr IS INITIAL.
+      ADD 1 TO gv_cnt.
+    ENDIF.
+    IF NOT p_lifex IS INITIAL.
+      ADD 1 TO gv_cnt.
+    ENDIF.
+    IF NOT p_traid IS INITIAL.
+      ADD 1 TO gv_cnt.
+    ENDIF.
+
+    IF gv_cnt > 1.
+      MESSAGE e001(00) WITH text-e25.
+    ENDIF.
+  ENDIF.
+
+*-----------------------------------------------------------------*
+AT SELECTION-SCREEN ON p_lifnr.
+
+  IF NOT p_lifex IS INITIAL.
+    IF p_lifnr IS INITIAL.
+      MESSAGE e001(00) WITH text-e23.
+    ENDIF.
+  ENDIF.
+
+*-----------------------------------------------------------------*
+AT SELECTION-SCREEN ON p_wadat.
+
+* check if the Actual GR date is situated in an open FI and MM period
+  gv_wadat = p_wadat.
+
+  CALL FUNCTION 'MR_PERIOD_DETERMINE'
+    EXPORTING
+      i_bukrs                = 'MRUA'     " specific program for Russia
+      i_budat                = gv_wadat
+    EXCEPTIONS
+      invalid_posting_period = 1
+      marv_no_entry          = 2
+      OTHERS                 = 3.
+
+  IF sy-subrc <> 0.
+    MESSAGE e001(00) WITH text-e26.
+  ENDIF.
+
+
+*--------- S T A R T   O F   M A I N   P R O C E S S I N G -----------*
+
+*---------------------------------------------------------------------*
+* START-OF-SELECTION                                                  *
+*---------------------------------------------------------------------*
+START-OF-SELECTION.
+
+*** MOD-001 * begin ***
+* Statistics for transaction / program
+  CALL METHOD ycl_statistics=>record_transaction.
+*** MOD-001 * end ***
+
+* Select inbound deliveries
+  REFRESH: gt_likp,
+           gt_output.
+
+  IF NOT p_vbeln IS INITIAL.
+    SELECT vbeln
+      INTO CORRESPONDING FIELDS OF TABLE gt_likp
+      FROM likp
+      WHERE vbeln = p_vbeln.
+  ELSEIF NOT p_bolnr IS INITIAL.
+    SELECT vbeln
+      INTO CORRESPONDING FIELDS OF TABLE gt_likp
+      FROM likp
+      WHERE bolnr = p_bolnr.
+  ELSEIF NOT p_traid IS INITIAL.
+    SELECT vbeln
+      INTO CORRESPONDING FIELDS OF TABLE gt_likp
+      FROM likp
+      WHERE traid = p_traid.
+  ELSEIF NOT p_lifex IS INITIAL.
+    SELECT vbeln
+      INTO CORRESPONDING FIELDS OF TABLE gt_likp
+      FROM likp
+      WHERE lifnr = p_lifnr
+        AND lifex = p_lifex.
+  ENDIF.
+
+  CHECK NOT gt_likp[] IS INITIAL.
+
+  SELECT * INTO TABLE gt_lips
+    FROM lips
+    FOR ALL ENTRIES IN gt_likp
+    WHERE vbeln = gt_likp-vbeln.
+
+  SORT gt_lips BY vbeln posnr.
+
+* Check if all related PO's are not locked
+  LOOP AT gt_lips.
+    CALL FUNCTION 'ENQUEUE_EMEKKOE'
+      EXPORTING
+        mode_ekko      = 'E'
+        mode_ekpo      = 'E'
+        mandt          = sy-mandt
+        ebeln          = gt_lips-vgbel
+*        ebelp          = gt_lips-vgpos
+      EXCEPTIONS
+        foreign_lock   = 1
+        system_failure = 2
+        OTHERS         = 3.
+
+    IF sy-subrc <> 0.
+      CLEAR gv_text.
+      CONCATENATE text-e01 gt_lips-vgbel text-e02 INTO gv_text
+                  SEPARATED BY space.
+      MESSAGE e001(00) WITH gv_text.
+      EXIT.
+    ELSE.
+      CALL FUNCTION 'DEQUEUE_EMEKKOE'
+        EXPORTING
+          mode_ekko = 'E'
+          mode_ekpo = 'E'
+          mandt     = sy-mandt
+          ebeln     = gt_lips-vgbel.
+    ENDIF.
+  ENDLOOP.
+
+* Check if all related PO's are already GR'd
+  LOOP AT gt_lips.
+    SELECT SINGLE wbstk INTO gv_wbstk
+      FROM vbuk WHERE vbeln = gt_lips-vbeln.
+
+    IF sy-subrc = 0 AND ( gv_wbstk = 'B' OR gv_wbstk = 'C' ).
+      CLEAR gv_text.
+      WRITE gt_lips-vbeln TO gv_vbeln NO-ZERO.
+      CONCATENATE text-e03 gt_lips-vbeln text-e04 INTO gv_text
+                  SEPARATED BY space.
+      MESSAGE e001(00) WITH gv_text.
+      EXIT.
+    ENDIF.
+  ENDLOOP.
+  clear:gv_cnt1."MOD-003
+* Do the necessary changes
+  LOOP AT gt_lips.
+    SELECT SINGLE bukrs INTO gv_bukrs
+      FROM t001k WHERE bwkey = gt_lips-werks.
+
+    IF sy-subrc = 0.
+      SELECT SINGLE bukrs INTO gv_bukrs
+        FROM yse_cc_act_cost WHERE bukrs = gv_bukrs.
+
+      IF sy-subrc = 0.
+*** MOD-002 * begin ***
+*       Check material type
+        CLEAR gv_mtart.
+        SELECT SINGLE mtart INTO gv_mtart
+               FROM mara
+               WHERE matnr = gt_lips-matnr.
+        CHECK gv_mtart = 'ZMAT'.
+*** MOD-002 * end ***
+*...... If batch does not exist, create it  and
+*                                change the inbound delivery
+        IF gt_lips-charg IS INITIAL.
+          CLEAR gv_retcd.
+          PERFORM sub_create_batch CHANGING gv_retcd.
+
+          IF gv_retcd = 0.
+            MOVE gv_batch TO gt_lips-charg.
+            MODIFY gt_lips TRANSPORTING charg.
+          ELSE.
+            CONTINUE.
+          ENDIF.
+        ENDIF.
+
+*...... Update characteristics GTD-number and Country of origin
+        PERFORM sub_update_gtd.
+
+        LOOP AT gt_return INTO wa_return
+                          WHERE type = 'E' OR type = 'A'.
+        ENDLOOP.
+
+        IF sy-subrc = 0.
+          MOVE gt_lips-vbeln     TO gt_output-vbeln.
+          MOVE gt_lips-posnr     TO gt_output-posnr.
+          MOVE gt_lips-vgbel     TO gt_output-vgbel.
+          MOVE wa_return-type    TO gt_output-type.
+          MOVE wa_return-id      TO gt_output-id.
+          MOVE wa_return-number  TO gt_output-number.
+          MOVE wa_return-message TO gt_output-message.
+          APPEND gt_output.
+          CLEAR gt_output.
+        ELSE.
+          COMMIT WORK AND WAIT.
+
+          MOVE gt_lips-vbeln TO gt_output-vbeln.
+          MOVE gt_lips-posnr TO gt_output-posnr.
+          MOVE gt_lips-vgbel TO gt_output-vgbel.
+          APPEND gt_output.
+          CLEAR gt_output.
+        ENDIF.
+
+*...... Change delivery with actual DR date
+        wa_lips = gt_lips.
+        AT END OF vbeln.
+          PERFORM sub_change_delivery.
+          CALL TRANSACTION 'VL32N' USING i_bdcdata
+             UPDATE 'S' MODE gv_mode MESSAGES INTO gt_err.
+
+          LOOP AT gt_err INTO wa_err WHERE msgtyp = 'A' OR
+                                           msgtyp = 'E'.
+          ENDLOOP.
+          IF sy-subrc = 0.
+            MOVE wa_lips-vbeln     TO gt_output-vbeln.
+*           move wa_lips-posnr     to gt_output-posnr.
+            MOVE wa_lips-vgbel     TO gt_output-vgbel.
+            MOVE wa_err-msgtyp     TO gt_output-type.
+            MOVE wa_err-msgid      TO gt_output-id.
+            MOVE wa_err-msgnr      TO gt_output-number.
+            PERFORM sub_write_message.
+*           continue.
+          ENDIF.
+        ENDAT.
+
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+
+*----------------------------------------------------------------------*
+* END-OF-SELECTION                                                     *
+*----------------------------------------------------------------------*
+END-OF-SELECTION.
+
+* Give overview of updated inbound deliveries
+  LOOP AT gt_output.
+    WRITE: /   gt_output-vbeln,
+            15 gt_output-posnr NO-ZERO,
+            23 gt_output-vgbel.
+
+    IF NOT gt_output-type IS INITIAL.
+      WRITE:  37 'E R R O R  ! ! ! '.
+      FORMAT COLOR COL_NEGATIVE.
+      WRITE:   / gt_output-type,
+              12 gt_output-id(2),
+              15 gt_output-number,
+              20 gt_output-message(72).
+      FORMAT RESET.
+    ENDIF.
+  ENDLOOP.
+
+
+*-S U B R O U T I N E S------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  SUB_UPDATE_GTD
+*&---------------------------------------------------------------------*
+*       Update GTD number
+*----------------------------------------------------------------------*
+FORM sub_update_gtd.
+
+  MOVE gt_lips-matnr TO gv_objkey+00(18).
+  MOVE gt_lips-werks TO gv_objkey+18(04).
+  MOVE gt_lips-charg TO gv_objkey+22(10).
+
+*** MOD-001 * begin ***
+*  clear wa_valchar.
+*  move c_GTDNUMBER to wa_valchar-charact.
+*  move p_GTDNR     to wa_valchar-value_char.
+*  append wa_valchar to gt_valchar.
+*  clear wa_valchar.
+*  move c_COUNTRY1  to wa_valchar-charact.
+*  move p_cntry     to wa_valchar-value_char.
+*  append wa_valchar to gt_valchar.
+
+* Get characteristics
+  CALL FUNCTION 'BAPI_OBJCL_GETDETAIL'
+    EXPORTING
+      objectkey              = gv_objkey
+      objecttable            = c_mcha
+      classnum               = c_class
+      classtype              = c_022
+*      KEYDATE                = SY-DATUM
+      unvaluated_chars       = c_x "MOD-003
+*      LANGUAGE               = SY-LANGU
+*    IMPORTING
+*      STATUS                 =
+*      STANDARDCLASS          =
+    TABLES
+      allocvaluesnum         = gt_valnum
+      allocvalueschar        = gt_valchar
+      allocvaluescurr        = gt_valcurr
+      return                 = gt_return.
+  SORT gt_valchar.
+
+* Update characteristic ZRU_GDTNUMBER
+  CLEAR wa_valchar.
+  READ TABLE gt_valchar INTO wa_valchar
+             WITH KEY charact = c_gtdnumber.
+  IF sy-subrc = 0.
+    MOVE p_gtdnr   TO: wa_valchar-value_char,
+                       wa_valchar-value_neutral.
+    MODIFY gt_valchar INDEX sy-tabix
+                      FROM wa_valchar.
+  ELSE.
+    MOVE c_gtdnumber  TO wa_valchar-charact.
+    MOVE p_gtdnr      TO wa_valchar-value_char.
+    APPEND wa_valchar TO gt_valchar.
+  ENDIF.
+
+* Update characteristic ZRU_COUNTRY1
+  CLEAR wa_valchar.
+  READ TABLE gt_valchar INTO wa_valchar
+             WITH KEY charact = c_country1.
+  IF sy-subrc = 0.
+    MOVE p_cntry   TO: wa_valchar-value_char,
+                       wa_valchar-value_neutral.
+    MODIFY gt_valchar INDEX sy-tabix
+                      FROM wa_valchar.
+  ELSE.
+    MOVE c_country1   TO wa_valchar-charact.
+    MOVE p_cntry      TO wa_valchar-value_char.
+    APPEND wa_valchar TO gt_valchar.
+  ENDIF.
+*Begin of MOD-003.
+* Update characteristic ZRU_GTDLAST
+  gv_cnt1 = gv_cnt1 + 1.
+  CLEAR: wa_valchar.
+  READ TABLE gt_valchar INTO wa_valchar
+             WITH KEY charact = c_gtdlast.
+  IF sy-subrc = 0.
+    MOVE:c_gtdlast  TO wa_valchar-charact,
+         gv_cnt1    TO wa_valchar-value_char,
+         gv_cnt1    TO wa_valchar-value_neutral.
+    CONDENSE: wa_valchar-value_char,wa_valchar-value_neutral.
+    APPEND wa_valchar TO gt_valchar.
+  ENDIF.
+*End of MOD-003.
+*** MOD-001 * end ***
+
+* Update characteristics
+  CALL FUNCTION 'BAPI_OBJCL_CHANGE'
+    EXPORTING
+      objectkey                = gv_objkey
+      objecttable              = c_mcha
+      classnum                 = c_class
+      classtype                = c_022
+*      STATUS                   = '1'
+*      STANDARDCLASS            =
+*      CHANGENUMBER             =
+*      KEYDATE                  = SY-DATUM
+*      NO_DEFAULT_VALUES        = ' '
+*    IMPORTING
+*      CLASSIF_STATUS           =
+    TABLES
+      allocvaluesnumnew        = gt_valnum
+      allocvaluescharnew       = gt_valchar
+      allocvaluescurrnew       = gt_valcurr
+      return                   = gt_return.
+
+ENDFORM.                    " SUB_UPDATE_GTD
+
+*&---------------------------------------------------------------------*
+*&      Form  SUB_CREATE_BATCH
+*&---------------------------------------------------------------------*
+*       Create batch and change inbound delivery
+*----------------------------------------------------------------------*
+*  <--- r_subrc   Returncode
+*----------------------------------------------------------------------*
+FORM sub_create_batch CHANGING r_subrc.
+
+  DATA: transaction_id LIKE arfctid,
+        commit_work(15) VALUE 'COMMIT_WORK',
+        status_of_transaction(15).
+
+  REFRESH gt_return.
+
+  CALL FUNCTION 'TRANSACTION_BEGIN'
+    IMPORTING
+      transaction_id = transaction_id
+    EXCEPTIONS
+      OTHERS         = 1.
+
+  gs_batchctrl-batchlevel = '0'.
+  gs_batchctrl-class_num  = c_class.
+  gs_batchctrl-doclassify = 'X'.
+
+  CALL FUNCTION 'BAPI_BATCH_CREATE'
+    EXPORTING
+      material                   = gt_lips-matnr
+*     BATCH                      =
+      plant                      = gt_lips-werks
+*     BATCHATTRIBUTES            =
+      batchcontrolfields         = gs_batchctrl
+*     BATCHSTORAGELOCATION       =
+*     INTERNALNUMBERCOM          =
+*     EXTENSION1                 =
+*     MATERIAL_EVG               =
+    IMPORTING
+      batch                      = gv_batch
+*     BATCHATTRIBUTES            =
+    TABLES
+      return                     = gt_return.
+
+  CALL FUNCTION 'TRANSACTION_STATUS'
+    IMPORTING
+      status = status_of_transaction
+    EXCEPTIONS
+      OTHERS = 1.
+
+  IF status_of_transaction = commit_work.
+    COMMIT WORK AND WAIT.
+  ENDIF.
+
+  CALL FUNCTION 'TRANSACTION_END'
+    EXPORTING
+      transaction_id = transaction_id
+    EXCEPTIONS
+      OTHERS         = 1.
+
+  LOOP AT gt_return INTO wa_return WHERE type = 'E'
+                                      OR type = 'A'.
+  ENDLOOP.
+
+  IF sy-subrc = 0.
+    r_subrc = 4.
+    MOVE gt_lips-vbeln     TO gt_output-vbeln.
+    MOVE gt_lips-posnr     TO gt_output-posnr.
+    MOVE gt_lips-vgbel     TO gt_output-vgbel.
+    MOVE wa_return-type    TO gt_output-type.
+    MOVE wa_return-id      TO gt_output-id.
+    MOVE wa_return-number  TO gt_output-number.
+    MOVE wa_return-message TO gt_output-message.
+    APPEND gt_output.
+    CLEAR gt_output.
+  ELSE.
+    r_subrc = 0.
+    REFRESH: gt_prot,
+             gt_del_items.
+    MOVE-CORRESPONDING gt_lips TO gt_del_items.
+    MOVE gv_batch              TO gt_del_items-charg.
+    APPEND gt_del_items.
+    CLEAR gt_del_items.
+
+    CALL FUNCTION 'LE_MOB_DELIVERY_UPDATE'
+      EXPORTING
+        do_commit                = ' '
+      TABLES
+        t_delivery_items         = gt_del_items
+        prot                     = gt_prot
+      EXCEPTIONS
+        conversion_overflow      = 1
+        essential_data_missing   = 2
+        error                    = 3
+        nothing_to_update        = 4
+        lock_after_update_failed = 5
+        error_in_delivery_update = 6
+        OTHERS                   = 7.
+
+    IF sy-subrc <> 0.
+      r_subrc = sy-subrc.
+      READ TABLE gt_prot INDEX 1.
+      MOVE gt_lips-vbeln     TO gt_output-vbeln.
+      MOVE gt_lips-posnr     TO gt_output-posnr.
+      MOVE gt_lips-vgbel     TO gt_output-vgbel.
+      MOVE gt_prot-msgty     TO gt_output-type.
+      MOVE gt_prot-msgid     TO gt_output-id.
+      MOVE gt_prot-msgno     TO gt_output-number.
+      MOVE gt_prot-msgv1     TO gt_output-message.
+      APPEND gt_output.
+      CLEAR gt_output.
+    ELSE.
+      COMMIT WORK AND WAIT.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    " SUB_CREATE_BATCH
+
+*&---------------------------------------------------------------------*
+*&      Form  SUB_CHANGE_DELIVERY
+*&---------------------------------------------------------------------*
+*       Update inbound delivery
+*----------------------------------------------------------------------*
+FORM sub_change_delivery.
+
+  DATA: l_date TYPE d.
+
+  REFRESH: i_bdcdata,
+           gt_err.
+
+*
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    'SAPMV50A'  '4104'  'X'  ''   ''
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    ''  ''  ''  'LIKP-VBELN'  gt_lips-vbeln
+          CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    ''  ''  ''  'BDC_OKCODE'  '/00'
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+*
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    'SAPMV50A'  '1000'  'X'  ''   ''
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    ''  ''  ''  'BDC_OKCODE'  '=T\01'
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+*
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    'SAPMV50A'  '1000'  'X'  ''   ''
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  WRITE gv_wadat TO l_date.
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    ''  ''  ''  'RV50A-WADAT_IST_LA'  l_date
+          CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    ''  ''  ''  'BDC_OKCODE'  '=SICH_T'
+           CHANGING struct_bdcdata.
+  APPEND struct_bdcdata  TO i_bdcdata.
+  CLEAR  struct_bdcdata.
+
+ENDFORM.                    " SUB_CHANGE_DELIVERY
+
+*&---------------------------------------------------------------------*
+*&      Form  SUB_WRITE_MESSAGE
+*&---------------------------------------------------------------------*
+*       Write error messages from B-I sessions
+*----------------------------------------------------------------------*
+FORM sub_write_message .
+
+  DATA:  lv_mestx   LIKE t100-text,
+         lv_msgnr   LIKE t100-msgnr.
+
+  LOOP AT gt_err.
+    lv_msgnr = gt_err-msgnr.
+    CALL FUNCTION 'RH_MESSAGE_GET'
+      EXPORTING
+*        SPRSL                   = SY-LANGU
+        arbgb                   = sy-msgid
+        msgnr                   = lv_msgnr
+        msgv1                   = sy-msgv1
+        msgv2                   = sy-msgv2
+        msgv3                   = sy-msgv3
+        msgv4                   = sy-msgv4
+      IMPORTING
+        msgtext                 = lv_mestx
+      EXCEPTIONS
+        message_not_found       = 1
+        OTHERS                  = 2.
+
+    IF sy-subrc = 0.
+      MOVE lv_mestx TO gt_output-message.
+      APPEND gt_output.
+      CLEAR gt_output.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    " SUB_WRITE_MESSAGE
+
+*List header: Column headings£º
+
+*001:Inb.Delivery  Item    POnumber
+*Text symbol text£º
+*E01:PO
+*E02:is locked
+*E03:Inb.delivery
+*E04:is already goods receipted
+*E10:No characteristics exist for
+*E11:Characteristic not in class
+*E12:Value is not valid
+*E16:Fill in Old Service Product number
+*E17:Fill in Item cat. group, MRP Type and Mat. Group
+*E23:Please fill also vendor number
+*E24:At least one parameter has to be filled in !
+*E25:Not more than 1 parameter may be filled in
+*E26:Posting is only possible in open periods
+*SC1:Vendor
+
+*SC2:Shipment number
+*Selection text£º
+*P_BOLNR:        Invoice reference number
+*P_CNTRY:        Country of origin
+*P_GTDNR:        GTD number
+*P_LIFEX:        Shipment number
+*P_LIFNR:D       .
+*P_TRAID:        Case number
+*P_VBELN:        Inbound delivery number
+
+*P_WADAT:        Actual GR date
+*List Title: Titlebar£º
+*:Updated inbound deliveries

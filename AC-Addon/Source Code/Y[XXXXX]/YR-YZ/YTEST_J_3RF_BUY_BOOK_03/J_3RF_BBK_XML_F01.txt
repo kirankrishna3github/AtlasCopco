@@ -1,0 +1,329 @@
+*&---------------------------------------------------------------------*
+*&  Include           J_3RF_BBK_XML_F01
+*&---------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  XML_INIT
+*&---------------------------------------------------------------------*
+*       INITIALIZATION event
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM xml_init .
+  CONSTANTS:
+    lc_xml_hier_key_pb14  TYPE j_3rf_rep_hier_key VALUE 'RPB14', " Q4/2014 - basic sheet
+    lc_xml_hier_key_pba14 TYPE j_3rf_rep_hier_key VALUE 'RPBA4'. " Q4/2014 - additional sheet
+  DATA: l_recheck TYPE flag.
+
+  pa_xml  = lc_xml_hier_key_pb14.
+  pa_xmla = lc_xml_hier_key_pba14.
+
+* check if XML engine is enabled
+  PERFORM check_xml_enabled.
+
+* read customizing of VAT declaration
+  PERFORM read_xml_customizing USING    g_vat_decl_section
+                               CHANGING pa_xml.
+  PERFORM read_xml_customizing USING    g_vat_decl_section_a
+                               CHANGING pa_xmla.
+
+  PERFORM check_xml_hier USING 'X'. " initial
+
+* 2099024 recheck XML hierarchy
+  IF pa_xml IS INITIAL.
+    pa_xml = gc_xml_hier_key_pb.
+    l_recheck = 'X'.
+  ENDIF.
+  IF pa_xmla IS INITIAL.
+    pa_xmla = gc_xml_hier_key_pba.
+    l_recheck = 'X'.
+  ENDIF.
+  IF l_recheck = 'X'.
+    PERFORM check_xml_hier USING 'X'. " initial
+  ENDIF.
+
+  IF gv_xml_enabled CA 'XB'.
+    _outopt = 'Adobe and XML Options'(914).
+  ELSE.
+    _outopt = 'Adobe Options'(915).
+  ENDIF.
+ENDFORM.                    " XML_INIT
+*&---------------------------------------------------------------------*
+*&      Form  CALL_XML
+*&---------------------------------------------------------------------*
+*       Generate XML file for Sales Ledger
+*----------------------------------------------------------------------*
+FORM call_xml .
+  DATA: ls_bk_guid     TYPE j_3rf_bk_guid,
+        ls_bk_guid_sav TYPE j_3rf_bk_guid,
+        ls_bk_guid_add TYPE j_3rf_bk_guid,
+        ls_totals      TYPE ty_adobe_total,
+        ls_dummy       TYPE ty_adobe_total,
+        l_sign         TYPE j_3rf_sign_item,
+        l_path         TYPE string,
+        buff_tab_old   TYPE j_3r_purchase_ledger_tab,
+        l_generated    TYPE flag, " 2120495
+        cx_oref        TYPE REF TO cx_root,
+        cx_text        TYPE string,
+        l_file_name    TYPE string.
+  FIELD-SYMBOLS:
+        <fs_line>      TYPE ty_adobe_line,
+        <fs_old>       TYPE j_3r_purchase_ledger_line.
+
+  CHECK gv_xml_enabled CA 'XB'.
+
+* initiate GUID key
+  CLEAR ls_bk_guid.
+  ls_bk_guid-bukrs       = mainbuk.
+  ls_bk_guid-gjahr       = br_gjahr-low.
+  ls_bk_guid-bk_type     = gc_xml_bk_type_pb.   " Purchase Ledger
+  ls_bk_guid-monat_from  = buff_header-monat_begin.
+  ls_bk_guid-monat_to    = buff_header-monat_end.
+  ls_bk_guid-output_date = ad_date.
+  IF ls_bk_guid-output_date IS INITIAL.
+    ls_bk_guid-output_date = sy-datum.
+  ENDIF.
+
+* get reporting period of basic sheet
+  PERFORM xml_guid_period USING  buff_header-budat_begin
+                                 buff_header-budat_end
+                        CHANGING ls_bk_guid.
+
+*  get GUID from table J_3RF_BK_GUID
+  IF gv_xml_enabled = 'X' AND
+     g_vat_decl_sel IS INITIAL.  " 2138132
+  CALL METHOD (gc_xml_class)=>get_bk_guid " cl_j3rf_vat_xml
+    CHANGING
+      cs_bk_guid = ls_bk_guid.
+  ENDIF.
+  ls_bk_guid_sav = ls_bk_guid.  " save GUID
+
+* get signature
+  PERFORM xml_get_signature CHANGING l_sign.
+  l_path = p_xmldir.  " file path
+
+* output date
+  buff_header-date_output = ls_bk_guid-output_date.
+
+* 2120495 fill VAT Return header
+  PERFORM fill_decl_header CHANGING buff_header.
+
+**********************************************************************
+* generate basic sheet
+
+* calculate totals
+  CLEAR ls_totals.
+  PERFORM get_totals USING buff_tab CHANGING ls_totals.
+
+  CLEAR l_generated.  " 2120495 call BADI
+  IF g_vat_decl_sel = gc_vat_decl_sel_corr.
+    l_generated = 'X'. " no main file for correction
+  ENDIF.
+
+  IF NOT ref IS INITIAL AND l_generated IS INITIAL.
+    try.
+      call badi ref->pl_xml
+        exporting
+          i_path       = l_path
+          i_bukrs      = mainbuk
+          i_tax_office = p_xmltax
+          is_header    = buff_header
+          it_items     = buff_tab
+          is_footer    = ls_totals
+          is_total     = ls_dummy
+          is_sign_item = l_sign
+          i_add_sheet  = space
+        changing
+          cs_guid      = ls_bk_guid
+          c_generated  = l_generated
+          c_file_name  = l_file_name
+         .
+     catch cx_sy_dyn_call_illegal_method into cx_oref.
+       cx_text = cx_oref->get_text( ).
+       write / cx_text.
+    endtry. " 2120495
+  ENDIF.
+
+  IF l_generated IS INITIAL AND " 2120495
+     gv_xml_enabled <> 'B'.
+  IF gv_xml_enabled_x14 IS INITIAL.
+*  old way - fill the data
+    LOOP AT buff_tab ASSIGNING <fs_line>.
+      APPEND INITIAL LINE TO buff_tab_old ASSIGNING <fs_old>.
+      MOVE-CORRESPONDING <fs_line> TO <fs_old>.
+      <fs_old>-mm_inv_vornu = <fs_line>-mm_inv_vornu.
+    ENDLOOP.
+
+  CALL METHOD (gc_xml_class)=>generate_purc_book_xml  " cl_j3rf_vat_xml
+    EXPORTING
+      i_hier_code  = pa_xml
+      i_file_path  = l_path
+      i_bukrs      = mainbuk
+      i_taxoffice  = p_xmltax
+      is_header    = buff_header
+      it_table     = buff_tab_old
+      is_footer    = ls_totals
+      is_total     = ls_dummy  " no incoming totals
+      is_sign_item = l_sign
+*     i_ul_ip      = 'UL'
+*     is_reorg     = ''
+      is_add_sheet = space
+    CHANGING
+      cs_bk_guid   = ls_bk_guid.
+  ELSE.
+*  new way
+  CALL METHOD (gc_xml_class)=>generate_purc_book_xml  " cl_j3rf_vat_xml
+    EXPORTING
+      i_hier_code  = pa_xml
+      i_file_path  = l_path
+      i_bukrs      = mainbuk
+      i_taxoffice  = p_xmltax
+      is_header    = buff_header
+      it_table     = buff_tab_old  " empty
+      it_table14   = buff_tab
+      is_footer    = ls_totals
+      is_total     = ls_dummy  " no incoming totals
+      is_sign_item = l_sign
+*     i_ul_ip      = 'UL'
+*     is_reorg     = ''
+      is_add_sheet = space
+    CHANGING
+      cs_bk_guid   = ls_bk_guid.
+  ENDIF. " 2120495
+  PERFORM get_xml_file_name CHANGING l_file_name.
+  ENDIF.
+
+**********************************************************************
+* generate additional sheet
+  IF p_add = 'X' AND
+     NOT buff_tab_add[] IS INITIAL.
+*   calculate totals
+    ls_totals = in_totals.
+    PERFORM get_totals USING buff_tab_add CHANGING ls_totals.
+
+*   reuse GUID from basic sheet
+    ls_bk_guid_add = ls_bk_guid.
+    CLEAR ls_bk_guid_add-guid2.
+
+*   2120495 fill VAT Return header
+    PERFORM fill_decl_header CHANGING buff_header_add.
+
+    CLEAR l_generated.
+    IF g_vat_decl_sel <> gc_vat_decl_sel_corr.
+      l_generated = 'X'. " no additional file for main declaration
+    ENDIF.
+    IF NOT ref IS INITIAL AND l_generated IS INITIAL.
+      try.
+        call badi ref->pl_xml
+          exporting
+            i_path       = l_path
+            i_bukrs      = mainbuk
+            i_tax_office = p_xmltax
+            is_header    = buff_header_add
+            it_items     = buff_tab_add
+            is_footer    = ls_totals
+            is_total     = in_totals
+            is_sign_item = l_sign
+            i_add_sheet  = 'X'
+          changing
+            cs_guid      = ls_bk_guid_add
+            c_generated  = l_generated
+            c_file_name  = l_file_name
+          .
+        catch cx_sy_dyn_call_illegal_method into cx_oref.
+          cx_text = cx_oref->get_text( ).
+          write / cx_text.
+      endtry.
+    ENDIF. " 2120495
+
+  REFRESH buff_tab_old.
+  IF l_generated IS INITIAL AND
+     gv_xml_enabled <> 'B'. " 2120495
+  IF gv_xml_enabled_x14 IS INITIAL.
+*   old way - fill the data
+    LOOP AT buff_tab_add ASSIGNING <fs_line>.
+      APPEND INITIAL LINE TO buff_tab_old ASSIGNING <fs_old>.
+      MOVE-CORRESPONDING <fs_line> TO <fs_old>.
+      <fs_old>-mm_inv_vornu = <fs_line>-mm_inv_vornu.
+    ENDLOOP.
+
+    CALL METHOD (gc_xml_class)=>generate_purc_book_xml " cl_j3rf_vat_xml
+      EXPORTING
+        i_hier_code  = pa_xmla
+        i_file_path  = l_path
+        i_bukrs      = mainbuk
+        i_taxoffice  = p_xmltax
+        is_header    = buff_header_add
+        it_table     = buff_tab_old
+        is_footer    = ls_totals
+        is_total     = in_totals
+        is_sign_item = l_sign
+*       i_ul_ip      = 'UL'
+*       is_reorg     = ''
+        is_add_sheet = 'X'
+      CHANGING
+        cs_bk_guid   = ls_bk_guid_add.
+  ELSE.
+    CALL METHOD (gc_xml_class)=>generate_purc_book_xml " cl_j3rf_vat_xml
+      EXPORTING
+        i_hier_code  = pa_xmla
+        i_file_path  = l_path
+        i_bukrs      = mainbuk
+        i_taxoffice  = p_xmltax
+        is_header    = buff_header_add
+        it_table     = buff_tab_old
+        it_table14   = buff_tab_add
+        is_footer    = ls_totals
+        is_total     = in_totals
+        is_sign_item = l_sign
+*       i_ul_ip      = 'UL'
+*       is_reorg     = ''
+        is_add_sheet = 'X'
+      CHANGING
+        cs_bk_guid   = ls_bk_guid_add.
+  ENDIF.
+  PERFORM get_xml_file_name CHANGING l_file_name.
+  ENDIF.
+  ENDIF.
+
+* save GUID of variant
+  IF ls_bk_guid <> ls_bk_guid_sav AND
+     gv_xml_enabled = 'X'         AND
+     g_vat_decl_sel IS INITIAL.  " 2138132
+    CALL METHOD (gc_xml_class)=>set_bk_guid  " cl_j3rf_vat_xml
+      EXPORTING
+        cs_bk_guid = ls_bk_guid.
+  ENDIF.
+
+* save VAT Return data
+  IF vr_prod = 'X' AND NOT g_vat_decl_sel IS INITIAL.  " 2138132
+    PERFORM pl_save_decl_data USING ls_bk_guid
+                                    ls_bk_guid_add
+                                    l_file_name.
+  ENDIF.
+
+ENDFORM.                    " CALL_XML
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_ADOBE_INTERFACE                           2099024
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM check_adobe_interface  USING fm_name type rs38l_fnam.
+
+  DATA: ls_stru TYPE fupararef-structure.
+
+  CLEAR gv_xml_enabled_p14.
+
+  SELECT SINGLE structure FROM fupararef
+     INTO ls_stru
+     WHERE funcname  = fm_name
+       AND r3state   = 'A'
+       AND parameter = 'IT_TABLE'
+       AND paramtype = 'I'.
+  IF sy-subrc = 0.
+    IF ls_stru = 'J_3R_PURCHASE_LEDGER_TAB14'.
+      gv_xml_enabled_p14 = 'X'.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    " CHECK_ADOBE_INTERFACE

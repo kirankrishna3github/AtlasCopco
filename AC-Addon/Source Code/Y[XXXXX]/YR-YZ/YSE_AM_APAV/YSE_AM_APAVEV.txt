@@ -1,0 +1,399 @@
+*&---------------------------------------------------------------------*
+*&  Include           YSE_AM_APAVEV                                    *
+*&---------------------------------------------------------------------*
+* LME-001 | 24.06.2011 | L. Mertens  USG Innotiv | CD1K965905 | CR1289 *
+*----------------------------------------------------------------------*
+* MOD-002 | 06.12.2012 | G.Rutten                | CD1K974143 |        *
+*----------------------------------------------------------------------*
+
+*----------------------------------------------------------------------*
+*                                                                      *
+*START-OF-SELECTION                                                    *
+*                                                                      *
+*----------------------------------------------------------------------*
+START-OF-SELECTION.
+
+  TYPES: BEGIN OF ty_vtstatus,
+          iwerk TYPE iwerk,
+          ingpr TYPE ingrp,
+          zzpod TYPE zzpod,
+*          zequcr TYPE zequcr,
+          zequac TYPE zequac,
+          zecnok TYPE zecnok,
+          zirel  TYPE zirel,
+         END OF ty_vtstatus.
+
+  DATA: lv_cmpl_del.
+  DATA: lv_iwerk TYPE iwerk,
+        lv_ingpr TYPE afih-ingpr,
+        gv_flag            TYPE xfeld.
+  DATA: gt_vtstatus TYPE STANDARD TABLE OF ty_vtstatus,
+        wa_vtstatus TYPE ty_vtstatus.
+
+  CONSTANTS: c_0010(4)                   VALUE '0010',
+             c_v                         VALUE 'V'.
+
+*First select all GI since selection date
+  SELECT mseg~aufnr
+    INTO CORRESPONDING FIELDS OF TABLE gt_gi_check
+    FROM mkpf INNER JOIN mseg
+      ON mkpf~mblnr = mseg~mblnr
+      AND mkpf~mjahr = mseg~mjahr
+        WHERE
+          mkpf~cpudt >= p_from         "GI created between today and
+          AND mseg~bwart = '261'       "Movement type GI
+          AND mseg~aufnr IS NOT NULL.  "Service order linked to movement
+
+  CHECK sy-subrc EQ 0.
+
+  SORT gt_gi_check.
+
+  DELETE ADJACENT DUPLICATES FROM gt_gi_check.
+
+*Next select all requirements from RESB for found GI'ed service orders
+
+*Select all requirements. When TECO has been set, requirements get
+*deletion indicator so no extra check is needed for TECO status
+  SELECT resb~rsnum resb~rspos resb~aufnr resb~vorab_sm resb~bdmng
+     resb~enmng resb~kzear caufv~objnr
+    INTO CORRESPONDING FIELDS OF TABLE gt_req_check
+    FROM resb INNER JOIN caufv
+    ON resb~aufnr = caufv~aufnr
+*    inner join jest
+*    on jest~objnr = caufv~objnr
+    FOR ALL entries IN gt_gi_check
+    WHERE caufv~aufnr = gt_gi_check-aufnr
+       AND resb~xloek NE 'X'
+       AND ( caufv~auart = 'ZAM1'
+           OR caufv~auart = 'ZAM2' ).
+*    and jest~stat = 'I0002'
+*    and jest~inact ne 'X'.
+
+  CHECK sy-subrc EQ 0.
+
+*Exclude the ones which already have APAV status set.
+  FORMAT COLOR COL_NEGATIVE INTENSIFIED ON.
+  SELECT objnr FROM jest INTO TABLE gt_apav
+    FOR ALL ENTRIES IN gt_req_check
+    WHERE objnr = gt_req_check-objnr
+    AND stat = 'E0010'
+    AND inact = 'X'.                                        "MOD001
+*   and inact <> 'X'.                                           "MOD001
+
+  IF sy-subrc NE 0.  "This means that there are service orders  "MOD001
+    "in our list that already have APAV status
+    LOOP AT gt_apav ASSIGNING <fs_apav>.
+      DELETE gt_req_check
+        WHERE objnr = <fs_apav>-objnr.
+      WRITE: / 'Service order ', <fs_apav>-objnr+2(20),
+      ' already has status APAV'.
+    ENDLOOP.
+  ENDIF.
+
+*Now we have all our service orders that had a GI during the selected
+*period, start checking if all components have been GI eg advanced sales
+* order is fully delivered
+*if all resb entries have been GI'ed, set service order status to APAV.
+
+*loop over all resb entries, check if withdrawn quantities are the same
+*as required quantities.
+*Also check if there are any advance shipment components, if so check
+* the delivery status of this sales order
+
+  LOOP AT gt_req_check ASSIGNING <fs_req_check>.
+    IF NOT <fs_req_check>-vorab_sm IS INITIAL.    "If an advance shipment exists for the current component
+      SELECT SINGLE vbuk~lfgsk      "Select complete delivered status from advance shipment sales order
+        INTO lv_cmpl_del
+        FROM vbak INNER JOIN vbuk
+        ON vbak~vbeln = vbuk~vbeln
+          WHERE vbak~aufnr EQ <fs_req_check>-aufnr
+          AND vbuk~lfgsk EQ 'C'.
+      IF sy-subrc NE 0.            "If advance shipment sales order isn't fully delivered yet delete all requirements of current service order
+        WRITE: / 'Service order ', <fs_req_check>-aufnr,
+        ' not fully GI-ed yet'.
+        DELETE gt_req_check WHERE aufnr EQ <fs_req_check>-aufnr.
+      ENDIF.
+    ELSE.                           "Regular component, so check withdrawn quantitie equals required quantity
+      IF ( <fs_req_check>-bdmng NE <fs_req_check>-enmng ) AND <fs_req_check>-kzear IS INITIAL.
+        WRITE: / 'Service order ', <fs_req_check>-aufnr,
+        ' not fully GI ''ed yet'. "
+        DELETE gt_req_check WHERE aufnr EQ <fs_req_check>-aufnr.      "If not yet GI'ed complete or not at all, delete all requirements of current service order
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+*Now all irrelevant service orders have been deletedn set APAV status
+*for remaining service orders.
+  FORMAT COLOR COL_POSITIVE INTENSIFIED ON.
+
+  DELETE ADJACENT DUPLICATES FROM gt_req_check COMPARING aufnr.
+
+  LOOP AT gt_req_check ASSIGNING <fs_req_check>.
+
+*.... Set user status APAV
+    CALL FUNCTION 'STATUS_CHANGE_EXTERN'
+      EXPORTING
+        objnr               = <fs_req_check>-objnr
+        user_status         = 'E0010'
+*      SET_INACT           = LD_INACT
+      EXCEPTIONS
+        object_not_found    = 1
+        status_inconsistent = 2
+        status_not_allowed  = 3
+        OTHERS              = 4.
+    COMMIT WORK.
+    WRITE: / 'Service order ', <fs_req_check>-aufnr, ' APAV status set'.
+
+*.... Set user status PRNT
+    CALL FUNCTION 'STATUS_CHANGE_EXTERN'
+      EXPORTING
+        objnr               = <fs_req_check>-objnr
+        user_status         = 'E0012'
+*      SET_INACT           = LD_INACT
+      EXCEPTIONS
+        object_not_found    = 1
+        status_inconsistent = 2
+        status_not_allowed  = 3
+        OTHERS              = 4.
+    COMMIT WORK.
+    WRITE: ', PRNT status set'.
+
+* begin of insert LME-001      " First time fix kit flow
+    SELECT SINGLE bemot ilart iwerk vkorg vtweg bukrs
+      INTO (gv_bemot, gv_ilart, gv_iwerk, gv_vkorg, gv_vtweg, gv_bukrs)
+      FROM viaufks WHERE aufnr = <fs_req_check>-aufnr.
+
+    IF sy-subrc = 0 AND gv_bemot = '1S' AND gv_ilart = 'FF'.
+*.... Select all parts from SEO.
+      REFRESH gt_aufm.
+      SELECT matnr erfmg erfme mblnr mjahr zeile
+         FROM aufm INTO CORRESPONDING FIELDS OF TABLE gt_aufm
+         WHERE aufnr EQ <fs_req_check>-aufnr
+           AND bwart EQ '261'.
+
+      IF NOT gt_aufm[] IS INITIAL.
+        SELECT SINGLE vaplz INTO gv_vaplz
+          FROM aufk WHERE aufnr = <fs_req_check>-aufnr.
+
+        CLEAR gv_retcd.
+
+        LOOP AT gt_aufm INTO gs_aufm.
+*........ Book all parts on FSE stock
+          g_header-pstng_date = sy-datum.
+          g_header-doc_date   = sy-datum.
+
+          REFRESH gt_item.
+          CLEAR gt_item.
+
+          gt_item-material  = gs_aufm-matnr.
+          gt_item-plant     = gv_iwerk.
+          gt_item-move_type = '262'.
+
+          CONCATENATE '2' gv_vaplz+5(3) INTO gv_stloc.
+          gt_item-stge_loc = gv_stloc.
+
+          WRITE gs_aufm-erfmg TO gv_qty UNIT gs_aufm-erfme.
+          gt_item-entry_qnt = gv_qty.
+
+          SELECT SINGLE meins INTO gv_meins
+            FROM mara WHERE matnr = gs_aufm-matnr.
+          IF sy-subrc = 0.
+            SELECT SINGLE isocode INTO gt_item-entry_uom_iso
+               FROM t006
+               WHERE msehi = gv_meins.
+          ENDIF.
+
+          gt_item-orderid = <fs_req_check>-aufnr.
+          gt_item-calc_motive = gv_bemot.
+          APPEND gt_item.
+
+          CLEAR g_headret.
+          CLEAR gt_return[].
+          g_goodsmvt_code_tmp = '03'.
+
+          CALL FUNCTION 'BAPI_GOODSMVT_CREATE'
+            EXPORTING
+              goodsmvt_header  = g_header
+              goodsmvt_code    = g_goodsmvt_code_tmp
+            IMPORTING
+              goodsmvt_headret = g_headret
+            TABLES
+              goodsmvt_item    = gt_item
+              return           = gt_return.
+
+          IF g_headret IS INITIAL.
+            WRITE: / 'Service order ', <fs_req_check>-aufnr,
+               ' Parts not moved to FSE stock'.
+            gv_retcd = 4.
+            EXIT.
+          ELSE.
+            CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+              EXPORTING
+                wait = 'X'.
+            WRITE: / 'Service order ', <fs_req_check>-aufnr,
+               ' All parts moved to FSE stock'.
+          ENDIF.
+
+*........ Book free issue parts to cost center
+          CLEAR gv_prat4.
+          SELECT SINGLE prat4 INTO gv_prat4
+            FROM mvke WHERE matnr = gs_aufm-matnr
+                        AND vkorg = gv_vkorg
+                        AND vtweg = gv_vtweg.
+
+          IF sy-subrc = 0 AND gv_prat4 = 'X'.
+            CLEAR gv_kostl.
+            SELECT SINGLE objid INTO gv_objid
+              FROM crhd WHERE objty = 'A'
+                          AND arbpl = gv_vaplz
+                          AND werks = gv_iwerk.
+
+            SELECT kostl INTO gv_kostl
+              FROM crco WHERE objty = 'A'
+                          AND objid = gv_objid
+                          AND endda = '99991231'.
+            ENDSELECT.
+
+            REFRESH gt_item.
+            CLEAR gt_item.
+
+            gt_item-material  = gs_aufm-matnr.
+            gt_item-plant     = gv_iwerk.
+            gt_item-move_type = '201'.
+            gt_item-stge_loc  = gv_stloc.
+            gt_item-entry_qnt = gv_qty.
+
+            IF NOT gv_meins IS INITIAL.
+              SELECT SINGLE isocode INTO gt_item-entry_uom_iso
+                 FROM t006
+                 WHERE msehi = gv_meins.
+            ENDIF.
+
+            gt_item-costcenter = gv_kostl.
+
+            SELECT SINGLE saknr INTO gt_item-gl_account
+              FROM yse_freeiss_acc WHERE vkorg = gv_vkorg.
+            APPEND gt_item.
+
+            CLEAR g_headret.
+            CLEAR gt_return[].
+            g_goodsmvt_code_tmp = '03'.
+
+            CALL FUNCTION 'BAPI_GOODSMVT_CREATE'
+              EXPORTING
+                goodsmvt_header  = g_header
+                goodsmvt_code    = g_goodsmvt_code_tmp
+              IMPORTING
+                goodsmvt_headret = g_headret
+              TABLES
+                goodsmvt_item    = gt_item
+                return           = gt_return.
+
+            IF g_headret IS INITIAL.
+              WRITE: / 'Service order ', <fs_req_check>-aufnr,
+                 ' Free issue parts not moved to cost center'.
+              gv_retcd = 4.
+              EXIT.
+            ELSE.
+              CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+                EXPORTING
+                  wait = 'X'.
+              WRITE: / 'Service order ', <fs_req_check>-aufnr,
+                 ' Free issue parts moved to cost center'.
+            ENDIF.
+          ENDIF.
+        ENDLOOP.
+
+        IF gv_retcd <> 0.
+          CONTINUE.
+        ENDIF.
+
+*...... If actual costs on SEO is zero --> do confirmation
+        REFRESH gt_ce11000.
+        SELECT rkaufnr vv200 vv300 vv400 vv500 vv600
+              FROM ce11000
+              INTO CORRESPONDING FIELDS OF TABLE gt_ce11000
+              WHERE rkaufnr  EQ <fs_req_check>-aufnr
+                AND paledger EQ c_02
+                AND vrgar    EQ c_0
+                AND bukrs    EQ gv_bukrs
+              %_HINTS DB6 'USE_OPTLEVEL 7'.
+
+        CLEAR gv_tot_actcost.
+        LOOP AT gt_ce11000.
+          gv_tot_actcost = gt_ce11000-vv200 + gt_ce11000-vv300 +
+                           gt_ce11000-vv400 + gt_ce11000-vv500 +
+                           gt_ce11000-vv600.
+        ENDLOOP.
+
+        IF gv_tot_actcost = 0.
+          REFRESH gt_return.
+          PERFORM fill_conf_to_create CHANGING gv_conf.
+
+          IF gv_conf IS INITIAL.
+            WRITE: / 'Service order ', <fs_req_check>-aufnr,
+               ' No final confirmation has been created'.
+          ELSE.
+            CALL FUNCTION 'ALM_ME_TIME_CONF_CREATE_2'
+              EXPORTING
+*                POST_WRONG_ENTRIES         =
+                confirmation_item          = gv_conf
+*                act_work                   = gv_act_work
+              IMPORTING
+                confirmation_number        = gv_conf_no
+                confirmation_counter       = gv_conf_cnt
+              TABLES
+                return                     = gt_return.
+
+            READ TABLE gt_return INTO gs_return WITH KEY type = 'E'.
+            IF sy-subrc = 0.
+              WRITE: / 'Service order ', <fs_req_check>-aufnr,
+                 ' No final confirmation has been created'.
+              gv_retcd = 4.
+            ELSE.
+              COMMIT WORK AND WAIT.
+              WRITE: / 'Service order ', <fs_req_check>-aufnr,
+                ' Final confirmation has been created'.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+
+        IF gv_retcd <> 0.
+          CONTINUE.
+        ENDIF.
+
+*...... The SEO can be set to TECO.
+        SUBMIT YSE_ORDER_SET_TECO WITH p_aufnr = <fs_req_check>-aufnr
+          AND RETURN.
+      ENDIF.
+    ENDIF.
+* end of insert LME-001
+
+  ENDLOOP.
+
+*&---------------------------------------------------------------------*
+*&      Form  fill_conf_to_create
+*&---------------------------------------------------------------------*
+FORM fill_conf_to_create CHANGING p_conf TYPE confco.
+
+  p_conf-order          = <fs_req_check>-aufnr.
+  p_conf-activity       = '0010'.
+  p_conf-work_cntr      = gv_vaplz.
+  p_conf-fin_conf       = 'X'.
+  p_conf-postg_date     = sy-datum.
+*  p_conf-dev_reason     = lv_afru-grund.
+*  p_conf-un_act_dur     = lv_afru-idaue.
+*  p_conf-actual_dur     = lv_afru-idaur.
+  p_conf-end_date       = sy-datum.
+  p_conf-end_time       = sy-uzeit.
+  p_conf-start_date     = sy-datum.
+  p_conf-start_time     = '000001'.
+  p_conf-un_work        = 'STD'.
+  p_conf-act_type       = 'ZAM001'.
+*  p_conf-fcstfintim     = lv_afru-pedz.
+  p_conf-plant          = gv_iwerk.
+  p_conf-calc_motive    = '1S'.
+  p_conf-zzernam        = sy-uname.
+*  p_conf-zzorigf        = lv_afru-origf.
+
+ENDFORM.                    " fill_conf_to_create

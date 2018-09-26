@@ -1,0 +1,182 @@
+*&---------------------------------------------------------------------*
+*&  Include           YRD_SD_SFS_UPD_FORMS
+*&---------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  PC_FILE_HELP
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM pc_file_help .
+
+  CALL FUNCTION 'WS_FILENAME_GET'
+    EXPORTING
+      def_filename     = ''
+      def_path         = 'C:\ '
+      mask             = ',ExcelÎÄ¼þ(*.XLS;*.XLSX),*.XLS;*.XLSX,'
+      mode             = 'O'
+      title            = 'UPLOAD'
+    IMPORTING
+      filename         = pcfile
+*     RC               =
+    EXCEPTIONS
+      inv_winsys       = 1
+      no_batch         = 2
+      selection_cancel = 3
+      selection_error  = 4
+      OTHERS           = 5.
+
+ENDFORM.                    " PC_FILE_HELP
+*&---------------------------------------------------------------------*
+*&      Form  EXCEL_INTO_INTAB
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM excel_into_intab .
+
+  FIELD-SYMBOLS: <wa_itab> TYPE alsmex_tabline.
+  CALL FUNCTION 'ALSM_EXCEL_TO_INTERNAL_TABLE'
+    EXPORTING
+      filename    = pcfile
+      i_begin_col = 1
+      i_begin_row = 1
+      i_end_col   = 5
+      i_end_row   = 9999
+    TABLES
+      intern      = itab.
+  IF sy-subrc <> 0.
+* Implement suitable error handling here
+  ENDIF.
+
+  SORT itab BY row.
+  DELETE itab WHERE row = '0001'.  "Delete Excel Title
+
+  LOOP AT itab ASSIGNING <wa_itab>.
+    CASE <wa_itab>-col.
+      WHEN '0001'.
+        wa_upload-vbeln = <wa_itab>-value.
+      WHEN '0002'.
+        wa_upload-posnr = <wa_itab>-value.
+      WHEN '0003'.
+        wa_upload-pstyv = <wa_itab>-value.
+      WHEN '0004'.
+        wa_upload-werks = <wa_itab>-value.
+      WHEN '0005'.
+        wa_upload-lgort = <wa_itab>-value.
+    ENDCASE.
+    AT END OF row.
+      APPEND wa_upload TO it_upload.
+      CLEAR wa_upload.
+    ENDAT.
+  ENDLOOP.
+
+ENDFORM.                    " EXCEL_INTO_INTAB
+*&---------------------------------------------------------------------*
+*&      Form  UPDATA_SO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM updata_so .
+
+  DATA: lines TYPE i.
+  DATA: length TYPE i.
+  DATA: it_return TYPE TABLE OF bapiret2 WITH HEADER LINE.
+  DATA: it_order_item_inx TYPE TABLE OF bapisditmx WITH HEADER LINE.
+  DATA: it_order_item_in TYPE TABLE OF bapisditm WITH HEADER LINE.
+  DATA: wa_header_inx TYPE bapisdh1x.
+  wa_header_inx-updateflag = 'U'.
+
+
+* CHECK SO
+  LOOP AT it_upload INTO wa_upload.
+    CLEAR: length.
+    length = STRLEN( wa_upload-vbeln ).
+    IF length <> '10'.
+      UNPACK wa_upload-vbeln TO wa_upload-vbeln.
+    ENDIF.
+
+    CLEAR: length.
+    length = STRLEN( wa_upload-posnr ).
+    IF length <> '6'.
+      UNPACK wa_upload-posnr TO wa_upload-posnr.
+    ENDIF.
+
+    CLEAR: length.
+    length = STRLEN( wa_upload-lgort ).
+    IF length <> '4'.
+      UNPACK wa_upload-lgort TO wa_upload-lgort.
+    ENDIF.
+
+    SELECT SINGLE *
+             FROM vbap
+            WHERE vbeln = wa_upload-vbeln
+              AND posnr = wa_upload-posnr.
+    IF sy-subrc = 0.
+      MODIFY it_upload FROM wa_upload.
+    ELSE.
+      DELETE TABLE it_upload FROM wa_upload.
+    ENDIF.
+  ENDLOOP.
+
+  CLEAR: it_upload1,it_upload1[].
+  it_upload1[] = it_upload[].
+  SORT it_upload1 BY vbeln posnr.
+  DELETE ADJACENT DUPLICATES FROM it_upload1 COMPARING vbeln.
+
+"Update RDC SO
+  LOOP AT it_upload1.
+
+    LOOP AT it_upload INTO wa_upload WHERE vbeln = it_upload1-vbeln.
+      it_order_item_inx-updateflag = 'U'.
+      it_order_item_inx-itm_number  = wa_upload-posnr.
+      it_order_item_inx-item_categ = 'X'.
+      it_order_item_inx-plant      = 'X'.
+      it_order_item_inx-store_loc  = 'X'.
+      APPEND it_order_item_inx.
+
+      it_order_item_in-itm_number  = wa_upload-posnr.
+      it_order_item_in-item_categ  = wa_upload-pstyv.
+      it_order_item_in-plant       = wa_upload-werks.
+      it_order_item_in-store_loc   = wa_upload-lgort.
+      APPEND it_order_item_in.
+    ENDLOOP.
+
+    CALL FUNCTION 'BAPI_SALESORDER_CHANGE'
+      EXPORTING
+        salesdocument    = it_upload1-vbeln
+        order_header_inx = wa_header_inx
+      TABLES
+        order_item_in    = it_order_item_in
+        order_item_inx   = it_order_item_inx
+        return           = it_return.
+
+    CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'.
+
+    CLEAR: it_order_item_in,it_order_item_in[],
+           it_order_item_inx,it_order_item_inx[].
+
+  ENDLOOP.
+
+
+
+* End of processing
+  LOOP AT it_return.
+    IF  it_return-type = 'S' AND it_return-id = 'V1'.
+      DESCRIBE TABLE it_upload LINES lines.
+    ELSEIF it_return-type = 'E' OR it_return-type = 'I' OR it_return-type = 'W'.
+      WRITE: AT /1 it_return-type, '|', it_return-message.
+    ENDIF.
+  ENDLOOP.
+  IF lines IS NOT INITIAL.
+    WRITE: 'End of processing:', lines, 'rows updated'.
+  ENDIF.
+
+ENDFORM.                    " UPDATA_SO

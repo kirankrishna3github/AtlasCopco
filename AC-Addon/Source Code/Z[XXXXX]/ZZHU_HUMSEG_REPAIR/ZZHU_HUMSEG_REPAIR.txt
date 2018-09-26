@@ -1,0 +1,237 @@
+*$*$----------------------------------------------------------------$*$*
+*$ Correction Inst.         0120061532 0001773303                     $*
+*$--------------------------------------------------------------------$*
+*$ Valid for       :                                                  $*
+*$ Software Component   SAP_APPL   SAP Application                    $*
+*$  Release 600          SAPKH60001 - SAPKH60026                      $*
+*$  Release 602          To SAPKH60216                                $*
+*$  Release 603          To SAPKH60315                                $*
+*$  Release 604          SAPKH60401 - SAPKH60416                      $*
+*$  Release 605          To SAPKH60513                                $*
+*$  Release 606          SAPKH60601 - SAPKH60613                      $*
+*$  Release 616          To SAPKH61608                                $*
+*$  Release 617          SAPKH61701 - SAPKH61706                      $*
+*$*$----------------------------------------------------------------$*$*
+*&--------------------------------------------------------------------*
+*& Object          REPS ZZHU_HUMSEG_REPAIR
+*& Object Header   PROG ZZHU_HUMSEG_REPAIR
+*&--------------------------------------------------------------------*
+*>>>> START OF INSERTION <<<<
+*/
+*/ REPORT zzhu_humseg_repair
+*/ This report recreates the missing records for table HUMSEG.
+*/ For outbound delivery only - for the last posting only.
+*/ It uses the existing VBFA entries to generate the HUMSEG-key.
+*/
+*>>>> END OF INSERTION <<<<<<
+...
+*&--------------------------------------------------------------------*
+*& REPORT ZZHU_HUMSEG_REPAIR
+*&--------------------------------------------------------------------*
+*>>>> START OF INSERTION <<<<
+REPORT zzhu_humseg_repair.
+
+CONSTANTS: const_outb TYPE char2 VALUE '01'.
+TABLES: vbfa, humseg, mseg.
+
+TYPES: gs_vbfa TYPE vbfa, gs_humseg TYPE humseg.
+
+DATA: l_tzone    TYPE tznzone,
+      p_vbeln   TYPE gs_vbfa-vbeln,
+      lt_vbfa   TYPE TABLE OF gs_vbfa,
+      lt_vbfa_r TYPE TABLE OF gs_vbfa,
+      lt_vbfa_x TYPE TABLE OF gs_vbfa,
+      lt_humseg TYPE TABLE OF gs_humseg,
+      lt_humseg_orig TYPE TABLE OF gs_humseg,
+      lt_humseg_insert TYPE TABLE OF gs_humseg,
+      lt_humseg_delete TYPE TABLE OF gs_humseg.
+
+DATA: ls_vbfa_r TYPE gs_vbfa,
+      ls_vbfa_x TYPE gs_vbfa,
+      ls_humseg TYPE gs_humseg,
+      lf_unique TYPE xfeld,
+      lf_lean   TYPE xfeld,
+      lf_mjahr  TYPE humseg-mjahr,
+      lf_mblnr  TYPE humseg-mblnr.
+
+FIELD-SYMBOLS: <humseg> TYPE gs_humseg.
+
+
+SELECTION-SCREEN: BEGIN OF BLOCK block1 WITH FRAME TITLE text-001.
+SELECT-OPTIONS: go_vbeln FOR vbfa-vbeln NO INTERVALS
+                                        NO-EXTENSION
+                                        OBLIGATORY.
+PARAMETERS:      p_test AS CHECKBOX DEFAULT 'X'.
+SELECTION-SCREEN: END OF BLOCK block1.
+
+*>>>> END OF INSERTION <<<<<<
+...
+*&--------------------------------------------------------------------*
+*& START-OF-SELECTION
+*&--------------------------------------------------------------------*
+*>>>> START OF INSERTION <<<<
+START-OF-SELECTION.
+
+* 0. Step check HUMSEG entries justified
+  CALL FUNCTION 'HU_TVSHP_SELECT'
+    IMPORTING
+      ef_exidv_unique    = lf_unique
+      ef_spe_lean_hustat = lf_lean.
+
+* HUMSEG must only exist when handling unit management or SPM LeanStatus is active -> incactive = exit
+  IF ( lf_unique IS INITIAL ) AND ( lf_lean IS INITIAL ).
+    WRITE:/ 'No HUMSEG needed, nothing to do'.
+    EXIT.
+  ENDIF.
+
+* 1. STEP : Read document flow & material document
+  REFRESH : lt_humseg_delete[],
+            lt_humseg_insert[].
+
+  LOOP AT go_vbeln.
+    REFRESH : lt_vbfa[],
+              lt_vbfa_r[],
+              lt_vbfa_x[].
+
+    SELECT * FROM vbfa INTO TABLE lt_vbfa WHERE vbelv = go_vbeln-low.
+
+    LOOP AT lt_vbfa INTO ls_vbfa_r.
+      IF ls_vbfa_r-vbtyp_n = 'R' AND ls_vbfa_r-bwart <> space.
+        SELECT SINGLE * FROM mseg
+               WHERE mblnr = ls_vbfa_r-vbeln      AND
+                     mjahr = ls_vbfa_r-erdat+0(4) AND
+                     zeile = ls_vbfa_r-posnn      AND
+                     parent_id = 0.
+        IF sy-subrc = 0.
+          APPEND ls_vbfa_r TO lt_vbfa_r.
+        ENDIF.
+      ENDIF.
+      IF ls_vbfa_r-vbtyp_n = 'X'.
+        APPEND ls_vbfa_r TO lt_vbfa_x.
+      ENDIF.
+    ENDLOOP.
+
+* 2. Sort documents' numbers from the newest to the oldest
+    SORT lt_vbfa_r DESCENDING BY erdat erzet.
+    DELETE lt_vbfa_r WHERE rfmng IS INITIAL.
+    READ TABLE lt_vbfa_r INDEX 1 INTO ls_vbfa_r.
+    lf_mblnr = ls_vbfa_r-vbeln.
+    lf_mjahr = ls_vbfa_r-erdat+0(4).
+
+* Keep only the entry from the last material document created
+    DELETE lt_vbfa_r WHERE vbeln NE lf_mblnr.
+
+* 3. Step : Clear the BAD lines from HUMSEG
+    REFRESH:  lt_humseg_orig[].
+
+    LOOP AT lt_vbfa_x INTO ls_vbfa_x.
+
+      SELECT * FROM humseg INTO TABLE lt_humseg_orig
+             WHERE venum = ls_vbfa_x-vbeln AND
+                   vepos = ls_vbfa_x-posnn AND
+                   mblnr = lf_mblnr AND
+                   mjahr = lf_mjahr AND
+                   object = const_outb.    "Outbound deliveries only
+
+      LOOP AT lt_humseg_orig INTO ls_humseg.
+        READ TABLE lt_vbfa_r INTO ls_vbfa_r
+                                  WITH KEY
+                                  vbeln   = ls_humseg-mblnr
+                                  erdat+0(4) = ls_humseg-mjahr
+                                  posnn = ls_humseg-mblpo.
+        IF sy-subrc IS INITIAL.
+        ELSE.
+          APPEND ls_humseg TO lt_humseg_delete.
+          DELETE lt_humseg_orig.
+        ENDIF.
+      ENDLOOP.
+    ENDLOOP.
+
+    SORT lt_humseg_delete ASCENDING BY venum vepos mblpo mblnr.
+    DELETE ADJACENT DUPLICATES FROM lt_humseg_delete.
+
+* 4. STEP : Create the missing HUMSEG entries
+    l_tzone = sy-zonlo.
+    CLEAR ls_humseg.
+
+* Common fields for new entries
+    ls_humseg-mjahr = lf_mjahr.
+    ls_humseg-mblnr = lf_mblnr.
+    ls_humseg-object = const_outb.    "Outbound deliveries only
+    ls_humseg-mandt = sy-mandt.
+
+* Check whether HUMSEG already contains any relevant entry (or not)
+    SORT lt_vbfa_x ASCENDING BY vbeln.
+
+    LOOP AT lt_vbfa_r INTO ls_vbfa_r.
+      ls_humseg-mblpo = ls_vbfa_r-posnn.
+      LOOP AT lt_vbfa_x INTO ls_vbfa_x WHERE posnv = ls_vbfa_r-posnv.
+        ls_humseg-venum = ls_vbfa_x-vbeln.
+        ls_humseg-vepos = ls_vbfa_x-posnn.
+        CONVERT DATE ls_vbfa_r-erdat TIME ls_vbfa_r-erzet
+                 INTO TIME STAMP ls_humseg-tstmp TIME ZONE l_tzone.
+        READ TABLE lt_humseg_orig ASSIGNING <humseg> WITH KEY
+                          venum = ls_humseg-venum
+                          vepos = ls_humseg-vepos
+                          mblpo = ls_humseg-mblpo
+                          mblnr = ls_humseg-mblnr
+                          mjahr = ls_humseg-mjahr.
+        IF NOT sy-subrc IS INITIAL.
+          APPEND ls_humseg TO lt_humseg_insert.
+        ENDIF.
+      ENDLOOP.
+    ENDLOOP.
+
+    SORT lt_humseg_insert ASCENDING BY venum vepos mblpo mblnr.
+    DELETE ADJACENT DUPLICATES FROM lt_humseg_insert.
+  ENDLOOP.
+
+* 4. STEP : make the DB updates - if not in test-mode
+  IF NOT lt_humseg_insert IS INITIAL
+  OR NOT lt_humseg_delete IS INITIAL.
+
+    WRITE:/ '             ! VENUM    !  VEPOS  ! MBLPO ! MBLNR '.
+    WRITE sy-uline.
+    CLEAR ls_humseg.
+* First delete the wrong entries
+    LOOP AT lt_humseg_delete INTO ls_humseg.
+      IF p_test IS INITIAL.
+        WRITE:/ 'HUMSEG entry ',
+        ls_humseg-venum, ' ', ls_humseg-vepos, ' ',
+        ls_humseg-mblpo, '  ', ls_humseg-mblnr,
+                'has been deleted'.
+*       !!!!!!!!! implicit DB commit !!!!!!!!!!
+        DELETE humseg FROM ls_humseg.
+      ELSE.
+        WRITE:/ 'HUMSEG entry ',
+        ls_humseg-venum, ' ', ls_humseg-vepos, ' ',
+        ls_humseg-mblpo, '  ', ls_humseg-mblnr,
+                'has to be deleted'.
+      ENDIF.
+    ENDLOOP.
+
+* Then add the new, correct HUMSEG entries
+    LOOP AT lt_humseg_insert INTO ls_humseg.
+      IF p_test IS INITIAL.
+        WRITE:/ 'HUMSEG entry ',
+        ls_humseg-venum, ' ', ls_humseg-vepos, ' ',
+        ls_humseg-mblpo, '  ', ls_humseg-mblnr,
+                'has been created'.
+*       !!!!!!!!! implicit DB commit !!!!!!!!!!
+        INSERT humseg FROM ls_humseg.
+      ELSE.
+        WRITE:/ 'HUMSEG entry ',
+        ls_humseg-venum, ' ', ls_humseg-vepos, ' ',
+        ls_humseg-mblpo, '  ', ls_humseg-mblnr,
+        'has to be created'.
+      ENDIF.
+    ENDLOOP.
+  ELSE.
+    WRITE:/ 'All HUMSEG entries are correct, nothing to do'.
+  ENDIF.
+*>>>> END OF INSERTION <<<<<<
+  ...
+*&--------------------------------------------------------------------*
+*>>> A T T E N T I O N: P L E A S E   N O T E:                        <<<
+*>>> Correction contains additional changes that are NOT shown here   <<<
+*>>> Display all changes by Note Assistant Note display functionality <<<

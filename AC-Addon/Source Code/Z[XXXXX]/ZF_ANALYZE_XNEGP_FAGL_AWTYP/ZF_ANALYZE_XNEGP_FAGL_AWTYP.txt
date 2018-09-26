@@ -1,0 +1,1095 @@
+*& !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+*& This report has only to be executed by SAP Employees working in
+*& SAP Support, changes in G/L have only to be done in case of
+*& individual check of each single posting and in case of confirmation
+*& provided by customer / auditor.
+*& !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+*&
+*&---------------------------------------------------------------------*
+*&
+*& The report will check the FAGL line items against the XNEGP settings
+*& in the corresponding BSEG items (or BSEG_ADD for legder-specific
+*& postings) assuming that BSEG-XNEGP is CORRECT!
+*& Take care it is not sure if XNEGP is corrrect or subsequently was
+*& changed in entry view, by e.g. a substitution during document change.
+*&
+*& Take care that subsequnet change in previous fiscal year will impact
+*& balances and therefore in case of changes the auditor needs to be
+*& involved!
+*&
+*& What will happen in case of correcting this inconsistency in G/L-side:
+*& FAGL items with incorrect DRCRK will be corrected and totals are
+*& adjusted accordingly (undo existing wrong totals + update totals from
+*& corrected items).
+*&
+*& Special handling of balance-0-clearing items (BUZEI is initial):
+*& If XNEGP is set in ALL BSEG items => bal-0-items need XNEGP, too.
+*& If XNEGP is linewise set in BSEG => bal-0-items are updated WITHOUT
+*& XNEGP.
+*&
+*& Update of FAGL with XNEGP: TSL/HSL > 0 => DRCRK = 'H'
+*&                            TSL/HSL < 0 => DRCRK = 'S'
+*& Update of FAGL w/o XNEGP: TSL/HSL > 0 => DRCRK = 'S'
+*&                           TSL/HSL < 0 => DRCRK = 'H'
+*&
+*& Correction of FAGL_SPLINFO-SHKZG.
+*&
+*& Version 1 based on Q3A ZF_CORR_XNEGP_AWTYP_FAGL including its
+*& Change history: 12.01.09 BUZEI initial check is added to exclude
+*&                          affected documents.
+*&                          Changed OUTPUT and UPDATE order to save spool
+*&                          in rollback case.
+*&                 21.01.09 KSL/OSL check added
+*&                 20.02.09 Exclude change in +/- sign, add WSL check
+*&                 29.05.09 Include documents posted only in non-leading
+*&                          ledgers (BKPF-BSTAT='L')
+*&                 07.06.10 Remove default S_AWTYP to allow Scheduler
+*&
+*&---------------------------------------------------------------------*
+REPORT  ZF_ANALYZE_XNEGP_FAGL_AWTYP.
+TABLES: bkpf.
+*** ledger information
+TYPES: BEGIN OF ledgertab,
+       rldnr    TYPE t881-rldnr,
+       tab      TYPE t881-tab,
+       tabname  TYPE t800a-ntable,
+       xleading TYPE t881-xleading,
+       END OF ledgertab.
+DATA: gt_ledgertab TYPE SORTED TABLE OF ledgertab WITH HEADER LINE
+      WITH UNIQUE KEY rldnr.
+DATA: gt_bkpf TYPE TABLE OF bkpf WITH HEADER LINE.
+*** tables for documents to be corrected
+DATA: gt_bkpf_corr TYPE SORTED TABLE OF bkpf WITH HEADER LINE
+      WITH UNIQUE DEFAULT KEY.
+DATA: gt_glu1_corr TYPE TABLE OF glu1 WITH HEADER LINE.
+DATA: gt_splinfo_corr TYPE TABLE OF fagl_splinfo WITH HEADER LINE.
+*** table for excluded cases                                   "UD120109
+DATA: gt_bkpf_excl TYPE SORTED TABLE OF bkpf WITH HEADER LINE"UD120109
+      WITH UNIQUE DEFAULT KEY.                              "UD120109
+*** RFDT export
+DATA: exp_key(22) TYPE c.
+*** split active?
+DATA: x_split(1) TYPE c.
+
+DATA: cnt_corr TYPE i,
+      cnt_excl TYPE i,                                      "UD120109
+      exp(1) TYPE c,
+      head(1) TYPE c.
+
+SELECTION-SCREEN BEGIN OF BLOCK 001 WITH FRAME.
+PARAMETERS: p_bukrs TYPE bkpf-bukrs OBLIGATORY.
+SELECT-OPTIONS: s_belnr FOR bkpf-belnr,
+                s_gjahr FOR bkpf-gjahr,
+                s_monat FOR bkpf-monat.
+SELECTION-SCREEN SKIP.
+*SELECT-OPTIONS: s_awtyp FOR bkpf-awtyp DEFAULT 'VBRK'.     "UD070610
+SELECT-OPTIONS: s_awtyp FOR bkpf-awtyp.                     "UD070610
+SELECTION-SCREEN SKIP.
+PARAMETERS: checkall AS CHECKBOX,
+            p_update AS CHECKBOX MODIF ID inc.
+SELECTION-SCREEN END OF BLOCK 001.
+
+AT SELECTION-SCREEN.
+  PERFORM check_input.
+
+AT SELECTION-SCREEN OUTPUT.
+  LOOP AT SCREEN.
+    IF screen-group1 = 'INC'.
+      IF exp = 'X'.
+        screen-invisible = 0.
+      ELSE.
+        screen-invisible = 1.
+      ENDIF.
+      MODIFY SCREEN.
+    ENDIF.
+  ENDLOOP.
+*** top of page
+TOP-OF-PAGE.
+  PERFORM top.
+
+START-OF-SELECTION.
+*** get ledger information
+  PERFORM get_ledgers.
+*** select headers
+  SELECT * FROM bkpf INTO TABLE gt_bkpf
+    WHERE bukrs EQ p_bukrs
+      AND belnr IN s_belnr
+      AND gjahr IN s_gjahr
+      AND monat IN s_monat
+      AND ( bstat EQ space                                  "DB290509
+            OR bstat = 'L' )                                "DB290509
+      AND awtyp IN s_awtyp.
+  IF sy-subrc NE 0.
+    WRITE:/ 'No documents selected' COLOR 3.
+    EXIT.
+  ENDIF.
+  LOOP AT gt_bkpf.                                          "DB290509
+    IF gt_bkpf-bstat <> 'L'.                                "DB290509
+*** check BSEG against FAGL
+      PERFORM process_bseg_xnegp.
+    ELSE.
+*** check BSEG_ADD against FAGL                             "DB290509
+      PERFORM process_bseg_add_xnegp.                       "DB290509
+    ENDIF.
+  ENDLOOP.
+
+*** output excluded cases                                   "UD120109
+  IF cnt_excl > 0.                                          "UD120109
+    PERFORM output_excl.                                    "UD120109
+  ENDIF.                                                    "UD120109
+*** output results
+  IF cnt_corr = 0.
+    WRITE:/ 'No affected line items found' COLOR 3.
+    EXIT.
+  ELSE.
+*** change order because of spool & rollback work           "UD120109
+*    PERFORM output.                                        "UD120109
+*    PERFORM update_items.                                  "UD120109
+    PERFORM update_items.                                   "UD120109
+    PERFORM output.                                         "UD120109
+  ENDIF.
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_LEDGERS
+*&---------------------------------------------------------------------*
+FORM get_ledgers .
+  DATA: lt_ledgers TYPE fagl_rldnr_tab,
+        ls_ledgers LIKE LINE OF lt_ledgers,
+        ls_t881 TYPE t881,
+        ls_ntable TYPE t800a-ntable.
+*** get involved ledgers and tablenames
+  REFRESH lt_ledgers.
+  CLEAR lt_ledgers.
+  CALL FUNCTION 'FAGL_GET_ALL_LEDGERS_IN_BUKRS'
+    EXPORTING
+      i_bukrs    = p_bukrs
+    IMPORTING
+      et_ledgers = lt_ledgers.
+*** build-up ledgertab
+  REFRESH gt_ledgertab.
+  LOOP AT lt_ledgers INTO ls_ledgers.
+    CLEAR ls_t881.
+    CLEAR ls_ntable.
+    SELECT SINGLE * FROM t881 INTO ls_t881
+      WHERE rldnr = ls_ledgers.
+    SELECT SINGLE ntable FROM t800a INTO ls_ntable
+      WHERE tab = ls_t881-tab.
+    CLEAR gt_ledgertab.
+    MOVE-CORRESPONDING ls_t881 TO gt_ledgertab.
+    gt_ledgertab-tabname = ls_ntable.
+    INSERT gt_ledgertab INTO TABLE gt_ledgertab.
+  ENDLOOP.
+ENDFORM.                    " GET_LEDGERS
+*&---------------------------------------------------------------------*
+*&      Form  PROCESS_BSEG_XNEGP
+*&---------------------------------------------------------------------*
+FORM process_bseg_xnegp .
+  DATA: lt_bseg TYPE TABLE OF bseg WITH HEADER LINE.
+  DATA: lt_glu1 TYPE TABLE OF glu1 WITH HEADER LINE.
+  DATA: lt_splinfo TYPE TABLE OF fagl_splinfo WITH HEADER LINE.
+  DATA: ls_wrbtr_00 TYPE fagl_splinfo_val-wrbtr.
+  DATA: ls_wrbtr_10 TYPE fagl_splinfo_val-wrbtr.
+  DATA: x_xnegp(1) TYPE c.
+  DATA: x_linewise(1) TYPE c.
+  DATA: x_excl(1) TYPE c.                                   "UD120109
+
+  REFRESH: lt_bseg, lt_glu1.
+  CLEAR: x_xnegp, x_linewise.
+  CLEAR: x_excl.                                            "UD120109
+*** select corresponding BSEG items
+  SELECT * FROM bseg INTO TABLE lt_bseg
+    WHERE bukrs = gt_bkpf-bukrs
+      AND belnr = gt_bkpf-belnr
+      AND gjahr = gt_bkpf-gjahr.
+*** check BSEG for XNEGP
+  READ TABLE lt_bseg WITH KEY
+    xnegp = 'X'
+  TRANSPORTING NO FIELDS.
+*** if CHECKALL eq SPACE: only in presence of BSEG-XNEGP go on with check
+  IF checkall EQ space.
+*** XNEGP is not found: continue with next document
+    CHECK sy-subrc = 0.
+    x_xnegp = 'X'.
+  ELSE.
+*** go on with check
+    IF sy-subrc = 0.
+      x_xnegp = 'X'.
+    ENDIF.
+  ENDIF.
+*** if X_LINEWISE = 'X': XNEGP not valid for entire document
+*** => balance-0-clearing items do not need XNEGP
+  READ TABLE lt_bseg WITH KEY
+    xnegp = ' '
+  TRANSPORTING NO FIELDS.
+  IF sy-subrc = 0.
+    x_linewise = 'X'.
+  ENDIF.
+*** select corresponding FAGL per ledger
+  LOOP AT gt_ledgertab.
+    SELECT * FROM (gt_ledgertab-tabname)
+    APPENDING CORRESPONDING FIELDS OF TABLE lt_glu1
+    WHERE  rldnr = gt_ledgertab-rldnr
+      AND rbukrs = gt_bkpf-bukrs
+      AND  gjahr = gt_bkpf-gjahr
+      AND  belnr = gt_bkpf-belnr.
+  ENDLOOP.
+*** exclude BUZEI initial cases                             "UD120109
+  LOOP AT lt_bseg.                                          "UD120109
+    READ TABLE lt_glu1 WITH KEY                             "UD120109
+      buzei = lt_bseg-buzei                                 "UD120109
+    TRANSPORTING NO FIELDS.                                 "UD120109
+    IF sy-subrc NE 0.                                       "UD120109
+      x_excl = 'X'.                                         "UD120109
+      MOVE-CORRESPONDING gt_bkpf TO gt_bkpf_excl.           "UD120109
+      INSERT gt_bkpf_excl INTO TABLE gt_bkpf_excl.          "UD120109
+      IF sy-subrc = 0.                                      "UD120109
+        ADD 1 TO cnt_excl.                                  "UD120109
+      ENDIF.                                                "UD120109
+      EXIT.                                                 "UD120109
+    ENDIF.                                                  "UD120109
+  ENDLOOP.                                                  "UD120109
+*** exclude cases with change in +/- sign                   "UD200209
+  LOOP AT lt_glu1.                                          "UD200209
+    CHECK NOT ( ( lt_glu1-tsl >= 0 AND                      "UD200209
+                  lt_glu1-hsl >= 0 AND                      "UD200209
+                  lt_glu1-ksl >= 0 AND                      "UD200209
+                  lt_glu1-osl >= 0 AND                      "UD200209
+                  lt_glu1-wsl >= 0 ) OR                     "UD200209
+                ( lt_glu1-tsl <= 0 AND                      "UD200209
+                  lt_glu1-hsl <= 0 AND                      "UD200209
+                  lt_glu1-ksl <= 0 AND                      "UD200209
+                  lt_glu1-osl <= 0 AND                      "UD200209
+                  lt_glu1-wsl <= 0 ) ).                     "UD200209
+    MOVE-CORRESPONDING gt_bkpf TO gt_bkpf_excl.             "UD200209
+    INSERT gt_bkpf_excl INTO TABLE gt_bkpf_excl.            "UD200209
+    IF sy-subrc = 0.                                        "UD200209
+      ADD 1 TO cnt_excl.                                    "UD200209
+    ENDIF.                                                  "UD200209
+    x_excl = 'X'.                                           "UD200209
+    EXIT.                                                   "UD200209
+  ENDLOOP.                                                  "UD200209
+  CHECK NOT x_excl = 'X'.                                   "UD120109
+*** check items belonging to BSEG
+  LOOP AT lt_glu1
+    WHERE linetype NE '01001'.
+*** check BSEG-XNEGP
+    READ TABLE lt_bseg WITH KEY
+      buzei = lt_glu1-buzei.
+*** XNEGP is set...
+    IF lt_bseg-xnegp = 'X'.
+*** ... error case: no XNEGP in FAGL
+      IF ( lt_glu1-drcrk = 'S' AND
+         ( lt_glu1-tsl > 0 OR
+           lt_glu1-hsl > 0 OR
+           lt_glu1-ksl > 0 OR
+*             lt_glu1-osl > 0 ) ) OR                        "UD210109
+           lt_glu1-osl > 0 OR                               "UD200209
+           lt_glu1-wsl > 0 ) ) OR                           "UD200209
+         ( lt_glu1-drcrk = 'H' AND
+         ( lt_glu1-tsl < 0 OR
+           lt_glu1-hsl < 0 OR
+           lt_glu1-ksl < 0 OR
+*             lt_glu1-osl < 0 ) ).                          "UD210109
+           lt_glu1-osl < 0 OR                               "UD200209
+           lt_glu1-wsl < 0 ) ).                             "UD200209
+        APPEND lt_glu1 TO gt_glu1_corr.
+        INSERT gt_bkpf INTO TABLE gt_bkpf_corr.
+        IF sy-subrc = 0.
+          ADD 1 TO cnt_corr.
+        ENDIF.
+      ENDIF.
+*** XNEGP is not set...
+    ELSE.
+***... error case: XNEGP set in FAGL
+      IF ( lt_glu1-drcrk = 'H' AND
+         ( lt_glu1-tsl > 0 OR
+           lt_glu1-hsl > 0 OR
+           lt_glu1-ksl > 0 OR
+*             lt_glu1-osl > 0 ) ) OR                        "UD210109
+           lt_glu1-osl > 0 OR                               "UD200209
+           lt_glu1-wsl > 0 ) ) OR                           "UD200209
+         ( lt_glu1-drcrk = 'S' AND
+         ( lt_glu1-tsl < 0 OR
+           lt_glu1-hsl < 0 OR
+           lt_glu1-ksl < 0 OR
+*             lt_glu1-osl < 0 ) ).                          "UD210109
+           lt_glu1-osl < 0 OR                               "UD200209
+           lt_glu1-wsl < 0 ) ).                             "UD200209
+        APPEND lt_glu1 TO gt_glu1_corr.
+        INSERT gt_bkpf INTO TABLE gt_bkpf_corr.
+        IF sy-subrc = 0.
+          ADD 1 TO cnt_corr.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+*** handling of bal-0-items
+  LOOP AT lt_glu1
+    WHERE linetype = '01001'.
+*** case: XNEGP valid for entire document...
+    IF x_xnegp = 'X' AND x_linewise EQ space.
+*** ... error case: no XNEGP in FAGL
+      IF ( lt_glu1-drcrk = 'S' AND
+         ( lt_glu1-tsl > 0 OR
+           lt_glu1-hsl > 0 OR
+           lt_glu1-ksl > 0 OR
+*             lt_glu1-osl > 0 ) ) OR                        "UD210109
+           lt_glu1-osl > 0 OR                               "UD200209
+           lt_glu1-wsl > 0 ) ) OR                           "UD200209
+         ( lt_glu1-drcrk = 'H' AND
+         ( lt_glu1-tsl < 0 OR
+           lt_glu1-hsl < 0 OR
+           lt_glu1-ksl < 0 OR
+*             lt_glu1-osl < 0 ) ).                          "UD210109
+           lt_glu1-osl < 0 OR                               "UD200209
+           lt_glu1-wsl < 0 ) ).                             "UD200209
+        APPEND lt_glu1 TO gt_glu1_corr.
+        INSERT gt_bkpf INTO TABLE gt_bkpf_corr.
+        IF sy-subrc = 0.
+          ADD 1 TO cnt_corr.
+        ENDIF.
+      ENDIF.
+*** case: XNEGP not valid for entire doc => not set in '01001' item
+    ELSE.
+***... error case: XNEGP set in FAGL
+      IF ( lt_glu1-drcrk = 'H' AND
+         ( lt_glu1-tsl > 0 OR
+           lt_glu1-hsl > 0 OR
+           lt_glu1-ksl > 0 OR
+*             lt_glu1-osl > 0 ) ) OR                        "UD210109
+           lt_glu1-osl > 0 OR                               "UD200209
+           lt_glu1-wsl > 0 ) ) OR                           "UD200209
+         ( lt_glu1-drcrk = 'S' AND
+         ( lt_glu1-tsl < 0 OR
+           lt_glu1-hsl < 0 OR
+           lt_glu1-ksl < 0 OR
+*             lt_glu1-osl < 0 ) ).                          "UD210109
+           lt_glu1-osl < 0 OR                               "UD200209
+           lt_glu1-wsl < 0 ) ).                             "UD200209
+        APPEND lt_glu1 TO gt_glu1_corr.
+        INSERT gt_bkpf INTO TABLE gt_bkpf_corr.
+        IF sy-subrc = 0.
+          ADD 1 TO cnt_corr.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+*** check FAGL_SPLINFO
+*** basic rule: SHKZG always depends on the +/- sign of amounts
+  IF x_split = 'X'.
+    REFRESH lt_splinfo.
+    SELECT * FROM fagl_splinfo INTO TABLE lt_splinfo
+      WHERE belnr = gt_bkpf-belnr
+        AND gjahr = gt_bkpf-gjahr
+        AND bukrs = gt_bkpf-bukrs.
+    CHECK sy-subrc = 0.
+    LOOP AT lt_splinfo.
+      CLEAR: ls_wrbtr_00, ls_wrbtr_10.
+*** get any amount ne 0 from FAGL_SPLINFO_VAL                      "UD210109
+**** get WRBTR from SPLINFO_VAL
+*        SELECT SINGLE wrbtr FROM fagl_splinfo_val INTO ls_wrbtr_00
+*          WHERE belnr = lt_splinfo-belnr
+*           AND  gjahr = lt_splinfo-gjahr
+*           AND  bukrs = lt_splinfo-bukrs
+*           AND  buzei = lt_splinfo-buzei
+*           AND spl_no = lt_splinfo-spl_no
+*           AND  curtp = '00'.
+**** get DMBTR from SPLINFO_VAL
+*        SELECT SINGLE wrbtr FROM fagl_splinfo_val INTO ls_wrbtr_10
+*          WHERE belnr = lt_splinfo-belnr
+*           AND  gjahr = lt_splinfo-gjahr
+*           AND  bukrs = lt_splinfo-bukrs
+*           AND  buzei = lt_splinfo-buzei
+*           AND spl_no = lt_splinfo-spl_no
+*           AND  curtp = '10'.
+      SELECT SINGLE wrbtr FROM fagl_splinfo_val INTO ls_wrbtr_00"UD210109
+        WHERE belnr EQ lt_splinfo-belnr                     "UD210109
+         AND  gjahr EQ lt_splinfo-gjahr                     "UD210109
+         AND  bukrs EQ lt_splinfo-bukrs                     "UD210109
+         AND  buzei EQ lt_splinfo-buzei                     "UD210109
+         AND spl_no EQ lt_splinfo-spl_no                    "UD210109
+         AND  wrbtr NE 0.                                   "UD210109
+*** read corresponding BSEG
+      READ TABLE lt_bseg WITH KEY
+        buzei = lt_splinfo-buzei.
+*** check SHKZG
+*        IF ( ls_wrbtr_00 > 0 OR ls_wrbtr_10 > 0 ).         "UD210109
+      IF ls_wrbtr_00 > 0.                                   "UD210109
+*** error case: SHKZG is 'H' although amounts > 0
+        IF lt_splinfo-shkzg = 'H'.
+          APPEND lt_splinfo TO gt_splinfo_corr.
+          INSERT gt_bkpf INTO TABLE gt_bkpf_corr.
+          IF sy-subrc = 0.
+            ADD 1 TO cnt_corr.
+          ENDIF.
+        ENDIF.
+*        ELSEIF ( ls_wrbtr_00 < 0 OR ls_wrbtr_10 < 0 ).     "UD210109
+      ELSEIF ls_wrbtr_00 < 0.                               "UD210109
+*** error case: SHKZG is 'S' although amounts < 0
+        IF lt_splinfo-shkzg = 'S'.
+          APPEND lt_splinfo TO gt_splinfo_corr.
+          INSERT gt_bkpf INTO TABLE gt_bkpf_corr.
+          IF sy-subrc = 0.
+            ADD 1 TO cnt_corr.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+
+ENDFORM.                    " PROCESS_BSEG_XNEGP
+
+*&---------------------------------------------------------------------*
+*&      Form  PROCESS_BSEG_ADD_XNEGP
+*&---------------------------------------------------------------------*
+FORM process_bseg_add_xnegp .
+  DATA: lt_bseg_add TYPE TABLE OF bseg_add WITH HEADER LINE.
+  DATA: lt_glu1 TYPE TABLE OF glu1 WITH HEADER LINE.
+  DATA: lt_splinfo TYPE TABLE OF fagl_splinfo WITH HEADER LINE.
+  DATA: ls_wrbtr_00 TYPE fagl_splinfo_val-wrbtr.
+  DATA: ls_wrbtr_10 TYPE fagl_splinfo_val-wrbtr.
+  DATA: x_xnegp(1) TYPE c.
+  DATA: x_linewise(1) TYPE c.
+  DATA: x_excl(1) TYPE c.                                   "UD120109
+
+
+  REFRESH: lt_bseg_add, lt_glu1.
+  CLEAR: x_xnegp, x_linewise.
+  CLEAR: x_excl.                                            "UD120109
+*** select corresponding BSEG items
+  SELECT * FROM bseg_add INTO TABLE lt_bseg_add
+    WHERE bukrs = gt_bkpf-bukrs
+      AND belnr = gt_bkpf-belnr
+      AND gjahr = gt_bkpf-gjahr.
+*** check BSEG for XNEGP
+  READ TABLE lt_bseg_add WITH KEY
+    xnegp = 'X'
+  TRANSPORTING NO FIELDS.
+*** if CHECKALL eq SPACE: only in presence of BSEG-XNEGP go on with check
+  IF checkall EQ space.
+*** XNEGP is not found: continue with next document
+    CHECK sy-subrc = 0.
+    x_xnegp = 'X'.
+  ELSE.
+*** go on with check
+    IF sy-subrc = 0.
+      x_xnegp = 'X'.
+    ENDIF.
+  ENDIF.
+*** if X_LINEWISE = 'X': XNEGP not valid for entire document
+*** => balance-0-clearing items do not need XNEGP
+  READ TABLE lt_bseg_add WITH KEY
+    xnegp = ' '
+  TRANSPORTING NO FIELDS.
+  IF sy-subrc = 0.
+    x_linewise = 'X'.
+  ENDIF.
+*** select corresponding FAGL per ledger
+  LOOP AT gt_ledgertab.
+    SELECT * FROM (gt_ledgertab-tabname)
+    APPENDING CORRESPONDING FIELDS OF TABLE lt_glu1
+    WHERE  rldnr = gt_ledgertab-rldnr
+      AND rbukrs = gt_bkpf-bukrs
+      AND  gjahr = gt_bkpf-gjahr
+      AND  belnr = gt_bkpf-belnr.
+  ENDLOOP.
+*** exclude BUZEI initial cases                             "UD120109
+  LOOP AT lt_bseg_add.                                      "UD120109
+    READ TABLE lt_glu1 WITH KEY                             "UD120109
+      buzei = lt_bseg_add-buzei                             "UD120109
+    TRANSPORTING NO FIELDS.                                 "UD120109
+    IF sy-subrc NE 0.                                       "UD120109
+      x_excl = 'X'.                                         "UD120109
+      MOVE-CORRESPONDING gt_bkpf TO gt_bkpf_excl.           "UD120109
+      INSERT gt_bkpf_excl INTO TABLE gt_bkpf_excl.          "UD120109
+      IF sy-subrc = 0.                                      "UD120109
+        ADD 1 TO cnt_excl.                                  "UD120109
+      ENDIF.                                                "UD120109
+      EXIT.                                                 "UD120109
+    ENDIF.                                                  "UD120109
+  ENDLOOP.                                                  "UD120109
+*** exclude cases with change in +/- sign                   "UD200209
+  LOOP AT lt_glu1.                                          "UD200209
+    CHECK NOT ( ( lt_glu1-tsl >= 0 AND                      "UD200209
+                  lt_glu1-hsl >= 0 AND                      "UD200209
+                  lt_glu1-ksl >= 0 AND                      "UD200209
+                  lt_glu1-osl >= 0 AND                      "UD200209
+                  lt_glu1-wsl >= 0 ) OR                     "UD200209
+                ( lt_glu1-tsl <= 0 AND                      "UD200209
+                  lt_glu1-hsl <= 0 AND                      "UD200209
+                  lt_glu1-ksl <= 0 AND                      "UD200209
+                  lt_glu1-osl <= 0 AND                      "UD200209
+                  lt_glu1-wsl <= 0 ) ).                     "UD200209
+    MOVE-CORRESPONDING gt_bkpf TO gt_bkpf_excl.             "UD200209
+    INSERT gt_bkpf_excl INTO TABLE gt_bkpf_excl.            "UD200209
+    IF sy-subrc = 0.                                        "UD200209
+      ADD 1 TO cnt_excl.                                    "UD200209
+    ENDIF.                                                  "UD200209
+    x_excl = 'X'.                                           "UD200209
+    EXIT.                                                   "UD200209
+  ENDLOOP.                                                  "UD200209
+  CHECK NOT x_excl = 'X'.                                   "UD120109
+*** check items belonging to BSEG
+  LOOP AT lt_glu1
+    WHERE linetype NE '01001'.
+*** check BSEG-XNEGP
+    READ TABLE lt_bseg_add WITH KEY
+      buzei = lt_glu1-buzei.
+*** XNEGP is set...
+    IF lt_bseg_add-xnegp = 'X'.
+*** ... error case: no XNEGP in FAGL
+      IF ( lt_glu1-drcrk = 'S' AND
+         ( lt_glu1-tsl > 0 OR
+           lt_glu1-hsl > 0 OR
+           lt_glu1-ksl > 0 OR
+*             lt_glu1-osl > 0 ) ) OR                        "UD210109
+           lt_glu1-osl > 0 OR                               "UD200209
+           lt_glu1-wsl > 0 ) ) OR                           "UD200209
+         ( lt_glu1-drcrk = 'H' AND
+         ( lt_glu1-tsl < 0 OR
+           lt_glu1-hsl < 0 OR
+           lt_glu1-ksl < 0 OR
+*             lt_glu1-osl < 0 ) ).                          "UD210109
+           lt_glu1-osl < 0 OR                               "UD200209
+           lt_glu1-wsl < 0 ) ).                             "UD200209
+        APPEND lt_glu1 TO gt_glu1_corr.
+        INSERT gt_bkpf INTO TABLE gt_bkpf_corr.
+        IF sy-subrc = 0.
+          ADD 1 TO cnt_corr.
+        ENDIF.
+      ENDIF.
+*** XNEGP is not set...
+    ELSE.
+***... error case: XNEGP set in FAGL
+      IF ( lt_glu1-drcrk = 'H' AND
+         ( lt_glu1-tsl > 0 OR
+           lt_glu1-hsl > 0 OR
+           lt_glu1-ksl > 0 OR
+*             lt_glu1-osl > 0 ) ) OR                        "UD210109
+           lt_glu1-osl > 0 OR                               "UD200209
+           lt_glu1-wsl > 0 ) ) OR                           "UD200209
+         ( lt_glu1-drcrk = 'S' AND
+         ( lt_glu1-tsl < 0 OR
+           lt_glu1-hsl < 0 OR
+           lt_glu1-ksl < 0 OR
+*             lt_glu1-osl < 0 ) ).                          "UD210109
+           lt_glu1-osl < 0 OR                               "UD200209
+           lt_glu1-wsl < 0 ) ).                             "UD200209
+        APPEND lt_glu1 TO gt_glu1_corr.
+        INSERT gt_bkpf INTO TABLE gt_bkpf_corr.
+        IF sy-subrc = 0.
+          ADD 1 TO cnt_corr.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+*** handling of bal-0-items
+  LOOP AT lt_glu1
+    WHERE linetype = '01001'.
+*** case: XNEGP valid for entire document...
+    IF x_xnegp = 'X' AND x_linewise EQ space.
+*** ... error case: no XNEGP in FAGL
+      IF ( lt_glu1-drcrk = 'S' AND
+         ( lt_glu1-tsl > 0 OR
+           lt_glu1-hsl > 0 OR
+           lt_glu1-ksl > 0 OR
+*             lt_glu1-osl > 0 ) ) OR                        "UD210109
+           lt_glu1-osl > 0 OR                               "UD200209
+           lt_glu1-wsl > 0 ) ) OR                           "UD200209
+         ( lt_glu1-drcrk = 'H' AND
+         ( lt_glu1-tsl < 0 OR
+           lt_glu1-hsl < 0 OR
+           lt_glu1-ksl < 0 OR
+*             lt_glu1-osl < 0 ) ).                          "UD210109
+           lt_glu1-osl < 0 OR                               "UD200209
+           lt_glu1-wsl < 0 ) ).                             "UD200209
+        APPEND lt_glu1 TO gt_glu1_corr.
+        INSERT gt_bkpf INTO TABLE gt_bkpf_corr.
+        IF sy-subrc = 0.
+          ADD 1 TO cnt_corr.
+        ENDIF.
+      ENDIF.
+*** case: XNEGP not valid for entire doc => not set in '01001' item
+    ELSE.
+***... error case: XNEGP set in FAGL
+      IF ( lt_glu1-drcrk = 'H' AND
+         ( lt_glu1-tsl > 0 OR
+           lt_glu1-hsl > 0 OR
+           lt_glu1-ksl > 0 OR
+*             lt_glu1-osl > 0 ) ) OR                        "UD210109
+           lt_glu1-osl > 0 OR                               "UD200209
+           lt_glu1-wsl > 0 ) ) OR                           "UD200209
+         ( lt_glu1-drcrk = 'S' AND
+         ( lt_glu1-tsl < 0 OR
+           lt_glu1-hsl < 0 OR
+           lt_glu1-ksl < 0 OR
+*             lt_glu1-osl < 0 ) ).                          "UD210109
+           lt_glu1-osl < 0 OR                               "UD200209
+           lt_glu1-wsl < 0 ) ).                             "UD200209
+        APPEND lt_glu1 TO gt_glu1_corr.
+        INSERT gt_bkpf INTO TABLE gt_bkpf_corr.
+        IF sy-subrc = 0.
+          ADD 1 TO cnt_corr.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+*** check FAGL_SPLINFO
+*** basic rule: SHKZG always depends on the +/- sign of amounts
+  IF x_split = 'X'.
+    REFRESH lt_splinfo.
+    SELECT * FROM fagl_splinfo INTO TABLE lt_splinfo
+      WHERE belnr = gt_bkpf-belnr
+        AND gjahr = gt_bkpf-gjahr
+        AND bukrs = gt_bkpf-bukrs.
+    CHECK sy-subrc = 0.
+    LOOP AT lt_splinfo.
+      CLEAR: ls_wrbtr_00, ls_wrbtr_10.
+*** get any amount ne 0 from FAGL_SPLINFO_VAL                      "UD210109
+**** get WRBTR from SPLINFO_VAL
+*        SELECT SINGLE wrbtr FROM fagl_splinfo_val INTO ls_wrbtr_00
+*          WHERE belnr = lt_splinfo-belnr
+*           AND  gjahr = lt_splinfo-gjahr
+*           AND  bukrs = lt_splinfo-bukrs
+*           AND  buzei = lt_splinfo-buzei
+*           AND spl_no = lt_splinfo-spl_no
+*           AND  curtp = '00'.
+**** get DMBTR from SPLINFO_VAL
+*        SELECT SINGLE wrbtr FROM fagl_splinfo_val INTO ls_wrbtr_10
+*          WHERE belnr = lt_splinfo-belnr
+*           AND  gjahr = lt_splinfo-gjahr
+*           AND  bukrs = lt_splinfo-bukrs
+*           AND  buzei = lt_splinfo-buzei
+*           AND spl_no = lt_splinfo-spl_no
+*           AND  curtp = '10'.
+      SELECT SINGLE wrbtr FROM fagl_splinfo_val INTO ls_wrbtr_00"UD210109
+        WHERE belnr EQ lt_splinfo-belnr                     "UD210109
+         AND  gjahr EQ lt_splinfo-gjahr                     "UD210109
+         AND  bukrs EQ lt_splinfo-bukrs                     "UD210109
+         AND  buzei EQ lt_splinfo-buzei                     "UD210109
+         AND spl_no EQ lt_splinfo-spl_no                    "UD210109
+         AND  wrbtr NE 0.                                   "UD210109
+*** read corresponding BSEG
+      READ TABLE lt_bseg_add WITH KEY
+        buzei = lt_splinfo-buzei.
+*** check SHKZG
+*        IF ( ls_wrbtr_00 > 0 OR ls_wrbtr_10 > 0 ).         "UD210109
+      IF ls_wrbtr_00 > 0.                                   "UD210109
+*** error case: SHKZG is 'H' although amounts > 0
+        IF lt_splinfo-shkzg = 'H'.
+          APPEND lt_splinfo TO gt_splinfo_corr.
+          INSERT gt_bkpf INTO TABLE gt_bkpf_corr.
+          IF sy-subrc = 0.
+            ADD 1 TO cnt_corr.
+          ENDIF.
+        ENDIF.
+*        ELSEIF ( ls_wrbtr_00 < 0 OR ls_wrbtr_10 < 0 ).     "UD210109
+      ELSEIF ls_wrbtr_00 < 0.                               "UD210109
+*** error case: SHKZG is 'S' although amounts < 0
+        IF lt_splinfo-shkzg = 'S'.
+          APPEND lt_splinfo TO gt_splinfo_corr.
+          INSERT gt_bkpf INTO TABLE gt_bkpf_corr.
+          IF sy-subrc = 0.
+            ADD 1 TO cnt_corr.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+
+ENDFORM.                    " PROCESS_BSEG_XNEGP
+
+*&---------------------------------------------------------------------*
+*&      Form  OUTPUT
+*&---------------------------------------------------------------------*
+FORM output .
+*** sort line items for output
+  SORT gt_glu1_corr BY rldnr gjahr belnr docln ASCENDING.
+  NEW-PAGE.
+  head = 'C'.
+  LOOP AT gt_bkpf_corr.
+    FORMAT COLOR 1 INTENSIFIED OFF.
+    WRITE:/ sy-vline NO-GAP,
+        (5) gt_bkpf_corr-bukrs,
+       (10) gt_bkpf_corr-belnr,
+        (5) gt_bkpf_corr-gjahr,
+       (10) gt_bkpf_corr-budat,
+        (5) gt_bkpf_corr-awtyp,
+       (20) gt_bkpf_corr-awkey,
+        120 sy-vline NO-GAP.
+    LOOP AT gt_glu1_corr
+      WHERE gjahr = gt_bkpf_corr-gjahr
+        AND belnr = gt_bkpf_corr-belnr.
+      FORMAT COLOR 2 INTENSIFIED OFF.
+      WRITE:/ sy-vline NO-GAP,
+          (5) gt_glu1_corr-ryear,
+         (10) gt_glu1_corr-docnr,
+          (5) gt_glu1_corr-rldnr,
+          (6) gt_glu1_corr-docln,
+         (10) gt_glu1_corr-racct,
+         (23) gt_glu1_corr-tsl,
+         (23) gt_glu1_corr-hsl,
+          (5) gt_glu1_corr-drcrk,
+          (5) gt_glu1_corr-buzei,
+          (5) gt_glu1_corr-bschl,
+          (5) gt_glu1_corr-linetype,
+          120 sy-vline NO-GAP.
+    ENDLOOP.
+    LOOP AT gt_splinfo_corr
+      WHERE gjahr = gt_bkpf_corr-gjahr
+        AND belnr = gt_bkpf_corr-belnr.
+      FORMAT COLOR 3 INTENSIFIED OFF.
+      WRITE:/ sy-vline NO-GAP,
+          (5) gt_splinfo_corr-buzei,
+          (6) gt_splinfo_corr-spl_no,
+          (5) gt_splinfo_corr-shkzg,
+          (5) gt_splinfo_corr-bschl,
+         (10) gt_splinfo_corr-hkont,
+          (5) gt_splinfo_corr-pswsl,
+         (15) gt_splinfo_corr-pswbt,
+          120 sy-vline NO-GAP.
+    ENDLOOP.
+    AT END OF belnr.
+      NEW-LINE.
+      ULINE (120).
+    ENDAT.
+  ENDLOOP.
+ENDFORM.                    " OUTPUT
+*&---------------------------------------------------------------------*
+*&      Form  UPDATE_ITEMS
+*&---------------------------------------------------------------------*
+FORM update_items .
+*** save data in RFDT
+  IF p_update = 'X'.
+    PERFORM write_to_rfdt.
+  ENDIF.
+  PERFORM update_fagl.
+*** Commit work is important for update task
+  IF p_update = 'X'.
+    COMMIT WORK.
+*** Send success message
+    FORMAT COLOR 5.
+    WRITE:/ 'Line items and totals adjusted in UPDATE mode.'.
+    FORMAT COLOR OFF.
+  ELSE.
+*** rollback work because of test mode
+    ROLLBACK WORK.
+*** Send success message
+    FORMAT COLOR 3.
+    WRITE:/ 'Adjustment of line items and totals simulated in TEST mode.'.
+    FORMAT COLOR OFF.
+  ENDIF.
+ENDFORM.                    " UPDATE_ITEMS
+*&---------------------------------------------------------------------*
+*&      Form  WRITE_TO_RFDT
+*&---------------------------------------------------------------------*
+FORM write_to_rfdt .
+  DATA: gs_date TYPE sy-datlo,
+        gs_time TYPE sy-timlo.
+*** get date and time
+  gs_date = sy-datlo.
+  gs_time = sy-timlo.
+*** build-up key for export
+  CLEAR exp_key.
+  exp_key(4)    = p_bukrs.
+  exp_key+4(6)  = 'FAGLNP'.
+  exp_key+10(6) = gs_date+2(6).
+  exp_key+16(6) = gs_time.
+
+  EXPORT
+    gt_bkpf_corr
+    gt_glu1_corr
+    gt_splinfo_corr
+  TO DATABASE rfdt(zz) ID exp_key.
+  IF sy-subrc = 0.
+    NEW-PAGE.
+    head = 'E'.
+    FORMAT COLOR 3 INTENSIFIED OFF.
+    WRITE:/ sy-vline NO-GAP,
+            exp_key,
+         50 sy-vline NO-GAP.
+    NEW-LINE.
+    ULINE (50).
+*** COMMIT WORK to ensure that data is witten prior to any dump in UPDATE_ITEMS
+    COMMIT WORK.
+  ENDIF.
+ENDFORM.                    " WRITE_TO_RFDT
+*&---------------------------------------------------------------------*
+*&      Form  UPDATE_FAGL
+*&---------------------------------------------------------------------*
+FORM update_fagl .
+*** FAGL structures for update
+  DATA: lt_glu1_wrong_upd TYPE TABLE OF glu1 WITH HEADER LINE,
+        lt_glu1_corr_upd TYPE TABLE OF glu1 WITH HEADER LINE.
+*** data used for G_GLDP_POSTING_A
+  DATA: lt_used LIKE rgiuse OCCURS 0 WITH HEADER LINE,
+        lt_glu1_add LIKE rgiad2 OCCURS 0 WITH HEADER LINE,
+        lf_offset LIKE t800a-fldgr,
+        lf_rpmax LIKE t800a-fldgr,
+        ld_tabix TYPE sy-tabix.
+
+  CLEAR: lf_offset,
+         lf_rpmax.
+
+*** update G/L part per ledger
+  LOOP AT gt_ledgertab.
+*** build-up data for update
+    CLEAR lt_used.
+    REFRESH lt_used.
+    lt_used-tab = gt_ledgertab-tabname.
+    lt_used-progroup = 'A'.
+    APPEND lt_used.
+*** undo transaction figures from GT_GLU1_WRONG per ledger
+    REFRESH lt_glu1_wrong_upd.
+    LOOP AT gt_glu1_corr
+      WHERE rldnr = gt_ledgertab-rldnr.
+      MOVE-CORRESPONDING gt_glu1_corr TO lt_glu1_wrong_upd.
+      lt_glu1_wrong_upd-tsl = lt_glu1_wrong_upd-tsl * -1.
+      lt_glu1_wrong_upd-hsl = lt_glu1_wrong_upd-hsl * -1.
+      lt_glu1_wrong_upd-ksl = lt_glu1_wrong_upd-ksl * -1.
+      lt_glu1_wrong_upd-osl = lt_glu1_wrong_upd-osl * -1.
+      lt_glu1_wrong_upd-msl = lt_glu1_wrong_upd-msl * -1.
+      CLEAR lt_glu1_wrong_upd-timestamp. "Otherwise collect will fail!!
+      APPEND lt_glu1_wrong_upd.
+    ENDLOOP.
+*** build-up GLU1_ADD from LT_GLU1_WRONG_UPD
+    REFRESH lt_glu1_add.
+    LOOP AT lt_glu1_wrong_upd.
+      CALL FUNCTION 'G_MAX_PERIOD_AND_OFFSET_GET'
+        EXPORTING
+          period = lt_glu1_wrong_upd-poper
+          table  = gt_ledgertab-tab
+        IMPORTING
+          offset = lf_offset
+          rpmax  = lf_rpmax.
+      MOVE-CORRESPONDING lt_glu1_wrong_upd TO lt_glu1_add.
+      lt_glu1_add-rpmax = lf_rpmax.
+      lt_glu1_add-buchkreis = lt_glu1_wrong_upd-rbukrs.
+*** no line item is created
+      lt_glu1_add-glsip = space.
+      lt_glu1_add-offset = lf_offset.
+      lt_glu1_add-post = 'X'.
+      APPEND lt_glu1_add.
+    ENDLOOP.
+*** undo totals
+    CALL FUNCTION 'G_GLDB_POSTING_A'
+      TABLES
+        int_used     = lt_used
+        int_glu1     = lt_glu1_wrong_upd
+        int_glu1_add = lt_glu1_add.
+
+*** update line items from GT_GLU1_CORR per ledger
+*** populate LT_GLU1_CORR_UPD
+    REFRESH lt_glu1_corr_upd.
+    LOOP AT gt_glu1_corr
+      WHERE rldnr = gt_ledgertab-rldnr.
+*** correction : opposite DRCRK
+      IF gt_glu1_corr-drcrk = 'S'.
+        gt_glu1_corr-drcrk = 'H'.
+      ELSE.
+        gt_glu1_corr-drcrk = 'S'.
+      ENDIF.
+      CLEAR gt_glu1_corr-timestamp. "Otherwise collect will fail!!
+      APPEND gt_glu1_corr TO lt_glu1_corr_upd.
+    ENDLOOP.
+*** update database from line item
+    LOOP AT lt_glu1_corr_upd.
+      UPDATE (gt_ledgertab-tabname)
+      SET   drcrk = lt_glu1_corr_upd-drcrk
+      WHERE ryear = lt_glu1_corr_upd-ryear
+      AND   docnr = lt_glu1_corr_upd-docnr
+      AND   rldnr = lt_glu1_corr_upd-rldnr
+      AND  rbukrs = lt_glu1_corr_upd-rbukrs
+      AND   docln = lt_glu1_corr_upd-docln.
+      IF sy-subrc NE 0.
+        MESSAGE x016(gu) WITH 'Update of FAGL items failed'.
+      ENDIF.
+    ENDLOOP.
+*** build-up GLU1_ADD from LT_GLU1_CORR_UPD
+    REFRESH lt_glu1_add.
+    LOOP AT lt_glu1_corr_upd.
+      CALL FUNCTION 'G_MAX_PERIOD_AND_OFFSET_GET'
+        EXPORTING
+          period = lt_glu1_corr_upd-poper
+          table  = gt_ledgertab-tab
+        IMPORTING
+          offset = lf_offset
+          rpmax  = lf_rpmax.
+      MOVE-CORRESPONDING lt_glu1_corr_upd TO lt_glu1_add.
+      lt_glu1_add-rpmax = lf_rpmax.
+      lt_glu1_add-buchkreis = lt_glu1_corr_upd-rbukrs.
+*** no line item is created
+      lt_glu1_add-glsip = space.
+      lt_glu1_add-offset = lf_offset.
+      lt_glu1_add-post = 'X'.
+      APPEND lt_glu1_add.
+    ENDLOOP.
+    CALL FUNCTION 'G_GLDB_POSTING_A'
+      TABLES
+        int_used     = lt_used
+        int_glu1     = lt_glu1_corr_upd
+        int_glu1_add = lt_glu1_add.
+  ENDLOOP.
+*** FAGL_SPLINFO is ledger-independent
+  DESCRIBE TABLE gt_splinfo_corr LINES sy-tfill.
+  IF sy-tfill > 0.
+    PERFORM corr_splinfo.
+  ENDIF.
+ENDFORM.                    " UPDATE_FAGL
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_INPUT
+*&---------------------------------------------------------------------*
+FORM check_input .
+  DATA: ls_t001 TYPE t001.
+  DATA: lt_bukrs TYPE fagl_t_bukrs,
+        ld_split_active TYPE boolean.
+  IF sy-ucomm EQ 'SAPONLY'. exp = 'X'. ENDIF.
+*** does company code exist?
+  SELECT SINGLE * FROM t001 INTO ls_t001
+    WHERE bukrs = p_bukrs.
+  IF sy-subrc NE 0.
+    MESSAGE e016(gu)
+    WITH 'Company code' p_bukrs 'does not exist'.
+  ENDIF.
+*** splitter active?
+  APPEND p_bukrs TO lt_bukrs.
+  CALL METHOD cl_fagl_split_services=>check_activity
+    EXPORTING
+      it_bukrs            = lt_bukrs
+    RECEIVING
+      rb_active           = ld_split_active
+    EXCEPTIONS
+      active_and_inactive = 1.
+  IF ld_split_active = 'X'.
+    x_split = 'X'.
+  ENDIF.
+
+ENDFORM.                    " CHECK_INPUT
+*&---------------------------------------------------------------------*
+*&      Form  TOP
+*&---------------------------------------------------------------------*
+FORM top .
+  CASE head.
+    WHEN 'C'.
+      FORMAT COLOR 1.
+      ULINE (120).
+      WRITE:/ sy-vline NO-GAP,
+              'Inconsistent line items to be corrected',
+          120 sy-vline NO-GAP.
+      WRITE:/ sy-vline NO-GAP,
+          (5) 'BUKRS',
+         (10) 'BELNR',
+          (5) 'GJAHR',
+         (10) 'BUDAT',
+          (5) 'AWTYP',
+         (20) 'AWKEY',
+          110 'HEADER',
+          120 sy-vline NO-GAP.
+      FORMAT COLOR 2.
+      WRITE:/ sy-vline NO-GAP,
+          (5) 'RYEAR',
+         (10) 'DOCNR',
+          (5) 'RLDNR',
+          (6) 'DOCLN',
+         (10) 'RACCT',
+         (23) 'TSL',
+         (23) 'HSL',
+          (5) 'DRCRK',
+          (5) 'BUZEI',
+          (5) 'BSCHL',
+          (5) 'LNTYP',
+          110 'G/L VIEW',
+          120 sy-vline NO-GAP.
+      FORMAT COLOR 3.
+      WRITE:/ sy-vline NO-GAP,
+          (5) 'BUZEI',
+          (6) 'SPL_NO',
+          (5) 'SHKZG',
+          (5) 'BSCHL',
+         (10) 'HKONT',
+          (5) 'PSWSL',
+         (15) 'PSWBT',
+          110 'SPLINFO',
+          120 sy-vline NO-GAP.
+      NEW-LINE.
+      ULINE (120).
+      FORMAT COLOR OFF.
+    WHEN 'E'.
+      FORMAT COLOR 3.
+      ULINE (50).
+      WRITE:/ sy-vline NO-GAP,
+              'Key for file export to RFDT (ZZ)',
+           50 sy-vline NO-GAP.
+      NEW-LINE.
+      ULINE (50).
+      FORMAT COLOR OFF.
+    WHEN 'X'.                                               "UD120109
+      FORMAT COLOR 6.                                       "UD120109
+      ULINE (120).                                          "UD120109
+      WRITE:/ sy-vline NO-GAP,                              "UD120109
+              'Excluded documents because of initial BUZEI:',"UD120109
+          120 sy-vline NO-GAP.                              "UD120109
+      WRITE:/ sy-vline NO-GAP,                              "UD120109
+          (5) 'BUKRS',                                      "UD120109
+         (10) 'BELNR',                                      "UD120109
+          (5) 'GJAHR',                                      "UD120109
+         (10) 'BUDAT',                                      "UD120109
+          (5) 'AWTYP',                                      "UD120109
+         (20) 'AWKEY',                                      "UD120109
+          120 sy-vline NO-GAP.                              "UD120109
+      NEW-LINE.                                             "UD120109
+      ULINE (120).                                          "UD120109
+      FORMAT COLOR OFF.                                     "UD120109
+    WHEN OTHERS.
+  ENDCASE.
+ENDFORM.                    " TOP
+*&---------------------------------------------------------------------*
+*&      Form  CORR_SPLINFO
+*&---------------------------------------------------------------------*
+FORM corr_splinfo .
+  LOOP AT gt_splinfo_corr.
+*** use opposite SHKZG
+    IF gt_splinfo_corr-shkzg = 'S'.
+      gt_splinfo_corr-shkzg = 'H'.
+    ELSE.
+      gt_splinfo_corr-shkzg = 'S'.
+    ENDIF.
+    UPDATE fagl_splinfo
+    SET   shkzg = gt_splinfo_corr-shkzg
+    WHERE belnr = gt_splinfo_corr-belnr
+    AND   gjahr = gt_splinfo_corr-gjahr
+    AND   bukrs = gt_splinfo_corr-bukrs
+    AND   buzei = gt_splinfo_corr-buzei
+    AND  spl_no = gt_splinfo_corr-spl_no.
+    IF sy-subrc NE 0.
+      MESSAGE x016(gu) WITH 'Update of FAGL_SPLINFO items failed'.
+    ENDIF.
+  ENDLOOP.
+ENDFORM.                    " CORR_SPLINFO
+*&---------------------------------------------------------------------*
+*&      Form  OUTPUT_EXCL
+*&---------------------------------------------------------------------*
+FORM output_excl .                                          "UD120109
+  NEW-PAGE.                                                 "UD120109
+  head = 'X'.                                               "UD120109
+  LOOP AT gt_bkpf_excl.                                     "UD120109
+    FORMAT COLOR 1 INTENSIFIED OFF.                         "UD120109
+    WRITE:/ sy-vline NO-GAP,                                "UD120109
+        (5) gt_bkpf_excl-bukrs,                             "UD120109
+       (10) gt_bkpf_excl-belnr,                             "UD120109
+        (5) gt_bkpf_excl-gjahr,                             "UD120109
+       (10) gt_bkpf_excl-budat,                             "UD120109
+        (5) gt_bkpf_excl-awtyp,                             "UD120109
+       (20) gt_bkpf_excl-awkey,                             "UD120109
+        120 sy-vline NO-GAP.                                "UD120109
+  ENDLOOP.                                                  "UD120109
+  NEW-LINE.                                                 "UD120109
+  ULINE (120).                                              "UD120109
+ENDFORM.                    " OUTPUT_EXCL                   "UD120109
+
+*Selection text£º
+*P_BUKRS:D       .
+*S_AWTYP:D       .
+*S_BELNR:D       .
+*S_GJAHR:D       .
+*S_MONAT:D       .

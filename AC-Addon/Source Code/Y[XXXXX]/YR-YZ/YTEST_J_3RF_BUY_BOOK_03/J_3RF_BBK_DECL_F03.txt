@@ -1,0 +1,398 @@
+*&---------------------------------------------------------------------*
+*&  Include           J_3RF_BBK_DECL_F03
+*&---------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  PL_COMPARE_EXTRACT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM pl_compare_extract .
+  DATA: lt_book   TYPE j_3r_t_buy,
+        ls_totals TYPE j_3rbuy,
+        ls_comp   TYPE ty_declcompare,
+        lt_comp   TYPE tt_declcompare.
+  FIELD-SYMBOLS: <fs_book>  TYPE j_3rbuy.
+
+  CLEAR g_compare_extract.
+  CHECK NOT gs_extract1c-exname IS INITIAL.
+
+  CHECK NOT p_book_alv1[] IS INITIAL.
+  PERFORM load_extract USING    gs_extract1c
+                       CHANGING lt_book ls_totals.
+  CHECK NOT lt_book[] IS INITIAL.
+
+  PERFORM sort_fields_by_variant USING lt_book[].
+  g_compare_extract = 'X'.
+
+* build comparison string for loaded extract
+  LOOP AT lt_book ASSIGNING <fs_book>.
+    ls_comp-index = sy-tabix.
+    PERFORM pl_compare_string USING    <fs_book>
+                              CHANGING ls_comp-comp_str.
+    INSERT ls_comp INTO TABLE lt_comp.
+  ENDLOOP.
+
+* compare, assume that most lines are the same
+  LOOP AT p_book_alv1 ASSIGNING <fs_book>.
+*   build key
+    PERFORM pl_compare_string USING    <fs_book>
+                              CHANGING ls_comp-comp_str.
+*   search key
+    READ TABLE lt_comp TRANSPORTING NO FIELDS
+      WITH TABLE KEY comp_str = ls_comp-comp_str.
+    IF sy-subrc = 0.
+      <fs_book>-ext_text_orig = ' '. " record is found
+    ELSE.
+      <fs_book>-ext_text_orig = 'X'. " record is not found
+    ENDIF.
+  ENDLOOP.
+
+  REFRESH: lt_book, lt_comp.
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  PL_COMPARE_STRING
+*&---------------------------------------------------------------------*
+*       Get unique comparison string according to PDF form
+*----------------------------------------------------------------------*
+FORM pl_compare_string  USING    is_book  TYPE j_3rbuy
+                        CHANGING e_string TYPE string.
+  TYPES: ty_curr TYPE c LENGTH 20.
+  DATA: l_waers      TYPE bkpf-waers,
+        l_wrbtr_pay  TYPE ty_curr,
+        l_hwste_pay  TYPE ty_curr.
+
+* fill amounts
+  l_waers = is_book-dmbtr_wrs_inv.
+  WRITE is_book-wrbtr_pay TO l_wrbtr_pay CURRENCY l_waers NO-GROUPING NO-GAP.
+  WRITE is_book-hwste_pay TO l_hwste_pay CURRENCY l_waers NO-GROUPING NO-GAP.
+
+  CLEAR e_string.
+  CONCATENATE is_book-belnr_orig_inv    is_book-gjahr_orig_inv   is_book-number_rev
+              is_book-belnr_corr_inv    is_book-gjahr_corr_inv   is_book-belnr_corr_rev
+              is_book-gjahr_corr_rev    is_book-number_rev       is_book-number_corr_rev
+              is_book-corr_type         is_book-corr_book
+              is_book-stcd1_cred       is_book-stcd3_cred
+              is_book-agent_name        is_book-agent_inn        is_book-agent_kpp
+              is_book-pay_ext_bldat     is_book-pay_ext_number   l_waers
+              is_book-mm_inv_budat      is_book-mm_inv_vornu
+              l_wrbtr_pay               l_hwste_pay
+    INTO e_string SEPARATED BY ';'.
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_DECL_SCREEN
+*&---------------------------------------------------------------------*
+*       Check VAT Return fields
+*----------------------------------------------------------------------*
+FORM pl_check_decl_screen .
+
+  PERFORM check_decl_screen USING 'X'
+                                  gc_xml_hier_key_pb_keys
+                                  gc_xml_hier_key_pba_keys.
+  CHECK sscrfields-ucomm = 'ONLI'. " Check on RUN
+
+  PERFORM pl_check_decl_start USING 'X'.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_DECL_START
+*&---------------------------------------------------------------------*
+*       Check VAT params at start
+*----------------------------------------------------------------------*
+FORM pl_check_decl_start  USING i_sel TYPE flag.
+  DATA: l_dummy  TYPE ltex-exname.
+
+* common checks
+  PERFORM check_decl_start  USING i_sel.
+
+  CHECK NOT g_vat_decl_flag IS INITIAL AND
+        NOT g_vat_decl_sel IS INITIAL.
+
+* if correction VAT Return then we read extract for main declaration
+  IF g_vat_decl_sel = gc_vat_decl_sel_corr.
+    IF p_sum = 'X'.
+      PERFORM read_decl_extracts USING    mainbuk
+                                          vr_gjahr
+                                          vr_perio
+                                          space
+                                 CHANGING l_dummy                   " pl_exname
+                                          g_vat_decl_main_extract.  " sl_exname.
+      IF g_vat_decl_main_extract IS INITIAL AND
+         i_sel = 'X' AND p_save = 'X'.
+        MESSAGE w077(9p) WITH mainbuk vr_gjahr vr_perio.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+* verify data for production run
+  IF vr_prod = 'X'.
+
+  ENDIF.
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  PL_PROCESS_DATA
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM pl_process_data  CHANGING ct_book TYPE j_3r_t_buy.
+* leave data for main or additional sheet only
+  IF g_vat_decl_sel <> gc_vat_decl_sel_corr.
+    DELETE ct_book WHERE belnr_add NE space.
+  ELSE.
+    DELETE ct_book WHERE belnr_add EQ space.
+  ENDIF.
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  PL_SAVE_DECL_DATA
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM pl_save_decl_data  USING  is_bk_guid     TYPE j_3rf_bk_guid
+                               is_bk_guid_add TYPE j_3rf_bk_guid
+                               i_file_name    TYPE string.
+
+  IF g_vat_decl_sel <> gc_vat_decl_sel_corr.
+    PERFORM save_decl_extracts USING    mainbuk
+                                        vr_gjahr
+                                        vr_perio
+                                        space
+                                        'PUR'
+                                        gs_extract2-exname " extract name
+                                        i_file_name.       " file name
+  ELSE.
+    PERFORM save_decl_extracts USING    mainbuk
+                                        vr_gjahr
+                                        vr_perio
+                                        vr_cnum
+                                        'PUR'
+                                        gs_extract2-exname " extract name
+                                        i_file_name.       " file name
+  ENDIF.
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  PL_DECL_INCOMING_TOTALS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM pl_decl_incoming_totals  CHANGING ct_totals TYPE j_3r_t_totals
+                                       cs_totals  TYPE j_3rbuy.
+  DATA: lt_book        TYPE j_3r_t_buy,
+        ls_totals      TYPE j_3rbuy,
+        it_bkpf_tmp    TYPE j3rdl_t_bkpf_cache,
+        it_bseg_tmp    TYPE j3rdl_t_bseg_cache,
+        it_doclist_tmp TYPE j3rdl_t_doclist_ext,
+        ran_bldat  TYPE TABLE OF bldat_ran,
+        ran_vtdat  TYPE TABLE OF bldat_ran,
+        ran_xblnr  TYPE TABLE OF bxlnr_ran,
+        ran_gjahr  TYPE TABLE OF cora_gjahr,
+        ran_monat  TYPE TABLE OF j_3rf_monat_ran,
+        ran_budat  TYPE TABLE OF j_3rf_budat_ran,
+        i_basic(1) TYPE c VALUE 'X',
+        ls_extract TYPE disextract.
+
+  CLEAR: cs_totals, ct_totals[].
+
+* get totals from extract if exists
+  IF NOT g_vat_decl_main_extract IS INITIAL.
+    CALL FUNCTION 'REUSE_ALV_EXTRACT_AT_INIT'
+      CHANGING
+        cs_extract1 = ls_extract
+        cs_extract2 = ls_extract.
+    ls_extract-exname = g_vat_decl_main_extract.
+    PERFORM load_extract USING    ls_extract
+                         CHANGING lt_book ls_totals.
+    IF NOT lt_book[] IS INITIAL.
+*     delete additional sheet
+      DELETE lt_book WHERE belnr_add NE space.
+      PERFORM pl_decl_get_totals_bk USING    lt_book[]
+                                    CHANGING ct_totals.
+      PERFORM pl_decl_get_totals CHANGING ct_totals
+                                          cs_totals.
+      RETURN.
+    ENDIF.
+  ENDIF.
+
+* build main sheet
+  PERFORM get_documents
+    TABLES
+      ad_belnr
+      ad_gjahr
+      ad_budat
+      ran_xblnr "empty
+      ad_monat
+      ran_bldat "empty
+      ad_vtdat  " 1872311    ran_vtdat "empty
+    CHANGING
+      it_bkpf_tmp[]
+      it_bseg_tmp[]
+      it_doclist_tmp[].
+  PERFORM get_add_documents
+    TABLES
+      ad_gjahr
+      ad_budat
+      ad_monat
+    USING
+      i_basic
+    CHANGING
+      it_bkpf_tmp[]
+      it_doclist_tmp[].
+* delete additional sheet
+  DELETE it_doclist_tmp WHERE belnr_add NE space.
+
+  PERFORM process_totals
+    USING
+      it_bkpf_tmp[]
+      it_bseg_tmp[]
+      it_doclist_tmp[]
+    CHANGING
+      ct_totals[].
+  FREE: it_bkpf_tmp, it_doclist_tmp, it_bseg_tmp.
+
+  PERFORM pl_decl_get_totals CHANGING ct_totals
+                                      cs_totals.
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  PL_DECL_GET_TOTALS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM pl_decl_get_totals  CHANGING ct_totals TYPE j_3r_t_totals
+                                  cs_totals  TYPE j_3rbuy.
+  FIELD-SYMBOLS: <fs> TYPE j_3r_totals.
+
+* Get the incoming totals line for the additional sheet output
+  LOOP AT ct_totals ASSIGNING <fs>.
+    cs_totals-dmbtr_pay  = cs_totals-dmbtr_pay  + <fs>-dmbtr_pay.
+    cs_totals-dmbtr_trn  = cs_totals-dmbtr_trn  + <fs>-dmbtr_trn.
+    cs_totals-hwbas_trn  = cs_totals-hwbas_trn  + <fs>-hwbas_trn.
+    cs_totals-hwbas2_trn = cs_totals-hwbas2_trn + <fs>-hwbas2_trn.
+    cs_totals-hwbas3_trn = cs_totals-hwbas3_trn + <fs>-hwbas3_trn.
+    cs_totals-hwbas4_trn = cs_totals-hwbas4_trn + <fs>-hwbas4_trn.
+    cs_totals-hwbas5_trn = cs_totals-hwbas5_trn + <fs>-hwbas5_trn.
+    cs_totals-hwste_trn  = cs_totals-hwste_trn  + <fs>-hwste_trn.
+    cs_totals-hwste2_trn = cs_totals-hwste2_trn + <fs>-hwste2_trn.
+    cs_totals-hwste3_trn = cs_totals-hwste3_trn + <fs>-hwste3_trn.
+    cs_totals-hwste5_trn = cs_totals-hwste5_trn + <fs>-hwste5_trn.
+    cs_totals-dmbtr_wrs_inv = <fs>-waers.
+  ENDLOOP.
+  cs_totals-hwste_pay  = cs_totals-hwste5_trn + cs_totals-hwste2_trn.
+  cs_totals-dmbtr_wrs_pay  =
+  cs_totals-dmbtr_wrs_trn  =
+  cs_totals-hwbas_wrs_trn  =
+  cs_totals-hwbas2_wrs_trn =
+  cs_totals-hwbas3_wrs_trn =
+  cs_totals-hwbas4_wrs_trn =
+  cs_totals-hwbas5_wrs_trn =
+  cs_totals-hwste_wrs_trn  =
+  cs_totals-hwste2_wrs_trn =
+  cs_totals-hwste3_wrs_trn =
+  cs_totals-hwste5_wrs_trn = cs_totals-dmbtr_wrs_inv.
+  cs_totals-belnr_add      = text-441. "'=>TOTAL'.
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  PL_DECL_GET_TOTALS_BK
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM pl_decl_get_totals_bk  USING    it_book   TYPE j_3r_t_buy
+                            CHANGING ct_totals TYPE j_3r_t_totals.
+  DATA: wa_totals TYPE j_3r_totals,
+        lv_waers  TYPE t001-waers.
+  FIELD-SYMBOLS: <fs> TYPE j_3rbuy.
+
+  SELECT SINGLE waers FROM t001 INTO lv_waers WHERE bukrs = mainbuk.
+  LOOP AT it_book ASSIGNING <fs>.
+    CLEAR wa_totals.
+    wa_totals-bukrs = <fs>-bukrs.
+    wa_totals-waers = <fs>-dmbtr_wrs_pay.
+    IF wa_totals-waers IS INITIAL.
+      wa_totals-waers = lv_waers.
+    ENDIF.
+
+    wa_totals-dmbtr_pay  = <fs>-dmbtr_pay.
+    wa_totals-dmbtr_trn  = <fs>-dmbtr_trn.
+    wa_totals-hwbas_trn  = <fs>-hwbas_trn.
+    wa_totals-hwbas2_trn = <fs>-hwbas2_trn.
+    wa_totals-hwbas3_trn = <fs>-hwbas3_trn.
+    wa_totals-hwbas4_trn = <fs>-hwbas4_trn.
+    wa_totals-hwbas5_trn = <fs>-hwbas5_trn.
+    wa_totals-hwste_trn  = <fs>-hwste_trn.
+    wa_totals-hwste2_trn = <fs>-hwste2_trn.
+    wa_totals-hwste3_trn = <fs>-hwste3_trn.
+    wa_totals-hwste5_trn = <fs>-hwste5_trn.
+    wa_totals-hwste_pay  = <fs>-hwste5_trn + <fs>-hwste2_trn.
+
+    wa_totals-gjahr_bas = br_gjahr-low.
+    wa_totals-monat_bas = sel_mona-low.
+    wa_totals-gjahr_add = ad_gjahr-low.
+    wa_totals-monat_add = ad_monat-low.
+    wa_totals-basic = ''.
+    COLLECT wa_totals INTO ct_totals.
+  ENDLOOP.
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  PL_MERGE_EXTRACTS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM pl_merge_extracts .
+  DATA: lt_exnames    type j3rdl_t_exname,
+        lt_book_tmp   type j_3r_t_buy,
+        ls_totals     type j_3rbuy,
+        ls_totals_tmp type j_3rbuy.
+
+  PERFORM check_merge_extracts USING space.
+
+*  get source extracts
+  select distinct exname from ltex
+    into table lt_exnames
+    where relid     = 'LT' and
+          report    = gs_extract_src-report    and
+          handle    = gs_extract_src-handle    and
+          log_group = gs_extract_src-log_group and
+          username  = gs_extract_src-username  and
+          exname in p_ex_src.
+  if lt_exnames[] IS INITIAL.
+      message e304(0k) with space.
+  endif.
+  sort lt_exnames[].
+
+* load extracts
+  loop at lt_exnames into gs_extract_src-exname.
+    perform load_extract using    gs_extract_src
+                         changing lt_book_tmp ls_totals_tmp.
+    append lines of lt_book_tmp to p_book[].
+
+*   totals
+    ls_totals-dmbtr_pay  = ls_totals-dmbtr_pay  + ls_totals_tmp-dmbtr_pay.
+    ls_totals-dmbtr_trn  = ls_totals-dmbtr_trn  + ls_totals_tmp-dmbtr_trn.
+    ls_totals-hwbas_trn  = ls_totals-hwbas_trn  + ls_totals_tmp-hwbas_trn.
+    ls_totals-hwbas2_trn = ls_totals-hwbas2_trn + ls_totals_tmp-hwbas2_trn.
+    ls_totals-hwbas3_trn = ls_totals-hwbas3_trn + ls_totals_tmp-hwbas3_trn.
+    ls_totals-hwbas4_trn = ls_totals-hwbas4_trn + ls_totals_tmp-hwbas4_trn.
+    ls_totals-hwbas5_trn = ls_totals-hwbas5_trn + ls_totals_tmp-hwbas5_trn.
+    ls_totals-hwste_trn  = ls_totals-hwste_trn  + ls_totals_tmp-hwste_trn.
+    ls_totals-hwste2_trn = ls_totals-hwste2_trn + ls_totals_tmp-hwste2_trn.
+    ls_totals-hwste3_trn = ls_totals-hwste3_trn + ls_totals_tmp-hwste3_trn.
+    ls_totals-hwste5_trn = ls_totals-hwste5_trn + ls_totals_tmp-hwste5_trn.
+
+    ls_totals-hwste_pay  = ls_totals-hwste5_trn + ls_totals-hwste2_trn.
+
+    clear: lt_book_tmp[], ls_totals_tmp.
+
+  endloop.
+
+* sort
+  PERFORM sort_fields_by_variant USING p_book[].
+
+* renumerate
+  PERFORM add_transparent_number.
+
+* save extract
+  perform create_extract using gs_extract_dst
+                               p_book[]
+                               ls_totals.
+
+* free memory
+  clear: p_book[].
+
+ENDFORM.

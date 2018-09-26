@@ -1,0 +1,414 @@
+************************************************************************
+* REPORT  : YSE_SD_DTC_AUTOMATION_04                                   *
+*----------------------------------------------------------------------*
+* AUTHOR  : Luc Mertens                                                *
+* CREATED : 08.07.2008                                                 *
+* DEV.NBR : CR0002 - Transfer Posting SSO to ASSO                      *
+************************************************************************
+* Modifications                                                        *
+************************************************************************
+* MOD-001|07.07.2009|L. Mertens USG Innotiv | CD1K949160 | CR0826      *
+*----------------------------------------------------------------------*
+* MOD-002|28.08.2009|L. Mertens USG Innotiv | CD1K950032 | CR0977      *
+************************************************************************
+REPORT YSE_SD_DTC_AUTOMATION_04.
+
+*----------------------------------------------------------------------*
+* Data declarations                                                    *
+*----------------------------------------------------------------------*
+* Dictionary tables
+TABLES: VBAP,
+        MKPF,
+        EKKO,
+        MSEG.
+
+* Internal tables
+DATA: I_mkpf       LIKE mkpf                OCCURS 0 WITH HEADER LINE.
+DATA: I_mseg       LIKE mseg                OCCURS 0 WITH HEADER LINE.
+DATA: I_ekko       LIKE ekko.
+DATA: I_ITEMS      LIKE BAPI2017_GM_ITEM_CREATE
+                                            OCCURS 0 WITH HEADER LINE.
+DATA: I_ITEMSSER   LIKE BAPI2017_GM_SERIALNUMBER
+                                            OCCURS 0 WITH HEADER LINE.
+DATA: I_RETURN     LIKE BAPIRET2            OCCURS 0 WITH HEADER LINE.
+
+* Structures
+DATA: STR_HEADER   LIKE BAPI2017_GM_HEAD_01.
+
+* Constants
+
+* Variables
+TYPES: begin of gty_sernr,
+         rsnum type rsnum,
+* begin of change MOD-001
+*         rspos type rspos,
+         rspos type posnr,
+* end of change MOD-001
+         sernr type gernr,
+       end of gty_sernr,
+
+       gtty_sernr type STANDARD TABLE OF gty_sernr.
+
+DATA: X_GMCODE          LIKE BAPI2017_GM_CODE,
+      gt_sernr          type gtty_sernr,
+      LS_HEADER         TYPE BAPIIBDLVHDRCON,
+      LT_SERNR          TYPE STANDARD TABLE OF BAPIDLVITMSERNO,
+      LS_SERNR          TYPE BAPIDLVITMSERNO,
+      gv_input(12)      type c,
+      gv_wadat          type datum,
+      gv_auart          type aufart,
+      gv_rsnum          type rsdbs-rsnum,
+      gv_rspos          type rsdbs-rspos,
+      gv_bukrs          type bukrs,
+      gv_sernp          like marc-sernp,
+      gv_vbeln          like vbak-vbeln,
+      gv_objkey         type SWO_TYPEID,
+      gv_posnr          type posnr_va,
+      gv_matnr          type matnr,
+      gv_ytpdate2       type YSE_TPDATE,
+      gv_ytptime2       type YSE_TPTIME,
+      gv_tab_timestamp_1(14)  type c,
+      gv_tab_timestamp_2(14)  type c,
+      gv_mkpf_timestamp(14)   type c,
+      wa_post           type yse_aso_trfpost,
+      lt_vbeln          TYPE VBELN_VA OCCURS 0 WITH HEADER LINE.
+
+*----------------------------------------------------------------------*
+* Selection screen                                                     *
+*----------------------------------------------------------------------*
+* Layout of the selection screen
+SELECTION-SCREEN BEGIN OF BLOCK B01.
+SELECT-OPTIONS: S_MATNR  FOR mseg-MATNR,
+                S_WERKS  FOR mseg-WERKS,
+                s_bsart  for ekko-bsart.
+SELECTION-SCREEN END OF BLOCK B01.
+
+
+************************************************************************
+* START MAIN PROGRAM                                                   *
+************************************************************************
+START-OF-SELECTION.
+
+  PERFORM SELECT_DATA.
+
+  PERFORM PROCESS_DATA.
+
+
+************************************************************************
+* SUBROUTINES  LEVEL 01                                                *
+************************************************************************
+*----------------------------------------------------------------------*
+*   Form  SELECT_DATA                                                  *
+*----------------------------------------------------------------------*
+FORM SELECT_DATA.
+
+  REFRESH: i_mkpf, i_mseg.
+
+* Get last rundate/time from custom table (fields '2')
+  select single ytpdate2 ytptime2
+      into (gv_ytpdate2, gv_ytptime2)
+      from YSE_ASO_TRFPOST.
+
+* Select all relevant goods receipts
+  SELECT * INTO TABLE i_mkpf FROM MKPF
+      WHERE budat GE gv_ytpdate2
+        and blart EQ 'WE'.
+
+  if i_mkpf[] is initial.
+    write: text-t01.
+    exit.
+  endif.
+
+  concatenate gv_ytpdate2 gv_ytptime2 into gv_tab_timestamp_2.
+  loop at i_mkpf.
+    concatenate i_mkpf-budat i_mkpf-cputm into gv_mkpf_timestamp.
+    if gv_mkpf_timestamp < gv_tab_timestamp_2.
+      delete i_mkpf.
+    endif.
+  endloop.
+
+  if i_mkpf[] is initial.
+    write: text-t01.
+    exit.
+  endif.
+
+  select * into table i_mseg from MSEG
+      for all entries in i_mkpf
+      where mblnr eq i_mkpf-mblnr
+        and mjahr eq i_mkpf-mjahr
+        and matnr in s_matnr
+        and werks in s_werks
+        and bwart eq '101'
+        and sobkz eq 'E'.
+
+  loop at i_mseg.
+    select single * into i_ekko
+      from EKKO where ebeln eq i_mseg-ebeln
+                  and bsart in s_bsart.
+    if sy-subrc <> 0.
+      delete i_mseg.
+    endif.
+  endloop.
+
+  if i_mseg[] is initial.
+    write: text-t01.
+    exit.
+  endif.
+
+* Set timestamp in custom table (fields '1')
+  wa_post-mandt    = sy-mandt.
+  wa_post-repid    = sy-repid.
+  wa_post-ytpdate1 = sy-datum.
+  wa_post-ytptime1 = sy-uzeit.
+  wa_post-ytpdate2 = gv_ytpdate2.
+  wa_post-ytptime2 = gv_ytptime2.
+  update yse_aso_trfpost from wa_post.
+
+ENDFORM.                    " SELECT_DATA
+
+*----------------------------------------------------------------------*
+*   Form  PROCESS_DATA                                                 *
+*----------------------------------------------------------------------*
+FORM PROCESS_DATA.
+
+  LOOP AT i_mseg.
+*.. Get the (binary) link of the SEO to the Adv Ship SO
+    move i_mseg-nplnr to gv_objkey.
+    clear: lt_vbeln[], lt_vbeln.
+
+    select single auart bukrs
+      into (gv_auart, gv_bukrs)
+      from aufk where aufnr = i_mseg-nplnr.
+
+    CALL FUNCTION 'ISM4_GET_EXISTING_LINK'
+      EXPORTING
+        OBJECTKEY_IMP = gv_objkey
+        AUART_IMP     = gv_auart
+      TABLES
+        VBELN_EXP     = lt_vbeln
+      EXCEPTIONS
+        NONSENSE      = 1
+        OTHERS        = 2.
+
+*.. Check if a Adv Ship SO nr has been returned
+    loop at lt_vbeln.
+    endloop.
+
+*.. Get item number of Adv Ship SO via PO item
+    if sy-subrc eq 0.
+      clear: gv_rsnum, gv_rspos.
+
+      select single rsnum rspos into (gv_rsnum, gv_rspos)
+           from rsdbs where ebeln = i_mseg-ebeln
+                        and ebelp = i_mseg-ebelp.
+
+      if sy-subrc = 0.
+        select single posnr into gv_posnr
+          from VBAP where vbeln        = lt_vbeln
+                      and zz_aso_rsnum = gv_rsnum
+                      and zz_aso_rspos = gv_rspos.
+
+        if sy-subrc = 0.
+*........ Check on serial numbers
+          refresh gt_sernr.
+          select single sernp into gv_sernp
+            from marc where matnr = i_mseg-matnr
+                        and werks = i_mseg-werks.
+
+          if sy-subrc = 0 and gv_sernp = 'Z001'.
+            perform check_sernr.
+          endif.
+          PERFORM transfer_posting.
+        endif.
+      endif.
+    endif.
+  ENDLOOP.
+
+* Copy timestamp '1' to timestamp '2' in custom table
+  wa_post-ytpdate2 = wa_post-ytpdate1.
+  wa_post-ytptime2 = wa_post-ytptime1.
+  update yse_aso_trfpost from wa_post.
+
+ENDFORM.                    " PROCESS_DATA
+
+************************************************************************
+* SUBROUTINES  LEVEL 02                                                *
+************************************************************************
+*&---------------------------------------------------------------------*
+*&      Form  transfer_posting
+*&---------------------------------------------------------------------*
+FORM transfer_posting .
+
+  CLEAR: STR_HEADER.
+  CLEAR: I_ITEMS, I_RETURN, I_ITEMSSER[].
+  REFRESH: I_ITEMS, I_RETURN, I_ITEMSSER.
+
+* Check/Get new posting date
+  concatenate sy-datum gv_bukrs into gv_input.
+  CALL FUNCTION 'CONVERSION_EXIT_YPSTD_INPUT'
+    EXPORTING
+      INPUT     = gv_input
+    IMPORTING
+      OUTPUT    = gv_wadat
+    EXCEPTIONS
+      NOT_FOUND = 1
+      OTHERS    = 2.
+
+  IF SY-SUBRC = 0.
+    STR_HEADER-PSTNG_DATE = gv_wadat.
+  else.
+    STR_HEADER-PSTNG_DATE = SY-DATUM.
+  endif.
+
+  STR_HEADER-DOC_DATE   = SY-DATUM.
+
+  X_GMCODE           = '04'.
+  I_ITEMS-material   = I_mseg-matnr.
+  I_ITEMS-plant      = I_mseg-werks.
+  I_ITEMS-STGE_LOC   = I_mseg-LGORT.
+  I_ITEMS-MOVE_TYPE  = '413'.
+  I_ITEMS-spec_stock = 'E'.
+
+  I_ITEMS-ENTRY_QNT  = i_mseg-erfmg.
+
+* SDI
+  I_ITEMS-val_sales_ord  = I_mseg-kdauf.
+  I_ITEMS-val_s_ord_item = I_mseg-kdpos.
+
+* Adv.
+  I_ITEMS-sales_ord  = lt_vbeln.
+  I_ITEMS-s_ord_item = gv_posnr.
+
+  I_ITEMS-move_mat   = I_mseg-matnr.
+  I_ITEMS-move_plant = I_mseg-werks.
+  I_ITEMS-move_STLOC = I_mseg-LGORT.
+
+* begin of insert MOD-002
+  select single bukrs into gv_bukrs
+    from yse_cc_act_cost where bukrs = gv_bukrs.
+
+  if sy-subrc = 0.
+    i_items-batch = i_items-val_type = i_mseg-charg.
+  endif.
+* end of insert MOD-002
+  APPEND I_ITEMS.
+
+* Copy over the sernrs if any
+  loop at gt_sernr into ls_sernr.
+    move: '1'               to I_ITEMSSER-MATDOC_ITM,
+          ls_sernr-SERIALNO to I_ITEMSSER-SERIALNO.
+    append I_ITEMSSER.
+  endloop.
+
+  perform check_mat_locked.
+
+  CALL FUNCTION 'BAPI_GOODSMVT_CREATE'
+    EXPORTING
+      GOODSMVT_HEADER       = STR_HEADER
+      GOODSMVT_CODE         = X_GMCODE
+    TABLES
+      GOODSMVT_ITEM         = I_ITEMS
+      GOODSMVT_SERIALNUMBER = I_ITEMSSER
+      RETURN                = I_RETURN.
+
+  IF I_RETURN[] IS INITIAL.
+    CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+      EXPORTING
+        WAIT = 'X'.
+    WRITE:/ 'Transfer posting successful for GR', i_mseg-mblnr.
+  ELSE.
+    WRITE:/ 'Transfer posting failed for GR', i_mseg-mblnr.
+    LOOP AT I_RETURN.
+      WRITE:/ I_RETURN-MESSAGE.
+    ENDLOOP.
+
+    CLEAR I_RETURN[].
+    CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'
+      IMPORTING
+        RETURN = I_RETURN.
+  ENDIF.
+
+ENDFORM.                    "transfer_posting
+
+*&---------------------------------------------------------------------*
+*&      Form  check_mat_locked
+*&---------------------------------------------------------------------*
+*       Check if material is still locked by the previous GR
+*----------------------------------------------------------------------*
+FORM check_mat_locked.
+
+  data: lv_stop(1) type c.
+  constants: gc_time type num2 value 1.
+
+  clear lv_stop.
+
+  while lv_stop = ' '.
+    CALL FUNCTION 'ENQUEUE_EMMARCE'
+      EXPORTING
+        MODE_MARC      = 'E'
+        MANDT          = SY-MANDT
+        MATNR          = i_mseg-matnr
+        WERKS          = i_mseg-werks
+      EXCEPTIONS
+        FOREIGN_LOCK   = 1
+        SYSTEM_FAILURE = 2
+        OTHERS         = 3.
+
+    IF SY-SUBRC <> 0.
+      wait up to gc_time seconds.
+    ELSE.
+      lv_stop = 'X'.
+      CALL FUNCTION 'DEQUEUE_EMMARCE'
+        EXPORTING
+          MODE_MARC = 'E'
+          MANDT     = SY-MANDT
+          MATNR     = i_mseg-matnr
+          WERKS     = i_mseg-werks.
+    ENDIF.
+  endwhile.
+
+ENDFORM.                    "check_mat_locked
+
+*&---------------------------------------------------------------------*
+*&      Form  check_sernr
+*&---------------------------------------------------------------------*
+FORM check_sernr .
+
+  data: lv_vbeln type VBELN_VL,
+        lv_posnr type posnr_vl.
+  data: lv_obknr type OBJKNR,
+        lv_sernr type gernr,
+        ls_sernr type gty_sernr.
+
+* Get the delivery
+  select single vbeln posnr from lips into (lv_vbeln, lv_posnr)
+    where vgbel = i_mseg-ebeln
+      and vgpos = i_mseg-ebelp.
+
+* Get the obknr
+  select single obknr from ser01 into lv_obknr
+    where lief_nr = lv_vbeln
+      and posnr   = lv_posnr.
+
+* Now check if any sernr's added
+  if sy-subrc eq 0.
+    select single sernr from objk into lv_sernr
+      where obknr = lv_obknr.
+
+    if sy-subrc eq 0.
+      move: gv_rsnum to ls_sernr-rsnum,
+            gv_rspos to ls_sernr-rspos,
+            lv_sernr     to ls_sernr-sernr.
+      append ls_sernr to gt_sernr.
+    endif.
+  endif.
+
+ENDFORM.                    " check_sernr
+
+*Text symbol text£º
+
+*T01:No documents selected
+*Selection text£º
+*S_BSART:D       .
+*S_MATNR:D       .
+*S_WERKS:D       .

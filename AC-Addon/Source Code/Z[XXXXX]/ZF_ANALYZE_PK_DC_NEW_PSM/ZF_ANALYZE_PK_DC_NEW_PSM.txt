@@ -1,0 +1,1341 @@
+*&---------------------------------------------------------------------*
+*& Report  ZF_ANALYZE_PK_DC_NEW_PSM
+*&---------------------------------------------------------------------*
+*& latest Version 4 !!! 26 February 2009
+*& o  Fix issues with memory consumption
+*&    (runtime error TSV_TNEW_PAGE_ALLOC_FAILED
+*&---------------------------------------------------------------------*f
+
+REPORT  zf_analyze_pk_dc_newgl LINE-SIZE 120 NO STANDARD PAGE HEADING.
+
+
+TABLES: bkpf, tbsl, fmglflexa.
+
+
+TYPES: BEGIN OF items.
+        INCLUDE STRUCTURE fmglflexa.
+TYPES: bschl_new TYPE fmglflexa-bschl.
+TYPES: marker TYPE usnam.
+TYPES: END OF items,
+       tt_items TYPE TABLE OF items.
+
+DATA  BEGIN OF ls_bkpf.
+DATA    bukrs     TYPE bukrs.
+DATA    belnr     TYPE belnr_d.
+DATA    gjahr     TYPE ryear.
+DATA    awtyp     TYPE awtyp.
+DATA    bstat     TYPE bstat_d.
+DATA    tcode     TYPE tcode.
+DATA  END OF ls_bkpf.
+DATA  lt_bkpf LIKE STANDARD TABLE OF ls_bkpf.
+
+DATA: lt_bseg TYPE TABLE OF bseg,
+      ls_bseg TYPE bseg,
+      lt_fmglflexa TYPE TABLE OF fmglflexa,
+      ls_fmglflexa TYPE fmglflexa,
+      lt_items TYPE TABLE OF items,
+      lt_itemsshkz TYPE TABLE OF items,
+      lt_belegshkzg LIKE lt_itemsshkz,
+      lt_itemsswitch TYPE TABLE OF items,
+      lt_items_q_only TYPE TABLE OF items,
+      ls_items TYPE items,
+      cnt TYPE i,
+      cntshkz TYPE i,
+      cnt_cw TYPE i,
+      lv_text TYPE string,
+      lv_reset,
+      lv_update,
+      lv_nignore,
+      lv_del,
+      lv_delcnt LIKE sy-dbcnt,
+      lv_shkz_ok TYPE c,
+      lv_switch_ok TYPE c,
+      lv_update_pk TYPE c,
+      lv_update_sh TYPE c,
+      lv_update_zero TYPE c,
+      lv_q_ignore TYPE c,
+      lv_q_only TYPE c,
+      cntswitch TYPE i,
+      cntshkzcp TYPE i,
+      cnt_qline TYPE i,
+      cnt_qbuzei TYPE i,
+      cnt_qnomkpf TYPE i,
+      ld_zero_itemsshkz TYPE i,
+      ld_zero_fmglflexa TYPE i,
+      anz TYPE p,
+      expert TYPE boole_d.
+
+
+SELECT-OPTIONS: s_bukrs FOR bkpf-bukrs OBLIGATORY,
+                s_gjahr FOR bkpf-gjahr OBLIGATORY,
+                s_belnr FOR bkpf-belnr,
+                s_monat FOR bkpf-monat.
+
+
+SELECTION-SCREEN SKIP.
+
+SELECTION-SCREEN BEGIN OF BLOCK 001 WITH FRAME TITLE text-s01.
+PARAMETERS: p_initpk  AS CHECKBOX DEFAULT 'X' MODIF ID u02,
+* allow initial posting keys in new GL - should allways
+* be activated as initial posting keys is normal (document splitting)
+            p_show_q AS CHECKBOX DEFAULT ' ' MODIF ID u02,
+* Saldonnullverrechnugszeilen, die nur Mengen beinhalten nicht ausgeben
+            p_ign_ok AS CHECKBOX DEFAULT 'X' MODIF ID u02.
+* Saldonullverrechnungszeilen aus xnegp-Belegen, die nicht nach xnegp-Logik
+* erzeugt sind, werden ignoriert (Belege, die Vor Einbau HW 1024404 per
+* SAPMF05A gebucht wurden und f¨¹r alle BSEG-Zeilen XNEGP gesetzt haben
+* theoretisch (bisher) waren nur Stornos betroffen.
+SELECTION-SCREEN END OF BLOCK 001.
+
+
+SELECTION-SCREEN BEGIN OF BLOCK 002 WITH FRAME TITLE text-s02.
+PARAMETERS: p_update AS CHECKBOX MODIF ID u01,
+            p_clnt(3) TYPE c DEFAULT 'GLF' MODIF ID u01.
+SELECTION-SCREEN END OF BLOCK 002.
+
+SELECTION-SCREEN BEGIN OF BLOCK 003 WITH FRAME TITLE text-s03.
+PARAMETERS: p_dele  AS CHECKBOX MODIF ID d01,
+            p_cl_d(3) TYPE c    MODIF ID d01.
+SELECT-OPTIONS:
+            s_ledger      FOR bkpf-rldnr MODIF ID d01,
+            s_poper       FOR fmglflexa-poper MODIF ID d01.
+SELECTION-SCREEN END OF BLOCK 003.
+
+AT SELECTION-SCREEN OUTPUT.
+
+  GET PARAMETER ID 'EXP' FIELD expert. " eingentlich PArameter ID der Recherche
+
+
+  IF expert IS INITIAL.
+    IF lv_del IS INITIAL.
+      CLEAR: p_dele.
+    ENDIF.
+    IF lv_update IS INITIAL.
+      CLEAR: p_update.
+    ENDIF.
+    IF lv_nignore IS INITIAL.
+      p_initpk = 'X'. " initiale Buchungsschl¨¹ssel ignorieren
+      p_show_q = ' '.   " Mengensaldonullzeilen nicht ausgeben
+    ENDIF.
+  ENDIF.
+
+  LOOP AT SCREEN.
+    IF screen-group1 = 'U01'.
+      IF lv_update = 'X'.
+        screen-invisible = '0'.
+        screen-active    = '1'.
+      ELSE.
+        screen-invisible = '1'.
+        screen-active    = '0'.
+      ENDIF.
+      MODIFY SCREEN.
+    ENDIF.
+    IF screen-group1 = 'D01'.
+      IF lv_del = 'X'.
+        screen-invisible = '0'.
+        screen-active    = '1'.
+      ELSE.
+        screen-invisible = '1'.
+        screen-active    = '0'.
+      ENDIF.
+      MODIFY SCREEN.
+    ENDIF.
+    IF screen-group1 = 'U02'.
+      IF lv_nignore = 'X'.
+        screen-invisible = '0'.
+        screen-active    = '1'.
+      ELSE.
+        screen-invisible = '1'.
+        screen-active    = '0'.
+      ENDIF.
+      MODIFY SCREEN.
+    ENDIF.
+
+  ENDLOOP.
+
+AT SELECTION-SCREEN.
+  IF  NOT p_clnt IS INITIAL
+  AND NOT p_update IS INITIAL.
+    lv_text = 'Backup client & has not an alpha numeric name!'.
+*   FIND REGEX '[[:alpha:]]' IN p_clnt.
+*    IF sy-subrc <> 0.
+    IF p_clnt >= '000' AND p_clnt <= '999'.
+      REPLACE '&' IN lv_text WITH p_clnt.
+      MESSAGE lv_text TYPE 'E'.
+    ENDIF.
+  ENDIF.
+  IF NOT p_dele IS INITIAL.
+    IF  NOT p_cl_d IS INITIAL.
+      lv_text =
+      'Backup client & to delete has not an alpha numeric name!'.
+*      FIND '[[:alpha:]]' IN p_cl_d.
+*      IF sy-subrc <> 0.
+      IF p_cl_d >= '000' AND p_cl_d <= '999'.
+        REPLACE '&' IN lv_text WITH p_cl_d.
+        MESSAGE lv_text TYPE 'E'.
+      ENDIF.
+    ELSE.
+      lv_text = 'NO Backup client is specified to delete!'.
+      MESSAGE lv_text TYPE 'E'.
+    ENDIF.
+  ENDIF.
+  IF sy-ucomm = 'SAPONLY'.
+    lv_update = 'X'.
+  ENDIF.
+  IF sy-ucomm = 'DELCLNT'.
+    lv_del = 'X'.
+  ENDIF.
+  IF sy-ucomm = 'ADDCH'.
+    lv_nignore = 'X'. "inital posting keys or Nur-Mengen-Saldonullzeilen
+  ENDIF.
+
+
+START-OF-SELECTION.
+
+  SELECT
+    bukrs belnr gjahr
+    awtyp bstat tcode
+    FROM bkpf INTO TABLE lt_bkpf
+    WHERE     bukrs IN s_bukrs
+      AND     belnr IN s_belnr
+      AND     gjahr IN s_gjahr
+      AND     monat IN s_monat
+      AND   ( bstat = space
+      OR      bstat = 'L' ).
+
+  IF sy-subrc NE 0.
+    FORMAT COLOR 6.
+    WRITE:/ sy-vline NO-GAP,
+           'No documents found at all. - Check selection CC / Year.',
+      105 sy-vline NO-GAP.
+    ULINE (105).
+    ULINE (105).
+  ENDIF.
+
+*----- process selected documents
+  LOOP AT lt_bkpf INTO ls_bkpf.
+**---- get new GL tables
+** --- restriction FMGLFLEXA is used all ledgers
+    REFRESH lt_fmglflexa.
+    SELECT * FROM fmglflexa INTO TABLE lt_fmglflexa
+      WHERE rbukrs EQ ls_bkpf-bukrs
+        AND  belnr EQ ls_bkpf-belnr
+        AND  gjahr EQ ls_bkpf-gjahr.
+
+    SORT lt_fmglflexa BY rbukrs ryear belnr buzei rldnr docnr docln.
+    LOOP AT lt_fmglflexa INTO ls_fmglflexa.
+
+*** Check wechselnde Betragsart in einer Buchungszeile
+* TSL kann - wegen Salden nur in HW - 0 sein, WSL ist dann aber gef¨¹llt.
+* Also pr¨¹fen wir ausgehen von WSL, TSL ignorieren wir und pr¨¹fen nur indirekt.
+* Alternativ k#nnte es eine FBB1-Buchung sein, bei welcher nur HSL ¨¹bergeben
+* wurde.
+* der Rest wird eh errechnet - entweder ausgehend von der Transaktionsw#hrung
+* oder aus der Hausw#hrung. Da die Betr#ge die in diesen W#hrungen durch die
+* W#hrungsumrechnung erzeugt wurden, sind immer proportional zu den
+* Ausgangsbetr#gen ... d.h. in den Parallelw#hrungen kann sich eigentlich nur
+* das wiederspieglen, was bereits in WSL oder HSL falsch ist...
+* allerdigns wenn die Ausgangsw#hrung zur Umrechnung recht schwach ist, kann es
+* Situationen geben, in welchen es in Parallelw#hrung (Hartw#hrung) Nullbetr#ge
+* gibt. Durch Verdichtung k#nnte dann auch dieses wechselnde Vorzeichen in
+* diesen Parallelw#hrungszeilen falsch sitzen. Das kann aber nur sein,
+* wenn ¨¹ber Zeilen verdichtet wurde, die falsches Soll-Habenkennzeichen hatten.
+* Da das aber nicht unwahrscheinlich ist, m¨¹ssen wir auch damit rechnen.
+* Doch Achtung es k#nnte ja TP aktiv sein, da w#re es dankbar, dass es
+* Belegzeilen gibt, die sowohl in HW als auch WSL = 0 sind, weil nur TP
+* fortgeschreiben wird - Folge: ALLES pr¨¹fen.
+
+      lv_switch_ok = 'X'. "keine wechselnde Betragsart (+ -) in einer Zeile
+      CLEAR lv_q_only. " reine Mengenzeile
+      CLEAR lv_q_ignore. " ignorieren von MENGEN-Zeilen mit Buzei <> '000'
+
+      IF ls_fmglflexa-wsl > 0.
+        IF NOT (     ls_fmglflexa-hsl >= 0
+                 AND ls_fmglflexa-ksl >= 0
+                 AND ls_fmglflexa-osl >= 0
+                 AND ls_fmglflexa-tsl >= 0 ).
+          CLEAR lv_switch_ok.
+        ENDIF.
+      ELSE.
+        IF ls_fmglflexa-wsl < 0.
+          IF NOT (     ls_fmglflexa-hsl <= 0
+                   AND ls_fmglflexa-ksl <= 0
+                   AND ls_fmglflexa-osl <= 0
+                   AND ls_fmglflexa-tsl <= 0 ).
+            CLEAR lv_switch_ok.
+          ENDIF.
+        ELSE.                                               "WSL = 0
+          IF ls_fmglflexa-hsl > 0.
+            IF NOT (     ls_fmglflexa-ksl >= 0
+                     AND ls_fmglflexa-osl >= 0
+                     AND ls_fmglflexa-tsl >= 0 ).
+              CLEAR lv_switch_ok.
+            ENDIF.
+          ELSE.
+            IF ls_fmglflexa-hsl < 0 .
+              IF NOT (     ls_fmglflexa-ksl <= 0
+                       AND ls_fmglflexa-osl <= 0
+                       AND ls_fmglflexa-tsl <= 0 ).
+                CLEAR lv_switch_ok.
+              ENDIF.
+            ELSE. "HSL und WSL sind 0, (damit automatisch auch TSL)
+* TSL m¨¹#te korrekt sein ausser: Saldonullverechnungszeilen wg. einz. Zeilen
+* mit Saldo-nur-in HW ...k#nnte es sein, dass kontierungsabh. Saldonull-
+* Zeilen nur in dieser W#hrung auftauchen. Also auch pr¨¹fen:
+              IF ls_fmglflexa-tsl > 0.
+                IF NOT (     ls_fmglflexa-ksl >= 0
+                         AND ls_fmglflexa-osl >= 0 ).
+                  CLEAR lv_switch_ok.
+                ENDIF.
+              ELSE.
+                IF ls_fmglflexa-tsl < 0 .
+                  IF NOT (     ls_fmglflexa-ksl <= 0
+                           AND ls_fmglflexa-osl <= 0
+                           AND ls_fmglflexa-tsl <= 0 ).
+                    CLEAR lv_switch_ok.
+                  ENDIF.
+                ELSE. "HSL und WSL und TSL sind 0,
+                  IF ( ls_fmglflexa-osl = 0 AND ls_fmglflexa-ksl  = 0 ).
+* can't be - w#re reine Nullbetragszeile ... aber man findet es doch:
+                    lv_q_only = 'X'.
+                    IF ls_fmglflexa-buzei = '000' .
+                      IF ls_fmglflexa-linetype = '01001'.
+* Saldonullverrechnungszeile nur  f¨¹r die Menge ??? - raus in den
+* Backupmandanten.
+* ... aber erst m#chte ich eine solche Zeile mal gesehen haben
+* das hat es noch nie gegeben.
+                        ls_items-marker = '#S#Null#' .
+                      ELSEIF ls_fmglflexa-linetype = ' ' AND ls_bkpf-awtyp = 'MKPF'.
+* das m¨¹#te eine KSTAT = 'U'-Zeile aus HW  886382  sein ... -
+* raus damit in den Backupmandanten
+* allerdings haben wir linetype ' ' auch bei migrierten Belegen ...
+* k#nnte also auch Saldonullverrechungszeile eines migrierten Phase 0-Beleg
+* oder migrierter Phase 1-Beleg ohne Belegaufteilugnsinfo sein
+
+                        ls_items-marker = '#U#Kstat' .
+                      ELSE.
+                        ls_items-marker = 'U?NoMKPF'. "nie gesehen. kein Update.
+                      ENDIF.
+* und f¨¹r den Fall, dass DOCH jemand 000 Zeilen ohne Betrag sehen m#chte: Flag.
+                    ELSE.
+                      ls_items-marker = '#?#Buzei' .
+* sehr fragw¨¹rdig ... eine reine Mengenzeile, zu der es eine
+* BSEG geben soll (weil BUZEI <> 000 - das hatten wir noch NIE - anschauen.
+* daher lv_q_ignore = ' '. belassen ... so etwas darf man nicht ignorieren.
+* hat evtl. jemand nachtr#glich Parallelw#hrung entfernt (SLO-Umstellung?)
+* die d¨¹rfen wir nicht l#schen ... daher in Standardausgabe ignorieren:
+                      lv_q_ignore ='X'.
+                      IF p_show_q = 'X'.
+                        CLEAR lv_q_ignore.
+                      ENDIF.
+                    ENDIF.
+                  ELSEIF NOT (    ( ls_fmglflexa-ksl < 0 AND ls_fmglflexa-osl <= 0 )
+                           OR ( ls_fmglflexa-osl < 0 AND ls_fmglflexa-ksl <= 0 )
+* OR ( ls_FMGLFLEXA-osl = 0 AND ls_FMGLFLEXA-ksl  = 0 ) " can't be - w#re reine Nullzeile
+                           OR ( ls_fmglflexa-ksl > 0 AND ls_fmglflexa-osl >= 0 )
+                           OR ( ls_fmglflexa-osl > 0 AND ls_fmglflexa-ksl >= 0 ) ).
+                    CLEAR lv_switch_ok.
+                  ENDIF.
+                ENDIF.
+              ENDIF.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+***
+      IF lv_switch_ok NE 'X'.
+
+        MOVE-CORRESPONDING ls_fmglflexa TO ls_items.
+        APPEND ls_items TO lt_itemsswitch.
+* zur Korrektur mu# man diese Belegzeile in 2 aufteilen ...
+* eine Soll und eine Haben-Zeile das ist nicht einfach ...
+* es ist nicht immer die Saldonullverrechnungszeile betroffen ....
+* f¨¹r die 2. Zeile brauchen wir neuen Z#hler in der  DOCLN ... zu korrigierende
+* Zeile mu# per Fuba f¨¹r Zeileweisen Storno ins Nirvana (und im Backupclient
+* gesichert werden ... man wei# ja nie!) Bsp: FBB1-Buchung - Split eines Kredi:
+* 3 Basiszeilen '2 Basiszeilen entgegehgesetzter BSCHL und entgegengesetzter
+* W#hrunsbetr#ge (ein#mlich TSL = 0, einmal HSL = 0) kreuzweise kontiert'
+* die neu zu erzeugenden m¨¹ssen mit zeilenweiser Verbuchung weggeschreiben
+* werden... aber erst mal ausgeben ............................
+        ADD 1 TO cntswitch.
+* Zeile von weiterer Verprobung ausschlie#en - n#chste Zeile im Loop.
+
+      ELSEIF lv_q_only = 'X' .
+        IF lv_q_ignore = ' '.
+          MOVE-CORRESPONDING ls_fmglflexa TO ls_items.
+          APPEND ls_items TO lt_items_q_only.
+          IF ls_items-marker NE '#?#Buzei'.
+            IF ls_items-marker NE 'U?NoMKPF'.
+* '#S#Null#' '#U#Kstat' oder .
+              ADD 1 TO cnt_qline.
+            ELSE.
+              ADD 1 TO cnt_qnomkpf.
+            ENDIF.
+          ELSE.
+            ADD 1 TO cnt_qbuzei . "#?#Buzei or kein MKPF
+          ENDIF.
+        ENDIF.
+      ELSE.
+* nur wenn okay Zeile auch hinsichtlich SHKZG bzw. BSCHL verproben
+* f¨¹r lv_q_ignore = 'X'. passiert im folgenden eh (noch nichts), da MSL
+* nicht verprobt wird.
+
+***-- balance zero items -> XNEGP needs to be checked
+        IF ( ls_fmglflexa-buzei    EQ '000' AND
+             ls_fmglflexa-linetype EQ '01001' ).
+          CLEAR ls_bseg.
+*** if xnegp in all items is set then balance zero items negative
+          DATA: lv_xnegp.
+          lv_xnegp = 'X'.
+
+          IF ls_bkpf-bstat <> 'L'.
+            SELECT * FROM bseg INTO ls_bseg
+              WHERE bukrs = ls_fmglflexa-rbukrs
+                AND belnr = ls_fmglflexa-belnr
+               AND gjahr = ls_fmglflexa-gjahr.
+              IF ls_bseg-xnegp IS INITIAL.
+                CLEAR lv_xnegp.
+                EXIT. "in case of 01001 it would only be interessting
+*               if ALL lines are assigned to negative posting indicator
+              ENDIF.
+            ENDSELECT.
+            ASSERT sy-subrc = 0.
+          ELSE.
+            SELECT * FROM bseg_add INTO CORRESPONDING FIELDS OF ls_bseg
+             WHERE bukrs = ls_fmglflexa-rbukrs
+              AND belnr = ls_fmglflexa-belnr
+              AND gjahr = ls_fmglflexa-gjahr.
+              IF ls_bseg-xnegp IS INITIAL.
+                CLEAR lv_xnegp.
+                EXIT.
+              ENDIF.
+            ENDSELECT.
+            ASSERT sy-subrc = 0.
+          ENDIF.
+
+          IF lv_xnegp IS INITIAL.
+            IF ( (   ls_fmglflexa-tsl < 0 OR ls_fmglflexa-hsl < 0
+                    OR ls_fmglflexa-ksl < 0 OR ls_fmglflexa-osl < 0
+                    OR ls_fmglflexa-wsl < 0 )
+                  AND  ls_fmglflexa-drcrk <> 'H' )
+              OR
+                 ( ( ls_fmglflexa-tsl > 0 OR ls_fmglflexa-hsl > 0
+                    OR ls_fmglflexa-ksl > 0 OR ls_fmglflexa-osl > 0
+                    OR ls_fmglflexa-wsl > 0 )
+                  AND  ls_fmglflexa-drcrk <> 'S' ).
+* falsches SHKZG in Saldonullverrechnungszeile.
+              MOVE-CORRESPONDING ls_fmglflexa TO ls_items.
+              CLEAR ls_items-bschl_new.
+              APPEND ls_items TO lt_itemsshkz.
+              ADD 1 TO cntshkz.
+            ELSE. " SHKZG okay, check BSCHL
+****--  non negative posting: 40 -> 'S' 50 -> 'H'
+              IF (   ls_fmglflexa-bschl = '40'
+                  OR ( ls_fmglflexa-bschl = ' ' AND p_initpk = ' ' ) )
+                 AND ls_fmglflexa-drcrk = 'H'.
+                CLEAR ls_items.
+                MOVE-CORRESPONDING ls_fmglflexa TO ls_items.
+                ls_items-bschl_new = '50'.
+                APPEND ls_items TO lt_items.
+                ADD 1 TO cnt.
+              ELSEIF (   ls_fmglflexa-bschl = '50'
+                      OR ( ls_fmglflexa-bschl = ' ' AND p_initpk = ' ' ) )
+                    AND ls_fmglflexa-drcrk = 'S'.
+                CLEAR ls_items.
+                MOVE-CORRESPONDING ls_fmglflexa TO ls_items.
+                ls_items-bschl_new = '40'.
+                APPEND ls_items TO lt_items.
+                ADD 1 TO cnt.
+              ELSE.
+**          item correct
+              ENDIF.
+            ENDIF.
+          ELSE. " lv_xnegp = 'X' - alle Zeilen des Belegs kamen aus
+*               Negativbuchung, daher wird auch die Saldo-Null-Verrechnungszeile
+*               mit Negativbuchungslogik fortgeschrieben.
+
+            IF ( (   ls_fmglflexa-tsl < 0 OR ls_fmglflexa-hsl < 0
+            OR ls_fmglflexa-ksl < 0 OR ls_fmglflexa-osl < 0
+            OR ls_fmglflexa-wsl < 0 )
+          AND  ls_fmglflexa-drcrk <> 'S' )
+      OR
+         ( ( ls_fmglflexa-tsl > 0 OR ls_fmglflexa-hsl > 0
+            OR ls_fmglflexa-ksl > 0 OR ls_fmglflexa-osl > 0
+            OR ls_fmglflexa-wsl > 0 )
+          AND  ls_fmglflexa-drcrk <> 'H' ).
+
+* SHKZG bei Saldo-Nullverrechnungszeile falsch sofern Storno aus SAPMF05a
+* war evtl. HW 1024404 nicht drinne dann m¨¹#te allerdings f¨¹r alle Saldonull-
+* Verrechnungszeilen das Soll-Habenkennzeichen falsch gesetzt sein.
+
+
+              MOVE-CORRESPONDING ls_fmglflexa TO ls_items.
+              IF ls_bkpf-tcode = 'FB08' OR ls_bkpf-tcode = 'FBU8'.
+                ls_items-bschl_new = 'ST'. " Stornomarkierung wg. Check 1024404
+              ENDIF.
+              APPEND ls_items TO lt_itemsshkz.
+              CLEAR ls_items-bschl_new.    " ... just to be sure....
+              ADD 1 TO cntshkz.
+
+            ELSE. " SHKZG okay - check BSCHL
+****--  negative posting: 40 - 'H' 50 - 'S'
+              IF (   ls_fmglflexa-bschl = '40'
+                  OR ( ls_fmglflexa-bschl = ' ' AND p_initpk = ' ' ) )
+                 AND ls_fmglflexa-drcrk = 'S'.
+                CLEAR ls_items.
+                MOVE-CORRESPONDING ls_fmglflexa TO ls_items.
+                ls_items-bschl_new = '50'.
+                APPEND ls_items TO lt_items.
+                ADD 1 TO cnt.
+              ELSEIF (   ls_fmglflexa-bschl = '50'
+                      OR ( ls_fmglflexa-bschl = ' ' AND p_initpk = ' ' ) )
+                      AND ls_fmglflexa-drcrk = 'H'.
+                CLEAR ls_items.
+                MOVE-CORRESPONDING ls_fmglflexa TO ls_items.
+                ls_items-bschl_new = '40'.
+                APPEND ls_items TO lt_items.
+                ADD 1 TO cnt.
+              ELSE.
+*           item correct
+              ENDIF.
+            ENDIF.
+          ENDIF.
+        ELSE.
+*** items with corresponding BSEG are checked against BSEG
+          IF ls_bseg-bukrs <> ls_fmglflexa-rbukrs
+          OR ls_bseg-gjahr <> ls_fmglflexa-gjahr
+          OR ls_bseg-belnr <> ls_fmglflexa-belnr
+          OR ls_bseg-buzei <> ls_fmglflexa-buzei.
+            PERFORM select_bseg.
+          ENDIF.
+
+          IF ls_bseg-xnegp = 'X'.
+            IF ( (   ls_fmglflexa-tsl < 0 OR ls_fmglflexa-hsl < 0
+                  OR ls_fmglflexa-ksl < 0 OR ls_fmglflexa-osl < 0
+                  OR ls_fmglflexa-wsl < 0 )
+                AND  ls_fmglflexa-drcrk <> 'S' )
+            OR
+               ( ( ls_fmglflexa-tsl > 0 OR ls_fmglflexa-hsl > 0
+                  OR ls_fmglflexa-ksl > 0 OR ls_fmglflexa-osl > 0
+                  OR ls_fmglflexa-wsl > 0 )
+                AND  ls_fmglflexa-drcrk <> 'H' ).
+
+**--- Meldung?
+              MOVE-CORRESPONDING ls_fmglflexa TO ls_items.
+              IF (   ls_fmglflexa-tsl = 0 AND ls_fmglflexa-hsl = 0
+                 AND ls_fmglflexa-ksl = 0 AND ls_fmglflexa-osl = 0 ).
+                "Problem korrigiert mit HW 992566 -> only WSL filled -> needs to be 'H'
+                "instead of actual 'S' (based on 0 is defined to be 'S')
+                ls_items-bschl_new = '+'.
+                ADD 1 TO cntshkzcp. "correction of SHKZG possible
+              ELSE.
+                CLEAR ls_items-bschl_new.
+              ENDIF.
+
+              APPEND ls_items TO lt_itemsshkz.
+              ADD 1 TO cntshkz.
+              CONTINUE.
+
+*   lv_shkzg_ok = ' '.
+            ENDIF.
+          ELSE.
+            IF ( (   ls_fmglflexa-tsl < 0 OR ls_fmglflexa-hsl < 0
+                  OR ls_fmglflexa-ksl < 0 OR ls_fmglflexa-osl < 0
+                  OR ls_fmglflexa-wsl < 0 )
+                AND  ls_fmglflexa-drcrk <> 'H' )
+            OR
+               ( ( ls_fmglflexa-tsl > 0 OR ls_fmglflexa-hsl > 0
+                  OR ls_fmglflexa-ksl > 0 OR ls_fmglflexa-osl > 0
+                  OR ls_fmglflexa-wsl > 0 )
+                AND  ls_fmglflexa-drcrk <> 'S' ).
+
+**--- Meldung?
+              MOVE-CORRESPONDING ls_fmglflexa TO ls_items.
+              IF (   ls_fmglflexa-tsl = 0 AND ls_fmglflexa-hsl = 0
+              AND     ls_fmglflexa-ksl = 0 AND ls_fmglflexa-osl = 0 ).
+                "Problem korrigiert mit HW 992566 -> only WSL filled -> needs to be 'H'
+                "instead of actual 'S' (based on 0 is defined to be 'S')
+                ls_items-bschl_new = '+'.
+                ADD 1 TO cntshkzcp. "correction of SHKZG possible
+              ELSE.
+                CLEAR ls_items-bschl_new.
+              ENDIF.
+              APPEND ls_items TO lt_itemsshkz.
+              ADD 1 TO cntshkz.
+              CONTINUE.
+            ENDIF.
+          ENDIF.
+
+
+**** ---- bseg-shkzg * bseg-xnegp = FMGLFLEXA-shkzg
+**** ---- get shkzg from totals:
+          IF (    ls_fmglflexa-drcrk =  ls_bseg-shkzg
+              AND ls_fmglflexa-bschl <> ls_bseg-bschl
+              AND ls_fmglflexa-bschl <> ' ' )
+             OR
+            (     ls_fmglflexa-drcrk =  ls_bseg-shkzg
+              AND ls_fmglflexa-bschl <> ls_bseg-bschl
+              AND p_initpk = ' ').
+            CLEAR ls_items.
+            MOVE-CORRESPONDING ls_fmglflexa TO ls_items.
+            ls_items-bschl_new = ls_bseg-bschl.
+            APPEND ls_items TO lt_items.
+            ADD 1 TO cnt.
+          ELSEIF  ls_fmglflexa-drcrk <> ls_bseg-shkzg.
+            SELECT SINGLE * FROM tbsl WHERE bschl = ls_bseg-bschl.
+            IF sy-subrc = 0.
+              IF     ls_fmglflexa-bschl <> tbsl-stbsl
+                 AND (     ls_fmglflexa-bschl <> ' '
+                       OR  p_initpk = ' ').
+                CLEAR ls_items.
+                MOVE-CORRESPONDING ls_fmglflexa TO ls_items.
+                ls_items-bschl_new = tbsl-stbsl.
+                APPEND ls_items TO lt_items.
+                ADD 1 TO cnt.
+              ENDIF.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+    ENDLOOP.
+
+* wenn lt_itemsshkz mit ls_bkpf-bukrs, ls_bkpf-belnr, ls_bkpf-gjahr
+* und bschl_new = 'ST' der Anzahl von
+* lt_FMGLFLEXA mit BUZEI '000' und linetype 01001 entspricht
+* jeweils unabh#ngig von den Ledgern
+* dann f¨¹r entsprechende Eintr#ge lt_itemsshkz bschl_new von 'ST' nach 'OK'
+* #ndern - OK entspricht HW 1024404
+
+    CLEAR ld_zero_fmglflexa.
+    LOOP AT lt_fmglflexa TRANSPORTING NO FIELDS WHERE buzei = '000'
+                                                  AND linetype = '01001'.
+      ADD 1 TO ld_zero_fmglflexa.
+    ENDLOOP.
+    CHECK ld_zero_fmglflexa GE 1.
+
+    CLEAR ld_zero_itemsshkz.
+    LOOP AT lt_itemsshkz TRANSPORTING NO FIELDS
+                        WHERE rbukrs = ls_bkpf-bukrs
+                           AND belnr = ls_bkpf-belnr
+                           AND gjahr = ls_bkpf-gjahr
+                           AND bschl_new = 'ST'.
+      ADD 1 TO ld_zero_itemsshkz.
+    ENDLOOP.
+
+    IF ld_zero_itemsshkz EQ ld_zero_fmglflexa.
+
+      LOOP AT lt_itemsshkz INTO ls_items
+                           WHERE rbukrs = ls_bkpf-bukrs
+                              AND belnr = ls_bkpf-belnr
+                              AND gjahr = ls_bkpf-gjahr
+                              AND bschl_new = 'ST'.
+        ls_items-bschl_new = 'OK'.
+
+        IF p_ign_ok <> 'X'.
+          MODIFY lt_itemsshkz FROM ls_items INDEX sy-tabix.
+        ELSE.
+          DELETE lt_itemsshkz INDEX sy-tabix.
+        ENDIF.
+      ENDLOOP.
+
+      IF p_ign_ok ='X'.
+        cntshkz = cntshkz - ld_zero_itemsshkz.
+      ENDIF.
+
+    ENDIF.
+
+  ENDLOOP.
+
+***
+  IF  NOT p_dele IS INITIAL
+  AND NOT p_cl_d IS INITIAL.
+    DELETE FROM fmglflexa CLIENT SPECIFIED
+           WHERE rclnt = p_cl_d
+           AND   rldnr  IN s_ledger
+           AND   rbukrs IN s_bukrs
+           AND   belnr  IN s_belnr
+           AND   gjahr  IN s_gjahr
+           AND   poper  IN s_poper.
+    lv_delcnt = sy-dbcnt.
+    COMMIT WORK.
+  ENDIF.
+
+  IF      p_update = 'X'
+  AND NOT p_clnt IS INITIAL.
+* steht schon eine Zeile zu diesem Beleg im Backupmandanten ???
+    lv_update_pk = 'X'.
+    lv_update_sh = 'X'.
+    lv_update_zero = 'X'.
+    DESCRIBE TABLE lt_items.
+    IF sy-tfill > 0.
+      PERFORM check_clnt TABLES   lt_items
+                         CHANGING lv_update_pk.
+    ENDIF.
+
+    DESCRIBE TABLE lt_itemsshkz.
+    IF sy-tfill > 0.
+      PERFORM check_clnt TABLES   lt_itemsshkz
+                         CHANGING lv_update_sh.
+    ENDIF.
+
+    DESCRIBE TABLE lt_items_q_only.
+    IF sy-tfill > 0 .
+      PERFORM check_clnt TABLES   lt_items_q_only
+                         CHANGING lv_update_zero.
+
+    ENDIF.
+  ENDIF.
+
+
+
+************************* output
+
+  IF cntswitch > 0.
+
+    FORMAT COLOR 6.
+    ULINE (105).
+
+    WRITE:/ sy-vline NO-GAP,
+    'SERIOUS ISSUE: Following Lines with changing amount type',
+    105 sy-vline NO-GAP.
+
+    WRITE:/  sy-vline NO-GAP, 105 sy-vline NO-GAP.
+
+    WRITE:/  sy-vline NO-GAP,
+    'Contact SAP Support for further analyzsis!',
+    105 sy-vline NO-GAP.
+
+    WRITE:/  sy-vline NO-GAP, 105 sy-vline NO-GAP.
+
+    WRITE:105 sy-vline NO-GAP.
+
+    WRITE:/ sy-vline NO-GAP,
+            5 'ERRORNOUS ITEMS with changing amount type:', cntswitch,
+            105 sy-vline NO-GAP.
+    WRITE:/ sy-vline NO-GAP,
+          5 'No automatic correction possible - further analysis necessary!',
+          105 sy-vline NO-GAP.
+    WRITE:/ sy-vline NO-GAP, 105 sy-vline NO-GAP.
+    WRITE:/ sy-vline NO-GAP,
+           (5) 'RYEAR',
+          (10) 'DOCNR',
+           (5) 'RLDNR',
+           (5) 'BUKRS',
+           (6) 'DOCLN',
+          (10) 'RACCT',
+           (5) 'GJAHR',
+          (10) 'BELNR',
+           (5) 'BUZEI',
+           (4) 'DRCRK',
+           (6) ' ',
+           (6) ' ',
+          (15) ' ',
+          105 sy-vline NO-GAP.
+    NEW-LINE.
+    ULINE (105).
+
+
+    SORT lt_itemsswitch BY rbukrs ryear belnr buzei rldnr.
+
+    LOOP AT lt_itemsswitch INTO ls_items.
+      FORMAT COLOR 2 INTENSIFIED OFF.
+      WRITE:/ sy-vline NO-GAP,
+               (5) ls_items-ryear,
+              (10) ls_items-docnr,
+               (5) ls_items-rldnr,
+               (5) ls_items-rbukrs,
+               (6) ls_items-docln,
+              (10) ls_items-racct,
+               (5) ls_items-gjahr,
+              (10) ls_items-belnr,
+               (5) ls_items-buzei,
+               (4) ls_items-drcrk.
+
+      HIDE: ls_items-rbukrs,
+            ls_items-belnr,
+            ls_items-gjahr.
+
+      WRITE: 105 sy-vline NO-GAP.
+      FORMAT COLOR OFF.
+      AT END OF belnr.
+        NEW-LINE.
+        ULINE (105).
+      ENDAT.
+    ENDLOOP.
+
+    ULINE (105).
+    ULINE (105).
+  ELSE.
+    FORMAT COLOR 5.
+    WRITE:/ sy-vline NO-GAP, 105 sy-vline NO-GAP.
+    WRITE:/ sy-vline NO-GAP,
+    'No line items with changing amount type (GLT0 009) found.',
+      105 sy-vline NO-GAP.
+    WRITE:/ sy-vline NO-GAP, 105 sy-vline NO-GAP.
+    ULINE (105).
+    ULINE (105).
+  ENDIF.
+
+*************************************************************************
+
+  IF ( cnt_qline > 0 OR cnt_qbuzei > 0 OR cnt_qnomkpf > 0 ).
+    anz =  cnt_qline + cnt_qbuzei + cnt_qnomkpf.
+    FORMAT COLOR 3.
+    ULINE (105).
+    WRITE:/  sy-vline NO-GAP, 105 sy-vline NO-GAP.
+    WRITE:105 sy-vline NO-GAP.
+
+    WRITE:/ sy-vline NO-GAP,
+            5 'Number of line items which contain only quantity:', 60 anz,
+            105 sy-vline NO-GAP.
+
+    WRITE:/  sy-vline NO-GAP, 105 sy-vline NO-GAP.
+    WRITE:/  sy-vline NO-GAP, 5 'IN DETAIL:', 105 sy-vline NO-GAP.
+
+    WRITE:/ sy-vline NO-GAP,
+* Betrag 0 in BSEG ? ->evtl. hat SLO  Parallelw#hrung nachtr#glich deaktiviert
+       5 'Q-line with corresponding BSEG-Buzei:', 55 cnt_qbuzei, 'should be correct',
+       105 sy-vline NO-GAP.
+
+    WRITE:/ sy-vline NO-GAP,
+     5 'Q-line without corresponding BSEG-Buzei: ', 55 cnt_qline,
+     'note 886382s issue',
+* note 886382 od. Saldonullverrechnungszeilen nach deaktiverter Parallelw#hrung
+      105 sy-vline NO-GAP.
+
+    WRITE:/ sy-vline NO-GAP,
+     5 'Q-Line, without corresponding BSEG:', 55 cnt_qnomkpf, 'needs to be analyzed',
+* Unklar... Deaktivierung von Parallelw#hrung ... k#nnte aber gel#scht werden
+        105 sy-vline NO-GAP.
+
+    WRITE:/ sy-vline NO-GAP, 105 sy-vline NO-GAP.
+    WRITE:/ sy-vline NO-GAP,
+           (5) 'RYEAR',
+          (10) 'DOCNR',
+           (5) 'RLDNR',
+           (5) 'BUKRS',
+           (6) 'DOCLN',
+          (10) 'RACCT',
+           (5) 'GJAHR',
+          (10) 'BELNR',
+           (5) 'BUZEI',
+           (4) 'DRCRK',
+           (8) 'MARKER',
+           (4) ' ',
+          (15) ' ',
+          105 sy-vline NO-GAP.
+    NEW-LINE.
+    ULINE (105).
+
+
+    SORT lt_items_q_only BY rbukrs ryear belnr buzei rldnr.
+
+    LOOP AT lt_items_q_only INTO ls_items.
+      FORMAT COLOR 2 INTENSIFIED OFF.
+      WRITE:/ sy-vline NO-GAP,
+               (5) ls_items-ryear,
+              (10) ls_items-docnr,
+               (5) ls_items-rldnr,
+               (5) ls_items-rbukrs,
+               (6) ls_items-docln,
+              (10) ls_items-racct,
+               (5) ls_items-gjahr,
+              (10) ls_items-belnr,
+               (5) ls_items-buzei,
+               (4) ls_items-drcrk,
+               (8) ls_items-marker.
+
+      HIDE: ls_items-rbukrs,
+            ls_items-belnr,
+            ls_items-gjahr.
+
+      IF p_update = 'X' AND ( ls_items-marker = '#U#Kstat' OR ls_items-marker = '#S#Null#' )
+        AND lv_update_zero = 'X'
+        AND NOT p_clnt IS INITIAL.
+
+        PERFORM move_fagl.
+      ENDIF.
+
+      WRITE: 105 sy-vline NO-GAP.
+      FORMAT COLOR OFF.
+      AT END OF belnr.
+        NEW-LINE.
+        ULINE (105).
+      ENDAT.
+    ENDLOOP.
+
+    ULINE (105).
+    ULINE (105).
+  ELSE.
+    FORMAT COLOR 5.
+    WRITE:/ sy-vline NO-GAP, 105 sy-vline NO-GAP.
+    WRITE:/ sy-vline NO-GAP, 'No "only quantity"-line found.',
+      105 sy-vline NO-GAP.
+    WRITE:/ sy-vline NO-GAP, 105 sy-vline NO-GAP.
+
+    ULINE (105).
+    ULINE (105).
+  ENDIF.
+
+*************************************************************************
+  IF cntshkz > 0.
+
+    FORMAT COLOR 3.
+    ULINE (105).
+
+    WRITE:/ sy-vline NO-GAP,
+    'SERIOUS ISSUE: Following lines with wrong debit credit indicator in new G/L',
+    105 sy-vline NO-GAP.
+
+    WRITE:/ sy-vline NO-GAP,
+    'OR wrong setting regarding negative posting indicator in BSEG',
+   105 sy-vline NO-GAP.
+
+
+    WRITE:/ sy-vline NO-GAP, 105 sy-vline NO-GAP.
+    WRITE:/ sy-vline NO-GAP,
+    'Contact SAP Support for further analyzation!', 105 sy-vline NO-GAP.
+    WRITE:/ sy-vline NO-GAP, 105 sy-vline NO-GAP.
+    WRITE:/ sy-vline NO-GAP,
+   'Without detailed analyzation a change of debit credit indicator',
+   105 sy-vline NO-GAP.
+    WRITE:/ sy-vline NO-GAP, 'OR value of BSEG-XNEGP',
+        105 sy-vline NO-GAP.
+    WRITE:/ sy-vline NO-GAP,
+       'is not allowed / is not possible,', 105 sy-vline NO-GAP.
+    WRITE:/ sy-vline NO-GAP,
+      'depending on the update of summary table entries.',
+       105 sy-vline NO-GAP.
+
+    WRITE:/ sy-vline NO-GAP, 105 sy-vline NO-GAP.
+
+    WRITE:/ sy-vline NO-GAP,
+            5 'Errornous items with wrong debit credit indicator OR XNEGP-setting:',
+            75 cntshkz,
+            105 sy-vline NO-GAP.
+    WRITE:/ sy-vline NO-GAP, 105 sy-vline NO-GAP.
+    IF cntshkzcp >= 1.
+      WRITE:/ sy-vline NO-GAP,
+           5 'Correction possible for ', cntshkzcp, ' Line item(s) - solved with note 992566',
+           105 sy-vline NO-GAP.
+      IF lv_reset = 'X' AND lv_update_sh NE 'X'.
+        WRITE:/ sy-vline NO-GAP,
+                5 'ITEMS FOUND IN BACKUP CLIENT', p_clnt,
+                'UPDATE WAS RESET',
+                105 sy-vline NO-GAP.
+      ELSEIF p_update = 'X'.
+        WRITE:/ sy-vline NO-GAP,
+                5 'ITEMS COPIED TO BACKUP CLIENT:', p_clnt,
+                105 sy-vline NO-GAP.
+      ENDIF.
+      WRITE:/ sy-vline NO-GAP, 105 sy-vline NO-GAP.
+    ENDIF.
+    WRITE:/ sy-vline NO-GAP,
+           (5) 'RYEAR',
+          (10) 'DOCNR',
+           (5) 'RLDNR',
+           (5) 'BUKRS',
+           (6) 'DOCLN',
+          (10) 'RACCT',
+           (5) 'GJAHR',
+          (10) 'BELNR',
+           (5) 'BUZEI',
+           (4) 'DRCRK',
+           (6) 'Text',
+           (6) ' ',
+          (15) ' ',
+          105 sy-vline NO-GAP.
+    NEW-LINE.
+    ULINE (105).
+
+    SORT lt_itemsshkz BY rbukrs ryear belnr buzei rldnr.
+    LOOP AT lt_itemsshkz INTO ls_items.
+      FORMAT COLOR 2 INTENSIFIED OFF.
+      WRITE:/ sy-vline NO-GAP,
+               (5) ls_items-ryear,
+              (10) ls_items-docnr,
+               (5) ls_items-rldnr,
+               (5) ls_items-rbukrs,
+               (6) ls_items-docln,
+              (10) ls_items-racct,
+               (5) ls_items-gjahr,
+              (10) ls_items-belnr,
+               (5) ls_items-buzei,
+               (4) ls_items-drcrk.
+
+      IF ls_items-bschl_new = '+'.
+        WRITE 'note 992566'.
+        IF p_update = 'X' AND lv_update_sh = 'X'.
+          PERFORM update_fagl_shkz_h.
+        ENDIF.
+      ELSEIF ls_items-bschl_new = 'OK'.
+        WRITE 'note 1024404'.
+      ENDIF.
+      HIDE: ls_items-rbukrs,
+            ls_items-belnr,
+            ls_items-gjahr.
+
+      WRITE: 105 sy-vline NO-GAP.
+      FORMAT COLOR OFF.
+      AT END OF belnr.
+        NEW-LINE.
+        ULINE (105).
+      ENDAT.
+    ENDLOOP.
+    ULINE (105).
+    ULINE (105).
+  ELSE.
+    FORMAT COLOR 5.
+    WRITE:/ sy-vline NO-GAP, 105 sy-vline NO-GAP.
+    WRITE:/ sy-vline NO-GAP,
+      'No line items with wrong debit credit indicator found.',
+       105 sy-vline NO-GAP.
+    WRITE:/ sy-vline NO-GAP, 105 sy-vline NO-GAP.
+
+    ULINE (105).
+    ULINE (105).
+  ENDIF.
+
+****************************************************************************
+
+  IF cnt > 0.
+    FORMAT COLOR 5.
+    ULINE (105).
+
+    WRITE:/ sy-vline NO-GAP,
+    'The following document lines with wrong posting keys are found.',
+    105 sy-vline NO-GAP.
+    WRITE:/ sy-vline NO-GAP,
+    'Correction (also in case of closed years) is possible.',
+    105 sy-vline NO-GAP.
+    WRITE:/ sy-vline NO-GAP, 105 sy-vline NO-GAP.
+
+    WRITE:/ sy-vline NO-GAP,
+            5 'ITEMS TO BE CORRECTED:', cnt, lv_text,
+            105 sy-vline NO-GAP.
+    IF lv_reset = 'X' AND lv_update_pk NE 'X'.
+      WRITE:/ sy-vline NO-GAP,
+              5 'ITEMS FOUND IN BACKUP CLIENT', p_clnt,
+              'UPDATE WAS RESET',
+              105 sy-vline NO-GAP.
+    ELSEIF p_update = 'X'.
+      WRITE:/ sy-vline NO-GAP,
+              5 'ITEMS COPIED TO BACKUP CLIENT:', p_clnt,
+              105 sy-vline NO-GAP.
+    ENDIF.
+    WRITE:/ sy-vline NO-GAP, 105 sy-vline NO-GAP.
+    WRITE:/ sy-vline NO-GAP,
+           (5) 'RYEAR',
+          (10) 'DOCNR',
+           (5) 'RLDNR',
+           (5) 'BUKRS',
+           (6) 'DOCLN',
+          (10) 'RACCT',
+           (5) 'GJAHR',
+          (10) 'BELNR',
+           (5) 'BUZEI',
+           (4) 'DRCRK',
+           (6) 'BSCHLold',
+           (6) 'BSCHLnew',
+          (15) 'TEXT',
+          105 sy-vline NO-GAP.
+    NEW-LINE.
+    ULINE (105).
+
+    SORT lt_items BY rbukrs ryear belnr buzei rldnr.
+    LOOP AT lt_items INTO ls_items.
+      FORMAT COLOR 2 INTENSIFIED OFF.
+      WRITE:/ sy-vline NO-GAP,
+               (5) ls_items-ryear,
+              (10) ls_items-docnr,
+               (5) ls_items-rldnr,
+               (5) ls_items-rbukrs,
+               (6) ls_items-docln,
+              (10) ls_items-racct,
+               (5) ls_items-gjahr,
+              (10) ls_items-belnr,
+               (5) ls_items-buzei,
+               (4) ls_items-drcrk,
+               (6) ls_items-bschl,
+               (6) ls_items-bschl_new.
+      HIDE: ls_items-rbukrs,
+            ls_items-belnr,
+            ls_items-gjahr.
+      IF p_update = 'X' AND lv_update_pk = 'X'.
+        PERFORM update_fagl.
+      ENDIF.
+      WRITE: 105 sy-vline NO-GAP.
+      FORMAT COLOR OFF.
+      AT END OF belnr.
+        NEW-LINE.
+        ULINE (105).
+      ENDAT.
+    ENDLOOP.
+  ELSE.
+    FORMAT COLOR 5.
+    WRITE:/ sy-vline NO-GAP, 105 sy-vline NO-GAP.
+    WRITE:/ sy-vline NO-GAP,
+     'No line items with wrong posting key found.',
+      105 sy-vline NO-GAP.
+    WRITE:/ sy-vline NO-GAP, 105 sy-vline NO-GAP.
+    ULINE (105).
+  ENDIF.
+
+  COMMIT WORK.
+
+  IF NOT p_dele IS INITIAL AND NOT p_cl_d IS INITIAL..
+    ULINE (105).
+    FORMAT COLOR 6.
+    WRITE:/ sy-vline NO-GAP, 105 sy-vline NO-GAP.
+    lv_text = 'Records deleted from client &c.'.
+    REPLACE: '&c' IN lv_text WITH p_cl_d.
+    WRITE:/ sy-vline NO-GAP,
+    lv_delcnt, lv_text, 105 sy-vline NO-GAP.
+
+    WRITE:/ sy-vline NO-GAP, 105 sy-vline NO-GAP.
+    ULINE (105).
+  ENDIF.
+
+  CLEAR: p_update, p_dele.
+
+AT LINE-SELECTION.
+  CHECK NOT ls_items-belnr IS INITIAL.
+  SET PARAMETER ID 'BUK' FIELD ls_items-rbukrs.
+  SET PARAMETER ID 'BLN' FIELD ls_items-belnr.
+  SET PARAMETER ID 'GJR' FIELD ls_items-gjahr.
+  CALL TRANSACTION 'FB03' AND SKIP FIRST SCREEN.
+****************************************************************************
+
+TOP-OF-PAGE.
+
+  FORMAT COLOR 1.
+  ULINE (105).
+
+**********************
+  IF lv_reset = 'X'.
+    WRITE:/ sy-vline NO-GAP,
+             5 'ITEMS FOUND IN BACKUP CLIENT', p_clnt,
+            'UPDATE WAS (paritially) RESET',
+            105 sy-vline NO-GAP.
+
+    IF lv_update_pk <> 'X'.
+      WRITE:/ sy-vline NO-GAP,
+       'No update of posting key - due to entries in backup client.',
+      105 sy-vline NO-GAP.
+    ENDIF.
+
+    IF lv_update_sh <> 'X'.
+      WRITE:/ sy-vline NO-GAP,
+       'No update of 992566-issues - due to entries in backup client.',
+      105 sy-vline NO-GAP.
+    ENDIF.
+
+    IF lv_update_zero <> 'X'.
+      WRITE:/ sy-vline NO-GAP,
+       'No update of KSTAT = "U" lines  - due to entries in backup client.',
+      105 sy-vline NO-GAP.
+    ENDIF.
+  ENDIF.
+
+  IF p_update = 'X'.
+    WRITE:/ sy-vline NO-GAP,
+            5 'ITEMS COPIED TO BACKUP CLIENT:', p_clnt,
+            105 sy-vline NO-GAP.
+  ENDIF.
+
+  IF p_update IS INITIAL.
+    lv_text = '  TEST RUN   '.
+  ELSE.
+    lv_text = ' UPDATE RUN '.
+  ENDIF.
+***********************
+  WRITE:/ sy-vline NO-GAP,
+        2 lv_text , lv_text, lv_text, lv_text, lv_text, lv_text, lv_text, lv_text,
+        105 sy-vline NO-GAP.
+  anz = cnt + cnt_qline + cnt_qnomkpf + cntshkz + cntswitch. " ignore cnt_qbuzei
+  WRITE:/ sy-vline NO-GAP,
+          5 'ERRORNOUS ITEMS :', 60 anz, 84 'BACKUP CLIENT:', p_clnt,
+          105 sy-vline NO-GAP.
+  anz = cnt + cnt_qline + cntshkzcp .
+  WRITE:/ sy-vline NO-GAP,
+          5 'Items which could be corrected without further analysis:', 60 anz ,
+          105 sy-vline NO-GAP.
+
+  ULINE (105).
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  update_fagl
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM update_fagl .
+  IF NOT p_clnt IS INITIAL.
+    ls_fmglflexa = ls_items.
+    ls_fmglflexa-rclnt = p_clnt.
+    INSERT fmglflexa CLIENT SPECIFIED FROM ls_fmglflexa  .
+    IF sy-subrc <> 0.
+      UPDATE fmglflexa CLIENT SPECIFIED FROM ls_fmglflexa.
+    ENDIF.
+  ENDIF.
+  UPDATE fmglflexa
+  SET bschl   = ls_items-bschl_new
+  WHERE ryear = ls_items-ryear
+  AND docnr   = ls_items-docnr
+  AND rldnr   = ls_items-rldnr
+  AND rbukrs  = ls_items-rbukrs
+  AND buzei   = ls_items-buzei
+  AND docln   = ls_items-docln.
+  IF sy-subrc = 0.
+    WRITE: 'Updated' COLOR 5.
+    ADD 1 TO cnt_cw.
+  ENDIF.
+*** commit counter
+  IF cnt_cw = 100.
+    cnt_cw = 0.
+    COMMIT WORK.
+  ENDIF.
+ENDFORM.                    " update_fagl
+
+*&---------------------------------------------------------------------*
+*&      Form  select_bseg
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM select_bseg.
+
+  CLEAR ls_bseg.
+  IF ls_fmglflexa-bstat = 'L'.
+    SELECT SINGLE * FROM bseg_add INTO CORRESPONDING FIELDS OF ls_bseg
+      WHERE bukrs EQ ls_fmglflexa-rbukrs
+        AND belnr EQ ls_fmglflexa-belnr
+        AND gjahr EQ ls_fmglflexa-gjahr
+        AND buzei EQ ls_fmglflexa-buzei.
+  ELSE.
+    SELECT SINGLE * FROM bseg INTO ls_bseg
+      WHERE bukrs EQ ls_fmglflexa-rbukrs
+        AND belnr EQ ls_fmglflexa-belnr
+        AND gjahr EQ ls_fmglflexa-gjahr
+        AND buzei EQ ls_fmglflexa-buzei.
+  ENDIF.
+**** ---- besg-shkzg * bseg-xnegp = FMGLFLEXA-shkzg
+**** ---- set shkzg according GL update:
+  IF ls_bseg-xnegp = 'X'.
+    IF ls_bseg-shkzg = 'S'.
+      ls_bseg-shkzg = 'H'.
+    ELSE.
+      ls_bseg-shkzg = 'S'.
+    ENDIF.
+  ENDIF.
+ENDFORM.                    "select
+*&---------------------------------------------------------------------*
+*&      Form  update_fagl_shkz
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM update_fagl_shkz_h .
+  IF NOT p_clnt IS INITIAL.
+    ls_fmglflexa = ls_items.
+    ls_fmglflexa-rclnt = p_clnt.
+    INSERT fmglflexa CLIENT SPECIFIED FROM ls_fmglflexa  .
+    IF sy-subrc <> 0.
+      UPDATE fmglflexa CLIENT SPECIFIED FROM ls_fmglflexa.
+    ENDIF.
+  ENDIF.
+  UPDATE fmglflexa
+  SET drcrk = 'H'
+  WHERE ryear = ls_items-ryear
+  AND docnr   = ls_items-docnr
+  AND rldnr   = ls_items-rldnr
+  AND rbukrs  = ls_items-rbukrs
+  AND docln   = ls_items-docln.
+  IF sy-subrc = 0.
+    WRITE: 'Updated' COLOR 5.
+    ADD 1 TO cnt_cw.
+  ENDIF.
+*** commit counter
+  IF cnt_cw = 100.
+    cnt_cw = 0.
+    COMMIT WORK.
+  ENDIF.
+
+ENDFORM.                    " update_fagl_shkz_h
+*&---------------------------------------------------------------------*
+*&      Form  MOVE_FAGL
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM move_fagl .
+
+  IF NOT p_clnt IS INITIAL.
+    ls_fmglflexa = ls_items.
+    ls_fmglflexa-rclnt = p_clnt.
+    INSERT fmglflexa CLIENT SPECIFIED FROM ls_fmglflexa  .
+    IF sy-subrc <> 0.
+      UPDATE fmglflexa CLIENT SPECIFIED FROM ls_fmglflexa.
+    ENDIF.
+  ENDIF.
+  DELETE FROM fmglflexa WHERE ryear = ls_items-ryear
+  AND docnr   = ls_items-docnr
+  AND rldnr   = ls_items-rldnr
+  AND rbukrs  = ls_items-rbukrs
+  AND buzei   = ls_items-buzei
+  AND docln   = ls_items-docln.
+  IF sy-subrc = 0.
+    WRITE: 'Correctd' COLOR 5.
+    ADD 1 TO cnt_cw.
+  ENDIF.
+*** commit counter
+  IF cnt_cw = 100.
+    cnt_cw = 0.
+    COMMIT WORK.
+  ENDIF.                  "
+ENDFORM.                    " MOVE_FAGL
+
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_CLNT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_LT_ITEMS  text
+*      <--P_SY_SUBRC  text
+*----------------------------------------------------------------------*
+FORM check_clnt  TABLES   it_items TYPE tt_items
+                 CHANGING cv_notfound.
+
+  SELECT * FROM fmglflexa CLIENT SPECIFIED
+          INTO ls_fmglflexa
+*              UP TO 1 ROWS
+          FOR ALL ENTRIES IN it_items
+          WHERE rclnt   = p_clnt
+          AND   rbukrs  = it_items-rbukrs
+          AND   ryear   = it_items-ryear
+          AND   rldnr   = it_items-rldnr
+          AND   docnr   = it_items-docnr
+          AND   docln   = it_items-docln.
+    EXIT.
+  ENDSELECT.
+  IF sy-subrc = 0.
+    " update run (mindestens teilweise reseted.
+    lv_reset = 'X'.
+*     lv_text =
+* 'Actual line items found in client &. Update run is (paritially) reset'.
+*  REPLACE '&' IN lv_text WITH p_clnt.
+*   MESSAGE lv_text TYPE 'I'.
+*    WRITE: / lv_text.
+    CLEAR: cv_notfound.
+  ELSE.
+    cv_notfound = 'X'. "update m#glich.
+  ENDIF.
+
+ENDFORM.                    " CHECK_CLNT

@@ -1,0 +1,288 @@
+*----------------------------------------------------------------------*
+* PROGRAM ID           : YAM_P026_SUPERCESSION                         *
+* PROGRAM TITLE        : AM: P026 Supercession                         *
+* AUTHOR               : Luc Mertens                                   *
+* DATE                 : 10/11/2004                                    *
+* DEVELOPMENT ID       : P026                                          *
+*                                                                      *
+* CHANGE REQUEST NUMBER: CD1K900740                                    *
+*                                                                      *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME     |CORRECTION NUMBER| CHANGE REFERENCE # *
+*----------------------------------------------------------------------*
+* MOD-001 |2006.03.16| M.Jacobs |CD1K905019|Only select GMIX           *
+* MOD-002 |30/01/2007|M.Jacobs  |CD1K909902|Material type ZMAT         *
+* MOD-003 |16/01/2008|M.Jacobs  |CD1K925301|Material status from MARA  *
+*                                            to MARC                   *
+************************************************************************
+* Program Description:  Overview of superceded and obsolete materials  *
+*                       without a new material in the MRP 4 view and   *
+*                       which do appear in gen. task lists.            *
+*                       Replacement of superceded materials in gen.    *
+*                       tasklists for the materials which have         *
+*                       a new materialnumber in the MRP 4 view.        *
+************************************************************************
+REPORT  YAM_SC_TEST no standard page heading line-size 255.
+
+
+************************************************************************
+*                   P A R A M E T E R S                                *
+************************************************************************
+PARAMETERS: p_check(1) type c default 'X',      "execute only checks
+            P_MATNR TYPE MATNR.
+
+
+************************************************************************
+*                   C O N S T A N T S                                  *
+************************************************************************
+* begin of deletion MOD-002
+*CONSTANTS: C_Mtart      LIKE mara-mtart VALUE 'ZHAW',
+* end of deletion MOD-002
+* begin of insertion MOD-002
+CONSTANTS: C_Mtart      LIKE mara-mtart value 'ZMAT',
+* end of insertion MOD-002
+           c_one(1)     type c value '1',
+           c_two(1)     type c value '2',
+* begin of insertion mod-001
+           c_werks     Like marc-werks value 'GMIX'.
+* end of insertion mod-001
+
+
+************************************************************************
+*                   V A R I A B L E S                                  *
+************************************************************************
+Data: g_upd(1)     type c,
+      g_list(1)    type c.
+
+
+************************************************************************
+*                  I N T E R N A L   T A B L E S                       *
+************************************************************************
+DATA: BEGIN OF gt_sel OCCURS 0,
+          matnr LIKE mara-matnr,         " Material number
+          WERKS LIKE marc-WERKS,         " Plant
+* begin of change MOD-003
+*          mstae LIKE mara-mstae,         " X-plant status
+          mmsta like marc-mmsta,
+* end of changde MOD-003
+          ausdt LIKE marc-ausdt,         " Eff.out date
+          nfmat like marc-nfmat,         " Follow-up matl
+      END OF gt_sel.
+
+DATA: gt_mess       like yam_p026_messages occurs 0 with header line,
+      gt_taskl      like yam_p026_tasklists occurs 0 with header line.
+
+************************************************************************
+*       S E L E C T - O P T I O N S / P A R A M E T E R S              *
+************************************************************************
+
+
+************************************************************************
+*       S T A R T - O F - S E L E C T I O N    E V E N T               *
+************************************************************************
+START-OF-SELECTION.
+  BREAK EXTMCS.
+  IF SY-BATCH <> 'X'.
+    MESSAGE E001(38) WITH text-004.
+  ENDIF.
+
+* selection of materials
+* begin of change MOD-003
+*  select mara~matnr mara~mstae marc~werks marc~ausdt marc~nfmat
+  select mara~matnr marc~mmsta marc~werks marc~ausdt marc~nfmat
+* end of change MOD-003
+     into corresponding fields of table gt_sel
+     from mara inner join marc
+     on  mara~matnr eq marc~matnr
+     where mara~mtart eq c_mtart
+* begin of insertion mod-001
+       and marc~werks eq c_werks
+* end of insertion mod-001
+* begin of change MOD-001
+*       and mara~mstae in ('A1', 'A2').
+       and marc~mmsta in ('A1', 'A2')
+       AND MARA~MATNR EQ P_MATNR.
+* end of change MOD-003
+
+
+************************************************************************
+*       E N D - O F - S E L E C T I O N    E V E N T                   *
+************************************************************************
+END-OF-SELECTION .
+ BREAK EXTMCS.
+  sort gt_sel by matnr werks.
+
+  clear: g_upd.
+  g_list = c_one.
+
+* check if superceded materials (without eff.out date) and obsolete ones
+* appear in gen. tasklists
+* begin of changde MOD-003
+*  loop at gt_sel where mstae = 'A2'
+*                    or ( ausdt = 0 and mstae = 'A1' ).
+ BREAK EXTMCS.
+  loop at gt_sel where mmsta = 'A2'
+                    or ( ausdt = 0 and mmsta = 'A1' ).
+* end of change MOD-003
+
+    refresh: gt_mess, gt_taskl.
+    clear: gt_mess, gt_taskl.
+
+    CALL FUNCTION 'YAM_MAT_IN_TASKLISTS'
+      EXPORTING
+        MAT_OLD                   = gt_sel-matnr
+*       MAT_NEW                   =
+        UPDATE                    = g_upd
+      TABLES
+        MESSAGES                  = gt_mess
+        TASKLISTS                 = gt_taskl
+      EXCEPTIONS
+        OLD_MAT_NOT_IN_MARA       = 1
+        NEW_MAT_NOT_IN_MARA       = 2
+        MATERIAL_NOT_USED         = 3
+        OTHERS                    = 4.
+
+    case sy-subrc.
+      when 0.                      "mat. used in gen.tasklists
+        perform write_tasklists.
+      when others.                 "mat. not used in gen.tasklists
+*       ok
+    endcase.
+
+  endloop.
+
+  if sy-subrc <> 0.                   "Nothing found
+    write: / text-005.
+  endif.
+
+  if p_check = 'X'.
+    g_upd = ' '.
+  else.
+    g_upd = 'X'.
+  endif.
+  new-page.
+
+  g_list = c_two.
+
+* replace superceded materials in gen. tasklists
+  loop at gt_sel where not ausdt is initial
+* begin of change MOD-003
+*                   and     mstae eq 'A1'.
+                    and     mmsta eq 'A1'.
+* end of change MOD-003
+
+    refresh: gt_mess, gt_taskl.
+    clear: gt_mess, gt_taskl.
+
+    CALL FUNCTION 'YAM_MAT_IN_TASKLISTS'
+      EXPORTING
+        MAT_OLD                   = gt_sel-matnr
+        MAT_NEW                   = gt_sel-nfmat
+        UPDATE                    = g_upd
+      TABLES
+        MESSAGES                  = gt_mess
+        TASKLISTS                 = gt_taskl
+      EXCEPTIONS
+        OLD_MAT_NOT_IN_MARA       = 1
+        NEW_MAT_NOT_IN_MARA       = 2
+        MATERIAL_NOT_USED         = 3
+        OTHERS                    = 4.
+
+    case sy-subrc.
+      when 0.                      "mat. replaced in gen.tasklists
+        perform write_tasklists.
+      when others.                 "mat. not used in gen.tasklists
+*       ok
+    endcase.
+
+  endloop.
+
+  if sy-subrc <> 0.                   "Nothing to replace
+    write: / text-006.
+  endif.
+
+
+************************************************************************
+*       T O P - O F - P A G E              E V E N T                   *
+************************************************************************
+TOP-OF-PAGE.
+
+  if g_list = c_one.
+    write: / text-011, 90 sy-datum, sy-uzeit, sy-pagno.
+  else.
+    if p_check = 'X'.
+      write: / text-010, 90 sy-datum, sy-uzeit, sy-pagno.
+    else.
+      write: / text-001, 90 sy-datum, sy-uzeit, sy-pagno.
+    endif.
+  endif.
+  uline.
+
+  write: / text-002,
+         / text-003.
+
+  uline.
+  skip.
+
+
+************************************************************************
+*       S U B R O U T I N E S                                          *
+***********************************************************************
+*&---------------------------------------------------------------------*
+*&      Form  write_tasklists
+*&---------------------------------------------------------------------*
+*       Write overview of actions performed
+*----------------------------------------------------------------------*
+FORM write_tasklists.
+
+  write: /  gt_sel-matnr no-zero,
+         15 gt_sel-werks,
+* begin of change MOD-003
+*         20 gt_sel-mstae,
+         20 gt_sel-mmsta,
+* end of change MOD-003
+         25 gt_sel-ausdt,
+         40 gt_sel-nfmat.
+
+  loop at gt_taskl.
+    write: /5 gt_taskl-plnnr,
+           15 gt_taskl-plnal,
+           25 gt_taskl-vornr.
+
+    if g_list = c_two and
+       not gt_mess[] is initial.
+      perform write_messages.
+    endif.
+  endloop.
+
+ENDFORM.                    " write_tasklists
+*
+*&---------------------------------------------------------------------*
+*&      Form  write_messages
+*&---------------------------------------------------------------------*
+*       Write errormessages during execution of call transaction (FM)
+*----------------------------------------------------------------------*
+FORM write_messages .
+
+  loop at gt_mess where plnnr = gt_taskl-plnnr
+                    and plnal = gt_taskl-plnal
+                    and vornr = gt_taskl-vornr.
+    write: /7 gt_mess-text.
+  endloop.
+
+ENDFORM.                   " write_messages
+
+*Text symbol text£º
+*001:Supercession took place in following General Task Lists :
+*002:Material      Plnt Stat Eff.out date   New material
+*003:    Group     Counter   Operation
+*004:EXECUTE IN BACKGROUND ONLY
+*005:No superceded or obsolete material found in general task lists
+*006:No materials had to be replaced
+*010:Following General Task Lists were checked for supercession (NO UPDATE) :
+
+*011:Overview of superceded and obsolete materials used in General Task Lists
+*Selection text£º
+*P_CHECK:        Execute only check ?

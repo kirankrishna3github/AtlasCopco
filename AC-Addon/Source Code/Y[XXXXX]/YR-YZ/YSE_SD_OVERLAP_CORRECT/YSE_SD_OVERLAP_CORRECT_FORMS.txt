@@ -1,0 +1,167 @@
+*&---------------------------------------------------------------------*
+*&  Include           YSE_SD_OVERLAP_CORRECT_FORMS
+*&---------------------------------------------------------------------*
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_file.
+
+  CALL FUNCTION 'F4_FILENAME'
+    EXPORTING
+      field_name = 'P_FILE'
+    IMPORTING
+      file_name  = p_file.
+*&---------------------------------------------------------------------*
+*&      Form  UPLOAD_DATA
+*&---------------------------------------------------------------------*
+*       Uploading the data in the file into internal table
+*----------------------------------------------------------------------*
+FORM upload_data .
+
+* Uploading the data in the file into internal table
+  CALL FUNCTION 'TEXT_CONVERT_XLS_TO_SAP'
+    EXPORTING
+      i_tab_raw_data       = it_type
+      i_filename           = p_file
+    TABLES
+      i_tab_converted_data = t_upload[]
+    EXCEPTIONS
+      conversion_failed    = 1
+      OTHERS               = 2.
+
+  IF sy-subrc NE 0.
+    MESSAGE ID sy-msgid
+    TYPE sy-msgty
+    NUMBER sy-msgno
+    WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF. " IF sy-subrc NE 0
+
+* Delete the first record from internal table as it is headers of columns
+  DELETE t_upload INDEX 1.
+
+* Move the input file data to internal table to fetch the data based on this from table A954
+  LOOP AT t_upload INTO wa_upload.
+    wa_input-kschl  = wa_upload-col1.
+    wa_input-vkorg  = wa_upload-col2.
+    wa_input-spart  = wa_upload-col3.
+    wa_input-matnr  = wa_upload-col4.
+    APPEND wa_input TO gt_input.
+  ENDLOOP. " LOOP AT t_upload INTO wa_upload
+
+ENDFORM. " UPLOAD_DATA
+*&---------------------------------------------------------------------*
+*&      Form  GET_A954
+*&---------------------------------------------------------------------*
+*       Fetch the condition records of the materials for which
+*       overlapping condition records exist based on the input file data.
+*----------------------------------------------------------------------*
+
+FORM get_a954 .
+
+  SORT gt_input BY kschl
+                   vkorg
+                   spart
+                   matnr.
+
+  DELETE ADJACENT DUPLICATES FROM gt_input
+                             COMPARING kschl
+                                       vkorg
+                                       spart
+                                       matnr.
+  IF NOT gt_input[] IS INITIAL.
+
+    SELECT * FROM a954
+             INTO TABLE gt_a954
+             FOR ALL ENTRIES IN gt_input
+             WHERE kschl = gt_input-kschl
+             AND   vkorg = gt_input-vkorg
+             AND   spart = gt_input-spart
+             AND   matnr = gt_input-matnr.
+
+  ENDIF. " IF NOT gt_input[] IS INITIAL
+
+ENDFORM.                                                    " GET_A954
+*&---------------------------------------------------------------------*
+*&      Form  DELETE_INVALID
+*&---------------------------------------------------------------------*
+* Delete the invalid records from A954, means if start date is         *
+* greater then end date.                                               *
+*----------------------------------------------------------------------*
+FORM delete_invalid .
+
+  LOOP AT gt_a954 INTO wa_a954.
+    IF wa_a954-datab GT wa_a954-datbi.
+      DELETE FROM a954 WHERE kschl = wa_a954-kschl
+                       AND   vkorg = wa_a954-vkorg
+                       AND   spart = wa_a954-spart
+                       AND   matnr = wa_a954-matnr
+                       AND   datbi = wa_a954-datbi
+                       AND   datab = wa_a954-datab.
+
+      DELETE gt_a954 WHERE kschl = wa_a954-kschl
+                     AND   vkorg = wa_a954-vkorg
+                     AND   spart = wa_a954-spart
+                     AND   matnr = wa_a954-matnr
+                     AND   datbi = wa_a954-datbi
+                     AND   datab = wa_a954-datab.
+
+    ENDIF. " IF wa_a954-datab GT wa_a954-datbi
+  ENDLOOP. " LOOP AT gt_a954 INTO wa_a954
+ENDFORM. " DELETE_INVALID
+*&---------------------------------------------------------------------*
+*&      Form  CORRECT_OVERLAPPING_RECS
+*&---------------------------------------------------------------------*
+* Correct overlapping records in table A954                            *
+* If 2nd records start date is lesser than or equal to 1st records     *
+* end date then make second records start as next date of 1st records  *
+* end date.                                                            *
+* If 2nd records start date is greater than 1st records end date       *
+* then do ot chage the start date of 2nd record.                       *
+*----------------------------------------------------------------------*
+FORM correct_overlapping_recs .
+
+  DATA: lv_cnt TYPE sy-tabix. " Index of Internal Tables
+
+  APPEND LINES OF gt_a954 TO gt_a954_tmp.
+
+  SORT gt_a954_tmp BY kschl
+                      vkorg
+                      spart
+                      matnr.
+
+  DELETE ADJACENT DUPLICATES FROM gt_a954_tmp
+                             COMPARING kschl
+                                       vkorg
+                                       spart
+                                       matnr.
+
+  WRITE:/ 'Overlapping condition records of below materials are corrected'(001).
+
+  LOOP AT gt_a954_tmp INTO wa_a954_tmp.
+
+    LOOP AT gt_a954 INTO wa_a954
+                    WHERE kschl  = wa_a954_tmp-kschl
+                    AND   vkorg  = wa_a954_tmp-vkorg
+                    AND   spart  = wa_a954_tmp-spart
+                    AND   matnr  = wa_a954_tmp-matnr.
+      lv_cnt = lv_cnt + 1.
+
+      IF lv_cnt NE '1'.
+* If current records start date is overlapping with just previus records of
+* same material then make the current records start as next date of previuos
+* records end date and update the table A954 accordingly.
+        IF wa_a954-datab LE wa_a954_1-datbi.
+          wa_a954-datab = wa_a954_1-datbi + 1.
+          UPDATE a954 FROM wa_a954.
+        ELSE. " ELSE -> IF wa_a954-datab LE wa_a954_1-datbi
+*          DO NOTHING
+        ENDIF. " IF wa_a954-datab LE wa_a954_1-datbi
+      ENDIF. " IF lv_tabix NE '1'
+* Assing current work area to check next records Start date
+      wa_a954_1 = wa_a954.
+
+    ENDLOOP. " LOOP AT gt_a954 INTO wa_a954
+* Clear the counter on chage of material.
+    CLEAR: lv_cnt,
+           wa_a954_1.
+    WRITE:/ wa_a954_tmp-matnr.
+  ENDLOOP. " LOOP AT gt_a954_tmp INTO wa_a954_tmp
+
+ENDFORM.                    " CORRECT_OVERLAPPING_RECS

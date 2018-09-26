@@ -1,0 +1,305 @@
+*&---------------------------------------------------------------------*
+*&  Include           YSE_SDMM_MASS_CHG_PRODATT_FRM
+*&---------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME     |CORRECTION NUMBER| CHANGE REFERENCE # *
+* MOD-001 |01/04/2013| Anda Wu  |CD1K975435       | #30383
+* MOD-002 |07/05/2013| Anda Wu  |CD1K975920       | CR2903
+* MOD-003 |03/03/2017| Anda Wu  |CD1K991058       | SAP0000051134
+*----------------------------------------------------------------------*
+
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_AUTHORIZATION
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM check_authorization .
+* Display the progress to the user in the status bar.
+  IF sy-batch <> gc_x.
+    CALL FUNCTION 'SAPGUI_PROGRESS_INDICATOR'
+      EXPORTING
+        percentage = '25'
+        text       = text-010.
+  ENDIF.
+
+
+* Check if the user has authorization for that sales org. / dist. channel or else display error.
+  AUTHORITY-CHECK OBJECT 'V_VBAK_VKO'
+         ID 'VKORG' FIELD p_vkorg
+         ID 'VTWEG' FIELD p_vtweg
+         ID 'SPART' DUMMY
+         ID 'ACTVT' DUMMY.
+  IF sy-subrc = 4.
+*   No authorisation to change data in sales org. / dist. channel
+    MESSAGE ID 'YSE_GENERAL' TYPE 'E' NUMBER '006' WITH p_vkorg.
+    EXIT.
+  ELSEIF sy-subrc <> 0.
+*   Error checking authorization.
+    MESSAGE ID 'YSE_GENERAL' TYPE 'E' NUMBER '004'.
+    EXIT.
+  ENDIF.
+
+ENDFORM.                    " CHECK_AUTHORIZATION
+
+*&---------------------------------------------------------------------*
+*&      Form  UPLOAD_FILES
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM upload_files .
+* Display the progress to the user in the status bar.
+  IF sy-batch <> gc_x.
+    CALL FUNCTION 'SAPGUI_PROGRESS_INDICATOR'
+      EXPORTING
+        percentage = '25'
+        text       = text-011.
+  ENDIF.
+
+* Upload the Material data from the excel file
+  CALL FUNCTION 'TEXT_CONVERT_XLS_TO_SAP'
+     EXPORTING
+* I_FIELD_SEPERATOR          =
+* I_LINE_HEADER              =
+       i_tab_raw_data             = i_tab_raw_data
+       i_filename                 = p_file1
+     TABLES
+       i_tab_converted_data       = gt_upload_acc
+   EXCEPTIONS
+    conversion_failed          = 1
+    OTHERS                     = 2
+             .
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+           WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+* Check if the uploaded files have data in them.
+  IF gt_upload_acc[] IS INITIAL.
+    MESSAGE text-005 TYPE 'E'.
+  ENDIF.
+* Begin of MOD-001
+  DATA: lv_lines TYPE i.
+  DESCRIBE TABLE gt_upload_acc LINES lv_lines.
+  IF lv_lines > gc_max_line.
+    MESSAGE s000(yse_general)
+      WITH text-030 gc_max_line text-031
+      DISPLAY LIKE 'E'.
+    LEAVE LIST-PROCESSING.
+  ENDIF.
+* End of MOD-001
+ENDFORM.                    " UPLOAD_FILE
+
+*&---------------------------------------------------------------------*
+*&      Form  OPTIMIZE_FILES
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM optimize_files .
+  DATA: ls_upload_acc   TYPE ty_upload_acc,
+        ls_product_att  TYPE ty_product_att.
+* Display the progress to the user in the status bar.
+  IF sy-batch <> gc_x.
+    CALL FUNCTION 'SAPGUI_PROGRESS_INDICATOR'
+      EXPORTING
+        percentage = '25'
+        text       = text-012.
+  ENDIF.
+
+* Sort the Materials and delete the duplicates from them.
+  SORT gt_upload_acc.
+  DELETE ADJACENT DUPLICATES FROM gt_upload_acc COMPARING matnr.
+
+* Move the uploaded data into the final internal table
+  LOOP AT gt_upload_acc INTO ls_upload_acc.
+    ls_product_att-mandt = sy-mandt.
+    ls_product_att-matnr = ls_upload_acc-matnr.
+    APPEND ls_product_att TO gt_product_att.
+    CLEAR: ls_product_att.
+  ENDLOOP.
+
+* Clear the contents of the database table and insert these new records
+  DELETE FROM yse_prodatt_upl.
+
+  IF NOT gt_product_att[] IS INITIAL.
+    INSERT yse_prodatt_upl FROM TABLE gt_product_att.
+    IF sy-subrc <> 0.
+      MESSAGE s000(yse_sales_log) WITH text-014
+        DISPLAY LIKE 'E'.
+      LEAVE LIST-PROCESSING.
+    ENDIF.
+  ELSE.
+    MESSAGE s000(yse_sales_log) WITH text-015
+      DISPLAY LIKE 'E'.
+    LEAVE LIST-PROCESSING.
+  ENDIF.
+
+ENDFORM.                    " OPTIMIZE_FILES
+
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_TABLES
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM check_prodatt .
+* Select the product attribute data into the internal table
+  SELECT COUNT(*) FROM yse_prodatt_upl.
+*   If both product Attributes table is empty, don't proceed further.
+  IF sy-subrc = 0.
+*****begin of mod-003 insert
+    IF p_reset IS NOT INITIAL.
+      DELETE FROM yse_prodatt_upl.
+*      LEAVE PROGRAM.
+    ELSE.
+*****end of mod-003 insert
+      MESSAGE I000(yse_sales_log) WITH text-004 text-e05 text-e06.
+*        DISPLAY LIKE 'E'.
+      LEAVE LIST-PROCESSING.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    " CHECK_TABLES
+
+* Begin of MOD-001
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_DATE
+*&---------------------------------------------------------------------*
+*       Change if the date in valid perild
+*----------------------------------------------------------------------*
+FORM check_date .
+  DATA: lv_today(8) TYPE n.
+  lv_today = sy-datum.
+  IF   lv_today+6(2) < gc_date_low
+    OR lv_today+6(2) > gc_date_high.
+    MESSAGE  e000(yse_general)
+      WITH text-035
+            gc_date_low
+            text-036
+            gc_date_high.
+  ENDIF.
+ENDFORM.                    " CHECK_DATE
+
+* End of MOD-001
+*&---------------------------------------------------------------------*
+*&      Form  DO_INIT
+*&---------------------------------------------------------------------*
+*       Do initialization
+*----------------------------------------------------------------------*
+FORM do_init .
+
+  CLEAR:
+    gv_number          ,
+    gv_jname           .
+
+  REFRESH:
+    i_tab_raw_data     ,
+    gt_upload_acc      ,
+    gt_product_att  .
+
+*  gv_date_restrict = gc_x.
+
+ENDFORM.                    " DO_INIT
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_CONFIRM
+*&---------------------------------------------------------------------*
+*       confirmation check
+*----------------------------------------------------------------------*
+FORM check_confirm .
+  DATA: ls_question TYPE string,
+        lv_answer   TYPE char1.
+  ls_question = text-017.
+  REPLACE '&' WITH p_vkorg INTO ls_question.
+  REPLACE '&' WITH p_vtweg INTO ls_question.
+  CALL FUNCTION 'POPUP_TO_CONFIRM'
+    EXPORTING
+      titlebar       = text-016
+      text_question  = ls_question
+    IMPORTING
+      answer         = lv_answer
+    EXCEPTIONS
+      text_not_found = 1
+      OTHERS         = 2.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+  IF lv_answer <> '1'.
+    LEAVE LIST-PROCESSING.
+  ENDIF.
+
+ENDFORM.                    " CHECK_CONFIRM
+*&---------------------------------------------------------------------*
+*&      Form  RUN_UPDATE
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM run_update .
+  DATA: gv_text TYPE char100.
+
+  IF sy-batch IS NOT INITIAL OR cb_back IS NOT INITIAL.
+    gv_jname = sy-repid.
+    CALL FUNCTION 'JOB_OPEN'
+      EXPORTING
+        jobname          = gv_jname
+      IMPORTING
+        jobcount         = gv_number
+      EXCEPTIONS
+        cant_create_job  = 1
+        invalid_job_data = 2
+        jobname_missing  = 3
+        OTHERS           = 4.
+    IF sy-subrc <> 0.
+      MESSAGE ID  sy-msgid TYPE sy-msgty NUMBER sy-msgno
+              WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+    ENDIF.
+    gv_text = text-020.
+    REPLACE '&' WITH gv_jname INTO gv_text.
+    MESSAGE ID 'YSE_GENERAL' TYPE 'S'
+      NUMBER '000' WITH gv_text(20)
+                        gv_text+21(20)
+                        gv_text+41(20)
+                        gv_text+61(20).
+
+    SUBMIT yse_sdmm_mass_chg_acc WITH  p_vkorg = p_vkorg
+                                WITH  p_vtweg = p_vtweg
+                                WITH  cb_acc  = cb_acc
+               VIA JOB  gv_jname NUMBER gv_number
+               AND RETURN.
+    IF sy-subrc = 0.
+      CALL FUNCTION 'JOB_CLOSE'
+        EXPORTING
+          jobcount             = gv_number
+          jobname              = gv_jname
+          strtimmed            = gc_x
+        EXCEPTIONS
+          cant_start_immediate = 1
+          invalid_startdate    = 2
+          jobname_missing      = 3
+          job_close_failed     = 4
+          job_nosteps          = 5
+          job_notex            = 6
+          lock_failed          = 7
+          invalid_target       = 8
+          OTHERS               = 9.
+      IF sy-subrc <> 0.
+        MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+                WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+      ENDIF.
+    ENDIF.
+  ELSE.
+    SUBMIT yse_sdmm_mass_chg_acc  WITH  p_vkorg = p_vkorg
+                                  WITH  p_vtweg = p_vtweg
+                                  WITH  cb_acc  = cb_acc
+                                  AND RETURN.
+  ENDIF.
+ENDFORM.                    " RUN_UPDATE

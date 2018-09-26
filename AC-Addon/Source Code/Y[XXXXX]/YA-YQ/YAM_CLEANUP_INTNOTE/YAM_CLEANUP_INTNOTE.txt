@@ -1,0 +1,204 @@
+*----------------------------------------------------------------------*
+* PROGRAM ID           : YAM_CLEANUP_INTNOTE                           *
+* PROGRAM TITLE        : AM: Clean-up internal note on equipment       *
+* AUTHOR               : Luc Mertens                                   *
+* DATE                 : 04/12/2007                                    *
+* DEVELOPMENT ID       : GB-CR 012                                     *
+* CHANGE REQUEST NUMBER: CD1K924061                                    *
+* PROGRAM DESCRIPTION  : Create report that cleans up the internal note*
+*                        on the equipments and copies the data into    *
+*                        an external file.                             *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME     |CORRECTION NUMBER| CHANGE REFERENCE # *
+*----------------------------------------------------------------------*
+*                                                                      *
+*----------------------------------------------------------------------*
+REPORT  YAM_CLEANUP_INTNOTE.
+
+*tables declaration ---------------------------------------------------*
+tables: EQUZ.
+
+*data declaration -----------------------------------------------------*
+data: lv_name           type TDOBNAME,
+      lv_header         type thead,
+      lt_tline_base     type standard table of tline,
+      ls_tline          like tline,
+      g_ofile           like /sapdmc/lsoinp-filename,
+      g_directory(25)   type c value '/var/load/xxx/UK/read/',
+      p_logsys          LIKE tbdlst-logsys.
+
+data: begin of gt_equi occurs 0,
+        equnr type equnr,
+        equnr_70 type tdobname,
+      end of gt_equi.
+
+data: gt_stxh like stxh occurs 0 with header line.
+
+data: begin of gt_lines occurs 0,
+        equnr(18)  type c,
+        tdline     type tdline,
+      end of gt_lines.
+
+*constants ------------------------------------------------------------*
+CONSTANTS: c_intnotes(11)  type c value 'YAM_INTNOTE'.
+
+*selection screen -----------------------------------------------------*
+select-options:
+      s_equnr           for  equz-equnr.
+parameters:
+      p_iwerk           type iwerk obligatory memory id WRK,
+      p_date            type sy-datum obligatory default '20060101',
+      p_spras           type spras obligatory default sy-langu.
+selection-screen skip 1.
+parameters:
+      p_test(1)         type c default 'X'.
+
+*initialization -------------------------------------------------------*
+INITIALIZATION.
+
+  CALL FUNCTION 'OWN_LOGICAL_SYSTEM_GET'
+    IMPORTING
+      own_logical_system             = p_logsys
+    EXCEPTIONS
+      own_logical_system_not_defined = 1
+      OTHERS                         = 2.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+         WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+*start of selection ---------------------------------------------------*
+start-of-selection.
+
+* select equipments
+  select * from EQUZ where equnr in s_equnr
+                       and datbi eq '99991231'
+*                      and erdat lt p_date
+                       and iwerk eq p_iwerk.
+    gt_equi-equnr    = equz-equnr.
+    gt_equi-equnr_70 = equz-equnr.
+    append gt_equi.
+    clear gt_equi.
+  endselect.
+
+  if gt_equi[] is initial.
+    write: / text-e04.                     "No equipments selected
+    return.
+  endif.
+
+* check if for the selected equipments an internal note exists
+  select * from STXH into table gt_stxh
+      for all entries in gt_equi
+      where tdobject eq 'EQUI'
+        and tdname   eq gt_equi-equnr_70
+        and tdid     eq 'INTV'
+        and tdspras  eq p_spras
+        and tdfdate  lt p_date.
+
+  if gt_stxh[] is initial.
+    write: / text-e02.                     "No internal notes available
+    return.
+  endif.
+
+* read internal notes and copy them in an external file
+  loop at gt_stxh.
+    refresh lt_tline_base.
+*   lv_name = gt_equi-equnr.
+
+    CALL FUNCTION 'READ_TEXT'
+      EXPORTING
+        ID                      = 'INTV'
+        LANGUAGE                = p_spras
+*       NAME                    = lv_name
+        NAME                    = gt_stxh-tdname
+        OBJECT                  = 'EQUI'
+      IMPORTING
+        HEADER                  = lv_header
+      TABLES
+        LINES                   = lt_tline_base
+      EXCEPTIONS
+        ID                      = 1
+        LANGUAGE                = 2
+        NAME                    = 3
+        NOT_FOUND               = 4
+        OBJECT                  = 5
+        REFERENCE_CHECK         = 6
+        WRONG_ACCESS_TO_ARCHIVE = 7
+        OTHERS                  = 8.
+
+    IF SY-SUBRC = 0 and not lt_tline_base[] is initial.
+      move gt_stxh-tdname(18) to gt_lines-equnr.
+
+      loop at lt_tline_base into ls_tline.
+        move ls_tline-tdline to gt_lines-tdline.
+        append gt_lines.
+      endloop.
+    ENDIF.
+  endloop.
+
+  if gt_lines[] is initial.
+    write: / text-e03.           "No internal notes copied to ext.file
+    return.
+  endif.
+
+* write internal notes into external file
+  REPLACE 'xxx' IN g_directory WITH p_logsys(3).
+  CONCATENATE g_directory c_intnotes p_iwerk INTO g_ofile.
+
+  open dataset g_ofile for output in text mode encoding default.
+  if sy-subrc <> 0.
+    write: / text-e01, g_ofile.            "Open dataset failed
+    return.
+  endif.
+
+  loop at gt_lines.
+    transfer gt_lines to g_ofile.
+  endloop.
+
+  close dataset g_ofile.
+
+  IF NOT p_test IS INITIAL.
+    WRITE: / '*** Test Mode - no delete ***'.
+  ELSE.
+*.. delete internal notes
+    loop at gt_stxh.
+
+      CALL FUNCTION 'DELETE_TEXT'
+        EXPORTING
+          ID              = 'INTV'
+          LANGUAGE        = p_spras
+          NAME            = gt_stxh-tdname
+          OBJECT          = 'EQUI'
+          savemode_direct = 'X'
+        EXCEPTIONS
+          NOT_FOUND       = 1
+          OTHERS          = 2.
+
+      IF SY-SUBRC = 0.
+        commit work.
+      ENDIF.
+
+    endloop.
+  endif.
+
+*end of selection -----------------------------------------------------*
+END-OF-SELECTION .
+
+  write: / 'Job finished'(i02).
+
+*Text symbol text£º
+*E01:Open dataset failed
+*E02:No internal notes available
+*E03:No internal notes copied to external file
+*E04:No equipments selected
+
+*I02:Job finished
+*Selection text£º
+*P_DATE:        Created before
+*P_IWERK:        Plant
+*P_OFILE:        Output filename
+*P_SPRAS:        Language
+*P_TEST:        Test (X = No delete of notes)
+*S_EQUNR:D       Equipment

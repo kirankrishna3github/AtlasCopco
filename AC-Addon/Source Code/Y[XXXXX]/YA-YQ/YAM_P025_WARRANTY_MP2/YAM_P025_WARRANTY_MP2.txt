@@ -1,0 +1,1559 @@
+*----------------------------------------------------------------------*
+* PROGRAM ID           : YAM_P025_WARRANTY_MEAS_POINT                  *
+* PROGRAM TITLE        : AM: P025 Warranty & Measurement Point Creation*
+* AUTHOR               : Ravin Malhotra                                *
+* DATE                 : 14/10/2004                                    *
+* DEVELOPMENT ID       : P025                                          *
+*                                                                      *
+* CHANGE REQUEST NUMBER:                                               *
+*                                                                      *
+************************************************************************
+* Program Description:  For new equipments created via interface I006  *
+*                       default warranty and measurement point records *
+*                       need to be added                               *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME     |CORRECTION NUMBER| CHANGE REFERENCE # *
+*----------------------------------------------------------------------*
+* MOD-001 | 2005.01.13 | Luc Mertens       |CD1K901334 |TPR UAT-027  | *
+* MOD-002 | 2005.01.20 | Marc Jacobs       |CD1K901384 |TPR-CP003-P025 *
+* MOD-003 | 2005.01.25 | Marc Jacobs       |CD1K901417 |TPR-CP003-P025 *
+* MOD-004 | 2005.04.12 | Luc Mertens       |CD1K902042 |DE-CR024       *
+*   split checks on and writes for customer and vendor warranty fields *
+* MOD-005 | 2005.04.22 | Luc Mertens       |CD1K902123 |DE-CR008       *
+*   derive measuring points from PGC - YAM*-table is changed           *
+* MOD-006 | 2005.05.02 | Luc Mertens       |CD1K902233 |DE-CR008       *
+*   split parameter warranty info into customer and vendor warranty    *
+* MOD-007 | 2005.11.24 | Luc Mertens       |CD1K903980 |GAP P041       *
+* MOD-008 | 2005.12.06 | Luc Mertens       |CD1K904150 |GAP P041       *
+* MOD-009 | 2006.01.19 | Luc Mertens       |CD1K904509 |CR061          *
+*   - fill annual estimate with default value for actual and estimated *
+*     running hours counter                                            *
+************************************************************************
+REPORT  YAM_P025_WARRANTY_MEAS_POINT     NO STANDARD PAGE HEADING
+                                         LINE-SIZE 165
+                                         LINE-COUNT 80
+                                         MESSAGE-ID YAM_P025     .
+
+************************************************************************
+*                   C O N S T A N T S                                  *
+************************************************************************
+CONSTANTS :C_WERKS        type equi-werk VALUE 'GBAA' ,
+           c_indicator(1) type c value 'X' ,
+           c_category(1)  type c value 'M' ,
+           c_months(2)    type c value '13' ,
+           c_ZAM_MODEL(9) type c value 'ZAM_MODEL' ,
+* begin of insertion MOD-002
+           c_equipment(10) type c value 'EQUIPMENT' ,
+* end of insertion MOD-002
+* begin of insertion MOD-004
+           c_1(1)         type c value '1',
+           c_2(1)         type c value '2',
+* end of insertion MOD-004
+* begin of insert MOD-005
+           c_999(3)       type c value '999',
+           c_langu        type sylangu value 'E',
+* end of insert MOD-005
+* begin of insert MOD-007
+           c_equi_country(20) type c value 'CH_EQUIPMENT_COUNTRY' ,
+* end of insert MOD-007
+* begin of insert MOD-009
+           c_act_runhours(17) type c value 'ZAM_RHRSTOTAL_ACT',
+           c_est_runhours(13) type c value 'ZAM_RHRSTOTAL',
+           c_default      type IMRC_PYEAC value '4000',
+* end of insert MOD-009
+           c_mafid        type ausp-mafid value 'O' ,
+           c_klart        type ausp-klart value '002' .
+
+************************************************************************
+*                   V A R I A B L E S                                  *
+************************************************************************
+data:  g_erdat  type equi-erdat ,                 " Order Number
+       g_werks  type equi-werk  ,                 " Plant
+* begin of insertion MOD-003
+       g_default(1) type c,                       " default values
+* end of insertion MOD-003
+* begin of insert MOD-009
+       g_subrc  type subrc,
+       g_text(100) type c,
+       g_runhours_exist,
+       l_mpobj    type imptt-mpobj ,
+       g_point    like imptt-point,
+* end of insert MOD-009
+       gv_mode(1)          TYPE c VALUE 'N',
+       g_equnr  type equi-equnr .                 " Equipment Number
+
+************************************************************************
+*                  I N T E R N A L   T A B L E S                       *
+************************************************************************
+
+** Equipment details
+DATA : BEGIN OF I_EQUI OCCURS 0,
+          equnr type equi-equnr,         " Equipment Number
+          erdat type equi-erdat,         " Equipment Creation Date
+          ansdt type equi-ansdt,         " Equi acquisition date
+          matnr type equi-matnr,         " Material Number
+          sernr type equi-sernr,         " Serial Number
+          objnr type equi-objnr,         " Object Number
+* begin of insertion MOD-002
+          eqart type equi-eqart,         " Type technical object
+* end of insertion MOD-002
+* begin of insert MOD-008
+          kmatn type equi-kmatn,         " Configurable material
+* end of insert MOD-008
+       END OF I_EQUI.
+
+** Status table
+DATA: BEGIN OF i_status OCCURS 0,
+         equnr type equi-equnr,         " Equipment Number
+         matnr type equi-matnr,         " Material Number
+         sernr type equi-sernr,         " Serial Number
+         statusmsg(100) TYPE c,         " Status message
+      END OF i_status.
+
+* begin of MOD-007
+DATA: begin of i_yam_prodh_prctr occurs 0.
+        include structure yam_prodh_prctr.
+DATA: end of i_yam_prodh_prctr.
+* end of MOD-007
+
+* begin of insert MOD-009
+DATA: l_struct_bdcdata  TYPE bdcdata ,             "BDCDATA table
+      l_i_bdcdata TYPE STANDARD TABLE OF bdcdata.  "Table for BDC data
+* end of insert MOD-009
+
+************************************************************************
+*       S E L E C T - O P T I O N S / P A R A M E T E R S              *
+************************************************************************
+
+SELECTION-SCREEN : BEGIN OF BLOCK B1 WITH FRAME TITLE TEXT-001.
+SELECT-OPTIONS: S_erdat FOR g_erdat .                "Posting Date
+PARAMETERS:     P_WERKS type equi-werk OBLIGATORY DEFAULT C_WERKS .
+SELECT-OPTIONS: s_equnr for g_equnr .           "Equipment Number
+
+* begin of insert MOD-005
+* language for characteristic description
+PARAMETERS:     P_LANGU type sylangu   OBLIGATORY DEFAULT C_LANGU .
+* end of insert MOD-005
+* begin of change MOD-006
+*ARAMETERS: P_WNTY as CHECKBOX default 'X' .
+PARAMETERS: P_WNTYCU as checkbox default 'X',
+            P_WNTYVE as checkbox default 'X'.
+* begin of change MOD-006
+PARAMETERS: P_MEAS as CHECKBOX default 'X' .
+* begin of insert MOD-007
+PARAMETERS: P_KMATN  as CHECKBOX default 'X',
+            P_KMATNI type kmatn OBLIGATORY,
+            P_KMATNP type kmatn OBLIGATORY.
+* end of insert MOD-007
+
+SELECTION-SCREEN: END OF BLOCK B1.
+
+************************************************************************
+*    Selection Screen Validations                                      *
+************************************************************************
+AT SELECTION-SCREEN .
+* begin of change MOD-006
+* if P_WNTY is initial and P_MEAS is initial .
+* begin of change MOD-007
+* if P_WNTYCU is initial and P_WNTYVE is initial and P_MEAS is initial.
+  if P_WNTYCU is initial and P_WNTYVE is initial
+    and P_MEAS is initial and P_KMATN is initial.
+* end of change MOD-007
+* end of change MOD-006
+    MESSAGE e001.
+  endif .
+
+
+AT SELECTION-SCREEN ON s_equnr.
+  if not s_equnr[] is initial .
+    SELECT equnr INTO g_equnr
+           up to 1 rows
+           FROM equi
+           WHERE equnr in s_equnr .
+    endselect .
+    IF sy-subrc NE 0.
+      MESSAGE e000.
+    ENDIF.
+  endif .
+
+************************************************************************
+*       S T A R T - O F - S E L E C T I O N    E V E N T               *
+************************************************************************
+START-OF-SELECTION.
+
+
+** Fetch Equipment Numbers based on the Selection Criteria
+  PERFORM Get_Equipment_Numbers .
+
+* begin of insert MOD-007
+** Preselect profitcenters
+  SELECT * INTO table i_yam_prodh_prctr
+       FROM yam_prodh_prctr.
+* end of insert MOD-007
+
+** Update Warranty & Measuring Point
+  PERFORM Update_Warranty_MeasPoint .
+
+
+************************************************************************
+*       E N D - O F - S E L E C T I O N    E V E N T                   *
+***********************************************************************
+END-OF-SELECTION .
+
+** Print a report stating the details updated for Warranty and Measuring
+** Points
+  if not i_status[] is initial .
+    write:/ text-014 .
+    write: text-015 ,
+    sy-datum , sy-uzeit .
+    ULINE AT /1(165).
+    write:  /1  text-016     ,
+             20 text-017     ,
+             39 text-018     ,
+             80 text-019     .
+    ULINE AT /1(165).
+    loop at i_status .
+      at new equnr .
+        skip 1 .
+      endat .
+      write: / i_status-equnr, i_status-matnr,
+               i_status-sernr , i_status-statusmsg  .
+
+
+    endloop .
+  endif .
+
+*Perform PRINT_STATUS_REPORT
+*&---------------------------------------------------------------------*
+*&      Form  Get_Equipment_Numbers
+*&---------------------------------------------------------------------*
+*       Fetch the Equipment Number based on Selection Criteria
+*----------------------------------------------------------------------*
+FORM Get_Equipment_Numbers .
+  data: l_date type sy-datum .
+
+  l_date = sy-datum - 1 .
+
+** IF selection screen date range and equipment no. range are not
+** provided
+  if s_erdat[] is initial and s_equnr[] is initial .
+    select a~equnr a~erdat a~ansdt a~matnr a~sernr a~objnr
+* begin of insertion MOD-002
+                 a~eqart
+* end of insertion MOD-002
+* begin of insert MOD-008
+                 a~kmatn
+* end of insert MOD-008
+                 into table i_equi
+                 from ( (  equi as a join equz as b
+                     on a~equnr = b~equnr   )
+                      join iloa as C
+                    on c~iloan = b~iloan )
+                 where a~erdat between l_date and sy-datum
+                 and   c~swerk = p_werks .
+
+    if sy-subrc ne 0  .
+*  Write Error message - No data available for the Selection Criteria
+      write: / text-002 .
+    else .
+      delete adjacent duplicates from i_equi comparing equnr .
+    endif .
+
+  else .
+** IF selection screen date range or equipment no. range are
+** provided in the selection screen
+    select a~equnr a~erdat a~ansdt a~matnr a~sernr a~objnr
+* begin of insertion MOD-002
+                 a~eqart
+* end of insertion MOD-002
+* begin of insert MOD-008
+                 a~kmatn
+* end of insert MOD-008
+                  into table i_equi
+                  from ( (  equi as a join equz as b
+                      on a~equnr = b~equnr   )
+                       join iloa as C
+                     on c~iloan = b~iloan )
+                  where a~equnr in s_equnr
+                  and   a~erdat in s_erdat
+                  and   c~swerk = p_werks .
+    if sy-subrc ne 0  .
+*  Write Error message - No data available for the Selection Criteria
+      write: / text-002 .
+    else .
+      delete adjacent duplicates from i_equi comparing equnr .
+    endif .
+  endif .
+
+ENDFORM.                    " Get_Equipment_Numbers
+*&---------------------------------------------------------------------*
+*&      Form  Update_Warranty_MeasPoint
+*&---------------------------------------------------------------------*
+*       Update Warranty & Measurement Point Details
+*----------------------------------------------------------------------*
+FORM Update_Warranty_MeasPoint .
+
+  data: l_objnr type bgmkobj-j_objnr ,        " Object Number
+        l_warranty_flag(1) type c    ,        " Warranty Flag
+* begin of insertion MOD-004
+        l_cust_warranty_flag(1) type c,       " Customer warranty flag
+        l_vend_warranty_flag(1) type c,       " Vendor   warranty flag
+* end of insertion MOD-004
+* begin of insert MOD-005
+        l_prdha type prodh_d,                 " Product hierarchy
+        l_zprodh3 type zprodh3,         " AM: Product Hierarchy L3 - PGC
+        l_zcolnr type zcolnr,                 " AM: Column number
+        l_mpexist(1) type c,                  " Meas.point exist flag
+* end of insert MOD-005
+        l_meas_flag(1) type c        ,        " Measurement Flag
+        l_warranty_end_date type sy-datum ,   " Warranty End date
+        l_date type d ,                       " Date in User Format
+* begin of delete MOD-009
+*       l_mpobj type imptt-mpobj ,
+*       l_struct_bdcdata  TYPE bdcdata ,       "BDCDATA table
+*       l_i_bdcdata TYPE STANDARD TABLE OF bdcdata,"Table for BDC data
+* end of delete MOD-009
+* begin of delete MOD-005
+*       l_i_ausp type standard table of ausp initial size 1
+*            with header line,
+*       l_zname(2) type c ,
+*       l_fm_equnr type ausp-objek ,
+*       l_fm_atinn type ausp-atinn ,
+* end of delete MOD-005
+        l_atbez type cabnt-atbez   ,
+        l_text(100) type c         .
+
+* begin of delete MOD-005
+** Status table
+* DATA: BEGIN OF l_i_yam_charvalues OCCURS 0,
+*          zname  type yam_charvalues-zname,   "
+*          zvalue type yam_charvalues-zvalue,  " Meas Position
+*          atnam  type yam_charvalues-atnam,   " Characteristic
+*          indct  type yam_charvalues-indct,   " Indicator
+*          atbez  type cabnt-atbez,            " Char. Description
+*       END OF l_i_yam_charvalues .
+* end of delete MOD-005
+* begin of insert MOD-005
+  DATA: BEGIN OF l_i_yam_p025_mp_char OCCURS 0,
+           zcolnr type yam_p025_mp_char-zcolnr, " AM: Column number
+           zvalue type yam_p025_mp_char-zvalue, " Position
+           atnam  type yam_p025_mp_char-atnam,  " Characteristic Name
+           indct  type yam_p025_mp_char-indct,  " Indicator
+           atbez  type cabnt-atbez,             " Char. description
+           atinn  type ausp-atinn,              " Internal characterist.
+        END OF l_i_yam_p025_mp_char.
+* end of insert MOD_005
+
+** Loop through the internal table and update the required information
+  loop at i_equi .
+* Clear Variables
+    clear: l_objnr,
+           l_warranty_flag ,
+* begin of insertion MOD-004
+           l_cust_warranty_flag,
+           l_vend_warranty_flag,
+* end of insertion MOD-004
+           l_i_bdcdata.
+
+* Validate if Warranty update checkbox is checked
+*  begin of change MOD-006
+*   if p_wnty ne c_indicator .
+    if p_wntycu ne c_indicator and
+       p_wntyve ne c_indicator.
+*  end of change MOD-006
+** Populate Status table with Warranty Information not populated - Sel.
+**                            Screen Checkbox not checked
+      Perform Status_message_update using i_equi-equnr
+                                          i_equi-matnr
+                                          i_equi-sernr
+                                          text-006 .
+      l_warranty_flag = c_indicator .
+    else .
+      if not i_equi-ansdt is initial .
+* begin of deletion MOD-004
+** Validate if warranty detail is already available or not
+*       select  j_objnr into l_objnr from bgmkobj
+*                             up to 1 rows
+*                             where j_objnr eq i_equi-objnr
+*                             and   lvorm   ne c_indicator .
+*       endselect .
+* end of deletion MOD-004
+
+* begin of insertion MOD-004
+** Validate if customer warranty detail is already available or not
+*** begin of insert MOD-006
+        if p_wntycu eq c_indicator.
+*** end of insert MOD-006
+          select  j_objnr into l_objnr from bgmkobj
+                                up to 1 rows
+                                where j_objnr eq i_equi-objnr
+                                and   gaart   eq c_1
+                                and   lvorm   ne c_indicator .
+          endselect .
+
+          if sy-subrc eq 0 .
+** Populate Status table with cust. Warranty Details already available
+            Perform Status_message_update using i_equi-equnr
+                                                i_equi-matnr
+                                                i_equi-sernr
+                                                text-003 .
+            l_cust_warranty_flag = c_indicator .
+          else .
+            CALL FUNCTION 'MONTH_PLUS_DETERMINE'
+              EXPORTING
+                MONTHS  = c_months
+                OLDDATE = i_equi-ansdt
+              IMPORTING
+                NEWDATE = l_warranty_end_Date.
+          endif .
+*** begin of insert MOD-006
+        endif.
+*** end of insert MOD-006
+
+** Validate if vendor warranty detail is already available or not
+*** begin of insert MOD-006
+        if p_wntyve eq c_indicator.
+*** end of insert MOD-006
+          select  j_objnr into l_objnr from bgmkobj
+                                up to 1 rows
+                                where j_objnr eq i_equi-objnr
+                                and   gaart   eq c_2
+                                and   lvorm   ne c_indicator .
+          endselect .
+* end of insertion MOD-004
+
+          if sy-subrc eq 0 .
+** Populate Status table with vendor Warranty Details already available
+            Perform Status_message_update using i_equi-equnr
+                                                i_equi-matnr
+                                                i_equi-sernr
+* begin of change MOD-004
+*                                             text-003.
+                                                text-023 .
+*         l_warranty_flag = c_indicator .
+            l_vend_warranty_flag = c_indicator.
+* end of change MOD-004
+          else .
+            CALL FUNCTION 'MONTH_PLUS_DETERMINE'
+              EXPORTING
+                MONTHS  = c_months
+                OLDDATE = i_equi-ansdt
+              IMPORTING
+                NEWDATE = l_warranty_end_Date.
+          endif .
+*** begin of insert MOD-006
+        endif.
+*** end of insert MOD-006
+      else .
+
+** Populate Status table with Equipment acquisition date not available
+        Perform Status_message_update using i_equi-equnr
+                                            i_equi-matnr
+                                            i_equi-sernr
+                                            text-004 .
+
+        l_warranty_flag = c_indicator .
+      endif .
+    endif .
+
+********* Call Transaction IE02 ***********************
+
+** Fill bdcdata structure
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+            USING    'SAPMIEQ0'  '0100'  'X'  ''  ''
+            CHANGING l_struct_bdcdata.
+    APPEND l_struct_bdcdata  TO l_i_bdcdata.
+    CLEAR  l_struct_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+            USING    ''  ''  ''  'BDC_CURSOR'  'RM63E-EQUNR'
+            CHANGING l_struct_bdcdata.
+    APPEND l_struct_bdcdata  TO l_i_bdcdata.
+    CLEAR  l_struct_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+            USING    ''  ''  ''  'BDC_OKCODE'  '/00'
+            CHANGING l_struct_bdcdata.
+    APPEND l_struct_bdcdata  TO l_i_bdcdata.
+    CLEAR  l_struct_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+            USING    ''  ''  ''  'RM63E-EQUNR'  i_equi-equnr
+            CHANGING l_struct_bdcdata.
+    APPEND l_struct_bdcdata  TO l_i_bdcdata.
+    CLEAR  l_struct_bdcdata.
+
+
+** Screen 2
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+            USING    'SAPMIEQ0'  '0101'  'X'  ''  ''
+            CHANGING l_struct_bdcdata.
+    APPEND l_struct_bdcdata  TO l_i_bdcdata.
+    CLEAR  l_struct_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+             USING    ''  ''  ''  'BDC_OKCODE'  '=T\05'
+             CHANGING l_struct_bdcdata.
+    APPEND l_struct_bdcdata  TO l_i_bdcdata.
+    CLEAR  l_struct_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+             USING    ''  ''  ''  'BDC_CURSOR'  'ITOB-SHTXT'
+             CHANGING l_struct_bdcdata.
+    APPEND l_struct_bdcdata  TO l_i_bdcdata.
+    CLEAR  l_struct_bdcdata.
+
+
+** Screen 3
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+            USING    'SAPMIEQ0'  '0101'  'X'  ''  ''
+            CHANGING l_struct_bdcdata.
+    APPEND l_struct_bdcdata  TO l_i_bdcdata.
+    CLEAR  l_struct_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+             USING    ''  ''  ''  'BDC_OKCODE'  '=MEPO'
+             CHANGING l_struct_bdcdata.
+    APPEND l_struct_bdcdata  TO l_i_bdcdata.
+    CLEAR  l_struct_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+             USING    ''  ''  ''  'BDC_CURSOR'  'WCHECK_V_H-GAERB_I'
+             CHANGING l_struct_bdcdata.
+    APPEND l_struct_bdcdata  TO l_i_bdcdata.
+    CLEAR  l_struct_bdcdata.
+
+    if l_warranty_flag ne c_indicator .
+
+** Populate Warranty Details
+
+* begin of insert MOD-006
+      if p_wntycu eq c_indicator.
+* end of insert MOD-006
+
+* begin of insertion MOD-004
+        if l_cust_warranty_flag ne c_indicator.
+* end of insertion MOD-004
+
+** Customer Warranty Begin Date
+          write i_equi-ansdt to l_date .
+          PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                   USING    ''  ''  ''  'WCHECK_V_H-GWLDT_O'  l_Date
+                   CHANGING l_struct_bdcdata.
+          APPEND l_struct_bdcdata  TO l_i_bdcdata.
+          CLEAR  l_struct_bdcdata.
+
+** Customer Warranty End Date
+          write l_warranty_end_Date to l_date .
+          PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                 USING ''  ''  ''  'WCHECK_V_H-GWLEN_O'  l_date
+                 CHANGING l_struct_bdcdata.
+          APPEND l_struct_bdcdata  TO l_i_bdcdata.
+          CLEAR  l_struct_bdcdata.
+
+** Customer Warranty (Inherit/Warranty)
+          PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                 USING    ''  ''  ''  'WCHECK_V_H-WAGET_O'  c_indicator
+                   CHANGING l_struct_bdcdata.
+          APPEND l_struct_bdcdata  TO l_i_bdcdata.
+          CLEAR  l_struct_bdcdata.
+
+** Customer Warranty (Pass on Warranty)
+          PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                 USING    ''  ''  ''  'WCHECK_V_H-GAERB_O'  c_indicator
+                   CHANGING l_struct_bdcdata.
+          APPEND l_struct_bdcdata  TO l_i_bdcdata.
+          CLEAR  l_struct_bdcdata.
+
+* begin of insertion MOD-004
+** Populate Status table with Customer Warranty Details Populated
+          Perform Status_message_update using i_equi-equnr
+                                              i_equi-matnr
+                                              i_equi-sernr
+                                              text-025.
+        endif.
+* end of insertion MOD-004
+
+* begin of insert MOD-006
+      endif.
+* end of insert MOD-006
+
+* begin of insert MOD-006
+      if p_wntyve eq c_indicator.
+* end of insert MOD-006
+
+* begin of insertion MOD-004
+        if l_vend_warranty_flag ne c_indicator.
+* end of insertion MOD-004
+
+** Vendor Warranty Begin date
+          write i_equi-ansdt to l_date .
+          PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                   USING    ''  ''  ''  'WCHECK_V_H-GWLDT_I'  l_Date
+                   CHANGING l_struct_bdcdata.
+          APPEND l_struct_bdcdata  TO l_i_bdcdata.
+          CLEAR  l_struct_bdcdata.
+
+** Vendor Warranty End date
+          write l_warranty_end_Date to l_date .
+          PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                 USING ''  ''  ''  'WCHECK_V_H-GWLEN_I'  l_Date
+                 CHANGING l_struct_bdcdata.
+          APPEND l_struct_bdcdata  TO l_i_bdcdata.
+          CLEAR  l_struct_bdcdata.
+
+** Vendor Warranty (Inherit/Warranty)
+          PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                USING    ''  ''  ''  'WCHECK_V_H-WAGET_I'   c_indicator
+                   CHANGING l_struct_bdcdata.
+          APPEND l_struct_bdcdata  TO l_i_bdcdata.
+          CLEAR  l_struct_bdcdata.
+
+** Vendor Warranty (Pass on Warranty)
+          PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                USING    ''  ''  ''  'WCHECK_V_H-GAERB_I'   c_indicator
+                   CHANGING l_struct_bdcdata.
+          APPEND l_struct_bdcdata  TO l_i_bdcdata.
+          CLEAR  l_struct_bdcdata.
+
+** Populate Status table with Vendor Warranty Details Populated
+          Perform Status_message_update using i_equi-equnr
+                                              i_equi-matnr
+                                              i_equi-sernr
+                                              text-005 .
+* begin of insertion MOD-004
+        endif.
+* end of insertion MOD-004
+
+* begin of insert MOD-006
+      endif.
+* end of insert MOD-006
+
+    endif .
+
+
+** Measuring Points
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+             USING    'SAPLIMR0'  '4110'  'X'  ''   ''
+             CHANGING l_struct_bdcdata.
+    APPEND l_struct_bdcdata  TO l_i_bdcdata.
+    CLEAR  l_struct_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+            USING    ''  ''  ''  'BDC_CURSOR'  'IMPT-INDCT(01)'
+            CHANGING l_struct_bdcdata.
+    APPEND l_struct_bdcdata  TO l_i_bdcdata.
+    CLEAR  l_struct_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+            USING    ''  ''  ''  'BDC_OKCODE'  '/00'
+            CHANGING l_struct_bdcdata.
+    APPEND l_struct_bdcdata  TO l_i_bdcdata.
+    CLEAR  l_struct_bdcdata.
+
+
+** Ignore if selection screen option for MEAS point not checked
+    if p_meas eq c_indicator .
+
+** begin of MOD-005 (delete)
+**    begin of mod-001 (insert)
+*     refresh l_i_yam_charvalues.
+**    end of mod-001
+** end of MOD-005 (delete)
+
+** begin of insert MOD-005
+      refresh l_i_yam_p025_mp_char.
+** end of insert MOD-005
+
+*  begin of delete MOD-005
+**Check if Measurement Point already created
+** if yes no additional Measurement Point have to be created
+*  end of delete MOD-005
+
+* begin of insert MOD-005
+* check if 1 measuring point is already created
+      l_mpexist = 'N'.
+* end of insert MOD-005
+      Select MPOBJ from IMPTT into l_mpobj up to 1 rows
+                   where mpobj eq i_equi-objnr .
+      endselect .
+      if sy-subrc eq 0 .
+* begin of insert MOD-005
+        l_mpexist = 'Y'.
+      endif.
+* end of insert MOD-005
+
+* begin of delete MOD-005
+** Populate Status table with Measuring Points already available
+*  no Meas Point details to be created
+*       Perform Status_message_update using i_equi-equnr
+*                                           i_equi-matnr
+*                                           i_equi-sernr
+*                                           text-009 .
+*
+*     else .
+* Meas Point details to be created
+*       move: i_equi-equnr to l_fm_equnr .
+*
+** Conversion exit to get internal value
+*       CALL FUNCTION 'CONVERSION_EXIT_ATINN_INPUT'
+*         EXPORTING
+*           INPUT  = C_ZAM_MODEL
+*         IMPORTING
+*           OUTPUT = L_FM_ATINN.
+*
+*
+*
+** FM to get the Characteristic value
+*       CALL FUNCTION 'CLFM_SELECT_AUSP'
+*         EXPORTING
+*           MAFID     = c_mafid
+*           CLASSTYPE = c_klart
+*           OBJECT    = l_fm_equnr
+*           FEATURE   = l_fm_atinn
+*         TABLES
+*           EXP_AUSP  = l_i_ausp
+*         EXCEPTIONS
+*           NO_VALUES = 1
+*           OTHERS    = 2.
+*
+** if not entry in l_i_ausp do not update meas points
+*       read table l_i_ausp index 1 .
+*       if sy-subrc eq 0 .
+*         l_zname = l_i_ausp-ATWRT+0(2) .
+* end of delete MOD-005
+
+* begin of insert MOD-005
+      clear l_prdha.
+      select single prdha into l_prdha
+         from mara where matnr = i_equi-matnr.
+      if sy-subrc is initial and
+         l_prdha ne space.
+        l_zprodh3 = l_prdha+4(4).
+* end of insert MOD-005
+
+* begin of insertion MOD-003
+        g_default = 'N'.
+* end of insertion MOD-003
+* begin of change MOD-005
+*         select zname zvalue atnam indct
+*                from yam_charvalues into table l_i_yam_charvalues
+*                  where zname eq l_zname .
+        clear l_zcolnr.
+        select single zcolnr into l_zcolnr
+               from yam_p025_mp_pgc
+                 where zprodh3 = l_zprodh3.
+* end of change MOD-005
+        if sy-subrc ne 0 .
+** Populate Status table with No Measuring Points available
+** in custom table
+* begin of insertion MOD-002
+          if not i_equi-eqart = c_equipment.
+* end of insertion MOD-002
+            Perform Status_message_update using i_equi-equnr
+                                                i_equi-matnr
+                                                i_equi-sernr
+                                                text-010 .
+* begin of insertion MOD-002
+          else.
+* begin of change MOD-005
+*           l_zname = '**'.
+*           g_default = 'Y'.
+*           select zname zvalue atnam indct
+*                from yam_charvalues into table l_i_yam_charvalues
+*                  where zname eq l_zname .
+            l_zcolnr = c_999.
+            g_default = 'Y'.
+            select zcolnr zvalue atnam indct
+                 from yam_p025_mp_char into table l_i_yam_p025_mp_char
+                   where zcolnr = l_zcolnr.
+* end of change MOD-005
+          endif.
+* end of insertion MOD-002
+* begin of insert MOD-005
+        else.
+          select zcolnr zvalue atnam indct
+               from yam_p025_mp_char into table l_i_yam_p025_mp_char
+                 where zcolnr = l_zcolnr.
+          if sy-subrc ne 0.
+            if not i_equi-eqart = c_equipment.
+              Perform Status_message_update using i_equi-equnr
+                                                  i_equi-matnr
+                                                  i_equi-sernr
+                                                  text-010 .
+            else.
+              l_zcolnr = c_999.
+              g_default = 'Y'.
+              select zcolnr zvalue atnam indct
+                from yam_p025_mp_char into table l_i_yam_p025_mp_char
+                  where zcolnr = l_zcolnr.
+            endif.
+          endif.
+* end of insert MOD-005
+        endif .
+      else .
+* begin of delete MOD-005
+** Populate Status table with Characteristic ZAM_MODEL or
+**                       characteristic value not available
+* end of delete MOD-005
+* begin of insertion MOD-002
+        if not i_equi-eqart = c_equipment.
+* end of insertion MOD-002
+          Perform Status_message_update using i_equi-equnr
+                                              i_equi-matnr
+                                              i_equi-sernr
+* begin of change MOD-005
+*                                             text-011 .
+* Populate Status table with Material or PGC not available
+                                              text-026.
+* end of change MOD-005
+* begin of insertion MOD-002
+        else.
+* begin of change MOD-005
+*           l_zname = '**'.
+*           g_default = 'Y'.
+*           select zname zvalue atnam indct
+*                from yam_charvalues into table l_i_yam_charvalues
+*                  where zname eq l_zname .
+          l_zcolnr = c_999.
+          g_default = 'Y'.
+          select zcolnr zvalue atnam indct
+             from yam_p025_mp_char into table l_i_yam_p025_mp_char
+               where zcolnr = l_zcolnr.
+* end of change MOD-005
+        endif.
+* end of insertion MOD-002
+      endif .
+**    begin of mod-001 (delete)
+**    endif .
+**    end of mod-001
+
+
+*   Populate characteristic description
+      clear l_meas_flag .
+* begin of delete MOD-005
+*       loop at l_i_yam_charvalues .
+** Conversion exit to get internal value
+*         clear l_fm_atinn .
+*         CALL FUNCTION 'CONVERSION_EXIT_ATINN_INPUT'
+*           EXPORTING
+*             INPUT  = l_i_yam_charvalues-atnam
+*           IMPORTING
+*             OUTPUT = L_FM_ATINN.
+*         select  atbez from cabnt into l_i_yam_charvalues-atbez
+*                      up to 1 rows
+*                      where atinn eq l_fm_atinn
+*                      and   spras eq sy-langu
+*                      and   lkenz ne c_indicator .
+*         endselect .
+* end of delete MOD-005
+
+* begin of insert MOD-005
+      loop at l_i_yam_p025_mp_char.
+        CALL FUNCTION 'CONVERSION_EXIT_ATINN_INPUT'
+          EXPORTING
+            INPUT  = l_i_yam_p025_mp_char-atnam
+          IMPORTING
+            OUTPUT = l_i_yam_p025_mp_char-atinn.
+
+** check if MP already created - if not, create new MP
+        select mpobj from IMPTT into l_mpobj
+           where mpobj eq i_equi-objnr
+             and atinn eq l_i_yam_p025_mp_char-atinn.
+        endselect.
+        if sy-subrc is initial.
+          delete l_i_yam_p025_mp_char.
+          continue.
+        endif.
+
+        select  atbez from cabnt into l_i_yam_p025_mp_char-atbez
+                     up to 1 rows
+                     where atinn eq l_i_yam_p025_mp_char-atinn
+                     and   spras eq p_langu
+                     and   lkenz ne c_indicator .
+        endselect .
+* end of insert MOD-005
+        if sy-subrc ne 0 .
+          l_meas_flag = c_indicator .
+** Populate Status table with Characteristic Name Invalid
+          clear l_text .
+* begin of change MOD-005
+*           concatenate text-013 l_i_yam_charvalues-atnam into l_text .
+          concatenate text-013 l_i_yam_p025_mp_char-atnam into l_text.
+* end of change MOD-005
+          Perform Status_message_update using i_equi-equnr
+                                              i_equi-matnr
+                                              i_equi-sernr
+                                              l_text .
+
+        else .
+* begin of change MOD-005
+*           modify l_i_yam_charvalues .
+          modify l_i_yam_p025_mp_char.
+* end of change MOD-005
+        endif .
+      endloop .
+* begin of change MOD-005
+*      if not l_i_yam_charvalues[] is initial and l_meas_flag eq space .
+*         loop at l_i_yam_charvalues .
+*           if sy-tabix = 1 .
+
+* begin of insert MOD-009
+      g_runhours_exist = 'N'.
+* end of insert MOD-009
+
+      if not l_i_yam_p025_mp_char[] is initial and
+         l_meas_flag eq space .
+        loop at l_i_yam_p025_mp_char .
+* begin of insert MOD-009
+          if l_i_yam_p025_mp_char-atnam = c_act_runhours or
+             l_i_yam_p025_mp_char-atnam = c_est_runhours.
+            g_runhours_exist = 'Y'.
+          endif.
+* end of insert MOD-009
+          if l_mpexist = 'N'.                   " none exist already
+* end of change MOD-005
+            PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+* begin of change MOD-005
+*          USING ''  ''  ''  'IMPT-PSORT(01)' l_i_yam_charvalues-zvalue
+            USING ''  ''  ''  'IMPT-PSORT(01)'
+                      l_i_yam_p025_mp_char-zvalue
+* end of change MOD-005
+                  CHANGING l_struct_bdcdata.
+            APPEND l_struct_bdcdata  TO l_i_bdcdata.
+            CLEAR  l_struct_bdcdata.
+
+
+            PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                  USING ''  ''  ''  'IMPT-MPTYP(01)'  c_category
+                  CHANGING l_struct_bdcdata.
+            APPEND l_struct_bdcdata  TO l_i_bdcdata.
+            CLEAR  l_struct_bdcdata.
+
+            PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+* begin of change MOD-005
+*           USING ''  ''  ''  'IMPT-ATNAM(01)' l_i_yam_charvalues-atnam
+            USING ''  ''  ''  'IMPT-ATNAM(01)'
+                       l_i_yam_p025_mp_char-atnam
+* end of change MOD-005
+                  CHANGING l_struct_bdcdata.
+            APPEND l_struct_bdcdata  TO l_i_bdcdata.
+            CLEAR  l_struct_bdcdata.
+
+
+            PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+* begin of change MOD-005
+*           USING ''  ''  ''  'IMPT-PTTXT(01)' l_i_yam_charvalues-atbez
+            USING ''  ''  ''  'IMPT-PTTXT(01)'
+                      l_i_yam_p025_mp_char-atbez
+* end of change
+             CHANGING l_struct_bdcdata.
+            APPEND l_struct_bdcdata  TO l_i_bdcdata.
+            CLEAR  l_struct_bdcdata.
+
+* begin of change MOD-005
+*             if l_i_yam_charvalues-indct eq c_indicator .
+            if l_i_yam_p025_mp_char-indct eq c_indicator .
+* end of change MOD-005
+              PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                    USING ''  ''  ''  'IMPT-INDCT(01)'  c_indicator
+                    CHANGING l_struct_bdcdata.
+              APPEND l_struct_bdcdata  TO l_i_bdcdata.
+              CLEAR  l_struct_bdcdata.
+            endif .
+
+
+
+            PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                     USING    'SAPLIMR0'  '4110'  'X'  ''   ''
+                     CHANGING l_struct_bdcdata.
+            APPEND l_struct_bdcdata  TO l_i_bdcdata.
+            CLEAR  l_struct_bdcdata.
+
+            PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                  USING    ''  ''  ''  'BDC_CURSOR'  'IMPT-PSORT(01)'
+                    CHANGING l_struct_bdcdata.
+            APPEND l_struct_bdcdata  TO l_i_bdcdata.
+            CLEAR  l_struct_bdcdata.
+
+            PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                    USING    ''  ''  ''  'BDC_OKCODE'  '=ADDP'
+                    CHANGING l_struct_bdcdata.
+            APPEND l_struct_bdcdata  TO l_i_bdcdata.
+            CLEAR  l_struct_bdcdata.
+
+* begin of insert MOD-005
+            l_mpexist = 'Y'.
+* end of insert MOD-005
+          else .
+** More than One Record **
+
+* begin of insert MOD-005
+            PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                   USING    'SAPLIMR0'  '4110'  'X'  ''   ''
+                   CHANGING l_struct_bdcdata.
+            APPEND l_struct_bdcdata  TO l_i_bdcdata.
+            CLEAR  l_struct_bdcdata.
+
+            PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                   USING    ''  ''  ''  'BDC_CURSOR'  'IMPT-PSORT(01)'
+                   CHANGING l_struct_bdcdata.
+            APPEND l_struct_bdcdata  TO l_i_bdcdata.
+            CLEAR  l_struct_bdcdata.
+
+            PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                   USING    ''  ''  ''  'BDC_OKCODE'  '=ADDP'
+                   CHANGING l_struct_bdcdata.
+            APPEND l_struct_bdcdata  TO l_i_bdcdata.
+            CLEAR  l_struct_bdcdata.
+* end of insert MOD-005
+
+            PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                     USING    'SAPLIMR0'  '4110'  'X'  ''   ''
+                     CHANGING l_struct_bdcdata.
+            APPEND l_struct_bdcdata  TO l_i_bdcdata.
+            CLEAR  l_struct_bdcdata.
+
+            PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                  USING    ''  ''  ''  'BDC_CURSOR'  'IMPT-INDCT(02)'
+                    CHANGING l_struct_bdcdata.
+            APPEND l_struct_bdcdata  TO l_i_bdcdata.
+            CLEAR  l_struct_bdcdata.
+
+            PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                    USING    ''  ''  ''  'BDC_OKCODE'  '/00'
+                    CHANGING l_struct_bdcdata.
+            APPEND l_struct_bdcdata  TO l_i_bdcdata.
+            CLEAR  l_struct_bdcdata.
+
+
+
+**********2 entry *******
+            PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+* begin of change MOD-005
+*          USING ''  ''  ''  'IMPT-PSORT(02)' l_i_yam_charvalues-zvalue
+            USING ''  ''  ''  'IMPT-PSORT(02)'
+                       l_i_yam_p025_mp_char-zvalue
+* end of change MOD-005
+                  CHANGING l_struct_bdcdata.
+            APPEND l_struct_bdcdata  TO l_i_bdcdata.
+            CLEAR  l_struct_bdcdata.
+
+
+            PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                  USING ''  ''  ''  'IMPT-MPTYP(02)'  c_category
+                  CHANGING l_struct_bdcdata.
+            APPEND l_struct_bdcdata  TO l_i_bdcdata.
+            CLEAR  l_struct_bdcdata.
+
+
+            PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+* begin of MOD-005
+*          USING ''  ''  ''  'IMPT-ATNAM(02)'  l_i_yam_charvalues-atnam
+            USING ''  ''  ''  'IMPT-ATNAM(02)'
+                       l_i_yam_p025_mp_char-atnam
+* end of MOD-005
+                  CHANGING l_struct_bdcdata.
+            APPEND l_struct_bdcdata  TO l_i_bdcdata.
+            CLEAR  l_struct_bdcdata.
+
+
+            PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+* begin of change MOD-005
+*           USING ''  ''  ''  'IMPT-PTTXT(02)' l_i_yam_charvalues-atbez
+            USING ''  ''  ''  'IMPT-PTTXT(02)'
+                       l_i_yam_p025_mp_char-atbez
+* end of change MOD-005
+             CHANGING l_struct_bdcdata.
+            APPEND l_struct_bdcdata  TO l_i_bdcdata.
+            CLEAR  l_struct_bdcdata.
+
+* begin of change MOD-005
+*             if l_i_yam_charvalues-indct eq c_indicator .
+            if l_i_yam_p025_mp_char-indct eq c_indicator .
+* end of change
+              PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                    USING ''  ''  ''  'IMPT-INDCT(02)'  c_indicator
+                    CHANGING l_struct_bdcdata.
+              APPEND l_struct_bdcdata  TO l_i_bdcdata.
+              CLEAR  l_struct_bdcdata.
+            endif .
+          endif .
+
+
+          PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                   USING    'SAPLIMR0'  '4110'  'X'  ''   ''
+                   CHANGING l_struct_bdcdata.
+          APPEND l_struct_bdcdata  TO l_i_bdcdata.
+          CLEAR  l_struct_bdcdata.
+
+          PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                  USING    ''  ''  ''  'BDC_CURSOR'  'IMPT-PSORT(01)'
+                  CHANGING l_struct_bdcdata.
+          APPEND l_struct_bdcdata  TO l_i_bdcdata.
+          CLEAR  l_struct_bdcdata.
+
+          PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                  USING    ''  ''  ''  'BDC_OKCODE'  '=ADDP'
+                  CHANGING l_struct_bdcdata.
+          APPEND l_struct_bdcdata  TO l_i_bdcdata.
+          CLEAR  l_struct_bdcdata.
+
+        endloop .
+** Populate Status table with Measurement Points Populated
+* begin if insertion MOD-003
+        if g_default = 'Y'.
+          Perform Status_message_update using i_equi-equnr
+                                              i_equi-matnr
+                                              i_equi-sernr
+                                              text-020.
+        else.
+* end of insertion MOD-003
+          Perform Status_message_update using i_equi-equnr
+                                              i_equi-matnr
+                                              i_equi-sernr
+                                              text-007 .
+* begin of insertion MOD-003.
+        endif.
+* end of insertion MOD-003
+
+* begin of insert MOD-005
+      else.
+** Populate Status table with MP already available or one of char. names
+** is invalid, No MP details created
+        Perform Status_message_update using i_equi-equnr
+                                            i_equi-matnr
+                                            i_equi-sernr
+                                            text-027.
+* end of insert MOD-005
+
+      endif .
+***begin of MOD-005 (delete)
+**  begin of mod-001 (insert)
+*     endif.
+**  end of mod-001
+***end of MOD-005 (delete)
+    else .
+** Populate Status table with Measurement Points not Populated
+      Perform Status_message_update using i_equi-equnr
+                                          i_equi-matnr
+                                          i_equi-sernr
+                                          text-008 .
+
+    endif .
+
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+             USING    'SAPLIMR0'  '4110'  'X'  ''   ''
+             CHANGING l_struct_bdcdata.
+    APPEND l_struct_bdcdata  TO l_i_bdcdata.
+    CLEAR  l_struct_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+             USING    ''  ''  ''  'BDC_OKCODE'  '/ERW'
+             CHANGING l_struct_bdcdata.
+    APPEND l_struct_bdcdata  TO l_i_bdcdata.
+    CLEAR  l_struct_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+            USING    ''  ''  ''  'BDC_CURSOR'  'IMPT-PSORT(01)'
+            CHANGING l_struct_bdcdata.
+    APPEND l_struct_bdcdata  TO l_i_bdcdata.
+    CLEAR  l_struct_bdcdata.
+
+* begin of insert MOD-007
+* Configuration data setup
+    if p_kmatn = c_indicator.
+
+* begin of insert MOD-008
+      if i_equi-kmatn is initial.
+* end of insert MOD-008
+
+        if i_equi-eqart = c_equipment.
+
+*       get Profitcenter to make distinction between AIP and the rest
+          clear l_prdha.
+          select single prdha into l_prdha
+             from mara where matnr = i_equi-matnr.
+
+          if sy-subrc is initial and
+             l_prdha ne space.
+
+            clear i_yam_prodh_prctr-prctr.
+
+            read table i_yam_prodh_prctr with key prodh = l_prdha.
+            if sy-subrc ne 0.
+
+*             No Profitcenter available - Config. data not populated
+              Perform Status_message_update using i_equi-equnr
+                                                  i_equi-matnr
+                                                  i_equi-sernr
+                                                  text-029.
+            else.
+                    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                             USING    'SAPMIEQ0'  '0101'  'X'  ''   ''
+                             CHANGING l_struct_bdcdata.
+                    APPEND l_struct_bdcdata  TO l_i_bdcdata.
+                    CLEAR  l_struct_bdcdata.
+
+                    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                             USING    ''  ''  ''  'BDC_OKCODE'  '=AUSI'
+                             CHANGING l_struct_bdcdata.
+                    APPEND l_struct_bdcdata  TO l_i_bdcdata.
+                    CLEAR  l_struct_bdcdata.
+
+* View selection
+                    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                             USING    'SAPMIEQ0'  '1030'  'X'  ''   ''
+                             CHANGING l_struct_bdcdata.
+                    APPEND l_struct_bdcdata  TO l_i_bdcdata.
+                    CLEAR  l_struct_bdcdata.
+
+                    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                       USING    ''  ''  ''  'EQUI-S_KONFI'  c_indicator
+                            CHANGING l_struct_bdcdata.
+                    APPEND l_struct_bdcdata  TO l_i_bdcdata.
+                    CLEAR  l_struct_bdcdata.
+
+                    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                             USING    ''  ''  ''  'BDC_OKCODE'  '/ERW'
+                             CHANGING l_struct_bdcdata.
+                    APPEND l_struct_bdcdata  TO l_i_bdcdata.
+                    CLEAR  l_struct_bdcdata.
+
+                    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                             USING    'SAPMIEQ0'  '0101'  'X'  ''   ''
+                             CHANGING l_struct_bdcdata.
+                    APPEND l_struct_bdcdata  TO l_i_bdcdata.
+                    CLEAR  l_struct_bdcdata.
+
+                    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                             USING    ''  ''  ''  'BDC_OKCODE'  '=T\09'
+                             CHANGING l_struct_bdcdata.
+                    APPEND l_struct_bdcdata  TO l_i_bdcdata.
+                    CLEAR  l_struct_bdcdata.
+
+* Configuration data
+                    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                             USING    'SAPMIEQ0'  '0101'  'X'  ''   ''
+                             CHANGING l_struct_bdcdata.
+                    APPEND l_struct_bdcdata  TO l_i_bdcdata.
+                    CLEAR  l_struct_bdcdata.
+
+                    if i_yam_prodh_prctr-prctr(2) = '13'.   " 3 = AIP
+                    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                            USING    ''  ''  ''  'EQUI-KMATN'  p_kmatnp
+                            CHANGING l_struct_bdcdata.
+                      APPEND l_struct_bdcdata  TO l_i_bdcdata.
+                      CLEAR  l_struct_bdcdata.
+                    else.
+                    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                            USING    ''  ''  ''  'EQUI-KMATN'  p_kmatni
+                            CHANGING l_struct_bdcdata.
+                      APPEND l_struct_bdcdata  TO l_i_bdcdata.
+                      CLEAR  l_struct_bdcdata.
+                    endif.
+
+                    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                             USING    ''  ''  ''  'BDC_OKCODE'  '=COCH'
+                             CHANGING l_struct_bdcdata.
+                    APPEND l_struct_bdcdata  TO l_i_bdcdata.
+                    CLEAR  l_struct_bdcdata.
+
+* Maintain characteristics
+                    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                             USING    'SAPLCEI0'  '0109'  'X'  ''   ''
+                             CHANGING l_struct_bdcdata.
+                    APPEND l_struct_bdcdata  TO l_i_bdcdata.
+                    CLEAR  l_struct_bdcdata.
+
+                    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                 USING    ''  ''  ''  'RCTMS-MNAME(01)'  c_equi_country
+                            CHANGING l_struct_bdcdata.
+                    APPEND l_struct_bdcdata  TO l_i_bdcdata.
+                    CLEAR  l_struct_bdcdata.
+
+                    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                        USING    ''  ''  ''  'RCTMS-MWERT(01)'  p_werks
+                            CHANGING l_struct_bdcdata.
+                    APPEND l_struct_bdcdata  TO l_i_bdcdata.
+                    CLEAR  l_struct_bdcdata.
+
+                    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+                             USING    ''  ''  ''  'BDC_OKCODE'  '=BACK'
+                             CHANGING l_struct_bdcdata.
+                    APPEND l_struct_bdcdata  TO l_i_bdcdata.
+                    CLEAR  l_struct_bdcdata.
+
+*                   Configuration data populated
+                    Perform Status_message_update using i_equi-equnr
+                                                        i_equi-matnr
+                                                        i_equi-sernr
+                                                        text-030.
+            endif.
+          else.
+*         PRODH not available - Configuration data not populated
+            Perform Status_message_update using i_equi-equnr
+                                                i_equi-matnr
+                                                i_equi-sernr
+                                                text-028.
+          endif.
+
+        endif.
+* begin of insert MOD-008
+      else.
+** Populate Status table with Configuration data already available
+        Perform Status_message_update using i_equi-equnr
+                                            i_equi-matnr
+                                            i_equi-sernr
+                                            text-032.
+      endif.
+* end of insert MOD-008
+    else .
+** Populate Status table with Configuration data not Populated
+      Perform Status_message_update using i_equi-equnr
+                                          i_equi-matnr
+                                          i_equi-sernr
+                                          text-031 .
+    endif.
+* end of insert MOD-007
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+             USING    'SAPMIEQ0'  '0101'  'X'  ''   ''
+             CHANGING l_struct_bdcdata.
+    APPEND l_struct_bdcdata  TO l_i_bdcdata.
+    CLEAR  l_struct_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+            USING    ''  ''  ''  'BDC_OKCODE'  '=BU'
+            CHANGING l_struct_bdcdata.
+    APPEND l_struct_bdcdata  TO l_i_bdcdata.
+    CLEAR  l_struct_bdcdata.
+
+    IF NOT l_i_bdcdata[] IS INITIAL.
+*Perform Call Transaction to update the customer
+      CALL TRANSACTION 'IE02' USING l_i_bdcdata
+      MODE gv_mode UPDATE 'S' .
+      if sy-subrc ne 0 .
+** Populate Status table with Call Transaction failed
+        Perform Status_message_update using i_equi-equnr
+                                            i_equi-matnr
+                                            i_equi-sernr
+                                            text-012 .
+
+**    begin of insert MOD-009
+      else.
+        if p_meas = c_indicator and g_runhours_exist = 'Y'.
+
+          refresh l_i_bdcdata.
+          perform prep_update_measpoint using c_act_runhours.
+
+          if not l_i_bdcdata[] IS INITIAL.
+            call transaction 'IK02' using l_i_bdcdata
+                     mode gv_mode update 'S'.
+            g_subrc = sy-subrc.
+
+            refresh l_i_bdcdata.
+            perform prep_update_measpoint using c_est_runhours.
+
+            if not l_i_bdcdata[] IS INITIAL.
+              call transaction 'IK02' using l_i_bdcdata
+                       mode gv_mode update 'S'.
+
+              if sy-subrc ne 0 or g_subrc ne 0.
+**              Populate Status table with Call Transaction failed
+                Perform Status_message_update using i_equi-equnr
+                                                    i_equi-matnr
+                                                    i_equi-sernr
+                                                    text-033 .
+              endif.
+
+            endif.
+
+          endif.
+
+        endif.
+**    end of insert MOD-009
+
+      endif .
+**    begin of mod-001 (insert)
+      refresh l_i_bdcdata.
+**    end of mod-001
+    endif.
+  endloop .
+
+ENDFORM.                    " Update_Warranty_MeasPoint
+*&---------------------------------------------------------------------*
+*&      Form  Status_message_update
+*&---------------------------------------------------------------------*
+*       Populate status message table
+*----------------------------------------------------------------------*
+*      -->P_I_EQUI_EQUNR  Equipment Number
+*      -->P_I_EQUI_MATNR  Material Number
+*      -->P_I_EQUI_SERNR  Serial Number
+*      -->P_TEXT          Status Message Text
+*----------------------------------------------------------------------*
+FORM Status_message_update  USING    P_I_EQUI_EQUNR type any
+                                     P_I_EQUI_MATNR type any
+                                     P_I_EQUI_SERNR type any
+                                     P_TEXT   type any .
+
+  i_status-equnr = p_I_equi_equnr .
+  i_status-matnr = p_i_equi_matnr .
+  i_status-sernr = p_i_equi_sernr .
+  i_status-statusmsg = p_text     .
+  append i_status .
+  clear  i_status .
+
+ENDFORM.                    " Status_message_update
+*&---------------------------------------------------------------------*
+*&      Form  prep_update_measpoint                      MOD-009
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_RUNHOURS  text
+*----------------------------------------------------------------------*
+FORM prep_update_measpoint  USING    P_RUNHOURS.
+
+  data: g_atinn    type atinn,
+        g_est_flag.
+
+  clear g_est_flag.
+
+* get internal number for the characteristic
+  select single atinn into g_atinn
+      from CABN
+      where atnam = p_runhours.
+
+  if sy-subrc = 0.
+    concatenate 'IE' i_equi-equnr into l_mpobj.
+    select point into g_point
+        from IMPTT
+        where atinn = g_atinn
+          and mpobj = l_mpobj.
+    endselect.
+
+    if sy-subrc ne 0.
+*     characteristic not available - 'Annual estimate' not populated
+      g_text = text-035.
+      replace '&' in g_text with p_runhours.
+      Perform Status_message_update using i_equi-equnr
+                                          i_equi-matnr
+                                          i_equi-sernr
+                                          g_text.
+      g_est_flag = c_indicator.
+    else.
+*     'Annual estimate' populated
+      g_text = text-034.
+      replace '&' in g_text with p_runhours.
+      Perform Status_message_update using i_equi-equnr
+                                          i_equi-matnr
+                                          i_equi-sernr
+                                          g_text.
+    endif.
+
+  else.
+*   characteristic not available - 'Annual estimate' not populated
+    g_text = text-035.
+    replace '&' in g_text with p_runhours.
+    Perform Status_message_update using i_equi-equnr
+                                        i_equi-matnr
+                                        i_equi-sernr
+                                        g_text.
+    g_est_flag = c_indicator.
+  endif.
+
+  if g_est_flag ne c_indicator.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+             USING    'SAPLIMR0'  '1110'  'X'  ''   ''
+             CHANGING l_struct_bdcdata.
+    APPEND l_struct_bdcdata  TO l_i_bdcdata.
+    CLEAR  l_struct_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+         USING    ''  ''  ''  'IMPT-POINT'  g_point
+            CHANGING l_struct_bdcdata.
+    APPEND l_struct_bdcdata  TO l_i_bdcdata.
+    CLEAR  l_struct_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+             USING    ''  ''  ''  'BDC_OKCODE'  '/00'
+             CHANGING l_struct_bdcdata.
+    APPEND l_struct_bdcdata  TO l_i_bdcdata.
+    CLEAR  l_struct_bdcdata.
+
+*
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+             USING    'SAPLIMR0'  '5110'  'X'  ''   ''
+             CHANGING l_struct_bdcdata.
+    APPEND l_struct_bdcdata  TO l_i_bdcdata.
+    CLEAR  l_struct_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+         USING    ''  ''  ''  'RIMR0-PYEAC'  c_default
+            CHANGING l_struct_bdcdata.
+    APPEND l_struct_bdcdata  TO l_i_bdcdata.
+    CLEAR  l_struct_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+             USING    ''  ''  ''  'BDC_OKCODE'  '=BU'
+             CHANGING l_struct_bdcdata.
+    APPEND l_struct_bdcdata  TO l_i_bdcdata.
+    CLEAR  l_struct_bdcdata.
+
+  endif.
+
+ENDFORM.                    " prep_update_measpoint
+
+*Text symbol text£º
+*001:Selection Screen Input
+*002:No data available for the Selection Criteria
+*003:Customer Warranty Details already available - Customer Warranty Info not populated
+*004:Equipment acquisition date not available - Warranty Info not populated
+*005:Vendor Warranty Information populated
+*006:Warranty Information not populated - Sel. Screen Checkbox not checked
+*007:Measurement Points populated
+*008:Measuring Points not populated - Sel. Screen Checkbox not checked
+*009:Measuring Points already available,  no Meas Point details to be created
+*010:No Measuring Points available in the custom table
+*011:Characteristic ZAM_MODEL or  characteristic value not available
+*012:Call Transaction failed !!
+*013:Characteristic Name is invalid, check Characteristic -
+*014:Atlas Copco - Warranty/Measurement point
+*015:creation for new equipments status report as on -
+*016:Equipment Number
+*017:Material Number
+*018:Serial Number
+*019:Status Message
+*020:Measurement Points populated with default measuring points.
+*023:Vendor Warranty Details already available - Vendor Warranty Info not populated
+*025:Customer Warranty Information populated
+*026:Material or PGC not available
+*027:MP already available or one of char.names is invalid, no MP details created
+*028:PRODH not available - Configuration data not populated
+*029:No Profitcenter available - Configuration data not populated
+*030:Configuration data populated
+*031:Configuration data not populated - Sel. Screen Checkbox not checked
+*032:Configuration data already available
+*033:Call Transaction 'IK02' failed !!
+*034:'Annual estimate' in & populated
+*035:& not available - 'Annual estimate' not populated
+*036:No variant table for Oil types (CU60)
+*037:Could not find char.CH_EQUIPMENT_COUNTRY - Config. data not populated
+*038:Could not find char.ZAM_PGC - Config. data not populated
+
+*039:Could not find char.ZAM_OILTYPE - Config.data not populated
+*Selection text£º
+*P_KMATN:        Create Configuration tab
+*P_KMATNI:        Configuration material AII/AIF
+*P_KMATNP:        Configuration material AIP
+*P_LANGU:        Language for char. description
+*P_MEAS:        Create  Measuring Points
+*P_WERKS:        Plant
+*P_WNTYCU:        Create Customer Warranty info
+*P_WNTYVE:        Create Vendor Warranty info
+*S_EQUNR:        Equipment Number
+*S_ERDAT:        Equipment Creation Date

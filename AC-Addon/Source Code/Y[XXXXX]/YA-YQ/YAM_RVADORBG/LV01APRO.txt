@@ -1,0 +1,31 @@
+*----------------------------------------------------------------------*
+*   INCLUDE LV01APRO                                                   *
+*----------------------------------------------------------------------*
+CONSTANTS:
+* SD-protocoltypes
+    BEGIN OF PROTOCOLTYPE,
+*     addresslist maintainance protocol
+      ADMP  LIKE SDPROTOCOL-PROTTYPE VALUE 'ADMP',
+*     pricingprotocol
+      CONDA LIKE SDPROTOCOL-PROTTYPE VALUE 'CONDA',
+*     integrity rules for activitys
+      IRVCK LIKE SDPROTOCOL-PROTTYPE VALUE 'IRVCK',
+*     materialdetermination protocol --> not yet 250396
+*     CONDD LIKE SDPROTOCOL-PROTTYPE VALUE 'CONDD',
+*     textprotocol
+      TEXT  LIKE SDPROTOCOL-PROTTYPE VALUE 'TEXT',
+    END   OF PROTOCOLTYPE,
+
+* caller of the protocol (values of table SDPROTCAL)
+    BEGIN OF PROTOCOLCALLER,
+*     SD-order
+      SDA   LIKE SDPROTCAL-CALLER VALUE 'SDA ',
+*     SD-Addresslist
+      SDAB  LIKE SDPROTCAL-CALLER VALUE 'SDAB',
+*     SD-delivery
+      SDL   LIKE SDPROTCAL-CALLER VALUE 'SDL ',
+*     SD-invoice
+      SDF   LIKE SDPROTCAL-CALLER VALUE 'SDF ',
+*     SD-activity
+      SDK   LIKE SDPROTCAL-CALLER VALUE 'SDK ',
+    END   OF PROTOCOLCALLER.

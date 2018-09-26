@@ -1,0 +1,674 @@
+*----------------------------------------------------------------------*
+***INCLUDE YAM_BACK_BILLING_F01 .
+*----------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  initialization
+*&---------------------------------------------------------------------*
+*       text: Perform the necessary initialization actions
+*----------------------------------------------------------------------*
+FORM initialization .
+*.. Local variables
+  DATA: ls_log    TYPE bal_s_log.
+
+  ls_log-object = 'YAM_BACKBILL'.
+
+*.. Create application log
+  CALL FUNCTION 'BAL_LOG_CREATE'
+    EXPORTING
+      i_s_log                 = ls_log
+    IMPORTING
+      e_log_handle            = gv_handle
+    EXCEPTIONS
+      log_header_inconsistent = 1
+      OTHERS                  = 2.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+ENDFORM.                    " initialization
+
+*eject
+*&---------------------------------------------------------------------*
+*&      Form  select_contracts
+*&---------------------------------------------------------------------*
+*       text: Select the relevant contract information
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM select_contracts .
+*.. Local variables
+  DATA: ls_vbcom TYPE vbcom.
+
+  ls_vbcom-vkorg = p_vkorg.
+  ls_vbcom-vtweg = p_vtweg.
+  ls_vbcom-spart = p_spart.
+  ls_vbcom-auart = p_auart.
+  ls_vbcom-kunnr = p_kunnr.
+  ls_vbcom-vbeln = p_vbeln.
+* begin of change by air21099 on 10/07/06
+* ls_vbcom-vboff = 'X'.
+  ls_vbcom-vboff = ' '.
+* end of change
+  ls_vbcom-trvog = '4'.
+
+  CALL FUNCTION 'RV_SALES_DOCUMENT_VIEW_3'
+    EXPORTING
+      vbcom                           = ls_vbcom
+      I_CONTRACT_WITH_REFSTATUS       = gc_charx
+*   I_NEW_VALIND_SELECT             =
+*   KONV_FLAG                       =
+*   BSTKD_FLAG                      =
+*   EURO_FLAG                       =
+* IMPORTING
+*   TIME                            =
+    TABLES
+      lvbmtv                          = gt_vbmtv
+*   LSELTAB                         =
+            .
+
+*.. Filter contract items not ready for back-billing
+  DELETE gt_vbmtv WHERE zzrbb NE gc_charx.
+
+  CALL FUNCTION 'SD_VEDA_PROCESS_SELECT'
+* EXPORTING
+*   I_BEGIN_OF_PROCESS       = '00000000'
+*   I_VBCOM                  =
+    TABLES
+      postab                   = gt_vbmtv
+    EXCEPTIONS
+      no_data_to_process       = 1
+      OTHERS                   = 2
+            .
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+
+ENDFORM.                    " select_contracts
+
+*eject
+*&---------------------------------------------------------------------*
+*&      Form  calculate_dc_value
+*&---------------------------------------------------------------------*
+*       text: Calculate the debit/credit value for each contract item
+*----------------------------------------------------------------------*
+FORM calculate_dc_value .
+*.. Local variables
+  DATA: lv_tabkey TYPE cdpos-tabkey,
+        ls_cdpos  TYPE cdpos.
+
+*.. Loop on the contract items
+  LOOP AT gt_vbmtv.
+*.... Determine annual estimate for contract item from measurement point
+    PERFORM det_ann_est_and_reading_diff CHANGING gt_vbmtv-zzest
+                                                  gt_vbmtv-zzmrd.
+
+    IF gt_vbmtv-zzest IS INITIAL OR
+       gt_vbmtv-zzmrd IS INITIAL OR
+       gt_vbmtv-zzmrd LE 0.
+*...... Problem determining the annual est./reading diff for contract item &1 &2.
+      MESSAGE e006 WITH gt_vbmtv-vbeln gt_vbmtv-posnr INTO gv_msg.
+      PERFORM add_message_to_log.
+      gt_vbmtv-exclu = gc_charx.
+      gt_vbmtv-zzcol = gc_red.
+    ELSE.
+*...... Can the calculation be done on the indexed contract value or not?
+      IF gs_bb_def-bb_index IS INITIAL.
+*........ If not, retrieve non-indexed value from change documents for current item
+        CONCATENATE '%' gt_vbmtv-posnr INTO lv_tabkey.
+        SELECT *
+        FROM cdpos
+        INTO ls_cdpos
+        WHERE objectclas EQ 'VERKBELEG'
+          AND objectid   EQ gt_vbmtv-vbeln
+          AND tabname    EQ 'VBAP'
+          AND tabkey     LIKE lv_tabkey
+          AND fname      EQ 'NETPR'.
+          "  order by changenr descending => not allowed for cluster table
+        ENDSELECT.
+        IF sy-subrc EQ 0.
+          gt_vbmtv-netpr = ls_cdpos-value_old.
+*.......... Check currency of old value equals current currency header, if not convert
+          IF ls_cdpos-cuky_old NE gt_vbmtv-waerk.
+            CALL FUNCTION 'CONVERT_TO_LOCAL_CURRENCY'
+              EXPORTING
+*               CLIENT                  = SY-MANDT
+                date                    = sy-datlo
+                foreign_amount          = gt_vbmtv-netpr
+                foreign_currency        = ls_cdpos-cuky_old
+                local_currency          = gt_vbmtv-waerk
+              IMPORTING
+                local_amount            = gt_vbmtv-netpr
+              EXCEPTIONS
+                no_rate_found           = 1
+                overflow                = 2
+                no_factors_found        = 3
+                no_spread_found         = 4
+                derived_2_times         = 5
+                OTHERS                  = 6
+                      .
+            IF sy-subrc <> 0.
+              PERFORM add_message_to_log.
+              gt_vbmtv-exclu = gc_charx.
+              gt_vbmtv-zzcol = gc_red.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+
+*...... Perform calculation logic according to scenario indication
+      CASE gt_vbmtv-zzbbs.
+        WHEN 'A'.  " Back-billing scenario A
+          PERFORM scenario_a USING gt_vbmtv-zzest.
+        WHEN 'B'.  " Back-billing scenario B
+          PERFORM scenario_b USING gt_vbmtv-zzest.
+        WHEN OTHERS.
+*.......... Back-billing scenario indicator missing for contract item &1 &2
+          MESSAGE e010 WITH gt_vbmtv-vbeln gt_vbmtv-posnr INTO gv_msg.
+          PERFORM add_message_to_log.
+          gt_vbmtv-exclu = gc_charx.
+          gt_vbmtv-zzcol = gc_red.
+      ENDCASE.
+*...... If credit value calculated, check if credit values are allowed
+      IF gt_vbmtv-zzdcv LT 0.
+        IF gs_bb_def-allow_cr NE gc_charx.
+*.......... Credits not allowed for sales area. No further processing for contract item &1 &2.
+          MESSAGE s011 WITH gt_vbmtv-vbeln gt_vbmtv-posnr INTO gv_msg.
+          PERFORM add_message_to_log.
+          gt_vbmtv-exclu = gc_charx.
+          gt_vbmtv-zzcol = gc_orange.
+        ENDIF.
+      ENDIF.
+*...... If back-billing percentage available for sales area, apply it
+      IF NOT gs_bb_def-bbprc IS INITIAL.
+        gt_vbmtv-zzdcv = gs_bb_def-bbprc * gt_vbmtv-zzdcv / 100.
+      ENDIF.
+    ENDIF.
+
+    MODIFY gt_vbmtv.
+  ENDLOOP.
+ENDFORM.                    " calculate_dc_value
+
+*eject
+*&---------------------------------------------------------------------*
+*&      Form  output_list
+*&---------------------------------------------------------------------*
+*       text: Output the contract item list including back-billing
+*             information
+*----------------------------------------------------------------------*
+FORM output_list .
+*.. Local variables
+  DATA: ls_layout TYPE slis_layout_alv,
+        ls_grid   TYPE lvc_s_glay,
+        ls_events TYPE slis_alv_event.
+
+  DATA: lt_events TYPE slis_t_event,
+        lt_event_exits TYPE slis_t_event_exit,
+        lt_fieldcat TYPE slis_t_fieldcat_alv.
+
+*.. Fill events
+  ls_events-form = ls_events-name = 'USER_COMMAND'.
+  APPEND ls_events TO lt_events.
+  ls_events-form = ls_events-name = 'PF_STATUS_SET'.
+  APPEND ls_events TO lt_events.
+  ls_events-form = ls_events-name = 'END_OF_LIST'.
+  APPEND ls_events TO lt_events.
+  ls_events-form = ls_events-name = 'TOP_OF_PAGE'.
+  APPEND ls_events TO lt_events.
+
+*.. Define layout
+  ls_layout-get_selinfos      = gc_charx.
+  ls_layout-colwidth_optimize = gc_charx.
+  ls_layout-detail_popup      = gc_charx.
+  ls_layout-box_fieldname     = 'SELKZ'.
+  ls_layout-no_keyfix         = gc_charx.
+  ls_layout-key_hotspot       = gc_charx.
+  ls_layout-group_change_edit = gc_charx.
+  ls_layout-totals_before_items = gc_charx.
+  ls_layout-info_fieldname      = 'ZZCOL'.
+
+*.. Define grid settings
+  ls_grid-coll_end_l = gc_charx.
+
+*.. Prepare field catalog
+  CALL FUNCTION 'REUSE_ALV_FIELDCATALOG_MERGE'
+    EXPORTING
+      i_structure_name       = 'YAM_VBMTV'
+      i_client_never_display = 'X'
+    CHANGING
+      ct_fieldcat            = lt_fieldcat
+    EXCEPTIONS
+      inconsistent_interface = 1
+      program_error          = 2
+      OTHERS                 = 3.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+*.. Call ALV grid output
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+    EXPORTING
+      i_callback_program = 'YAM_BACK_BILLING'
+      i_structure_name   = 'YAM_VBMTV'
+      i_grid_settings    = ls_grid
+      is_layout          = ls_layout
+      i_save             = 'A'
+      it_fieldcat        = lt_fieldcat
+      it_events          = lt_events
+    TABLES
+      t_outtab           = gt_vbmtv
+    EXCEPTIONS
+      program_error      = 1
+      OTHERS             = 2.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+ENDFORM.                    " output_list
+
+*eject
+*&---------------------------------------------------------------------*
+*&      Form  scenario_a
+*&---------------------------------------------------------------------*
+*       text: Calculation according to scenario A
+*----------------------------------------------------------------------*
+FORM scenario_a USING ip_estim TYPE p.
+*.. Calculate amount customer should have paid based on actuals
+  gt_vbmtv-bzwrt = ( gt_vbmtv-netpr / ip_estim * gt_vbmtv-zzmrd ).
+*.. Calculate debit/credit value based on what he already paid
+  gt_vbmtv-zzdcv = gt_vbmtv-bzwrt - gt_vbmtv-netpr.
+
+ENDFORM.                    " scenario_a
+
+*eject
+*&---------------------------------------------------------------------*
+*&      Form  scenario_b
+*&---------------------------------------------------------------------*
+*       text: Calculation according to scenario B
+*----------------------------------------------------------------------*
+FORM scenario_b USING ip_estim TYPE p.
+*.. Local variables
+  DATA: ls_a099 TYPE a099,
+        ls_konp TYPE konp.
+
+*.. Check ZMIN condition type can be found for contract item
+  SELECT SINGLE *
+  FROM a099
+  INTO ls_a099
+  WHERE kappl EQ 'V'
+    AND kschl EQ 'ZMIN'
+    AND vbeln EQ gt_vbmtv-vbeln
+    AND posnr EQ gt_vbmtv-posnr
+    AND datbi GE sy-datlo
+    AND datab LE sy-datlo.
+  IF sy-subrc NE 0.
+*.... No ZMIN condition found for contract item &1 &2
+    MESSAGE e003 WITH gt_vbmtv-vbeln gt_vbmtv-posnr INTO gv_msg.
+    PERFORM add_message_to_log.
+    gt_vbmtv-exclu = gc_charx.  " Exclude item from further processing
+    gt_vbmtv-zzcol = gc_red.    " Set item line to color red
+  ENDIF.
+
+  SELECT SINGLE *
+  FROM konp
+  INTO ls_konp
+  WHERE knumh EQ ls_a099-knumh.
+  IF sy-subrc EQ 0.
+    IF ls_konp-kzbzg IS INITIAL.
+      PERFORM scenario_b_wo_scale USING ip_estim ls_konp.
+    ELSE.
+      PERFORM scenario_b_w_scale USING ip_estim ls_konp.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    " scenario_b
+
+*eject
+*&---------------------------------------------------------------------*
+*&      Form  scenario_b_w/o_scale
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM scenario_b_wo_scale USING ip_estim TYPE p
+                               ip_konp  TYPE konp.
+*.. Local variables
+  DATA: lv_actual TYPE netwr.
+
+*.. Calculate actual yearly contract value based on meter reading difference
+  lv_actual = gt_vbmtv-netpr / ip_estim * gt_vbmtv-zzmrd.
+
+*.. Check currency for ZMIN condition type and convert if needed
+  IF ip_konp-konwa NE gt_vbmtv-waerk.
+    CALL FUNCTION 'CONVERT_TO_LOCAL_CURRENCY'
+      EXPORTING
+        date             = sy-datlo
+        foreign_amount   = ip_konp-kbetr
+        foreign_currency = ip_konp-konwa
+        local_currency   = gt_vbmtv-waerk
+      IMPORTING
+        local_amount     = ip_konp-kbetr
+      EXCEPTIONS
+        no_rate_found    = 1
+        overflow         = 2
+        no_factors_found = 3
+        no_spread_found  = 4
+        derived_2_times  = 5
+        OTHERS           = 6.
+    IF sy-subrc <> 0.
+      PERFORM add_message_to_log.
+      gt_vbmtv-exclu = gc_charx.
+      gt_vbmtv-zzcol = gc_red.
+      EXIT.
+    ENDIF.
+  ENDIF.
+
+*.. If actual value > minimum yearly value
+  IF lv_actual > ip_konp-kbetr.
+*.... Charge actual
+    gt_vbmtv-zzdcv = lv_actual - gt_vbmtv-netpr.
+    gt_vbmtv-bzwrt = lv_actual.
+  ELSE.
+*.... Charge minimum
+    gt_vbmtv-zzdcv = ip_konp-kbetr - gt_vbmtv-netpr.
+    gt_vbmtv-bzwrt = ip_konp-kbetr.
+  ENDIF.
+
+ENDFORM.                    " scenario_b_w/o_scale
+
+*eject
+*&---------------------------------------------------------------------*
+*&      Form  scenario_b_w_scale
+*&---------------------------------------------------------------------*
+*       text: Scenario B with scale levels
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM scenario_b_w_scale USING ip_estim TYPE p
+                              ip_konp  TYPE konp.
+*.. Local variables
+  DATA: ls_konm TYPE konm.
+
+*.. Determine the correct scale level based on meter reading difference
+  SELECT *
+  FROM konm
+  INTO ls_konm
+  WHERE knumh EQ ip_konp-knumh
+    AND kstbm GE gt_vbmtv-zzmrd.
+    EXIT.
+  ENDSELECT.
+  IF sy-subrc EQ 0.
+*.... Check currency for ZMIN condition type and convert if needed
+    IF ip_konp-konwa NE gt_vbmtv-waerk.
+      CALL FUNCTION 'CONVERT_TO_LOCAL_CURRENCY'
+        EXPORTING
+          date             = sy-datlo
+          foreign_amount   = ls_konm-kbetr
+          foreign_currency = ip_konp-konwa
+          local_currency   = gt_vbmtv-waerk
+        IMPORTING
+          local_amount     = ip_konp-kbetr
+        EXCEPTIONS
+          no_rate_found    = 1
+          overflow         = 2
+          no_factors_found = 3
+          no_spread_found  = 4
+          derived_2_times  = 5
+          OTHERS           = 6.
+      IF sy-subrc <> 0.
+        PERFORM add_message_to_log.
+        gt_vbmtv-exclu = gc_charx.
+        gt_vbmtv-zzcol = gc_red.
+        EXIT.
+      ENDIF.
+    ENDIF.
+
+    gt_vbmtv-zzdcv = ls_konm-kbetr - gt_vbmtv-netpr.
+    gt_vbmtv-bzwrt = ls_konm-kbetr.
+  ELSE.
+*.... No suitable scale level found for &1 &2
+    MESSAGE e004 WITH gt_vbmtv-vbeln gt_vbmtv-posnr INTO gv_msg.
+    PERFORM add_message_to_log.
+    gt_vbmtv-exclu = gc_charx.  " Exclude item from further processing
+    gt_vbmtv-zzcol = gc_red.
+  ENDIF.
+ENDFORM.                    " scenario_b_w_scale
+
+*eject
+*&---------------------------------------------------------------------*
+*&      Form  add_message_to_log
+*&---------------------------------------------------------------------*
+*       text: Add a generated message to the application log
+*----------------------------------------------------------------------*
+FORM add_message_to_log .
+*.. Local variables
+  DATA: ls_msg TYPE bal_s_msg.
+
+  MOVE-CORRESPONDING syst TO ls_msg.
+  CALL FUNCTION 'BAL_LOG_MSG_ADD'
+    EXPORTING
+*     I_LOG_HANDLE              =
+      i_s_msg                   = ls_msg
+*   IMPORTING
+*     E_S_MSG_HANDLE            =
+*     E_MSG_WAS_LOGGED          =
+*     E_MSG_WAS_DISPLAYED       =
+    EXCEPTIONS
+      log_not_found             = 1
+      msg_inconsistent          = 2
+      log_is_full               = 3
+      OTHERS                    = 4
+            .
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+*.. Flag log as having entries
+  IF gv_log IS INITIAL.
+    gv_log = gc_charx.
+  ENDIF.
+
+ENDFORM.                    " add_message_to_log
+
+*eject
+*&---------------------------------------------------------------------*
+*&      Form  determine_annual_estimate_&_reading_diff
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM det_ann_est_and_reading_diff CHANGING ep_estim TYPE zzest
+                                           ep_zzmrd TYPE zzmrd_char.
+*.. Local variables
+  DATA: lv_equnr TYPE equnr,
+        lv_point TYPE imrc_point,
+        lv_mpobj TYPE imrc_mpobj,
+        ls_imrg  TYPE imrg,
+        ls_impt  TYPE impt,
+        lv_offset_time TYPE imrc_itime.
+
+*.. Determine equipment for contract item
+  SELECT SINGLE equnr
+  INTO lv_equnr
+  FROM viser02
+  WHERE sdaufnr EQ gt_vbmtv-vbeln
+    AND posnr   EQ gt_vbmtv-posnr.
+  IF sy-subrc EQ 0.
+    gt_vbmtv-equnr = lv_equnr.
+    CONCATENATE 'IE' lv_equnr INTO lv_mpobj.
+*.... Determine relevant measurement point
+    SELECT SINGLE point
+    INTO lv_point
+    FROM imptt
+    WHERE mpobj EQ lv_mpobj
+      AND psort EQ 'BACKBILLING'.
+
+    IF sy-subrc NE 0.
+*...... Measuring point & does not exist
+      MESSAGE e001(ir) WITH 'BACKBILLING' INTO gv_msg.
+      PERFORM add_message_to_log.
+    ELSE.
+*...... Get measurement point details & last measurement document
+      CALL FUNCTION 'MEASUREM_DOCUM_READ_LAST'
+        EXPORTING
+          point           = lv_point
+          offset_date     = '99991231'
+          offset_time     = '235959'
+        IMPORTING
+          imrg_wa         = ls_imrg
+          impt_wa         = ls_impt
+        EXCEPTIONS
+          imrg_not_found  = 1
+          imptt_not_found = 2
+          OTHERS          = 3.
+      IF sy-subrc <> 0.
+        PERFORM add_message_to_log.
+        EXIT.
+      ENDIF.
+
+*...... Store unit of measurement, date of last measurement & last measurement value
+      gt_vbmtv-msehi      = ls_impt-msehi.
+      gt_vbmtv-idate_last = ls_imrg-idate.
+      lv_offset_time      = ls_imrg-itime.
+*...... Check counter reading entered as difference
+      IF ls_imrg-idiff = gc_charx.
+*........ Convert total counter reading to characteristic Uom
+        PERFORM uom_convert USING ls_imrg-cntrr
+                                  ls_impt-msehi
+                            CHANGING gt_vbmtv-recdv_last.
+        IF sy-subrc <> 0.
+          PERFORM add_message_to_log.
+          EXIT.
+        ENDIF.
+      ELSE.
+        gt_vbmtv-recdv_last = ls_imrg-recdv.
+      ENDIF.
+      CLEAR ls_imrg.
+
+*...... Get previous measurement document (document before last)
+      CALL FUNCTION 'MEASUREM_DOCUM_READ_LAST'
+        EXPORTING
+          point            = lv_point
+          offset_date      = gt_vbmtv-idate_last
+          offset_time      = lv_offset_time
+          offset_inclusive = space
+        IMPORTING
+          imrg_wa          = ls_imrg
+        EXCEPTIONS
+          imrg_not_found   = 1
+          imptt_not_found  = 2
+          OTHERS           = 3.
+
+      IF sy-subrc EQ 0.
+*........ Date of previous measurement & previous measurement value
+        gt_vbmtv-idate_prev = ls_imrg-idate.
+*........ Check counter reading entered as difference
+        IF ls_imrg-idiff = gc_charx.
+*.......... Convert total counter reading to characteristic Uom
+          PERFORM uom_convert USING ls_imrg-cntrr
+                                    ls_impt-msehi
+                              CHANGING gt_vbmtv-recdv_prev.
+          IF sy-subrc <> 0.
+            PERFORM add_message_to_log.
+            EXIT.
+          ENDIF.
+        ELSE.
+          gt_vbmtv-recdv_prev = ls_imrg-recdv.
+        ENDIF.
+        CLEAR ls_imrg.
+      ENDIF.
+
+*...... Convert annual estimate to characteristic Uom
+      PERFORM uom_convert USING ls_impt-pyear
+                                ls_impt-msehi
+                          CHANGING ep_estim.
+      IF sy-subrc <> 0.
+        PERFORM add_message_to_log.
+        EXIT.
+      ENDIF.
+
+*...... Calculate measurement reading difference
+      ep_zzmrd = gt_vbmtv-recdv_last - gt_vbmtv-recdv_prev.
+
+      CLEAR ls_impt.
+    ENDIF.
+  ENDIF.
+ENDFORM.                    " det_ann_est_&_reading_diff
+
+*eject
+*&---------------------------------------------------------------------*
+*&      Form  uom_convert
+*&---------------------------------------------------------------------*
+*       text: Convert from SI to uom
+*----------------------------------------------------------------------*
+*      <-- ep_result       text: Conversion result
+*      --> ip_input        text: Input value
+*      --> ip_msehi        text: Target uom
+*----------------------------------------------------------------------*
+FORM uom_convert  USING    ip_input
+                           ip_msehi
+                  CHANGING ep_result.
+  CALL FUNCTION 'UNIT_CONVERSION_SIMPLE'
+    EXPORTING
+      input                = ip_input
+      unit_out             = ip_msehi
+    IMPORTING
+      output               = ep_result
+    EXCEPTIONS
+      conversion_not_found = 1
+      division_by_zero     = 2
+      input_invalid        = 3
+      output_invalid       = 4
+      overflow             = 5
+      type_invalid         = 6
+      units_missing        = 7
+      unit_in_not_found    = 8
+      unit_out_not_found   = 9
+      OTHERS               = 10.
+
+
+ENDFORM.                    " uom_convert
+
+*eject
+*&---------------------------------------------------------------------*
+*&      Form  save_application_log
+*&---------------------------------------------------------------------*
+*       text: Save the current application log to database
+*----------------------------------------------------------------------*
+FORM save_application_log .
+*.. Local variables
+  DATA: lt_handle TYPE bal_t_logh.
+
+  APPEND gv_handle TO lt_handle.
+
+  CALL FUNCTION 'BAL_DB_SAVE'
+    EXPORTING
+*     I_CLIENT               = SY-MANDT
+      i_in_update_task       = 'X'
+      i_t_log_handle         = lt_handle
+*   IMPORTING
+*     E_NEW_LOGNUMBERS       =
+    EXCEPTIONS
+      log_not_found          = 1
+      save_not_allowed       = 2
+      numbering_error        = 3
+      OTHERS                 = 4
+            .
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+  COMMIT WORK.
+
+ENDFORM.                    " save_application_log

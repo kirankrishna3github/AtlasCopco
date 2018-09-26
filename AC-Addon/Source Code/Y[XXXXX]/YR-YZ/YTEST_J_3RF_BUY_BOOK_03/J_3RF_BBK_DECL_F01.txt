@@ -1,0 +1,422 @@
+*&---------------------------------------------------------------------*
+*&  Include           J_3RF_BBK_DECL_F01
+*&---------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  VAT_DECL_INIT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM vat_decl_init USING i_section   TYPE j3rdl_decl_section
+                         i_section_a TYPE j3rdl_decl_section.
+
+  DATA: lc_func TYPE rs38l_fnam VALUE 'J3RVATDSEC_HIER'.
+
+  CLEAR g_vat_decl_flag.
+
+* check that function module J3RVATDSEC_HIER exists
+  CALL FUNCTION 'FUNCTION_EXISTS'
+    EXPORTING
+      funcname           = lc_func
+    EXCEPTIONS
+      function_not_exist = 1
+      OTHERS             = 2.
+  IF sy-subrc = 0.
+    g_vat_decl_flag = 'X'.
+  ENDIF.
+
+* set sections
+  g_vat_decl_section   = i_section.
+  g_vat_decl_section_a = i_section_a.
+
+* 2131494 - init merging extracts
+  call function 'REUSE_ALV_EXTRACT_AT_INIT'
+    changing
+      cs_extract1 = gs_extract_src
+      cs_extract2 = gs_extract_dst.
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_DECL_BEFORE_OUTPUT
+*&---------------------------------------------------------------------*
+*       Set flags
+*----------------------------------------------------------------------*
+FORM check_decl_before_output .
+  PERFORM check_decl_flags.
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_DECL_FLAGS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM check_decl_flags .
+  IF bk_vers IS INITIAL.
+    bk_vers = j3rdl_ver_default.
+  ENDIF.
+
+  CASE bk_vers.
+    WHEN j3rdl_ver_0283. " Version per Decree 283
+      ver2012 = ' '. ver2014 = ' '.
+    WHEN j3rdl_ver_1137. " Version per Decree 1137
+      ver2012 = 'X'. ver2014 = ' '.
+    WHEN j3rdl_ver_0735. " Version per Decree 735 (Extension of 1137)
+      ver2012 = 'X'. ver2014 = 'X'.
+    WHEN j3rdl_ver_decl_15. " VAT Declaration 2015
+      ver2012 = 'X'. ver2014 = 'X'.
+  ENDCASE.
+
+* set flag VAT Declaration is selected
+  CLEAR g_vat_decl_sel.
+  IF gv_xml_enabled = 'X' AND bk_vers >= j3rdl_ver_decl_15.
+    IF vr_type = j3rdl_decl_type_corr.
+      g_vat_decl_sel = gc_vat_decl_sel_corr.  " correction
+    ELSE.
+      g_vat_decl_sel = gc_vat_decl_sel_main.  " main declaration
+    ENDIF.
+  ENDIF.
+
+* incoming totals are calculated from main extract
+  IF NOT g_vat_decl_sel IS INITIAL.
+    p_add = 'X'.
+    IF g_vat_decl_sel <> gc_vat_decl_sel_corr.
+      CLEAR p_sum.
+    ENDIF.
+  ENDIF.
+  IF p_add IS INITIAL.
+    CLEAR: p_sum.
+  ENDIF.
+  IF p_sum IS INITIAL.
+    CLEAR: p_update.
+  ENDIF.
+
+* format correction number
+  CALL FUNCTION 'J3RF_VATDECL_CORR_NUMB_ZERO'
+    CHANGING
+      cv_corr_num       = vr_cnum.
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  F4_FOR_VR_CNUM
+*&---------------------------------------------------------------------*
+*       Search help for VR_CNUM
+*----------------------------------------------------------------------*
+FORM f4_for_vr_cnum .
+  DATA: it_ret TYPE TABLE OF ddshretval,
+        s_shlp TYPE shlp_descr,
+        l_bukrs TYPE bkpf-bukrs,
+        l_gjahr TYPE bkpf-gjahr,
+        l_perio TYPE j_3rvatdqmperiod.
+  FIELD-SYMBOLS: <fs>     LIKE LINE OF s_shlp-interface,
+                 <fs_ret> LIKE LINE OF it_ret.
+  CONSTANTS: c_shlpname TYPE shlpname   VALUE 'J_3RF_VATDFILES',
+             c_corr_num TYPE ddshlpsfld VALUE 'CORR_NUM'.
+
+* get search help description
+  CALL FUNCTION 'F4IF_GET_SHLP_DESCR'
+    EXPORTING
+     shlpname = c_shlpname
+    IMPORTING
+      shlp     = s_shlp
+    EXCEPTIONS
+      OTHERS   = 1.
+  CHECK sy-subrc IS INITIAL.
+
+* get screen params
+  PERFORM get_screen_field  USING    'MAINBUK'
+                            CHANGING l_bukrs.
+  PERFORM get_screen_field  USING    'VR_GJAHR'
+                            CHANGING l_gjahr.
+  PERFORM get_screen_field  USING    'VR_PERIO'
+                            CHANGING l_perio.
+
+* set SHLP params
+  SET PARAMETER ID 'BUK' FIELD l_bukrs.
+  SET PARAMETER ID 'GJR' FIELD l_gjahr.
+  SET PARAMETER ID 'J_3RVATDQMPERIOD' FIELD l_perio.
+
+* CORR_NUM is a field for selection
+  READ TABLE s_shlp-interface ASSIGNING <fs> WITH KEY shlpfield = c_corr_num.
+  IF sy-subrc IS INITIAL.
+    <fs>-valfield = 'X'.
+  ENDIF.
+
+* rise a dialog
+  CALL FUNCTION 'F4IF_START_VALUE_REQUEST'
+    EXPORTING
+      shlp          = s_shlp
+    TABLES
+      return_values = it_ret.
+
+* get result
+  READ TABLE it_ret ASSIGNING <fs_ret>
+    WITH KEY shlpname  = c_shlpname
+             fieldname = c_corr_num.
+  IF sy-subrc IS INITIAL.
+    vr_cnum = <fs_ret>-fieldval.
+    CALL FUNCTION 'J3RF_VATDECL_CORR_NUMB_ZERO'
+      CHANGING
+        cv_corr_num       = vr_cnum.
+  ENDIF.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  READ_DECL_EXTRACTS
+*&---------------------------------------------------------------------*
+*       Read extract names from J_3RVATDFILES
+*----------------------------------------------------------------------*
+FORM read_decl_extracts  USING    i_bukrs   TYPE bkpf-bukrs
+                                  i_gjahr   TYPE bkpf-gjahr
+                                  i_perio   TYPE j_3rvatdqmperiod
+                                  i_corrnum TYPE j_3rvatdcorrnum
+                         CHANGING e_pl_exname TYPE ltex-exname
+                                  e_sl_exname TYPE ltex-exname.
+
+  SELECT SINGLE pl_extract sl_extract FROM j_3rvatdfiles
+    INTO (e_pl_exname, e_sl_exname)
+    WHERE bukrs    = i_bukrs   AND
+          gjahr    = i_gjahr   AND
+          period   = i_perio   AND
+          corr_num = i_corrnum.
+  IF sy-subrc <> 0.
+    CLEAR: e_pl_exname, e_sl_exname.
+  ENDIF.
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  SAVE_DECL_EXTRACTS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM save_decl_extracts  USING    i_bukrs     TYPE bkpf-bukrs
+                                  i_gjahr     TYPE bkpf-gjahr
+                                  i_perio     TYPE j_3rvatdqmperiod
+                                  i_corrnum   TYPE j_3rvatdcorrnum
+                                  i_book_ver  TYPE c " SAL or PUR
+                                  i_extract   TYPE ltex-exname
+                                  i_file_name TYPE string.
+  DATA: ls_vatdfiles TYPE j_3rvatdfiles,
+        l_fn_file    TYPE name_feld,
+        l_fn_extract TYPE name_feld.
+  FIELD-SYMBOLS: <fs_file>    TYPE j_3rvatdfiles-fn_pbcurrp,
+                 <fs_extract> TYPE j_3rvatdfiles-pl_extract.
+
+  CHECK NOT i_extract   IS INITIAL OR
+        NOT i_file_name IS INITIAL.
+
+  CASE i_book_ver.
+    WHEN 'SAL'.
+      l_fn_extract = 'SL_EXTRACT'.
+      IF i_corrnum IS INITIAL.
+        l_fn_file    = 'FN_SBCURRP'.
+      ELSE.
+        l_fn_file    = 'FN_SBADDPG'.
+      ENDIF.
+    WHEN 'PUR'.
+      l_fn_extract = 'PL_EXTRACT'.
+      IF i_corrnum IS INITIAL.
+        l_fn_file    = 'FN_PBCURRP'.
+      ELSE.
+        l_fn_file    = 'FN_PBADDPG'.
+      ENDIF.
+    WHEN OTHERS.
+      RETURN.
+  ENDCASE.
+
+  ASSIGN COMPONENT l_fn_file    OF STRUCTURE ls_vatdfiles TO <fs_file>.
+  CHECK sy-subrc = 0.
+  ASSIGN COMPONENT l_fn_extract OF STRUCTURE ls_vatdfiles TO <fs_extract>.
+  CHECK sy-subrc = 0.
+
+* read database record
+  SELECT SINGLE * FROM j_3rvatdfiles
+    INTO ls_vatdfiles
+    WHERE bukrs    = i_bukrs   AND
+          gjahr    = i_gjahr   AND
+          period   = i_perio   AND
+          corr_num = i_corrnum.
+  IF sy-subrc <> 0.
+    CLEAR ls_vatdfiles.
+    ls_vatdfiles-bukrs    = i_bukrs.
+    ls_vatdfiles-gjahr    = i_gjahr.
+    ls_vatdfiles-period   = i_perio.
+    ls_vatdfiles-corr_num = i_corrnum.
+
+    IF NOT i_file_name IS INITIAL.
+      <fs_file>    = i_file_name.
+    ENDIF.
+    IF NOT i_extract IS INITIAL.
+      <fs_extract> = i_extract.
+    ENDIF.
+
+    INSERT j_3rvatdfiles FROM ls_vatdfiles.
+  ELSE.
+    <fs_file>    = i_file_name.
+    <fs_extract> = i_extract.
+
+    MODIFY j_3rvatdfiles FROM ls_vatdfiles.
+  ENDIF.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  FILL_DECL_HEADER
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM fill_decl_header  CHANGING c_header TYPE j_3r_sp_ledger_header.
+
+  DATA: l_crnum TYPE j_3rvatdcorrnum.
+
+  c_header-vat_decl = g_vat_decl_sel.
+  IF NOT g_vat_decl_sel IS INITIAL.
+*   format correction number to integer
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_OUTPUT'
+      EXPORTING
+        input  = vr_cnum
+      IMPORTING
+        output = l_crnum.
+    IF l_crnum = '0'.
+      CLEAR l_crnum.
+    ENDIF.
+    c_header-corr_num  = l_crnum.
+    c_header-corr_mode = '0'. " replace data
+  ENDIF.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_DECL_START
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM check_decl_start  USING i_sel TYPE flag.
+  CLEAR g_vat_decl_main_extract.
+
+  CHECK NOT g_vat_decl_flag IS INITIAL AND
+        NOT g_vat_decl_sel IS INITIAL.
+
+  CHECK p_xml   = 'X' AND  " verify for production mode only
+        vr_prod = 'X'.
+
+*  if correction VAT Return then we need extract for main declaration
+  IF g_vat_decl_sel = gc_vat_decl_sel_corr.
+
+*   correction number is required
+    IF vr_cnum IS INITIAL.
+      MESSAGE e076(9p).
+    ENDIF.
+
+*   check correction number
+    CALL FUNCTION 'J3RF_VATDECL_CORR_NUMB_CHECK'
+      EXPORTING
+        i_bukrs             = mainbuk
+        i_gjahr             = vr_gjahr
+        i_period            = vr_perio
+        i_corr_num          = vr_cnum
+      EXCEPTIONS
+        OTHERS              = 1.
+    IF sy-subrc <> 0.
+      MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+              WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_DECL_SCREEN
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM check_decl_screen  USING i_sel  TYPE flag
+                              i_key  TYPE string
+                              i_keya TYPE string.
+  STATICS: sv_add_report TYPE flag VALUE space.
+
+* read customizing of VAT declaration
+  PERFORM check_standard_xml_hier USING    g_vat_decl_section
+                                           i_key
+                                  CHANGING pa_xml.
+
+  PERFORM check_standard_xml_hier USING    g_vat_decl_section_a
+                                           i_keya
+                                  CHANGING pa_xmla.
+
+* 2138132 - check additional sheet selection
+  IF g_vat_decl_sel = gc_vat_decl_sel_main AND
+     p_noex         = 'X'                  AND
+     sv_add_report IS INITIAL.
+    if sel_mona-low is initial and br_budat-low is initial.
+      set cursor field 'SEL_MONA-LOW'.
+      MESSAGE w081(9p).
+      sv_add_report = 'X'.
+    endif.
+    if ad_monat-low is initial and ad_budat-low is initial.
+      set cursor field 'AD_MONAT-LOW'.
+      MESSAGE w081(9p).
+      sv_add_report = 'X'.
+    endif.
+  ENDIF.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_STANDARD_XML_HIER
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM check_standard_xml_hier  USING    i_section TYPE j3rdl_decl_section
+                                       i_keys    TYPE string
+                              CHANGING c_xml     TYPE j_3rf_rep_hier_key.
+  DATA: l_str TYPE string,
+        l_xml TYPE j_3rf_rep_hier_key.
+
+  l_xml = c_xml.
+  IF g_vat_decl_cust = 'X'.
+    CLEAR l_xml.
+  ELSEIF NOT l_xml IS INITIAL.
+    CONCATENATE ';' l_xml ';' INTO l_str.
+    IF i_keys CS l_str.
+      CLEAR l_xml.
+    ENDIF.
+  ENDIF.
+
+  CHECK l_xml IS INITIAL. " standard hierarchy
+
+* read customizing
+  PERFORM read_xml_customizing USING    i_section
+                               CHANGING l_xml.
+  IF NOT l_xml IS INITIAL.
+    c_xml = l_xml.
+  ENDIF.
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_MERGE_EXTRACTS                              2131494
+*&---------------------------------------------------------------------*
+*       Check selection screen for merging extracts
+*----------------------------------------------------------------------*
+FORM check_merge_extracts USING i_scr TYPE flag.
+
+  CHECK sscrfields-ucomm = 'ONLI' OR  " Check on RUN
+        i_scr IS INITIAL.
+
+  CHECK p_merge = 'X'.
+
+  IF p_ex_src[] IS INITIAL.
+    MESSAGE e078(9P).
+  ENDIF.
+
+  IF p_ex_dst IS INITIAL.
+    MESSAGE e079(9P).
+  ENDIF.
+
+* check destination extract
+  IF gs_extract_dst-exname <> p_ex_dst.
+    gs_extract_dst-exname = p_ex_dst.
+
+    call function 'REUSE_ALV_EXTRACT_EXISTENCE'
+      changing
+        cs_extract = gs_extract_dst
+      exceptions
+        not_found  = 1
+        others     = 2.
+    if sy-subrc = 0.
+      message w307(0k) with gs_extract_dst-exname.
+    endif.
+  ENDIF.
+ENDFORM.

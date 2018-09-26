@@ -1,0 +1,511 @@
+*&---------------------------------------------------------------------*
+*&  Include           YSE_INST_BASE_REPORTS_EV                         *
+*&---------------------------------------------------------------------*
+************************************************************************
+*initilization                                                         *
+*
+************************************************************************
+initialization.
+*This export is required to display the search help for the status selection fields
+*It is imported again in the search help exit
+  data: p_obtyp(3) type c value 'IEQ'.
+  export p_obtyp to memory id 'PM_OBTYP'.
+
+
+***********************************************************************
+*At selection-screen output                                           *
+***********************************************************************
+at selection-screen output.
+
+*Title
+  set titlebar 'EQU'.
+
+*Set Icon for adress button
+  perform set_icon using p_adrfl ad_icon text-ad0 text-ad1.  "This perform will check if address data has been entered, if this is the case
+  "a green icon will be displayed, otherwise a red icon will be displayed
+
+*Not serviced selection options
+
+  perform change_serv_fields.              "This subroutine will (de)activate the not service options related to the checkbox
+
+
+
+************************************************************************
+*At selection-screen                                                   *
+************************************************************************
+at selection-screen.
+  case sy-ucomm.
+*If address button is clicked, open search-help
+    when 'ADDR'.
+      perform adress_sel.
+    when 'SERV'.
+
+  endcase.
+*Perform some checks on partner number and function
+  perform check_partner.        "This subroutine will check if the entered partner exists, and if it does convert the number to an internal format
+
+
+*First check if service equipments since parameter is active,
+*If so, maintenance data is advisable
+  if not p_no_ser is initial and so_swerk is initial and so_strno is initial and so_iwerk is initial and so_ingrp is initial.
+    message w021(yse_inst_base_rep).  "It is advisable to enter some maintenance data to reduce processing time
+
+  endif.
+
+
+
+***********************************************************************
+*At selection screen on value request for p_parnr                     *
+***********************************************************************
+at selection-screen on value-request for p_parnr.
+*Provide search help for partner number
+  data: l_repid like sy-repid.
+
+  l_repid = sy-cprog.
+
+  call function 'PM_PARTNER_VALUE_REQUEST'
+    exporting
+      parnr_imp   = p_parnr
+      repid       = l_repid
+      parvw_field = 'P_PARVW'
+    importing
+      parnr_exp   = p_parnr.
+
+**First check if service equipments since parameter is active,
+**If so, maintenance data is advisable
+*if not P_NO_SER is initial and so_swerk is initial and so_strno is initial.
+*  MESSAGE W021(YSE_INST_BASE_REP).  "Please enter a maintenance plant for the not serviced equipments
+*endif.
+
+************************************************************************
+*START-OF-SELECTION                                                    *
+************************************************************************
+start-of-selection.
+
+
+*The logic of the report is that one line item should appear in the
+*ALV grid per equipment. The ¡®main¡¯ selection parameters can be used in
+*a standard view, V_EQUI. Since the report is base on several standard
+*reports, the fields in this view aren¡¯t sufficient to perform the
+*select, e.g. the select cannot be done in one go. Therefore the
+*following logic has been used: if there are any additional selection
+*criteria used, these will be evaluated and the equipment numbers that
+*result from these criteria are first selected. Next these selected
+*equipment numbers are then used in the main select on the standard view.
+* The last step is then, if any equipments have been found, to select
+*additional detailed data related to the found equipments.
+
+  data: lt_equnr type standard table of ty_equnr,
+        lv_subrc type sysubrc value 0.
+
+  types: begin of ty_range_equnr,
+           equnr type equnr,
+         end of ty_range_equnr.
+
+  data: lt_range_equnr type standard table of ty_range_equnr.
+
+  field-symbols:  <fs_range_equnr> type ty_range_equnr.
+
+*If range is used select all to filter out later
+  loop at so_equnr.
+    if not so_equnr-high is initial.
+      select equnr from equi into table lt_range_equnr
+        where equnr between so_equnr-low and so_equnr-high.
+      loop at lt_range_equnr assigning <fs_range_equnr>.
+        so_equnr-low = <fs_range_equnr>-equnr.
+        so_equnr-sign   = 'I'.
+        so_equnr-option = 'EQ'.
+        clear so_equnr-high.
+        append so_equnr.
+      endloop.
+    endif.
+  endloop.
+
+*Select the equnrs via contract data
+  if not so_matkl is initial or not so_vbegd is initial or not so_vendd is initial.   "If contract type or begin or end date is filled
+    perform select_equi_by_contract_data tables lt_equnr.    "Select the equinrs taking into account the contract data
+    perform check_result_equnr tables lt_equnr
+                               changing lv_subrc.
+    if lv_subrc ne 0.
+      message s009(yse_inst_base_rep).  "No equipments found for the entered contract data
+      exit.
+    endif.
+
+  endif.    "Contract data
+
+
+*Select the equnrs by using the address data
+  if p_adrfl eq 'X'.           "Address search help contains selection data
+    clear lt_equnr.               "Clear local euqnr table
+    perform select_equi_by_address tables lt_equnr.    "Select euqnrs taking into account the address data
+    perform check_result_equnr tables lt_equnr
+                               changing lv_subrc.
+    if lv_subrc ne 0.
+      message s001(yse_inst_base_rep).    "No equipments found for the entered address data
+      exit.
+    endif.
+
+  endif.  "Address search help contains selection data
+
+
+*Select the equnrs related to partner and partner type
+  if not p_parnr is initial.    "If partner number is filled
+    clear lt_equnr.               "Clear local euqnr table
+    perform select_equi_by_partner tables lt_equnr.    "Select euqnrs taking into account the partner data
+    perform check_result_equnr tables lt_equnr
+                               changing lv_subrc.
+    if lv_subrc ne 0.
+      message s006(yse_inst_base_rep).    "No equipments found for the entered partner
+      exit.
+    endif.
+
+  endif.    "If partner number is filled
+
+*Check if mainworkcenter is to be taken into account
+  if not so_gewrk is initial.    "If mainworkcenter is filled
+    perform check_main_workcenter.
+  endif.    "If mainworkcenter is filled
+
+*Update date range from parameters to use in main select on view
+  if p_datuv is initial.
+    p_datuv = '00000000'.
+  endif.
+  if p_datub is initial.
+    p_datub = '99993112'.
+  endif.
+
+  if p_datuv < sy-datum.
+    gr_datab-sign = 'I'.
+    gr_datab-option = 'LE'.
+    gr_datab-low = p_datub.
+    append gr_datab.
+  endif.
+  if p_datub > '00000000' .
+    gr_datbi-sign = 'I'.
+    gr_datbi-option = 'GE'.
+    gr_datbi-low = p_datuv.
+    append gr_datbi.
+  endif.
+
+*{Moved after main select for performance reasons
+
+**Select the equnrs related to status profile
+*  IF NOT P_SELSCH IS INITIAL.    "If status profile is filled
+**    CLEAR LT_EQUNR.               "Clear local euqnr table
+*    PERFORM SELECT_EQUI_BY_STATUS_PROFILE TABLES LT_EQUNR.   "Select equinrs taking into account the status profile
+*    PERFORM CHECK_RESULT_EQUNR TABLES LT_EQUNR
+*                               CHANGING LV_SUBRC.
+*
+*    IF LV_SUBRC NE 0.
+*      MESSAGE S007(YSE_INST_BASE_REP).  "No equipments found for the entered status profile
+*      EXIT.
+*    ENDIF.
+*
+*  ENDIF.    "If status profile is filled
+
+*}
+
+*If required, take into account the not serviced equipments
+  if not p_no_ser is initial.
+    perform exclude_serviced_equipments.
+  endif.
+
+*{ Putted this in the main join, resulting number of materials to be used in the main select was to big
+**If required, take into account the PGC
+*if not so_prdha is initial.
+*  perform select_pgc_materials changing lv_subrc.
+*  IF LV_SUBRC NE 0.
+*      MESSAGE S012(YSE_INST_BASE_REP).
+*      EXIT.
+*  ENDIF.
+*
+*endif.
+*}
+
+*If required, take into account customer and/or vendor warranty
+  if not so_gwldo is initial or not so_gwleo is initial.  "Customer warranty
+    clear lt_equnr.               "Clear local euqnr table
+    perform select_equi_by_cust_war tables lt_equnr.    "Select euqnrs taking into account the customer warranty
+    perform check_result_equnr tables lt_equnr
+                               changing lv_subrc.
+    if lv_subrc ne 0.
+      message s020(yse_inst_base_rep).    "No equipments found for the entered customer warranty period
+      exit.
+    endif.
+  endif.
+
+  if not so_gwldi is initial or not so_gwlei is initial.  "Vendor warranty
+    clear lt_equnr.               "Clear local euqnr table
+    perform select_equi_by_vend_war tables lt_equnr.    "Select euqnrs taking into account the vendor warranty
+    perform check_result_equnr tables lt_equnr
+                               changing lv_subrc.
+    if lv_subrc ne 0.
+      message s019(yse_inst_base_rep).    "No equipments found for the entered vendor warranty period
+      exit.
+    endif.
+  endif.
+
+
+
+*Show progress
+  call function 'SAPGUI_PROGRESS_INDICATOR'
+    exporting
+      text = 'Data being selected'(098).
+
+*Concatenate GAC and PGC into selection string for prod. hier.
+  replace all occurrences of '*' in p_gac with '%'.
+  concatenate '%' p_gac '%' into gv_prdha.
+
+  if not so_equnr[] is initial.
+    select equnr
+      from equi
+      into table it_equi
+      for all entries in so_equnr
+      where equnr = so_equnr-low.
+  endif.
+
+
+  if not so_equnr is initial.
+    select * from yse_v_equi
+            into table it_yse_v_equi
+            for all entries in it_equi
+            where equnr = it_equi-equnr                   "this will contain any including equnrs
+            and   equnr in gr_ex_equnr                 "This range will contain all the excluded equnrs, if any were entered
+            and   datab in gr_datab
+            and   datbi in gr_datbi
+            and   eqktx in so_eqktx
+            and   matnr in so_matnr
+            and   sernr in so_sernr
+            and   auldt in so_auldt
+            and   inbdt in so_inbdt
+            and   tplnr in so_strno
+            and   iwerk in so_iwerk
+            and   swerk in so_swerk
+            and   ingrp in so_ingrp
+            and   gewrk in gr_gewrk
+            and   vtweg in so_vtweg
+            and   spras eq sy-langu
+            and   timbi eq 0
+            and   prdha like gv_prdha.
+
+    data: ls_equ type ty_equnr.
+    loop at it_yse_v_equi.
+      move-corresponding it_yse_v_equi to ls_equ.
+      append ls_equ to gt_equnr.
+    endloop.
+  else.
+
+*code for Select from main equipment view while taking into account the result from the address, partner, etc
+    select *
+              from yse_v_equi
+                 into corresponding fields of table gt_equnr
+                           where equnr in so_equnr                    "this will contain any including equnrs
+                           and   equnr in gr_ex_equnr                 "This range will contain all the excluded equnrs, if any were entered
+                           and   datab in gr_datab
+                           and   datbi in gr_datbi
+                           and   eqktx in so_eqktx
+                           and   matnr in so_matnr
+                           and   sernr in so_sernr
+                           and   auldt in so_auldt
+                           and   inbdt in so_inbdt
+                           and   tplnr in so_strno
+                           and   iwerk in so_iwerk
+                           and   swerk in so_swerk
+                           and   ingrp in so_ingrp
+                           and   gewrk in gr_gewrk
+                           and   vtweg in so_vtweg
+                           and   spras eq sy-langu
+                           and   timbi eq 0
+                           and   prdha like gv_prdha.
+
+
+    if sy-subrc ne 0.
+      message s011(yse_inst_base_rep).      "No equipments selected
+      exit.
+    endif.
+  endif.
+
+*Select the equnrs related to selection scheme
+  if not p_selsch is initial.    "If selection scheme is filled
+    perform select_equi_by_status_profile2 tables lt_equnr.   "Select equinrs taking into account the status profile
+
+    if gt_equnr[] is initial.
+      message s007(yse_inst_base_rep).  "No equipments found for the entered selection scheme
+      exit.
+    endif.
+
+  endif.    "If status profile is filled
+
+
+
+
+*Select the equnrs related to the included and/or excluded status
+  if not so_stai1 is initial or
+     not so_stae1 is initial.
+    clear lt_equnr.
+    perform select_equi_by_status.      "Select equnrs by status, this has to be done after the main select, because the functionmodule used
+    if gt_equnr[] is initial.
+      message s008(yse_inst_base_rep).
+      exit.
+    endif.
+  endif.
+
+*Selection of additional detail data
+  loop at gt_equnr assigning <fs_equnr>.
+*Main work center
+    select single arbpl from crhd
+        into <fs_equnr>-arbpl
+        where objty eq 'A'
+        and objid eq <fs_equnr>-gewrk.
+*Get partners
+*Ship-to
+    perform get_partner using <fs_equnr>-ship 'WE' <fs_equnr>-objnr.
+    perform get_partner_name using <fs_equnr>-ship <fs_equnr>-ship_name.
+*Sold-to
+    perform get_partner using <fs_equnr>-sold 'AG' <fs_equnr>-objnr.
+    perform get_partner_name using <fs_equnr>-sold <fs_equnr>-sold_name.
+*Payer
+    perform get_partner using <fs_equnr>-payer 'RG' <fs_equnr>-objnr.
+    perform get_partner_name using <fs_equnr>-payer <fs_equnr>-payer_name.
+*Bill-to
+    perform get_partner using <fs_equnr>-bill 'RE' <fs_equnr>-objnr.
+    perform get_partner_name using <fs_equnr>-bill <fs_equnr>-bill_name.
+*Distributor
+    perform get_partner using <fs_equnr>-distri 'ZD' <fs_equnr>-objnr.
+    perform get_partner_name using <fs_equnr>-distri <fs_equnr>-distri_name.
+*End customer
+    perform get_partner using <fs_equnr>-end 'ZE' <fs_equnr>-objnr.
+    perform get_partner_name using <fs_equnr>-end <fs_equnr>-end_name.
+*Owner
+    perform get_partner using <fs_equnr>-owner 'ZO' <fs_equnr>-objnr.
+*Sales rep sales
+    perform get_partner using <fs_equnr>-sales_rep_sales 'ZV' <fs_equnr>-objnr.
+*Sales rep services
+    perform get_partner using <fs_equnr>-sales_rep_serv 'ZW' <fs_equnr>-objnr.
+
+** Begin INS IVB 02/07/2007
+* Read warranty dates (even if there was no selection on this fields)
+    perform select_warranty_dates using <fs_equnr>-objnr <fs_equnr>-cust_war_b <fs_equnr>-cust_war_e
+                                                         <fs_equnr>-vend_war_b <fs_equnr>-vend_war_e.
+** End INS IVB 02/07/2007
+
+    if not so_vbegd is initial or not so_vendd is initial or not so_matkl is initial.   "Contracts have already been selected in contract selection perform
+      "These can be 'linked' via the selection internal table
+      read table gt_contract_data with key equnr = <fs_equnr>-equnr assigning <fs_contract_data>.
+      if sy-subrc eq 0.
+        move: <fs_contract_data>-auart to <fs_equnr>-auart,
+              <fs_contract_data>-vbeln to <fs_equnr>-vbeln,
+              <fs_contract_data>-vbegdat to <fs_equnr>-vbegdat,
+              <fs_contract_data>-venddat to <fs_equnr>-venddat.
+      endif.
+    else.  "No contracts have been selected yet, so start selection for every equnr
+      perform select_contract_data_by_equinr.
+    endif.
+*Select statusses via contract data
+    perform get_statusses.
+
+* Begin of Insert Mod-001.
+    clear it_kna1_ihpa.
+    move <fs_equnr>-ship to it_kna1_ihpa-kunnr.
+    append it_kna1_ihpa.
+    clear it_kna1_ihpa.
+    move <fs_equnr>-sold to it_kna1_ihpa-kunnr.
+    append it_kna1_ihpa.
+*  End of Insert Mod-001.
+
+  endloop.
+
+* Begin of Insert Mod-001.
+  delete adjacent duplicates from it_kna1_ihpa comparing kunnr.
+
+
+  if not it_kna1_ihpa[] is initial.
+    select  kunnr
+            pstlz
+            ort01
+            stras
+            adrnr
+                 from kna1
+                 into table it_kna1
+                 for all entries in
+                 it_kna1_ihpa
+                 where kunnr = it_kna1_ihpa-kunnr.
+
+    if not it_kna1[] is initial.
+      select addrnumber
+             str_suppl3
+             from adrc
+             into table it_adrc
+             for all entries in
+             it_kna1
+             where addrnumber = it_kna1-adrnr.
+    endif.
+* Begin of insertion MOD-004
+    IF NOT gt_equnr[] IS INITIAL.
+      SELECT objnr
+             equnr
+             invnr
+             msgrp FROM mcipmis
+                   INTO TABLE lt_mcipmis
+                   FOR ALL ENTRIES IN gt_equnr
+                   WHERE objnr = gt_equnr-objnr
+                   AND   equnr = gt_equnr-equnr.
+        IF sy-subrc = 0.
+           SORT lt_mcipmis by objnr ASCENDING.
+        ENDIF.
+      ENDIF.
+* End of insertion MOD-004
+    loop at gt_equnr into <fs_equnr>.
+* Begin of insertion MOD-004
+
+      READ TABLE lt_mcipmis INTO wa_mcipmis
+                            WITH KEY objnr = <fs_equnr>-objnr
+                            BINARY SEARCH.
+      IF sy-subrc = 0.
+        <fs_equnr>-invnr  = wa_mcipmis-invnr.
+        <fs_equnr>-msgrp  = wa_mcipmis-msgrp.
+      ENDIF.
+* End of insertion MOD-004
+
+*  SHIP TO ADRRESS
+      clear it_kna1.
+      read table it_kna1 with key kunnr = <fs_equnr>-ship.
+      if sy-subrc = 0.
+        read table it_adrc with key addrnumber = it_kna1-adrnr.
+
+        concatenate it_kna1-pstlz it_kna1-ort01 it_adrc-str_suppl3
+              it_kna1-stras into <fs_equnr>-ship_addr separated by ' ,'.
+      endif.
+
+*SOLD TO ADDRESS
+      if <fs_equnr>-ship <> <fs_equnr>-sold.
+        clear it_kna1.
+        read table it_kna1 with key kunnr = <fs_equnr>-sold.
+        if sy-subrc = 0.
+          read table it_adrc with key addrnumber = it_kna1-adrnr.
+
+          concatenate it_kna1-pstlz it_kna1-ort01 it_adrc-str_suppl3
+                 it_kna1-stras into <fs_equnr>-sold_addr separated by ' ,'.
+        endif.
+      else.
+        <fs_equnr>-sold_addr = <fs_equnr>-ship_addr.
+      endif.
+
+*      modify gt_equnr from <fs_equnr> transporting ship_addr sold_addr.            " - MOD-004
+      MODIFY gt_equnr FROM <fs_equnr> TRANSPORTING ship_addr sold_addr invnr msgrp. " + MOD-004
+
+    endloop.
+
+  endif.
+*  End of Insert Mod-001.
+
+*END-OF-SELCTION********************************************************
+*
+************************************************************************
+end-of-selection.
+
+  if sy-batch is initial.
+    call screen 100.
+  else.
+    perform alv_display.
+  endif.

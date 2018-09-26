@@ -1,0 +1,334 @@
+*&---------------------------------------------------------------------*
+*& Report  Z_OSSNOTE_418007                                            *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+* This report checks for all KNA1-entries whether a correct ADRC-entry
+* exists.
+* When there is not complete data in ADRC, it will update the ADRC.
+* It assumes that there already exists an ADRC entry and a correct
+* entry in ADRV. If there is no adrc entry for kna1 record, it doesn't
+* create a new entry in adrc table.
+*----------------------------------------------------------------------*
+* Parameters:
+*   TESTMODE: run report in test mode without changing database
+*&---------------------------------------------------------------------*
+* Note: 418007
+
+* This report does NOT consider any communication data (JUST ADRC, not
+* ADRV...)
+* ATTENTION: update adrc only if necessary, i.e. if kna1 is stronger!
+* DO NOT UPDATE ADRC in general if the adrc-entry differs KNA1, example:
+* ADRC-CITY1 differs from KNA1-ort01, this can be due to the different
+* field lenghth....!!!!
+
+* Original  U6B
+* Version   1.1
+* Date      14.07.2005
+
+REPORT  Z_OSSNOTE_418007                        .
+
+TYPE-POOLS: szadr.
+
+PARAMETERS: TESTMODE(1) TYPE C DEFAULT 'X'.
+
+* Definition of the local structure that stores address fields
+* of kna1 table
+data: begin of gs_local_kna1,
+      land1 like kna1-land1,
+      name1 like kna1-name1,
+      name2 like kna1-name2,
+      name3 like kna1-name3,
+      name4 like kna1-name4,
+      ort01 like kna1-ort01,
+      ort02 like kna1-ort02,
+      pfach like kna1-pfach,
+      pstl2 like kna1-pstl2,
+      pstlz like kna1-pstlz,
+      regio like kna1-regio,
+      sortl like kna1-sortl,
+      spras like kna1-spras,
+      stras like kna1-stras,
+      pfort like kna1-pfort,
+      lzone like kna1-lzone,
+      txjcd like kna1-txjcd,
+      end of gs_local_kna1.
+
+* variable for KNA1 internal table
+data: lt_kna1 like table of kna1,
+*      lt_kna1_update like table of kna1,
+      ls_kna1 like kna1,
+      ls_kna1_orig like kna1.
+
+* variable for ADRC internal table
+data: lt_adrc like table of adrc,
+      lt_adrc_update like table of adrc,
+      ls_adrc type adrc.
+
+* variable for the local kna1 structure
+Data : ls_local_kna1 like gs_local_kna1,
+       ls_local_kna1_orig like gs_local_kna1,
+       ls_addr1_complete TYPE szadr_addr1_complete,
+       ls_addr1_data       TYPE szadr_addr1_line.
+
+* variable for cursor
+DATA : lv_cursor TYPE cursor.
+DATA : lv_size TYPE i VALUE 20000.
+
+* variable for TFMC internal table
+DATA: lt_tfmc LIKE TABLE OF tfmc,
+      lv_tfmc LIKE tfmc.
+
+
+start-of-selection.
+  refresh lt_tfmc.
+
+* Get all data from TFMC
+  SELECT * FROM tfmc INTO TABLE lt_tfmc.
+
+* Fetch all KNA1 records
+  OPEN CURSOR WITH HOLD lv_cursor FOR
+     select * from kna1.
+  DO.
+* Initializations
+    refresh lt_adrc.
+    refresh lt_adrc_update.
+    clear ls_kna1.
+    clear ls_local_kna1.
+    clear ls_local_kna1_orig.
+    refresh lt_kna1.
+    FETCH NEXT CURSOR lv_cursor INTO TABLE lt_kna1
+       PACKAGE SIZE lv_size.
+    IF sy-subrc NE 0.
+      CLOSE CURSOR lv_cursor.
+      EXIT.
+    ENDIF.
+
+* Get data from ADRC
+    select * from adrc
+             into corresponding fields of table lt_adrc
+             for all entries in lt_kna1
+             where addrnumber = lt_kna1-adrnr.
+
+* Sort internal table for faster processing
+    sort lt_kna1 by adrnr.
+    sort lt_adrc by addrnumber.
+
+* Delete duplicate addresses from lt_adrc
+    delete adjacent duplicates from lt_adrc.
+
+* Start processing
+    loop at lt_kna1 into ls_kna1.
+      move ls_kna1 to ls_kna1_orig.
+      clear ls_adrc.
+      clear ls_addr1_data.
+      clear ls_local_kna1.
+      clear ls_local_kna1_orig.
+
+* Get default adrc entry for the the kna1 entry
+      read table lt_adrc
+         with key addrnumber = ls_kna1-adrnr
+         nation = ' '
+         binary search
+         into ls_adrc.
+* If adrc entry doesn't exist for this kna1 record don't do anything.
+      if sy-subrc <> 0.
+* Protocol
+        write : /'Warning : The customer ', ls_kna1-kunnr.
+        write : ' doesn''t have entry in ADRC table'.
+        continue.
+      endif.
+
+* Fill the local kna1 structure
+      move-corresponding ls_kna1 to ls_local_kna1_orig.
+
+      clear ls_addr1_complete.
+      move-corresponding ls_adrc to ls_addr1_data-data.
+      ls_addr1_complete-addrnumber = ls_adrc-addrnumber.
+      append ls_addr1_data to ls_addr1_complete-addr1_tab.
+      clear ls_kna1.
+
+* Get the equivalent KNA1 entry for ADRC entry
+      CALL FUNCTION 'CONVERT_CAM_TO_MASTER'
+        EXPORTING
+          ADDRESS              = ls_addr1_complete
+          ADDR_TYPE            = '1'
+          MASTER_TAB           = 'KNA1'
+        CHANGING
+          CONVERTED            = ls_kna1
+        EXCEPTIONS
+          MASTER_TAB_NOT_FOUND = 1
+          INVALID_ADDRESS_TYPE = 2
+          NO_CONVERSION        = 3
+          OTHERS               = 4.
+      IF SY-SUBRC <> 0.
+* Protocol
+        Write :
+        'Error while synchronizing ADRC & KNA1 entry for customer '.
+        write : ls_kna1_orig-kunnr.
+      ENDIF.
+
+      move-corresponding ls_kna1 to ls_local_kna1.
+
+
+* Check if address fields in KNA1 & ADRC are in sync
+      if ls_local_kna1 <> ls_local_kna1_orig.
+
+        clear ls_addr1_complete.
+        clear ls_addr1_data.
+
+* Get the equivalent ADRC entry for KNA1 entry
+        CALL FUNCTION 'CONVERT_MASTER_TO_CAM'
+         EXPORTING
+           converted                  = ls_kna1_orig
+           master_tab                 = 'KNA1'
+           addr_type                  = '1'
+*       UPDATEFLAG                 = 'I'
+         CHANGING
+           address                    = ls_addr1_complete
+        EXCEPTIONS
+          master_tab_not_found       = 1
+          invalid_address_type       = 2
+          no_conversion              = 3
+          OTHERS                     = 4.
+
+        IF sy-subrc <> 0.
+* Protocol
+          Write :
+         'Error while synchronizing ADRC & KNA1 entry for customer '.
+          write : ls_kna1_orig-kunnr.
+        ENDIF.
+
+        loop at ls_addr1_complete-addr1_tab into ls_addr1_data.
+
+* Update address fields in ADRC from KNA1 table entry
+*         MOVE-corresponding ls_addr1_data-data to ls_adrc.
+          MOVE ls_addr1_data-data-country TO ls_adrc-country.
+          MOVE ls_addr1_data-data-name1 TO ls_adrc-name1.
+          MOVE ls_addr1_data-data-name2 TO ls_adrc-name2.
+          MOVE ls_addr1_data-data-name3 TO ls_adrc-name3.
+          MOVE ls_addr1_data-data-name4 TO ls_adrc-name4.
+          MOVE ls_addr1_data-data-city1 TO ls_adrc-city1.
+          MOVE ls_addr1_data-data-city2 TO ls_adrc-city2.
+          MOVE ls_addr1_data-data-po_box TO ls_adrc-po_box.
+          MOVE ls_addr1_data-data-post_code1 TO ls_adrc-post_code1.
+          MOVE ls_addr1_data-data-post_code2 TO ls_adrc-post_code2.
+          MOVE ls_addr1_data-data-post_code3 TO ls_adrc-post_code3.
+          MOVE ls_addr1_data-data-region TO ls_adrc-region.
+          MOVE ls_addr1_data-data-sort1 TO ls_adrc-sort1.
+          MOVE ls_addr1_data-data-langu TO ls_adrc-langu.
+          MOVE ls_addr1_data-data-street TO ls_adrc-street.
+          MOVE ls_addr1_data-data-extension2 TO ls_adrc-extension2.
+          MOVE ls_addr1_data-data-po_box_loc TO ls_adrc-po_box_loc.
+          MOVE ls_addr1_data-data-transpzone TO ls_adrc-transpzone.
+
+* Update match code fields
+          CLEAR lv_tfmc.
+          READ TABLE lt_tfmc INTO lv_tfmc WITH KEY ktoid = 'D'
+                                               fldna = 'NAME1'.
+          IF sy-subrc = 0 AND
+            ( lv_tfmc-fldnr = '1' OR
+              lv_tfmc-fldnr = '2' OR
+              lv_tfmc-fldnr = '3' ).
+            IF lv_tfmc-fldnr = '1'.
+              MOVE ls_kna1_orig-mcod1 TO ls_adrc-mc_name1.
+            ELSEIF lv_tfmc-fldnr = '2'.
+              MOVE ls_kna1_orig-mcod2 TO ls_adrc-mc_name1.
+            ELSEIF lv_tfmc-fldnr = '3'.
+              MOVE ls_kna1_orig-mcod3 TO ls_adrc-mc_name1.
+            ENDIF.
+          ELSE.
+
+            PERFORM shift_and_uppercase
+              USING ls_adrc-name1 CHANGING ls_adrc-mc_name1.
+          ENDIF.
+
+          CLEAR lv_tfmc.
+          READ TABLE lt_tfmc INTO lv_tfmc WITH KEY ktoid = 'D'
+                                                   fldna = 'ORT01'.
+          IF sy-subrc = 0 AND
+            ( lv_tfmc-fldnr = '1' OR
+              lv_tfmc-fldnr = '2' OR
+              lv_tfmc-fldnr = '3' ).
+            IF lv_tfmc-fldnr = '1'.
+              MOVE ls_kna1_orig-mcod1 TO ls_adrc-mc_city1.
+            ELSEIF lv_tfmc-fldnr = '2'.
+              MOVE ls_kna1_orig-mcod2 TO ls_adrc-mc_city1.
+            ELSEIF lv_tfmc-fldnr = '3'.
+              MOVE ls_kna1_orig-mcod3 TO ls_adrc-mc_city1.
+            ENDIF.
+          ELSE.
+
+            PERFORM shift_and_uppercase
+              USING ls_adrc-city1 CHANGING ls_adrc-mc_city1.
+          ENDIF.
+
+          CLEAR lv_tfmc.
+          READ TABLE lt_tfmc INTO lv_tfmc WITH KEY ktoid = 'D'
+                                                   fldna = 'STRAS'.
+          IF sy-subrc = 0 AND
+            ( lv_tfmc-fldnr = '1' OR
+              lv_tfmc-fldnr = '2' OR
+              lv_tfmc-fldnr = '3' ).
+            IF lv_tfmc-fldnr = '1'.
+              MOVE ls_kna1_orig-mcod1 TO ls_adrc-mc_street.
+            ELSEIF lv_tfmc-fldnr = '2'.
+              MOVE ls_kna1_orig-mcod2 TO ls_adrc-mc_street.
+            ELSEIF lv_tfmc-fldnr = '3'.
+              MOVE ls_kna1_orig-mcod3 TO ls_adrc-mc_street.
+            ENDIF.
+          ELSE.
+
+            PERFORM shift_and_uppercase
+              USING ls_adrc-street CHANGING ls_adrc-mc_street.
+          ENDIF.
+          append ls_adrc to lt_adrc_update.
+
+* Protocol
+          Write : / 'Address for the customer ', ls_kna1_orig-kunnr.
+          Write : 'has been modified. Addr No : ', ls_kna1_orig-adrnr.
+
+        endloop.
+
+      endif.
+      clear ls_kna1.
+      clear ls_kna1_orig.
+    endloop.
+
+    if lt_adrc_update is initial.
+* Protocol
+      write : /
+    'There are no customers with inconsistencies in KNA1 & ADRC tables'.
+    endif.
+
+
+* If test mode is initial update ADRC table
+    if testmode is initial.
+      update adrc from table lt_adrc_update.
+    endif.
+  enddo.
+
+
+*&---------------------------------------------------------------------*
+*&      Form  shift_and_uppercase
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_LV_ADRC_NAME1  text
+*      <--P_LV_ADRC_MC_NAME1  text
+*----------------------------------------------------------------------*
+FORM shift_and_uppercase
+  USING    field1
+  CHANGING field2.
+
+  DATA: helpfield(50).
+
+  MOVE field1 TO helpfield.
+  SHIFT helpfield LEFT DELETING LEADING space.
+*tg  ausf¨¹hrlichere Behandlung SET LOCALE LANGUAGE ..... ?
+  TRANSLATE helpfield TO UPPER CASE.        "#EC TRANSLANG     wg. TODO
+  MOVE helpfield TO field2.
+
+ENDFORM.                    "SHIFT_AND_UPPERCASE
+
+*Selection text£º
+*TESTMODE:        TESTMODE

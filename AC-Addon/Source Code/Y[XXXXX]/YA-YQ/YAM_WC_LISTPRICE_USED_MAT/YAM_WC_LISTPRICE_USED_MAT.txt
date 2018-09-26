@@ -1,0 +1,600 @@
+*----------------------------------------------------------------------
+* PROGRAM ID           : YAM_WC_LISTPRICE_USED_MAT                     *
+* PROGRAM TITLE        : AM: Listprice for used materials              *
+* AUTHOR               : Luc Mertens                                   *
+* DATE                 : 29/29/2006                                    *
+* DEVELOPMENT ID       : ALL-GAP113                                    *
+* CHANGE REQUEST NUMBER: CD1K906043                                    *
+* PROGRAM DESCRIPTION  : Create report with listprice for the used     *
+*                        materials.                                    *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME     |CORRECTION NUMBER| CHANGE REFERENCE # *
+* MOD-01  |03/09/2014|EXTIBMDCA |CD1K982874       | CR3349             *
+*----------------------------------------------------------------------*
+*                                                                      *
+*----------------------------------------------------------------------*
+REPORT YAM_WC_LISTPRICE_USED_MAT  no standard page heading
+                                  line-size 100.
+
+*----------------------------------------------------------------------*
+* type-pool ALV                                                        *
+*----------------------------------------------------------------------*
+TYPE-POOLS: SLIS.
+
+*----------------------------------------------------------------------*
+* DB tables                                                            *
+*----------------------------------------------------------------------*
+TABLES: aufk,                          " Order master data
+        afru,                          " Confirmation
+        yam_wc_listpr,                 " display structure
+        T370a.                         " activity type of a transaction
+
+*----------------------------------------------------------------------*
+* global data                                                          *
+*----------------------------------------------------------------------*
+* display structure
+DATA: begin of object_tab occurs 0.
+        include structure yam_wc_listpr.
+data:   selected,
+        pm_selected type pm_selected.
+data: end of object_tab.
+
+* selected order
+data: begin of gt_ord occurs 0,
+        aufnr  like viaufkst-aufnr,
+        auart  like viaufkst-auart,
+        werks  like viaufkst-werks,
+        bemot  like viaufkst-bemot,
+        gewrk  like viaufkst-gewrk,
+        vkorg  like viaufkst-vkorg,
+        vtweg  like viaufkst-vtweg,
+        idat3  like viaufkst-idat3,
+      end of gt_ord.
+
+* selected movements
+data: begin of i_aufm occurs 0,
+        aufnr  like aufm-aufnr,
+        matnr  like aufm-matnr,
+        erfmg  like aufm-erfmg,
+        bwart  like aufm-bwart,
+        erfme  LIKE aufm-erfme,
+      end of i_aufm.
+
+* final internal table with movements
+data: begin of i_aufm_final occurs 0,
+        aufnr  like aufm-aufnr,
+        matnr  like aufm-matnr,
+        erfmg  like aufm-erfmg,
+        erfme  LIKE aufm-erfme,
+      end of i_aufm_final.
+
+DATA: wa_ord  like gt_ord.
+
+* not used, needed for includes miolxtop, miolxf14, mioxf16
+DATA: sel_tab LIKE yam_wc_listpr OCCURS 0 WITH HEADER LINE.
+
+DATA: go_on           VALUE '1',                            " 0 or 1
+      gt_crhd         LIKE crhd OCCURS 0,
+      gt_fieldcat     TYPE slis_t_fieldcat_alv,
+      g_knumh         type knumh,
+      g_kbetr         type KBETR_KOND,
+      gs_crid         TYPE crid,
+      gt_crid         TYPE crid_tab.
+
+*----------------------------------------------------------------------*
+* constants                                                            *
+*----------------------------------------------------------------------*
+CONSTANTS: c_a        type CR_OBJTY value 'A',
+           c_v        type kappl    value 'V',
+           c_261      type bwart    value '261',
+           c_262      type bwart    value '262',
+           c_961      type bwart    value '961',
+           c_962      type bwart    value '962',
+           c_pr00     type kschl    value 'PR00',
+           c_01(2)    type c        value '01'.
+
+
+*- SELECTION SCREEN---------------------------------------------------
+* input selection
+SELECTION-SCREEN BEGIN OF BLOCK B1 WITH FRAME TITLE TEXT-001.
+select-options: s_aufnr    for  aufk-aufnr,
+                s_auart    for  aufk-auart,
+                s_bemot    for  aufk-bemot,
+                s_idat3    for  aufk-idat3 obligatory.
+PARAMETERS:     p_werks    type werks obligatory memory id WRK.
+SELECTION-SCREEN END OF BLOCK B1.
+
+* list variant
+SELECTION-SCREEN BEGIN OF BLOCK B2 WITH FRAME.
+PARAMETERS: variant LIKE disvariant-variant.
+SELECTION-SCREEN END OF BLOCK B2.
+
+PARAMETERS:
+  dy_selm DEFAULT '0' NO-DISPLAY,      " selection mode
+  dy_tcode LIKE sy-tcode NO-DISPLAY,   " transaction
+  p_ocall NO-DISPLAY.                  " 'X' => prog called from
+" pm order
+
+*----------------------------------------------------------------------*
+* includes                                                             *
+*----------------------------------------------------------------------*
+INCLUDE miolxtop.
+INCLUDE miolxf14.
+INCLUDE miolxf16.
+
+*----------------------------------------------------------------------*
+* initialization                                                       *
+*----------------------------------------------------------------------*
+INITIALIZATION.
+
+  perform date.
+
+* get aktype (display or change mode)
+  PERFORM get_acttype_afru_l.
+* get variant for selection screen
+  PERFORM variant_start_f16.
+* initializes g_variant
+  PERFORM variant_init_f14 USING '    ' '    ' '    '.
+* fill variant with the default variant
+  IF variant IS INITIAL.
+    PERFORM get_default_variant_f14 USING variant.
+  ENDIF.
+* fill g_fieldcat_tab
+  PERFORM create_fieldcat_f14 USING 'YAM_WC_LISTPR'.
+
+*----------------------------------------------------------------------*
+* F4 help for list variant                                             *
+*----------------------------------------------------------------------*
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR variant.
+  PERFORM variant_inputhelp_f14 USING variant.
+
+*----------------------------------------------------------------------*
+* at selection-screen on plant                                         *
+*----------------------------------------------------------------------*
+AT SELECTION-SCREEN ON p_werks.
+
+  AUTHORITY-CHECK OBJECT 'I_IWERK'
+           ID 'TCD'   FIELD sy-tcode
+           ID 'IWERK' FIELD p_werks.
+
+  IF sy-subrc NE 0.
+*.. No authorization for plant
+    MESSAGE E001(00) WITH text-e03 p_werks.
+  ENDIF.
+
+*----------------------------------------------------------------------*
+* at selection-screen                                                  *
+*----------------------------------------------------------------------*
+AT SELECTION-SCREEN.
+
+*--- take always default variant
+  IF variant IS INITIAL.
+    PERFORM get_default_variant_f14 USING variant.
+  ENDIF.
+*--- Correct Listvariant chosen ? -------------------------------------*
+  PERFORM variant_existence_f14 USING variant.
+
+
+*-START OF SELECTION----------------------------------------------------
+START-OF-SELECTION.
+
+  g_form_set_pf_stat = 'PF_STATUS_L'.
+
+  PERFORM determine_g_tcode_f16.
+  PERFORM get_acttype_afru_l.
+  PERFORM prepare_display_list_f14.
+  PERFORM update_fieldcat_variant_f14.
+  PERFORM check_fieldcat_variant_l.
+
+* select orders
+  PERFORM select_ord.
+
+  IF NOT gt_ord[] IS INITIAL.
+
+    gs_crid-objty = c_a.
+
+    LOOP AT gt_ord into wa_ord.
+      gs_crid-objid = wa_ord-gewrk.
+      COLLECT gs_crid INTO gt_crid.
+    ENDLOOP.
+
+*.. preselect work centers
+    PERFORM preselect_crhd TABLES gt_crid.
+
+*.. select goods movements from AUFM
+    SELECT aufnr matnr erfmg bwart
+      INTO table i_aufm
+      FROM aufm FOR all entries in gt_ord
+      WHERE aufnr = gt_ord-aufnr
+        AND bwart in (c_261, c_262, c_961, c_962).
+
+    sort i_aufm by aufnr matnr.
+
+*.. Populate data into Final Internal Table
+    LOOP AT i_aufm.
+      CLEAR i_aufm_final.
+      i_aufm_final-aufnr = i_aufm-aufnr.
+      i_aufm_final-matnr = i_aufm-matnr.
+      i_aufm_final-erfme = i_aufm-erfme.
+      IF i_aufm-bwart = c_961 or
+         i_aufm-bwart = c_261.
+        i_aufm_final-erfmg = i_aufm-erfmg .
+      ELSEIF i_aufm-bwart = c_962 or
+             i_aufm-bwart = c_262.
+        i_aufm_final-erfmg = i_aufm-erfmg * -1 .
+      ENDIF .
+      COLLECT i_aufm_final .
+    ENDLOOP .
+
+*.. skip items with zero qty
+    LOOP AT i_aufm_final.
+      if i_aufm_final-erfmg = 0.
+        delete i_aufm_final.
+      endif.
+    ENDLOOP.
+
+  ENDIF.
+
+  REFRESH object_tab.
+
+  loop at gt_ord into wa_ord.
+    PERFORM fill_object_tab using wa_ord.
+  endloop.
+
+  DESCRIBE TABLE object_tab LINES sy-tabix.
+  IF sy-tabix = 0.
+    go_on = '0'.
+    MESSAGE s047(ih).
+  ENDIF.
+
+*-----------------------------------------------------------------------
+END-OF-SELECTION.
+
+* create ALV-GRID
+  PERFORM build_field_catlog CHANGING gt_fieldcat.
+  PERFORM alv_display.
+
+
+*- SUBROUTINES---------------------------------------------------------
+*&---------------------------------------------------------------------*
+*&      Form  DATE                                                     *
+*----------------------------------------------------------------------*
+FORM DATE .
+
+  data: g_date like sy-datum.
+
+  g_date = sy-datum.
+  g_date+6(2) = '01'.
+
+  s_idat3-high = g_date - 1.
+
+  s_idat3-low = s_idat3-high.
+  s_idat3-low+6(2) = '01'.
+
+  s_idat3-sign = 'I'.
+  s_idat3-option = 'BT'.
+
+  append s_idat3.
+
+ENDFORM.                    "date
+
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_ORD
+*&---------------------------------------------------------------------*
+*       select data from the db
+*----------------------------------------------------------------------*
+FORM select_ord.
+
+  SELECT aufnr auart werks bemot vkorg vtweg gewrk idat3
+    INTO corresponding fields of TABLE gt_ord
+    FROM VIAUFKST
+    WHERE aufnr in s_aufnr
+      AND werks EQ p_werks
+      AND auart in s_auart
+      AND bemot in s_bemot
+      AND idat3 in s_idat3.
+
+ENDFORM.                               " SELECT_CONF
+
+*&---------------------------------------------------------------------*
+*&      Form  build_field_catlog
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      <--P_GT_FIELDCAT  text
+*----------------------------------------------------------------------*
+FORM build_field_catlog  CHANGING pt_fieldcat TYPE slis_t_fieldcat_alv.
+
+  DATA : ls_fcat TYPE slis_fieldcat_alv,
+         lv_idx(3)   type n,
+         lv_fname(9) type c.
+
+*--------------------------Work center-----------------------*
+  ls_fcat-fieldname = 'ARBPL'.
+  ls_fcat-rollname = 'ARBPL'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+*--------------------------Order number----------------------*
+  ls_fcat-fieldname = 'AUFNR'.
+  ls_fcat-rollname = 'AUFNR'.
+* Begin of insertion by EXTIBMDCA for CR3349
+  ls_fcat-ref_tabname   = 'AFKO'.
+  ls_fcat-ref_fieldname = 'AUFNR'.
+* End of insertion by EXTIBMDCA for CR3349
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+*--------------------------Order type------------------------*
+  ls_fcat-fieldname = 'AUART'.
+  ls_fcat-rollname = 'AUFART'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+*--------------------------Material number-------------------*
+  ls_fcat-fieldname = 'MATNR'.
+  ls_fcat-rollname = 'MATNR'.
+* Begin of insertion by EXTIBMDCA for CR3349
+  ls_fcat-ref_tabname   = 'MARA'.
+  ls_fcat-ref_fieldname = 'MATNR'.
+* End of insertion by EXTIBMDCA for CR3349
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+*--------------------------Plant-----------------------------*
+  ls_fcat-fieldname = 'WERKS'.
+  ls_fcat-rollname = 'WERKS_D'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+*--------------------------Accounting indicator--------------*
+  ls_fcat-fieldname = 'BEMOT'.
+  ls_fcat-rollname = 'BEMOT'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+*--------------------------Plant-----------------------------*
+  ls_fcat-fieldname = 'KBETR'.
+  ls_fcat-outputlen = '5'.
+  ls_fcat-seltext_l = 'Value'.
+  APPEND ls_fcat TO pt_fieldcat.
+  CLEAR ls_fcat.
+
+ENDFORM.                    " build_field_catlog
+
+*&---------------------------------------------------------------------*
+*&      Form  USER_COMMAND_L
+*&---------------------------------------------------------------------*
+*       event user_command, called from ALV
+*----------------------------------------------------------------------*
+FORM user_command_l USING p_ucomm LIKE sy-ucomm
+                          p_selfield TYPE slis_selfield.
+
+  p_selfield-refresh = g_s.
+
+  PERFORM check_pf2_with_object_f16 USING p_ucomm.
+  PERFORM set_p_selfield_general_f16 USING p_selfield.
+
+  CASE p_ucomm.
+*   show order
+    WHEN 'AUFK'.
+      PERFORM fcodes_with_mark_f16 USING p_ucomm p_selfield.
+*   show detail
+    WHEN 'IOBJ'.
+      p_ucomm = 'AUFK'.
+      PERFORM fcodes_with_mark_f16 USING p_ucomm p_selfield.
+  ENDCASE.
+
+*--- If list is empty now - leave ALV
+  IF object_tab[] IS INITIAL AND g_variant_save NE g_x.
+    p_selfield-exit = g_x.
+    MESSAGE s047(ih).
+  ENDIF.
+
+ENDFORM.                               " USER_COMMAND_L
+
+*&---------------------------------------------------------------------*
+*&      Form  PF_STATUS_L
+*&---------------------------------------------------------------------*
+*       set pf-status, called from ALV
+*----------------------------------------------------------------------*
+*----------------------------------------------------------------------*
+FORM pf_status_l USING extab TYPE slis_t_extab.
+
+  APPEND 'V-A' TO extab.
+  set pf-status 'MAIN' EXCLUDING extab.
+
+ENDFORM.                               " PF_STATUS_L
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_ARBPL
+*&---------------------------------------------------------------------*
+*       read work center
+*----------------------------------------------------------------------*
+*  -->  gewrk
+*  <--  arbpl
+*----------------------------------------------------------------------*
+FORM get_arbpl USING    gewrk TYPE cr_objid
+               CHANGING arbpl TYPE arbpl.
+
+  DATA:
+    l_crhd LIKE crhd.
+
+  READ TABLE gt_crhd INTO l_crhd
+    WITH KEY objid = gewrk
+    binary search.
+
+  arbpl = l_crhd-arbpl.
+
+ENDFORM.                               " GET_ARBPL
+
+*&---------------------------------------------------------------------*
+*&      Form  FILL_OBJECT_TAB
+*&---------------------------------------------------------------------*
+*       fill object_tab with selected data
+*----------------------------------------------------------------------*
+FORM fill_object_tab USING i_ord structure gt_ord.
+
+  CLEAR object_tab.
+  MOVE-CORRESPONDING i_ord TO object_tab.
+
+  PERFORM get_arbpl USING i_ord-gewrk object_tab-arbpl.
+
+  loop at i_aufm_final where aufnr = i_ord-aufnr.
+
+*.. get listprices
+    move i_aufm_final-matnr to object_tab-matnr.
+
+    SELECT SINGLE knumh FROM a304 INTO g_knumh
+                 WHERE kappl =  c_v
+                   AND kschl =  c_pr00
+                   AND vkorg =  i_ord-vkorg
+                   AND vtweg =  i_ord-vtweg
+                   AND matnr =  i_aufm_final-matnr
+                   AND kfrst =  ' '
+                   AND datab <= i_ord-idat3
+                   AND datbi >= i_ord-idat3.
+
+    IF sy-subrc = 0.
+      SELECT SINGLE kbetr FROM konp INTO g_kbetr
+                WHERE knumh = g_knumh
+                  AND kopos = c_01.
+
+      IF sy-subrc = 0.
+        object_tab-kbetr = g_kbetr * i_aufm_final-erfmg.
+      ENDIF.
+    ENDIF.
+
+    collect object_tab.
+
+  endloop.
+
+ENDFORM.                               " FILL_OBJECT_TAB
+
+*&---------------------------------------------------------------------*
+*&      Form  fcodes_with_mark_l
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_F_UCOMM  text
+*      -->P_F_SELFIELD  text
+*----------------------------------------------------------------------*
+FORM fcodes_with_mark_l  USING   p_ucomm LIKE sy-ucomm
+                              p_selfield TYPE slis_selfield.
+
+  DATA: h_ucomm LIKE sy-ucomm.
+
+  PERFORM mark_selected_f16 CHANGING object_tab-selected
+                                     object_tab-pm_selected.
+
+  CASE p_ucomm.
+*   Display order document
+    WHEN 'AUFK'.
+      SET PARAMETER ID 'ANR' FIELD  object_tab-aufnr.
+      CALL TRANSACTION 'IW33' AND SKIP FIRST SCREEN.
+  ENDCASE.
+
+ENDFORM.                    " fcodes_with_mark_l
+
+*&---------------------------------------------------------------------*
+*&      Form  alv_display
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM alv_display .
+
+  g_repid = sy-repid.
+
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+     EXPORTING
+       i_callback_program                =  g_repid
+       i_save                            = 'A'
+       it_events                         =  g_events_tab[]
+*      I_GRID_TITLE                      =  g_title
+*      I_GRID_SETTINGS                   =
+*      is_layout                         =  g_layout
+       it_fieldcat                       =  gt_fieldcat[]
+       is_variant                        =  g_variant
+     TABLES
+        t_outtab                         =  object_tab.
+
+ENDFORM.                    " alv_display
+
+*&---------------------------------------------------------------------*
+*&      Form  PRESELECT_CRHD
+*&---------------------------------------------------------------------*
+FORM preselect_crhd TABLES it_crid TYPE crid_tab.
+
+  SELECT * FROM crhd INTO TABLE gt_crhd
+    FOR ALL ENTRIES IN it_crid
+    WHERE objty = it_crid-objty
+    AND   objid = it_crid-objid.
+
+  SORT gt_crhd BY objid.
+
+ENDFORM.                               " PRESELECT_CRHD
+
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_FIELDCAT_VARIANT_L
+*&---------------------------------------------------------------------*
+*       set disp. fields if no list variant exists
+*----------------------------------------------------------------------*
+FORM check_fieldcat_variant_l.
+
+  DATA fieldcat_wa TYPE slis_fieldcat_alv.
+  DATA index       LIKE sy-tabix.
+
+  index = 1.
+
+  DESCRIBE TABLE g_selfields_tab LINES sy-tabix.
+  IF sy-tabix IS INITIAL.
+    LOOP AT g_fieldcat_tab INTO fieldcat_wa.
+      CASE fieldcat_wa-fieldname.
+        WHEN 'PM_SELECTED'.
+          fieldcat_wa-no_out  = space.
+          fieldcat_wa-col_pos = 1.
+        WHEN 'ARBPL'.
+          fieldcat_wa-no_out  = space.
+          fieldcat_wa-col_pos = 2.
+        WHEN 'AUFNR'.
+          fieldcat_wa-no_out = space.
+          fieldcat_wa-col_pos = 3.
+        WHEN OTHERS.
+          fieldcat_wa-no_out = g_x.
+      ENDCASE.
+      MODIFY g_fieldcat_tab FROM fieldcat_wa.
+    ENDLOOP.
+  ENDIF.
+
+  PERFORM create_g_selfields_tab_f14.
+
+ENDFORM.                               " CHECK_FIELDCAT_VARIANT_L
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_ACTTYPE_AFRU_L
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM get_acttype_afru_l.
+
+  SELECT SINGLE * FROM t370a WHERE tcode = g_tcode.
+  IF sy-subrc <> 0.
+    SELECT SINGLE * FROM t370a WHERE tcode = 'IW73'.
+    IF sy-subrc <> 0.
+      RAISE iw29_not_in_t370a.
+    ENDIF.
+  ENDIF.
+  g_aktyp = t370a-aktyp.
+
+ENDFORM.                               " GET_ACTTYPE_AFRU_L
+
+*Text symbol text£º
+*001:Selection screen input
+
+*E03:No authorisation for plant
+*Selection text£º
+*P_WERKS:        Plant
+*S_AUART:D       Order Type
+*S_AUFNR:D       Order
+*S_BEMOT:D       Accounting Indicator
+*S_IDAT3:        Completed
+*VARIANT:D       Layout

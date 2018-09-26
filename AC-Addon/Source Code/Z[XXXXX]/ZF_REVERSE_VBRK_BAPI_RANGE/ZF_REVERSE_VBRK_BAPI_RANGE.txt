@@ -1,0 +1,903 @@
+*&---------------------------------------------------------------------*
+*& Report  ZF_REVERSE_VBRK_BAPI
+*&
+*&---------------------------------------------------------------------*
+*& The report will reverse FI documents with missing original billing
+*& doc using the new canellation process (AC_DOCUMENT_REVERSE) via the
+*& FI interface. This will create a new gap in SD document numbering
+*& because the process will take a DUMMY number for a reversal on SD
+*& side.
+*&
+*&---------------------------------------------------------------------*
+*& change log:
+*& UD050510 - external doc numbering requires valid AC_DOC_NO for
+*&            simulation => taken from NRIV-TONUMBER
+*& UD270511 - new flag added for ALE-extern processing: clearing info
+*&            will temporarily be deleted from BSEG/BSAD/BSAS to simu-
+*&            late the reversal. In test mode the reset is later undone
+*&            again.
+*& UD310511 - 'DELETE gt_bseg FROM gt_bseg_ale.' replaced by
+*&            'DELETE TABLE gt_bseg FROM gt_bseg_ale.' to avoid dump
+*& UD010611 - Output of FI document details added for update mode
+*& UD120911 - 4.6C: Use FM 'BAPI_ACC_BILLING_REV_CHECK' and
+*&            BAPI_ACC_BILLING_REV_POST
+*& UD041011 - output revised to display condensed clearing information
+*&            of excluded cases
+*& UD240613 - directly enter the NUMKI because of missing debug/replace
+*&---------------------------------------------------------------------*
+*& Version: 7
+*&---------------------------------------------------------------------*
+*& Report in Q3A
+*& Author: d033001
+*&---------------------------------------------------------------------*
+
+REPORT  zf_reverse_vbrk_bapi_range LINE-SIZE 150 NO STANDARD PAGE
+HEADING.
+
+TABLES: bkpf.
+DATA: gt_bkpf TYPE TABLE OF bkpf WITH HEADER LINE.
+TYPES: BEGIN OF excl,
+       bukrs TYPE bkpf-bukrs,
+       belnr TYPE bkpf-belnr,
+       gjahr TYPE bkpf-gjahr,
+       awtyp TYPE bkpf-awtyp,
+       awkey TYPE bkpf-awkey,
+       error TYPE c,
+       END OF excl.
+DATA: gt_bkpf_excl TYPE TABLE OF excl WITH HEADER LINE.
+DATA: cnt_excl TYPE i.
+DATA: gt_bseg TYPE TABLE OF bseg WITH HEADER LINE.
+DATA: gt_bseg_excl TYPE TABLE OF bseg WITH HEADER LINE.
+DATA: gs_bapi TYPE bapiacrev.
+DATA: gs_glvor TYPE bkpf-glvor.
+DATA: gt_return TYPE TABLE OF bapiret2 WITH HEADER LINE.
+DATA: gt_return_upd TYPE TABLE OF bapiret2 WITH HEADER LINE.
+DATA: d_bukrs TYPE bkpf-bukrs.
+DATA: d_belnr TYPE bkpf-belnr.
+DATA: d_gjahr TYPE bkpf-gjahr.
+DATA: no_corr TYPE c.
+DATA: gs_tvfk TYPE tvfk.
+DATA: gs_tvfk_rev TYPE tvfk.
+DATA: gs_nriv TYPE nriv.                                    "UD050510
+DATA: gs_t003 TYPE t003.                                    "UD050510
+DATA: x_ext TYPE c.                                         "UD050510
+DATA: dummy_doc TYPE bkpf-belnr.                            "UD050510
+DATA: gt_bseg_ale TYPE TABLE OF bseg WITH HEADER LINE.      "UD270511
+DATA: gt_bsad_ale TYPE TABLE OF bsad WITH HEADER LINE.      "UD270511
+DATA: gt_bsas_ale TYPE TABLE OF bsas WITH HEADER LINE.      "UD270511
+DATA: exp TYPE c.                                           "UD270511
+
+*** provide summarized output of clearing information       "UD041011
+TYPES: BEGIN OF clear,                                      "UD041011
+       bukrs TYPE bseg-bukrs,                               "UD041011
+       augdt TYPE bseg-augdt,                               "UD041011
+       augbl TYPE bseg-augbl,                               "UD041011
+       koart TYPE bseg-koart,                               "UD041011
+       kunnr TYPE bseg-kunnr,                               "UD041011
+       hkont TYPE bseg-hkont,                               "UD041011
+       END OF clear.                                        "UD041011
+DATA: gt_clear TYPE SORTED TABLE OF clear WITH HEADER LINE  "UD041011
+      WITH UNIQUE KEY bukrs augdt augbl koart kunnr hkont.  "UD041011
+
+SELECTION-SCREEN BEGIN OF BLOCK 001 WITH FRAME.
+
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(25) text_001 FOR FIELD p_bukrs.
+SELECTION-SCREEN POSITION 28.
+PARAMETERS: p_bukrs TYPE bkpf-bukrs OBLIGATORY.
+SELECTION-SCREEN END OF LINE.
+
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(25) text_002 FOR FIELD s_belnr.
+SELECTION-SCREEN POSITION 25.
+SELECT-OPTIONS: s_belnr FOR bkpf-belnr.
+SELECTION-SCREEN END OF LINE.
+
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(25) text_003 FOR FIELD p_gjahr.
+SELECTION-SCREEN POSITION 28.
+PARAMETERS: p_gjahr TYPE bkpf-gjahr OBLIGATORY.
+SELECTION-SCREEN END OF LINE.
+
+SELECTION-SCREEN SKIP.
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(25) text_004 FOR FIELD p_stgrd.
+SELECTION-SCREEN POSITION 28.
+PARAMETERS: p_stgrd TYPE bkpf-stgrd OBLIGATORY.
+SELECTION-SCREEN END OF LINE.
+
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(25) text_005 FOR FIELD p_budat.
+SELECTION-SCREEN POSITION 28.
+PARAMETERS: p_budat TYPE bkpf-budat.
+SELECTION-SCREEN END OF LINE.
+
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(25) text_006 FOR FIELD p_fkart.
+SELECTION-SCREEN POSITION 28.
+PARAMETERS: p_fkart TYPE tvfk-fkart OBLIGATORY.
+SELECTION-SCREEN END OF LINE.
+
+SELECTION-SCREEN SKIP.                                      "UD240613
+SELECTION-SCREEN BEGIN OF LINE.                             "UD240613
+SELECTION-SCREEN COMMENT 1(25) text_009 FOR FIELD p_numki.  "UD240613
+SELECTION-SCREEN POSITION 28.                               "UD240613
+PARAMETERS: p_numki TYPE nriv-nrrangenr.                    "UD240613
+SELECTION-SCREEN END OF LINE.                               "UD240613
+
+SELECTION-SCREEN SKIP.
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(25) text_007 FOR FIELD p_test.
+SELECTION-SCREEN POSITION 28.
+PARAMETERS: p_test AS CHECKBOX DEFAULT 'X'.
+SELECTION-SCREEN END OF LINE.
+
+SELECTION-SCREEN BEGIN OF LINE.                             "UD270511
+SELECTION-SCREEN COMMENT 1(25) text_008 FOR FIELD p_dani.   "UD270511
+SELECTION-SCREEN POSITION 28.                               "UD270511
+PARAMETERS: p_dani AS CHECKBOX MODIF ID inc.                "UD270511
+SELECTION-SCREEN END OF LINE.                               "UD270511
+
+SELECTION-SCREEN END OF BLOCK 001.
+
+INITIALIZATION.
+
+  text_001 = 'Company Code'.
+  text_002 = 'Document Number'.
+  text_003 = 'Fiscal Year'.
+  text_004 = 'Reversal Reason'.
+  text_005 = 'Different Reversal Date'.
+  text_006 = 'Original Billing Type'.
+  text_007 = 'Test Run'.
+  text_008 = 'Process ALE clearings'.                       "UD270511
+  text_009 = 'SD Number Range'.                             "UD240613
+
+AT SELECTION-SCREEN.
+  PERFORM check_input.
+
+AT SELECTION-SCREEN OUTPUT.
+  PERFORM screen.
+
+AT LINE-SELECTION.
+  SET PARAMETER ID 'BUK' FIELD d_bukrs.
+  SET PARAMETER ID 'BLN' FIELD d_belnr.
+  SET PARAMETER ID 'GJR' FIELD d_gjahr.
+  CALL TRANSACTION 'FB03' AND SKIP FIRST SCREEN.
+
+START-OF-SELECTION.
+*** select documents
+  PERFORM select_docs.
+*** output excluded cases
+  IF cnt_excl > 0.
+    PERFORM output_excl.
+  ENDIF.
+
+
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_INPUT
+*&---------------------------------------------------------------------*
+FORM check_input .
+  DATA: ls_vbrk TYPE vbrk.
+  DATA: ls_t041c TYPE t041c.
+
+*** check STGRD allows different STDAT
+*  IF p_budat IS NOT INITIAL.                               "UD120911
+  IF p_budat NE '00000000'.                                 "UD120911
+    SELECT SINGLE * FROM t041c INTO ls_t041c
+      WHERE stgrd = p_stgrd.
+    IF sy-subrc NE 0.
+      MESSAGE e016(gu)
+      WITH 'Reversal reason not found'.
+    ENDIF.
+    IF ls_t041c-xabwd NE 'X'.
+      MESSAGE e016(gu)
+      WITH 'Reversal reason does not allow different reversal date'.
+    ENDIF.
+  ENDIF.
+*** get FKART for determination of reversal FKART
+  SELECT SINGLE * FROM tvfk INTO gs_tvfk
+    WHERE fkart = p_fkart.
+  IF sy-subrc NE 0.
+    MESSAGE e016(gu)
+    WITH 'No TVFK entry found for FKART' p_fkart.
+  ENDIF.
+  SELECT SINGLE * FROM tvfk INTO gs_tvfk_rev
+    WHERE fkart = gs_tvfk-fkarts.
+  IF sy-subrc NE 0.
+    MESSAGE e016(gu)
+    WITH 'No TVFK entry found for reversal FKART' gs_tvfk-fkarts.
+  ENDIF.
+*** check NUMKI if entered                                  "UD240613
+  IF p_numki NE space.                                      "UD240613
+    DATA: ls_nriv TYPE nriv.                                "UD240613
+    SELECT SINGLE * FROM nriv INTO ls_nriv                  "UD240613
+      WHERE object    EQ 'RV_BELEG'                         "UD240613
+        AND subobject EQ space                              "UD240613
+        AND nrrangenr EQ p_numki                            "UD240613
+        AND toyear    EQ '0000'.                            "UD240613
+    IF sy-subrc NE 0.                                       "UD240613
+      MESSAGE e016(gu)                                      "UD240613
+      WITH 'Number range' p_numki 'invalid'.                "UD240613
+    ENDIF.                                                  "UD240613
+  ENDIF.                                                    "UD240613
+  IF sy-ucomm EQ 'SAPONLY'. exp = 'X'. ENDIF.
+ENDFORM.                    " CHECK_INPUT
+
+*&---------------------------------------------------------------------*
+*&      Form  WRITE_DOCUMENT
+*&---------------------------------------------------------------------*
+FORM write_document .
+
+  NEW-PAGE.
+  FORMAT COLOR 1 INTENSIFIED ON.
+  ULINE (120).
+  WRITE:/ sy-vline NO-GAP,
+          'FI document to be reversed:',
+      120 sy-vline NO-GAP.
+  WRITE:/ sy-vline NO-GAP,
+      (5) 'BUKRS',
+     (10) 'BELNR',
+      (5) 'GJAHR',
+      (5) 'BLART',
+     (10) 'BUDAT',
+      (5) 'AWTYP',
+     (20) 'AWKEY',
+      120 sy-vline NO-GAP.
+  FORMAT COLOR 2.
+  WRITE:/ sy-vline NO-GAP,
+      (5) 'BUZEI',
+     (10) 'AUGDT',
+     (10) 'AUGBL',
+      (5) 'BSCHL',
+      (5) 'KOART',
+      (5) 'UMSKZ',
+     (15) 'PSWBT',
+      (5) 'PSWSL',
+     (10) 'VBELN',
+     (10) 'HKONT',
+     (10) 'KUNNR',
+      120 sy-vline NO-GAP.
+  NEW-LINE.
+  ULINE (120).
+  FORMAT COLOR 1 INTENSIFIED OFF.
+  WRITE:/ sy-vline NO-GAP,
+      (5) gt_bkpf-bukrs,
+     (10) gt_bkpf-belnr,
+      (5) gt_bkpf-gjahr,
+      (5) gt_bkpf-blart,
+     (10) gt_bkpf-budat,
+      (5) gt_bkpf-awtyp,
+     (20) gt_bkpf-awkey,
+      120 sy-vline NO-GAP.
+*** drill-down
+  d_bukrs = gt_bkpf-bukrs.
+  d_belnr = gt_bkpf-belnr.
+  d_gjahr = gt_bkpf-gjahr.
+  HIDE: d_bukrs, d_belnr, d_gjahr.
+  FORMAT COLOR 2 INTENSIFIED OFF.
+  LOOP AT gt_bseg.
+    WRITE:/ sy-vline NO-GAP,
+          (5) gt_bseg-buzei,
+         (10) gt_bseg-augdt,
+         (10) gt_bseg-augbl,
+          (5) gt_bseg-bschl,
+          (5) gt_bseg-koart,
+          (5) gt_bseg-umskz,
+         (15) gt_bseg-pswbt,
+          (5) gt_bseg-pswsl,
+         (10) gt_bseg-vbeln,
+         (10) gt_bseg-hkont,
+         (10) gt_bseg-kunnr,
+          120 sy-vline NO-GAP.
+*** drill-down
+    d_bukrs = gt_bseg-bukrs.
+    d_belnr = gt_bseg-belnr.
+    d_gjahr = gt_bseg-gjahr.
+    HIDE: d_bukrs, d_belnr, d_gjahr.
+  ENDLOOP.
+  NEW-LINE.
+  ULINE (120).
+ENDFORM.                    " WRITE_DOCUMENT
+
+*&---------------------------------------------------------------------*
+*&      Form  TEST_REVERSAL
+*&---------------------------------------------------------------------*
+FORM test_reversal .
+
+  REFRESH: gt_return.
+*** test mode: check if reversal is possible
+*  CALL FUNCTION 'BAPI_ACC_DOCUMENT_REV_CHECK'              "UD120911
+  CALL FUNCTION 'BAPI_ACC_BILLING_REV_CHECK'                "UD120911
+    EXPORTING
+      reversal = gs_bapi
+*      bus_act  = gs_glvor                                  "UD120911
+    TABLES
+      return   = gt_return.
+*** messages?
+  DESCRIBE TABLE gt_return LINES sy-tfill.
+  IF sy-tfill > 0.
+    NEW-LINE.
+    ULINE (120).
+    FORMAT COLOR 3 INTENSIFIED ON.
+    WRITE:/ sy-vline NO-GAP,
+            'Messages from simulation:',
+        120 sy-vline NO-GAP.
+    WRITE:/ sy-vline NO-GAP,
+        (5) 'TYPE',
+        (5) 'ID',
+        (5) 'No.',
+      (100) 'Message',
+       120 sy-vline NO-GAP.
+    NEW-LINE.
+    ULINE (120).
+    LOOP AT gt_return.
+      FORMAT COLOR 2 INTENSIFIED OFF.
+      WRITE:/ sy-vline NO-GAP,
+          (5) gt_return-type,
+          (5) gt_return-id,
+          (5) gt_return-number,
+        (100) gt_return-message,
+          120 sy-vline NO-GAP.
+    ENDLOOP.
+    NEW-LINE.
+    ULINE (120).
+    READ TABLE gt_return WITH KEY
+      type = 'E'
+    TRANSPORTING NO FIELDS.
+    IF sy-subrc = 0.
+*** error messages: no update!
+      no_corr = 'X'.
+      WRITE:/ sy-vline NO-GAP,
+              'Excluded from update run due to error messages' COLOR 6,
+          120 sy-vline NO-GAP.
+      NEW-LINE.
+      ULINE (120).
+      CLEAR gt_bkpf_excl.
+      MOVE-CORRESPONDING gt_bkpf TO gt_bkpf_excl.
+      gt_bkpf_excl-error = '4'.
+      APPEND gt_bkpf_excl.
+    ENDIF.
+  ENDIF.
+ENDFORM.                    " TEST_REVERSAL
+
+*&---------------------------------------------------------------------*
+*&      Form  POST_REVERSAL
+*&---------------------------------------------------------------------*
+FORM post_reversal .
+  DATA: no_buffer TYPE c.
+  DATA: ls_vbeln TYPE vbrk-vbeln.
+  DATA: ls_returncode TYPE inri-returncode.
+  DATA: lt_accdn TYPE TABLE OF accdn WITH HEADER LINE.      "UD010611
+
+*** only go on if simulation was successful
+  CHECK no_corr EQ space.
+*** get billing document number
+  CLEAR no_buffer.
+  CLEAR ls_vbeln.
+  CLEAR ls_vbeln.
+*** if P_NUMKI is entered => override                       "UD240613
+  IF p_numki NE space.                                      "UD240613
+    gs_tvfk_rev-numki = p_numki.                            "UD240613
+  ENDIF.                                                    "UD240613
+  CALL FUNCTION 'NUMBER_GET_NEXT'
+       EXPORTING
+            nr_range_nr             = gs_tvfk_rev-numki
+            object                  = 'RV_BELEG'
+            ignore_buffer           = no_buffer
+       IMPORTING
+            returncode              = ls_returncode
+            number                  = ls_vbeln
+       EXCEPTIONS
+            interval_not_found      = 1
+            number_range_not_intern = 2
+            object_not_found        = 3
+            quantity_is_0           = 4
+            quantity_is_not_1       = 5
+            interval_overflow       = 6
+            OTHERS                  = 99.
+  IF sy-subrc NE 0.
+    MESSAGE ID sy-msgid TYPE 'A' NUMBER sy-msgno
+      WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+*** enrich GS_BAPI with new AWKEY of reversal billing document
+  gs_bapi-obj_key = ls_vbeln.
+*** external document numbering: new AC_DOC_NO is required  "UD050510
+  IF x_ext = 'X'.                                           "UD050510
+    gs_bapi-ac_doc_no  = ls_vbeln.                          "UD050510
+  ENDIF.                                                    "UD050510
+*** post reversal
+  REFRESH gt_return_upd.
+*  CALL FUNCTION 'BAPI_ACC_DOCUMENT_REV_POST'               "UD120911
+  CALL FUNCTION 'BAPI_ACC_BILLING_REV_POST'                 "UD120911
+    EXPORTING
+      reversal = gs_bapi
+*      bus_act  = gs_glvor                                  "UD120911
+    TABLES
+      return   = gt_return_upd.
+*** messages?
+  DESCRIBE TABLE gt_return_upd LINES sy-tfill.
+  IF sy-tfill > 0.
+    NEW-LINE.
+    ULINE (120).
+    FORMAT COLOR 3 INTENSIFIED ON.
+    WRITE:/ sy-vline NO-GAP,
+            'Messages from update run:',
+        120 sy-vline NO-GAP.
+    WRITE:/ sy-vline NO-GAP,
+        (5) 'TYPE',
+        (5) 'ID',
+        (5) 'No.',
+      (100) 'Message',
+       120 sy-vline NO-GAP.
+    NEW-LINE.
+    ULINE (120).
+    LOOP AT gt_return_upd.
+      FORMAT COLOR 2 INTENSIFIED OFF.
+      WRITE:/ sy-vline NO-GAP,
+          (5) gt_return_upd-type,
+          (5) gt_return_upd-id,
+          (5) gt_return_upd-number,
+        (100) gt_return_upd-message,
+          120 sy-vline NO-GAP.
+    ENDLOOP.
+    NEW-LINE.
+    ULINE (120).
+    READ TABLE gt_return_upd WITH KEY
+      type = 'E'
+    TRANSPORTING NO FIELDS.
+*** no errors: UPDATE
+    IF sy-subrc NE 0.
+      COMMIT WORK.
+*** get FI document number posted                           "UD010611
+      REFRESH: lt_accdn.                                    "UD010611
+      CLEAR: lt_accdn.                                      "UD010611
+      lt_accdn-awtyp = gs_bapi-obj_type.                    "UD010611
+      lt_accdn-awref = gs_bapi-obj_key(10).                 "UD010611
+      lt_accdn-aworg = gs_bapi-obj_key+10(10).              "UD010611
+      APPEND lt_accdn.                                      "UD010611
+      CALL FUNCTION 'FI_DOCUMENT_NUMBER_GET'                "UD010611
+        TABLES                                              "UD010611
+          t_accdn = lt_accdn.                               "UD010611
+      READ TABLE lt_accdn INDEX 1.                          "UD010611
+      FORMAT COLOR 5 INTENSIFIED OFF.                       "UD010611
+      WRITE:/ sy-vline NO-GAP,                              "UD010611
+              'FI document',                                "UD010611
+              lt_accdn-bukrs,                               "UD010611
+              lt_accdn-belnr,                               "UD010611
+              lt_accdn-gjahr,                               "UD010611
+              'was successfully posted.',                   "UD010611
+          120 sy-vline NO-GAP.                              "UD010611
+      NEW-LINE.                                             "UD010611
+      ULINE (120).                                          "UD010611
+    ELSE.
+      ROLLBACK WORK.
+      CLEAR gt_bkpf_excl.
+      MOVE-CORRESPONDING gt_bkpf TO gt_bkpf_excl.
+      gt_bkpf_excl-error = '3'.
+      APPEND gt_bkpf TO gt_bkpf_excl.
+      ADD 1 TO cnt_excl.
+    ENDIF.
+  ENDIF.
+ENDFORM.                    " POST_REVERSAL
+
+*&---------------------------------------------------------------------*
+*&      Form  BUILD_REVERSAL
+*&---------------------------------------------------------------------*
+FORM build_reversal .
+
+*** external document numbering                             "UD050510
+  SELECT SINGLE * FROM t003 INTO gs_t003                    "UD050510
+    WHERE blart EQ gt_bkpf-blart.                           "UD050510
+  SELECT SINGLE * FROM nriv INTO gs_nriv                    "UD050510
+    WHERE object    EQ 'RF_BELEG'                           "UD050510
+      AND subobject EQ gt_bkpf-bukrs                        "UD050510
+      AND nrrangenr EQ gs_t003-numkr                        "UD050510
+      AND toyear    GE gt_bkpf-gjahr.                       "UD050510
+  IF sy-subrc NE 0.                                         "UD050510
+    MESSAGE e016(gu)                                        "UD050510
+    WITH 'Numberrange not found'.                           "UD050510
+  ENDIF.                                                    "UD050510
+  CLEAR: x_ext, dummy_doc.                                  "UD050510
+  IF gs_nriv-externind EQ 'X'.                              "UD050510
+    x_ext = 'X'.                                            "UD050510
+    dummy_doc = gs_nriv-tonumber(10).                       "UD050510
+  ENDIF.                                                    "UD050510
+*** build-up data for FM
+  CLEAR: gs_glvor, gs_bapi.
+  gs_glvor           = 'SD00'.
+  gs_bapi-obj_type   = 'VBRK'.
+  gs_bapi-obj_key_r  = gt_bkpf-awkey.
+*** use original BUDAT or different one?
+  IF p_budat IS INITIAL.
+    gs_bapi-pstng_date = gt_bkpf-budat.
+  ELSE.
+    gs_bapi-pstng_date = p_budat.
+  ENDIF.
+  gs_bapi-comp_code  = gt_bkpf-bukrs.
+  gs_bapi-reason_rev = p_stgrd.
+*** external document numbering: new AC_DOC_NO is required  "UD050510
+*  gs_bapi-ac_doc_no  = gs_bkpf-belnr.                      "UD050510
+  IF x_ext = 'X'.                                           "UD050510
+    gs_bapi-ac_doc_no  = dummy_doc.                         "UD050510
+  ENDIF.                                                    "UD050510
+
+  CALL FUNCTION 'OWN_LOGICAL_SYSTEM_GET'
+       IMPORTING
+            own_logical_system = gs_bapi-obj_sys.
+
+  IF p_budat IS INITIAL.
+    CALL FUNCTION 'FI_PERIOD_DETERMINE'
+         EXPORTING
+              i_budat = gt_bkpf-budat
+              i_bukrs = gt_bkpf-bukrs
+         IMPORTING
+              e_monat = gs_bapi-fis_period.
+  ELSE.
+    CALL FUNCTION 'FI_PERIOD_DETERMINE'
+         EXPORTING
+              i_budat = p_budat
+              i_bukrs = gt_bkpf-bukrs
+         IMPORTING
+              e_monat = gs_bapi-fis_period.
+  ENDIF.
+ENDFORM.                    " BUILD_REVERSAL
+
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_DOCS
+*&---------------------------------------------------------------------*
+FORM select_docs .
+  DATA: ls_vbrk TYPE vbrk.
+  DATA: upd TYPE i.                                         "UD270511
+
+*** check BELNR is not empty
+  LOOP AT s_belnr
+    WHERE sign EQ 'I'.
+    EXIT.
+  ENDLOOP.
+  IF sy-subrc NE 0.
+    MESSAGE e016(gu)
+    WITH 'Document number required'.
+  ENDIF.
+*** select headers
+  SELECT * FROM bkpf INTO TABLE gt_bkpf
+    WHERE bukrs EQ p_bukrs
+      AND belnr IN s_belnr
+      AND gjahr EQ p_gjahr
+      AND bstat EQ space
+      AND stblg EQ space
+      AND awtyp = 'VBRK'.
+  IF sy-subrc NE 0.
+    WRITE:/ 'No documents selected' COLOR 3.
+  ENDIF.
+  CHECK sy-subrc = 0.
+*** verify that the corresponding billing doc is missing
+  LOOP AT gt_bkpf.
+    SELECT SINGLE * FROM vbrk INTO ls_vbrk
+      WHERE vbeln = gt_bkpf-awkey(10).
+*** VBRK existing => exclude
+    IF sy-subrc = 0.
+      DELETE gt_bkpf.
+      CLEAR gt_bkpf_excl.
+      MOVE-CORRESPONDING gt_bkpf TO gt_bkpf_excl.
+      gt_bkpf_excl-error = '1'.
+      APPEND gt_bkpf_excl TO gt_bkpf_excl.
+      ADD 1 TO cnt_excl.
+    ENDIF.
+  ENDLOOP.
+  DESCRIBE TABLE gt_bkpf LINES sy-tfill.
+  CHECK sy-tfill > 0.
+*** select line items for output
+  LOOP AT gt_bkpf.
+    REFRESH gt_bseg.
+    SELECT * FROM bseg INTO TABLE gt_bseg
+      WHERE bukrs = gt_bkpf-bukrs
+        AND belnr = gt_bkpf-belnr
+        AND gjahr = gt_bkpf-gjahr.
+*** special case: ALE-extern => remove clearing             "UD270511
+    IF p_dani EQ 'X'.                                       "UD270511
+      REFRESH: gt_bseg_ale, gt_bsad_ale, gt_bsas_ale.       "UD270511
+      LOOP AT gt_bseg                                       "UD270511
+        WHERE augbl EQ 'ALE-extern'.                        "UD270511
+        APPEND gt_bseg TO gt_bseg_ale.                      "UD270511
+        PERFORM items_ale.                                  "UD270511
+      ENDLOOP.                                              "UD270511
+*** perform DB update also for test                         "UD270511
+      upd = 1.                                              "UD270511
+      PERFORM update_ale USING upd.                         "UD270511
+    ENDIF.                                                  "UD270511
+*** check if cleared items are involved
+    LOOP AT gt_bseg
+      WHERE augbl NE space.
+      EXIT.
+    ENDLOOP.
+*** cleared items found => exclude
+    IF sy-subrc = 0.
+      APPEND gt_bseg TO gt_bseg_excl.
+*** save key for output                                     "UD041011
+      CLEAR gt_clear.                                       "UD041011
+      MOVE-CORRESPONDING gt_bseg TO gt_clear.               "UD041011
+      COLLECT gt_clear.                                     "UD041011
+      CLEAR gt_bkpf_excl.
+      MOVE-CORRESPONDING gt_bkpf TO gt_bkpf_excl.
+      gt_bkpf_excl-error = '2'.
+      APPEND gt_bkpf_excl TO gt_bkpf_excl.
+      ADD 1 TO cnt_excl.
+      DELETE gt_bkpf.
+      CONTINUE.
+    ENDIF.
+    CLEAR no_corr.
+*** list document details
+    PERFORM write_document.
+*** build-up data for FM
+    PERFORM build_reversal.
+*** test reversal
+    PERFORM test_reversal.
+*** in test mode: undo ALE changes                          "UD270511
+    IF p_dani EQ 'X' AND p_test EQ 'X'.                     "UD270511
+      upd = 2.                                              "UD270511
+      PERFORM update_ale USING upd.                         "UD270511
+    ENDIF.                                                  "UD270511
+*** update mode: post reversal
+    IF p_test EQ space.
+      PERFORM post_reversal.
+    ENDIF.
+  ENDLOOP.
+ENDFORM.                    " SELECT_DOCS
+
+*&---------------------------------------------------------------------*
+*&      Form  OUTPUT_EXCL
+*&---------------------------------------------------------------------*
+FORM output_excl .
+
+  NEW-PAGE.
+  FORMAT COLOR 6 INTENSIFIED ON.
+  ULINE (120).
+  WRITE:/ sy-vline NO-GAP,
+          'FI documents excluded from reversal process:',
+      120 sy-vline NO-GAP.
+  FORMAT COLOR 1 INTENSIFIED ON.
+  WRITE:/ sy-vline NO-GAP,
+      (5) 'BUKRS',
+     (10) 'BELNR',
+      (5) 'GJAHR',
+      (5) 'AWTYP',
+     (20) 'AWKEY',
+     (20) 'ERROR',
+      120 sy-vline NO-GAP.
+  FORMAT COLOR 2.
+  WRITE:/ sy-vline NO-GAP,
+      (5) 'BUZEI',
+     (10) 'AUGDT',
+     (10) 'AUGBL',
+      (5) 'BSCHL',
+      (5) 'KOART',
+      (5) 'UMSKZ',
+     (15) 'PSWBT',
+      (5) 'PSWSL',
+     (10) 'VBELN',
+     (10) 'HKONT',
+     (10) 'KUNNR',
+      120 sy-vline NO-GAP.
+  NEW-LINE.
+  ULINE (120).
+  SORT gt_bkpf_excl BY belnr.
+  LOOP AT gt_bkpf_excl.
+    FORMAT COLOR 1 INTENSIFIED OFF.
+    WRITE:/ sy-vline NO-GAP,
+        (5) gt_bkpf_excl-bukrs,
+       (10) gt_bkpf_excl-belnr,
+        (5) gt_bkpf_excl-gjahr,
+        (5) gt_bkpf_excl-awtyp,
+       (20) gt_bkpf_excl-awkey.
+*** output messages
+    CASE gt_bkpf_excl-error.
+      WHEN '1'.
+        WRITE: 'Original billing doc does exist' COLOR 6.
+      WHEN '2'.
+        WRITE: 'Document contains cleared items' COLOR 6.
+      WHEN '3'.
+        WRITE: 'Error within actual reversal process' COLOR 6.
+      WHEN '4'.
+        WRITE: 'Error within simulation of reversal' COLOR 6.
+    ENDCASE.
+    WRITE: 120 sy-vline NO-GAP.
+*** drill-down
+    d_bukrs = gt_bkpf_excl-bukrs.
+    d_belnr = gt_bkpf_excl-belnr.
+    d_gjahr = gt_bkpf_excl-gjahr.
+    HIDE: d_bukrs, d_belnr, d_gjahr.
+*** output cleared BSEG
+    IF gt_bkpf_excl-error = '2'.
+      FORMAT COLOR 2 INTENSIFIED OFF.
+      LOOP AT gt_bseg_excl
+        WHERE bukrs = gt_bkpf_excl-bukrs
+          AND belnr = gt_bkpf_excl-belnr
+          AND gjahr = gt_bkpf_excl-gjahr.
+        WRITE:/ sy-vline NO-GAP,
+              (5) gt_bseg_excl-buzei,
+             (10) gt_bseg_excl-augdt,
+             (10) gt_bseg_excl-augbl,
+              (5) gt_bseg_excl-bschl,
+              (5) gt_bseg_excl-koart,
+              (5) gt_bseg_excl-umskz,
+             (15) gt_bseg_excl-pswbt,
+              (5) gt_bseg_excl-pswsl,
+             (10) gt_bseg_excl-vbeln,
+             (10) gt_bseg_excl-hkont,
+             (10) gt_bseg_excl-kunnr,
+              120 sy-vline NO-GAP.
+*** drill-down
+        d_bukrs = gt_bseg_excl-bukrs.
+        d_belnr = gt_bseg_excl-belnr.
+        d_gjahr = gt_bseg_excl-gjahr.
+        HIDE: d_bukrs, d_belnr, d_gjahr.
+      ENDLOOP.
+    ENDIF.
+    AT END OF belnr.
+      NEW-LINE.
+      ULINE (120).
+    ENDAT.
+  ENDLOOP.
+*** output summarized clearing data                         "UD041011
+  DESCRIBE TABLE gt_clear LINES sy-tfill.                   "UD041011
+  CHECK sy-tfill GT 0.                                      "UD041011
+  SKIP 2.                                                   "UD041011
+  FORMAT COLOR 3 INTENSIFIED ON.                            "UD041011
+  ULINE (120).                                              "UD041011
+  WRITE:/ sy-vline NO-GAP,                                  "UD041011
+          'Condensed clearing information for FBRA:',       "UD041011
+      120 sy-vline NO-GAP.                                  "UD041011
+  FORMAT COLOR 1 INTENSIFIED ON.                            "UD041011
+  WRITE:/ sy-vline NO-GAP,                                  "UD041011
+      (5) 'BUKRS',                                          "UD041011
+     (10) 'AUGDT',                                          "UD041011
+     (10) 'AUGBL',                                          "UD041011
+      (5) 'KOART',                                          "UD041011
+     (10) 'HKONT',                                          "UD041011
+     (10) 'KUNNR',                                          "UD041011
+      120 sy-vline NO-GAP.                                  "UD041011
+  NEW-LINE.                                                 "UD041011
+  ULINE (120).                                              "UD041011
+  LOOP AT gt_clear.                                         "UD041011
+    FORMAT COLOR 2 INTENSIFIED OFF.                         "UD041011
+    WRITE:/ sy-vline NO-GAP,                                "UD041011
+      (5) gt_clear-bukrs,                                   "UD041011
+     (10) gt_clear-augdt,                                   "UD041011
+     (10) gt_clear-augbl,                                   "UD041011
+      (5) gt_clear-koart,                                   "UD041011
+     (10) gt_clear-hkont,                                   "UD041011
+     (10) gt_clear-kunnr,                                   "UD041011
+      120 sy-vline NO-GAP.                                  "UD041011
+  ENDLOOP.                                                  "UD041011
+  NEW-LINE.                                                 "UD041011
+  ULINE (120).                                              "UD041011
+ENDFORM.                    " OUTPUT_EXCL
+
+*&---------------------------------------------------------------------*
+*&      Form  ITEMS_ALE
+*&---------------------------------------------------------------------*
+FORM items_ale .
+
+  CASE gt_bseg-koart.
+    WHEN 'D'.
+      SELECT SINGLE * FROM bsad INTO gt_bsad_ale
+        WHERE bukrs EQ gt_bseg_ale-bukrs
+          AND kunnr EQ gt_bseg_ale-kunnr
+          AND augdt EQ gt_bseg_ale-augdt
+          AND augbl EQ gt_bseg_ale-augbl
+          AND gjahr EQ gt_bseg_ale-gjahr
+          AND belnr EQ gt_bseg_ale-belnr
+          AND buzei EQ gt_bseg_ale-buzei.
+      APPEND gt_bsad_ale.
+      IF gt_bseg-xhres EQ 'X'.
+        SELECT SINGLE * FROM bsas INTO gt_bsas_ale
+          WHERE bukrs EQ gt_bseg_ale-bukrs
+            AND hkont EQ gt_bseg_ale-hkont
+            AND augdt EQ gt_bseg_ale-augdt
+            AND augbl EQ gt_bseg_ale-augbl
+            AND gjahr EQ gt_bseg_ale-gjahr
+            AND belnr EQ gt_bseg_ale-belnr
+            AND buzei EQ gt_bseg_ale-buzei.
+        APPEND gt_bsas_ale.
+      ENDIF.
+    WHEN 'S'.
+      SELECT SINGLE * FROM bsas INTO gt_bsas_ale
+        WHERE bukrs EQ gt_bseg_ale-bukrs
+          AND hkont EQ gt_bseg_ale-hkont
+          AND augdt EQ gt_bseg_ale-augdt
+          AND augbl EQ gt_bseg_ale-augbl
+          AND gjahr EQ gt_bseg_ale-gjahr
+          AND belnr EQ gt_bseg_ale-belnr
+          AND buzei EQ gt_bseg_ale-buzei.
+      APPEND gt_bsas_ale.
+  ENDCASE.
+ENDFORM.                    " ITEMS_ALE
+
+*&---------------------------------------------------------------------*
+*&      Form  UPDATE_ALE
+*&---------------------------------------------------------------------*
+FORM update_ale  USING    upd TYPE i.
+
+  IF upd EQ 1.
+***********************************************************************
+*** remove ALE-extern clearing info from DB:
+***********************************************************************
+*** ... from BSEG
+    LOOP AT gt_bseg_ale.
+      CLEAR: gt_bseg_ale-augdt, gt_bseg_ale-augcp,
+             gt_bseg_ale-augbl.
+      UPDATE bseg
+      SET   augdt = gt_bseg_ale-augdt
+            augcp = gt_bseg_ale-augcp
+            augbl = gt_bseg_ale-augbl
+      WHERE bukrs = gt_bseg_ale-bukrs
+      AND   belnr = gt_bseg_ale-belnr
+      AND   gjahr = gt_bseg_ale-gjahr
+      AND   buzei = gt_bseg_ale-buzei.
+    ENDLOOP.
+*** ... from BSAD
+    LOOP AT gt_bsad_ale.
+      DELETE bsad FROM gt_bsad_ale.
+      CLEAR: gt_bsad_ale-augdt, gt_bsad_ale-augbl.
+      INSERT bsid FROM gt_bsad_ale.
+    ENDLOOP.
+*** ... from BSAS
+    LOOP AT gt_bsas_ale.
+      DELETE bsas FROM gt_bsas_ale.
+      CLEAR: gt_bsas_ale-augdt, gt_bsas_ale-augbl.
+      INSERT bsis FROM gt_bsas_ale.
+    ENDLOOP.
+*** finish with COMMIT WORK
+    COMMIT WORK.
+*** ... revise GT_BSEG
+    LOOP AT gt_bseg_ale.
+*      DELETE gt_bseg FROM gt_bseg_ale.                     "UD310511
+      DELETE TABLE gt_bseg FROM gt_bseg_ale.                "UD310511
+    ENDLOOP.
+***********************************************************************
+*** undo changes in test mode
+***********************************************************************
+  ELSEIF upd EQ 2.
+*** ... in BSEG
+    LOOP AT gt_bseg_ale.
+      UPDATE bseg
+      SET   augdt = gt_bseg_ale-augdt
+            augcp = gt_bseg_ale-augcp
+            augbl = gt_bseg_ale-augbl
+      WHERE bukrs = gt_bseg_ale-bukrs
+      AND   belnr = gt_bseg_ale-belnr
+      AND   gjahr = gt_bseg_ale-gjahr
+      AND   buzei = gt_bseg_ale-buzei.
+    ENDLOOP.
+*** ... in BSAD
+    LOOP AT gt_bsad_ale.
+      DELETE bsid FROM gt_bsad_ale.
+      INSERT bsad FROM gt_bsad_ale.
+    ENDLOOP.
+*** ... in BSAS
+    LOOP AT gt_bsas_ale.
+      DELETE bsis FROM gt_bsas_ale.
+      INSERT bsas FROM gt_bsas_ale.
+    ENDLOOP.
+*** finish with COMMIT WORK
+    COMMIT WORK.
+  ENDIF.
+ENDFORM.                    " UPDATE_ALE
+*&---------------------------------------------------------------------*
+*&      Form  SCREEN
+*&---------------------------------------------------------------------*
+FORM screen .
+
+  LOOP AT SCREEN.
+    IF screen-group1 = 'INC'.
+      IF exp = 'X'.
+        screen-invisible = 0.
+        screen-active = 1.
+      ELSE.
+        screen-invisible = 1.
+        screen-active = 0.
+      ENDIF.
+      MODIFY SCREEN.
+    ENDIF.
+  ENDLOOP.
+ENDFORM.                    " SCREEN

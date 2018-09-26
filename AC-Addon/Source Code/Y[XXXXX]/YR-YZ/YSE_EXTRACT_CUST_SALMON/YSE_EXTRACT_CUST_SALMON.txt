@@ -1,0 +1,246 @@
+*----------------------------------------------------------------------*
+* PROGRAM ID           : YSE_EXTRACT_CUST_SALMON                       *
+* PROGRAM TITLE        : Create customerfile for Salmon                *
+* AUTHOR               : Luc Mertens                                   *
+* DATE                 : 05/05/2010                                    *
+* DEVELOPMENT ID       :                                               *
+* CHANGE REQUEST NUMBER: CD1K956505                                    *
+* PROGRAM DESCRIPTION  : Create file with info about customers         *
+*                        for Salmon                                    *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME                  |CORR.NR.  | CHANGE REF.  *
+*----------------------------------------------------------------------*
+* MOD-001 |20  .  .  |                       |CD1K9     |
+*
+*----------------------------------------------------------------------*
+REPORT  YSE_EXTRACT_CUST_SALMON.
+
+*- Tables -------------------------------------------------------------*
+TABLES: kna1,
+        knb1.
+
+*- Variables ----------------------------------------------------------*
+DATA: g_directory(25) TYPE c VALUE '/var/load/xxx/UK/read/',
+      g_ofile         LIKE /sapdmc/lsoinp-filename,
+      p_logsys        LIKE tbdlst-logsys,
+      gv_addrnumber   TYPE adrc-addrnumber.
+
+*- Constants ----------------------------------------------------------*
+CONSTANTS:
+  c_rec(15) TYPE c VALUE 'YSE_SALMON_CUST'.
+
+*- Internal tables ----------------------------------------------------*
+DATA: begin of gt_cust occurs 0.
+DATA:   bukrs   TYPE knb1-bukrs.
+DATA:   hkunnr  TYPE knvh-hkunnr.
+        INCLUDE STRUCTURE YSE_CUST_SALMON.
+DATA: end of gt_cust.
+
+DATA: begin of gt_cust_out occurs 0.
+        INCLUDE STRUCTURE YSE_CUST_SALMON.
+DATA: end of gt_cust_out.
+
+DATA: gt_tvko LIKE tvko OCCURS 0 WITH HEADER LINE.
+
+DATA:
+    IT_DD03L          LIKE DD03L OCCURS 0 WITH HEADER LINE,
+    IT_DD04T          LIKE DD04T OCCURS 0 WITH HEADER LINE,
+    it_outxls(4096)   TYPE c OCCURS 0,
+    wa_outxls(4096)   TYPE c,
+    wa_outxls_h(4096) TYPE c.
+
+ranges: r_vkorg FOR tvko-vkorg.
+
+************************************************************************
+*       S E L E C T - O P T I O N S / P A R A M E T E R S              *
+************************************************************************
+SELECTION-SCREEN: BEGIN OF BLOCK b1 WITH FRAME TITLE text-001.
+SELECT-OPTIONS: s_bukrs FOR knb1-bukrs,              " Comp.Code
+                s_kunnr FOR kna1-kunnr.              " Customer
+SELECTION-SCREEN: END OF BLOCK b1.
+
+
+*- Initialization -----------------------------------------------------*
+INITIALIZATION.
+
+  CALL FUNCTION 'OWN_LOGICAL_SYSTEM_GET'
+    IMPORTING
+      own_logical_system             = p_logsys
+    EXCEPTIONS
+      own_logical_system_not_defined = 1
+      OTHERS                         = 2.
+
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+         WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+
+*- Start-of-selection -------------------------------------------------*
+START-OF-SELECTION.
+
+* Get appropriate sales organizations
+  SELECT * INTO table gt_tvko
+    FROM tvko.
+
+* Select customer data
+  SELECT a~kunnr a~bran1
+         b~name1 b~name2 b~name3 b~name4 b~country
+         c~bukrs
+         d~vkorg d~vtweg d~spart d~kdgrp d~loevm
+         e~hkunnr
+                      INTO corresponding fields of TABLE gt_cust
+                      FROM kna1 as a
+                      inner join adrc as b
+                        ON  b~addrnumber = a~adrnr
+                      INNER JOIN knb1 AS c
+                        ON  c~kunnr = a~kunnr
+                      INNER JOIN knvv as d
+                        ON  d~kunnr = c~kunnr
+                      left outer JOIN knvh as e
+                        ON  e~kunnr = d~kunnr
+                       AND  e~vkorg = d~vkorg
+                       AND  e~vtweg = d~vtweg
+                       AND  e~spart = d~spart
+                       AND  e~hityp = 'A'
+                       AND  e~datbi = '99991231'
+                      WHERE c~bukrs IN s_bukrs
+                        AND a~kunnr IN s_kunnr.
+
+  IF gt_cust[] IS INITIAL.
+    MESSAGE S001(00) WITH text-e02.
+    EXIT.
+  ENDIF.
+*
+  LOOP AT gt_cust.
+    READ TABLE gt_tvko WITH KEY vkorg = gt_cust-vkorg
+                                bukrs = gt_cust-bukrs.
+
+    IF sy-subrc <> 0.
+      delete gt_cust.
+    ENDIF.
+
+    IF NOT gt_cust-hkunnr IS INITIAL.
+      CLEAR gv_addrnumber.
+      SELECT SINGLE adrnr INTO gv_addrnumber
+        FROM kna1 WHERE kunnr = gt_cust-hkunnr.
+
+      if sy-subrc = 0.
+        SELECT SINGLE sort1 INTO gt_cust-sort1
+          FROM adrc WHERE addrnumber = gv_addrnumber.
+
+        IF sy-subrc = 0.
+          modify gt_cust transporting sort1.
+        ENDIF.
+      endif.
+    ENDIF.
+  ENDLOOP.
+
+*- End-of-selection ---------------------------------------------------*
+END-OF-SELECTION.
+
+* Get fields of structure 'YSE_CUST_SALMON'
+  SELECT * FROM DD03L
+        INTO TABLE IT_DD03L
+        WHERE TABNAME = 'YSE_CUST_SALMON'.
+
+* Get the descriptions of the fields in the structure
+  SELECT * FROM DD04T
+        INTO TABLE IT_DD04T
+        FOR ALL ENTRIES IN IT_DD03L
+        WHERE ROLLNAME EQ IT_DD03L-ROLLNAME
+          AND DDLANGUAGE EQ 'EN'.
+
+* Create header line
+  CLEAR WA_OUTXLS_h.
+  SORT IT_DD03L BY POSITION.
+  LOOP AT IT_DD03L.
+    READ TABLE IT_DD04T WITH KEY ROLLNAME = IT_DD03L-ROLLNAME.
+    IF WA_OUTXLS_h IS INITIAL.
+      WA_OUTXLS_h = IT_DD04T-REPTEXT.
+    ELSE.
+      CONCATENATE WA_OUTXLS_h ';' IT_DD04T-REPTEXT INTO WA_OUTXLS_h.
+    ENDIF.
+  ENDLOOP.
+
+  REPLACE 'xxx' IN g_directory WITH p_logsys(3).
+
+* Create outputfile per company code .csv, semi-colon separated
+  SORT gt_cust by bukrs kunnr.
+
+  LOOP AT gt_cust.
+
+    at NEW bukrs.
+      CONCATENATE g_directory c_rec '_' gt_cust-bukrs INTO g_ofile.
+
+      OPEN DATASET g_ofile FOR OUTPUT IN TEXT MODE ENCODING DEFAULT.
+      IF sy-subrc <> 0.
+        WRITE: / text-e03, g_ofile.
+        EXIT.
+      ENDIF.
+
+*.... Write header line
+      TRANSFER WA_OUTXLS_h TO g_ofile.
+
+      refresh gt_cust_out.
+    endat.
+
+    MOVE-CORRESPONDING gt_cust to gt_cust_out.
+    APPEND gt_cust_out.
+    CLEAR gt_cust_out.
+
+    at END OF bukrs.
+      CALL FUNCTION 'SAP_CONVERT_TO_CSV_FORMAT'
+        TABLES
+          i_tab_sap_data       = gt_cust_out
+        CHANGING
+          i_tab_converted_data = it_outxls
+        EXCEPTIONS
+          conversion_failed    = 1
+          OTHERS               = 2.
+
+      IF sy-subrc <> 0.
+        MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+                WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+      ENDIF.
+
+*.... Process lines
+      LOOP AT it_outxls INTO wa_outxls.
+        CATCH SYSTEM-EXCEPTIONS CONVT_CODEPAGE = 1.
+          TRANSFER wa_outxls TO g_ofile.
+        ENDCATCH.
+        if sy-subrc = 1.
+          clear: gt_cust-name1,
+                 gt_cust-name2,
+                 gt_cust-name3,
+                 gt_cust-name4.
+          TRANSFER wa_outxls TO g_ofile.
+        endif.
+      endloop.
+
+      CLOSE DATASET g_ofile.
+      IF sy-subrc <> 0.
+        WRITE: / text-e04, g_ofile.
+        EXIT.
+      ENDIF.
+    ENDAT.
+
+  endloop.
+
+  WRITE: / text-002.
+
+
+*- Subroutines --------------------------------------------------------*
+*Text symbol text£º
+*001:Selection Screen Input
+*002:End of program
+*E01:Execute only in Background !!
+*E02:No customers selected !
+*E03:Open dataset failed for :
+
+*E04:Close dataset failed for :
+*Selection text£º
+*S_BUKRS:D       .
+*S_KUNNR:D       .

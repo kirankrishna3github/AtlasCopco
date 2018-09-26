@@ -1,0 +1,455 @@
+*&---------------------------------------------------------------------*
+*&  Include           YAM_UPDATE_EQUI_PARTNERS_F01
+*&---------------------------------------------------------------------*
+
+*&---------------------------------------------------------------------*
+*&      Form  select_file
+*&---------------------------------------------------------------------*
+*       Opens a file chooser and stores the filename in P_FILE on
+*       the selection screen.
+*----------------------------------------------------------------------*
+FORM select_file .
+
+  DATA: lt_file TYPE filetable,             "used by CL_GUI_FRONTEND_SERVICES
+        lv_rc TYPE i,                       "used by CL_GUI_FRONTEND_SERVICES
+        lv_action TYPE int4.                "used by CL_GUI_FRONTEND_SERVICES
+
+  FIELD-SYMBOLS: <ls_file> TYPE file_table. "used to read LT_FILE
+
+* Call dialog to select file
+  CALL METHOD cl_gui_frontend_services=>file_open_dialog
+    EXPORTING
+      multiselection          = abap_false
+    CHANGING
+      file_table              = lt_file
+      rc                      = lv_rc
+      user_action             = lv_action
+    EXCEPTIONS
+      file_open_dialog_failed = 1
+      cntl_error              = 2
+      error_no_gui            = 3
+      not_supported_by_gui    = 4
+      OTHERS                  = 5.
+  IF sy-subrc <> 0.
+    MESSAGE text-001 TYPE 'S' DISPLAY LIKE 'E'.
+    RETURN.
+  ENDIF.
+
+* Only continue if user hasn't cancelled
+  CHECK lv_action EQ 0.
+
+* Copy filename to selection screen
+  READ TABLE lt_file ASSIGNING <ls_file> INDEX 1.
+  IF sy-subrc EQ 0.
+    p_file = <ls_file>-filename.
+  ELSE.
+    MESSAGE text-002 TYPE 'S' DISPLAY LIKE 'E'.
+  ENDIF.
+
+ENDFORM.                    " SELECT_FILE
+
+*&---------------------------------------------------------------------*
+*&      Form  read_file
+*&---------------------------------------------------------------------*
+*       Read the file into GT_DATA. Some data is manipulated:
+*       - empty rows are removed
+*       - leading zeros are added to equipment numbers if necessary
+*----------------------------------------------------------------------*
+FORM read_file .
+
+  FIELD-SYMBOLS: <ls_data> TYPE gty_file. "used for reading GT_DATA
+
+  CALL FUNCTION 'SAPGUI_PROGRESS_INDICATOR'
+    EXPORTING
+      percentage = 1
+      text       = text-009.
+
+* Read the file
+  CALL METHOD cl_gui_frontend_services=>gui_upload
+    EXPORTING
+      filename                = p_file
+      has_field_separator     = 'X'
+    CHANGING
+      data_tab                = gt_data
+    EXCEPTIONS
+      file_open_error         = 1
+      file_read_error         = 2
+      no_batch                = 3
+      gui_refuse_filetransfer = 4
+      invalid_type            = 5
+      no_authority            = 6
+      unknown_error           = 7
+      bad_data_format         = 8
+      header_not_allowed      = 9
+      separator_not_allowed   = 10
+      header_too_long         = 11
+      unknown_dp_error        = 12
+      access_denied           = 13
+      dp_out_of_memory        = 14
+      disk_full               = 15
+      dp_timeout              = 16
+      not_supported_by_gui    = 17
+      error_no_gui            = 18
+      OTHERS                  = 19.
+  IF sy-subrc <> 0.
+    gv_file_error = 'X'.
+    MESSAGE text-003 TYPE 'S' DISPLAY LIKE 'E'.
+    RETURN.
+  ENDIF.
+
+* Remove empty lines
+  DELETE gt_data
+    WHERE equnr IS INITIAL
+      AND parvw IS INITIAL
+      AND parnr IS INITIAL.
+
+* Add leading zeros to equipment number
+  LOOP AT gt_data ASSIGNING <ls_data>.
+    CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+      EXPORTING
+        input  = <ls_data>-equnr
+      IMPORTING
+        output = <ls_data>-equnr.
+  ENDLOOP.
+
+ENDFORM.                    " READ_FILE
+
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_EQUIPMENTS
+*&---------------------------------------------------------------------*
+*       - Check if the equipments in the upload file comply with the
+*         selection criteria.
+*       - Convert the partner functions
+*----------------------------------------------------------------------*
+FORM check_equipments .
+
+  DATA: lt_equi TYPE TABLE OF v_equi,       "used for reading db table V_EQUI
+        lt_tpaum  TYPE TABLE OF tpaum.    "Conversion of partner functions
+
+  FIELD-SYMBOLS: <ls_data>  TYPE gty_file,  "used for reading GT_DATA
+                 <ls_tpaum> TYPE tpaum.     "used for reading GT_TPAUM
+
+  CALL FUNCTION 'SAPGUI_PROGRESS_INDICATOR'
+    EXPORTING
+      percentage = 34
+      text       = text-010.
+
+* Check that the file is not empty
+  CHECK gt_data[] IS NOT INITIAL.
+
+* Select equipment data
+  SELECT * FROM v_equi INTO TABLE lt_equi
+    FOR ALL ENTRIES IN gt_data
+    WHERE equnr EQ gt_data-equnr
+      AND vkorg IN s_vkorg
+      AND vtweg IN s_vtweg
+      AND spart IN s_spart.
+
+* Select partner conversion data
+  SELECT * FROM tpaum
+    INTO TABLE lt_tpaum
+    WHERE spras EQ sy-langu.
+
+* Check if record can be processed
+  LOOP AT gt_data ASSIGNING <ls_data>.
+    "Check if equipment is found
+    READ TABLE lt_equi
+      WITH KEY equnr = <ls_data>-equnr
+      TRANSPORTING NO FIELDS.
+    IF sy-subrc NE 0.
+      PERFORM add_log USING gc_status_e <ls_data>-equnr <ls_data>-parvw <ls_data>-parnr text-a00 text-008.
+      DELETE gt_data WHERE equnr EQ <ls_data>-equnr.
+      CONTINUE.
+    ENDIF.
+
+    "Convert partner function to internal format
+    READ TABLE lt_tpaum ASSIGNING <ls_tpaum>
+      WITH KEY pabez = <ls_data>-parvw.
+    IF sy-subrc NE 0.
+      PERFORM add_log USING gc_status_e <ls_data>-equnr <ls_data>-parvw <ls_data>-parnr text-a00 text-013.
+      DELETE gt_data WHERE equnr EQ <ls_data>-equnr.
+      CONTINUE.
+    ELSE.
+      <ls_data>-parvw = <ls_tpaum>-parvw.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    " CHECK_EQUIPMENTS
+
+*&---------------------------------------------------------------------*
+*&      Form  UPDATE_PARTNERS
+*&---------------------------------------------------------------------*
+*       Instead of updating them directly, we delete the existing
+*       partners and insert the new ones. This gives us the history.
+*
+*       Note: it could be better to combine all records together and
+*             perform the FM PM_PARTNER_UPDATE only once, but this
+*             doesn't give us the detailed feedback we need.
+*----------------------------------------------------------------------*
+FORM update_partners .
+
+  TYPES: BEGIN OF lty_ihpa,
+           equnr TYPE equnr.
+          INCLUDE STRUCTURE ihpavb.
+  TYPES: END OF lty_ihpa.
+
+  DATA: lt_ihpa TYPE TABLE OF lty_ihpa,       "used to read EQUI and IHPA
+        ls_ihpa TYPE lty_ihpa,                "used for filling LT_IHPA
+        lt_ihpavb TYPE TABLE OF ihpavb,       "used for FM PM_PARTNER_UPDATE
+        ls_ihpavb TYPE ihpavb.                "used for filling LT_IHPAVB
+  DATA: lv_counter TYPE i_count.
+
+  FIELD-SYMBOLS: <ls_data>    TYPE gty_file,  "used for reading GT_DATA
+                 <ls_ihpa>    TYPE lty_ihpa,  "used for reading LT_IHPA
+                 <ls_ihpavb>  TYPE ihpavb.    "used for reading LT_IHPAVB
+
+  CALL FUNCTION 'SAPGUI_PROGRESS_INDICATOR'
+    EXPORTING
+      percentage = 67
+      text       = text-011.
+
+* Check that the file is not empty
+  CHECK gt_data[] IS NOT INITIAL.
+
+* Read partners data
+  "Select the mapping equipment-equipment number and all partners (if there are any - hence the left outer join)
+*  SELECT * INTO CORRESPONDING FIELDS OF TABLE lt_ihpa doesn't work when no partners are found => OBJNR is empty
+  SELECT equi~equnr
+         equi~mandt
+         equi~objnr
+         ihpa~parvw
+         ihpa~counter
+         ihpa~obtyp
+         ihpa~parnr
+         ihpa~inher
+         ihpa~erdat
+         ihpa~erzeit
+         ihpa~ernam
+         ihpa~aedat
+         ihpa~aezeit
+         ihpa~aenam
+         ihpa~kzloesch
+         ihpa~adrnr
+         ihpa~tzonsp
+    INTO CORRESPONDING FIELDS OF TABLE lt_ihpa
+    FROM equi AS equi
+    LEFT OUTER JOIN ihpa AS ihpa
+      ON ihpa~objnr EQ equi~objnr
+    FOR ALL ENTRIES IN gt_data
+    WHERE equi~equnr EQ gt_data-equnr.
+
+* Process partners data
+  LOOP AT gt_data ASSIGNING <ls_data>.
+
+* Delete existing partner(s)
+    REFRESH lt_ihpavb.
+    "Should only be 1 partner, but more are theoretically possible
+    LOOP AT lt_ihpa ASSIGNING <ls_ihpa>
+      WHERE equnr     EQ <ls_data>-equnr
+        AND parvw     EQ <ls_data>-parvw
+        AND kzloesch  NE 'X'.
+      "Prepare for FM PM_PARTNER_UPDATE
+      CLEAR ls_ihpavb.
+      <ls_ihpa>-kzloesch = 'X'.
+      MOVE-CORRESPONDING <ls_ihpa> TO ls_ihpavb.
+      ls_ihpavb-updkz = 'D'.
+      APPEND ls_ihpavb TO lt_ihpavb.
+    ENDLOOP.
+    IF sy-subrc EQ 0.
+      UNASSIGN <ls_ihpa>.
+      IF p_test IS INITIAL. "Active run
+        "Delete the partner(s)
+        CALL FUNCTION 'PM_PARTNER_UPDATE'
+          TABLES
+            fxihpa = lt_ihpavb[].
+        IF sy-subrc EQ 0.
+          LOOP AT lt_ihpavb ASSIGNING <ls_ihpavb>.
+            PERFORM add_log USING gc_status_s <ls_data>-equnr <ls_ihpavb>-parvw <ls_ihpavb>-parnr text-a01 text-005.
+          ENDLOOP.
+        ELSE.
+          LOOP AT lt_ihpavb ASSIGNING <ls_ihpavb>.
+            PERFORM add_log USING gc_status_e <ls_data>-equnr <ls_ihpavb>-parvw <ls_ihpavb>-parnr text-a01 text-006.
+          ENDLOOP.
+        ENDIF.
+      ELSE. "Test run
+        LOOP AT lt_ihpavb ASSIGNING <ls_ihpavb>.
+          PERFORM add_log USING gc_status_i <ls_data>-equnr <ls_ihpavb>-parvw <ls_ihpavb>-parnr text-a01 text-012.
+        ENDLOOP.
+      ENDIF.
+    ENDIF. "sy-subrc EQ 0
+
+* Insert new partner
+    "Prepare for FM PM_PARTNER_UPDATE
+    REFRESH lt_ihpavb.
+    CLEAR ls_ihpavb.
+    "Try to read the last record of this partner type (needed for counter)
+    SORT lt_ihpa BY parvw counter DESCENDING.
+    LOOP AT lt_ihpa ASSIGNING <ls_ihpa>
+      WHERE equnr EQ <ls_data>-equnr
+        AND parvw EQ <ls_data>-parvw.
+      EXIT.
+    ENDLOOP.
+    IF sy-subrc EQ 0. "Partner type found (may be deleted)
+      ls_ihpavb-objnr = <ls_ihpa>-objnr.
+      ls_ihpavb-parvw = <ls_data>-parvw.
+      ls_ihpavb-counter = <ls_ihpa>-counter + 1.
+      ls_ihpavb-obtyp = <ls_ihpa>-obtyp.
+      ls_ihpavb-parnr = <ls_data>-parnr.
+      ls_ihpavb-erdat = sy-datum.
+      ls_ihpavb-erzeit = sy-uzeit.
+      ls_ihpavb-ernam = sy-uname.
+      ls_ihpavb-aedat = sy-datum.
+      ls_ihpavb-aezeit = sy-uzeit.
+      ls_ihpavb-aenam = sy-uname.
+      ls_ihpavb-updkz = 'I'.
+      APPEND ls_ihpavb TO lt_ihpavb.
+    ELSE. "New partner type
+      READ TABLE lt_ihpa ASSIGNING <ls_ihpa>
+        WITH KEY equnr = <ls_data>-equnr.
+      IF sy-subrc NE 0.
+        "This shouldn't happen
+        PERFORM add_log USING gc_status_e <ls_data>-equnr <ls_data>-parvw <ls_data>-parnr text-a02 text-007.
+        CONTINUE.
+      ENDIF.
+      ls_ihpavb-objnr = <ls_ihpa>-objnr.
+      ls_ihpavb-parvw = <ls_data>-parvw.
+      ls_ihpavb-obtyp = 'IEQ'.
+      ls_ihpavb-parnr = <ls_data>-parnr.
+      ls_ihpavb-erdat = sy-datum.
+      ls_ihpavb-erzeit = sy-uzeit.
+      ls_ihpavb-ernam = sy-uname.
+      ls_ihpavb-aedat = sy-datum.
+      ls_ihpavb-aezeit = sy-uzeit.
+      ls_ihpavb-aenam = sy-uname.
+      ls_ihpavb-updkz = 'I'.
+      APPEND ls_ihpavb TO lt_ihpavb.
+    ENDIF.
+    IF p_test IS INITIAL. "Active run
+      "Insert the partner
+      TRY .
+          CALL FUNCTION 'PM_PARTNER_UPDATE'
+            TABLES
+              fxihpa = lt_ihpavb[].
+        CATCH cx_root.
+          PERFORM add_log USING gc_status_e <ls_data>-equnr <ls_data>-parvw <ls_data>-parnr text-a02 text-007.
+          UNASSIGN <ls_ihpa>.
+          CONTINUE.
+      ENDTRY.
+      IF sy-subrc EQ 0.
+        PERFORM add_log USING gc_status_s <ls_data>-equnr <ls_data>-parvw <ls_data>-parnr text-a02 text-005.
+        "Add record to internal table
+        CLEAR ls_ihpa.
+        MOVE-CORRESPONDING ls_ihpavb TO ls_ihpa.
+        ls_ihpa-equnr = <ls_data>-equnr.
+        ls_ihpa-mandt = sy-mandt.
+        APPEND ls_ihpa TO lt_ihpa.
+      ELSE.
+        PERFORM add_log USING gc_status_e <ls_data>-equnr <ls_data>-parvw <ls_data>-parnr text-a02 ''.
+      ENDIF.
+    ELSE. "Test run
+      PERFORM add_log USING gc_status_i <ls_data>-equnr <ls_data>-parvw <ls_data>-parnr text-a02 text-012.
+    ENDIF.
+    UNASSIGN <ls_ihpa>.
+
+  ENDLOOP. "gt_data ASSIGNING <ls_data>
+
+ENDFORM.                    " UPDATE_PARTNERS
+
+*&---------------------------------------------------------------------*
+*&      Form  add_log
+*&---------------------------------------------------------------------*
+*       Add a log record to GT_LOG
+*----------------------------------------------------------------------*
+*      -->UV_STATUS_E  text
+*      -->UV_EQUNR     text
+*      -->UV_PARVW     text
+*      -->UV_PARNR     text
+*      -->UV_ACTION    text
+*      -->UV_MESSAGE   text
+*----------------------------------------------------------------------*
+FORM add_log  USING    uv_status_e TYPE char1
+                       uv_equnr    TYPE equnr
+                       uv_parvw    TYPE parvw
+                       uv_parnr    TYPE i_parnr
+                       uv_action   TYPE string
+                       uv_message  TYPE string.
+
+  DATA: ls_log TYPE gty_log.  "used for filling GT_LOG
+
+  ls_log-status = uv_status_e.
+  ls_log-equnr = uv_equnr.
+  ls_log-parvw = uv_parvw.
+  ls_log-parnr = uv_parnr.
+  ls_log-action = uv_action.
+  IF uv_message IS NOT INITIAL.
+    ls_log-message = uv_message.
+  ELSEIF sy-msgid IS NOT INITIAL OR
+         sy-msgno IS NOT INITIAL OR
+         sy-msgv1 IS NOT INITIAL OR
+         sy-msgv2 IS NOT INITIAL OR
+         sy-msgv3 IS NOT INITIAL OR
+         sy-msgv4 IS NOT INITIAL.
+    MESSAGE ID sy-msgid TYPE 'I' NUMBER sy-msgno WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4 INTO ls_log-message.
+  ENDIF.
+  APPEND ls_log TO gt_log.
+
+ENDFORM.                    " ADD_LOG
+
+*&---------------------------------------------------------------------*
+*&      Form  DISPLAY_LOG
+*&---------------------------------------------------------------------*
+*       Display GT_LOG as an ALV
+*----------------------------------------------------------------------*
+FORM display_log .
+
+  DATA: lo_table      TYPE REF TO cl_salv_table,
+        lo_functions  TYPE REF TO cl_salv_functions,
+        lo_display    TYPE REF TO cl_salv_display_settings,
+        lo_columns    TYPE REF TO cl_salv_columns_table,
+        lo_column     TYPE REF TO cl_salv_column_table.
+
+* Get an instance of LO_TABLE
+  cl_salv_table=>factory(
+    IMPORTING
+      r_salv_table = lo_table
+    CHANGING
+      t_table = gt_log ).
+
+* Add functions
+  lo_functions = lo_table->get_functions( ).
+  lo_functions->set_all( abap_true ).
+
+* Set striped pattern
+  lo_display = lo_table->get_display_settings( ).
+  lo_display->set_striped_pattern( cl_salv_display_settings=>true ).
+
+* Set title
+  IF p_test IS INITIAL.
+    lo_display->set_list_header( text-t01 ).
+  ELSE.
+    lo_display->set_list_header( text-t02 ).
+  ENDIF.
+
+* Optimize columns
+  lo_columns = lo_table->get_columns( ).
+  lo_columns->set_optimize( cl_salv_display_settings=>true ).
+
+* Add traffic lights
+  lo_columns->set_exception_column( value = 'STATUS' ).
+
+* Set column title
+  lo_column ?= lo_columns->get_column( 'ACTION' ).
+  lo_column->set_long_text( text-h01 ).
+  lo_column->set_medium_text( text-h01 ).
+  lo_column->set_short_text( text-h01 ).
+
+* Set column title
+  lo_column ?= lo_columns->get_column( 'MESSAGE' ).
+  lo_column->set_long_text( text-h02 ).
+  lo_column->set_medium_text( text-h02 ).
+  lo_column->set_short_text( text-h02 ).
+
+* Display ALV
+  lo_table->display( ).
+
+ENDFORM.                    " DISPLAY_LOG

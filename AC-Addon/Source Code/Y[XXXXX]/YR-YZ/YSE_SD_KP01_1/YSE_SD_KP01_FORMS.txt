@@ -1,0 +1,1086 @@
+*&---------------------------------------------------------------------*
+*&  Include           YSE_SD_KP01_FORMS                                *
+*&---------------------------------------------------------------------*
+
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME     |CORRECTION NUMBER| CHANGE REFERENCE # *
+*----------------------------------------------------------------------*
+* MOD-001 |17.02.2009|J. Smets  |CD1K946415       |Select open orders  *
+************************************************************************
+*----------------------------------------------------------------------*
+* MOD-002 |05.08.2009|S. Basu  |CD1K949648     |Add Customer PO Type   *
+* MOD-002 |05.08.2009|S. Basu  |CD1K949648     |Performance Tuning     *
+************************************************************************
+* MOD-003 |12.04.2010|G. Rutten|CD1K955973     |Bug Fix CR1369         *
+* MOD-004 |28.02.2011|Lakshmi R|CD1K963280     |CR1879                 *
+*----------------------------------------------------------------------*
+************************************************************************
+* MOD-005 |20.01.2014|CSC      |CD1K979597     |add sold-to      CR3022*
+*----------------------------------------------------------------------*
+* MOD-006 |13.05.2016|Uma Kanidarapu|CD1K988869    |CR3907             *
+*   Add Availability check with PO reference                           *
+*----------------------------------------------------------------------*
+*MOD-007  |27.06.2016|UmaM Rao |CD1K989138     |CR3959                 *
+*YSE_KP01 Availability Report - Additional fields                      *
+*----------------------------------------------------------------------*
+* MOD-008  | 16.08.2016 | Vishnupriya | CD1K989496  |CR4026            *
+* YSE_KP01 Availability Report - Spool report columns missing          *
+*----------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_DATA
+*&---------------------------------------------------------------------*
+FORM select_data .
+
+  DATA:
+    BEGIN OF lt_matnr OCCURS 0,
+      matnr LIKE mara-matnr,
+    END OF lt_matnr,
+    BEGIN OF lt_vbeln OCCURS 0,
+      vbeln LIKE vbap-vbeln,
+    END OF lt_vbeln.
+
+* Begin of Mod-0002  Performance Tuning - Satya 05/Aug/2009
+  DATA: BEGIN OF t_lt_vbeln OCCURS 0,
+          vbeln LIKE vbak-vbeln,
+        END OF t_lt_vbeln.
+  IF cb_get NE 'X'.                         "insert MOD-004
+
+* Get VBEP data with the delivery date first as this is the most selective criteria.
+* This makes the total data to select later on much less (IT_VBAK)
+    SELECT DISTINCT vbeln
+           FROM vbep
+           INTO t_lt_vbeln
+           WHERE vbep~edatu EQ p_vdatu.   "requested delivery date
+
+      APPEND t_lt_vbeln.
+    ENDSELECT.
+* Don't continue if nothing found
+    CHECK sy-subrc EQ 0.
+    SORT t_lt_vbeln BY vbeln.
+* End of Mod-0002
+
+* Order lines
+    SELECT      vbak~vbeln vbap~posnr  auart vbak~vkorg vbak~vtweg augru cmgst lsstk
+                vbap~werks lgort vbap~matkl vbap~matnr kwmeng AS menge zz_aso_rsnum zz_aso_rspos
+                mtart  prdha dismm mtpos mvke~mvgr4 vbup~gbsta
+           INTO TABLE it_vbap
+           FROM vbak
+           JOIN vbuk
+             ON vbak~vbeln EQ vbuk~vbeln
+           JOIN vbap
+             ON vbak~vbeln EQ vbap~vbeln
+*** MOD-001 * begin insert ***
+           JOIN vbup
+             ON vbap~vbeln = vbup~vbeln  AND
+                vbap~posnr = vbup~posnr
+*** MOD-001 * end insert ***
+           JOIN marc
+             ON vbap~matnr EQ marc~matnr
+            AND vbap~werks EQ marc~werks
+           JOIN mara
+             ON vbap~matnr EQ mara~matnr
+           JOIN mvke
+             ON vbap~matnr EQ mvke~matnr
+            AND vbak~vkorg EQ mvke~vkorg
+            AND vbak~vtweg EQ mvke~vtweg
+            FOR ALL entries IN t_lt_vbeln                        " +MOD-0002 - Satya
+*         WHERE VBAK~AUART IN SO_AUART                         " -MOD-0002 - Satya
+          WHERE vbak~vbeln EQ t_lt_vbeln-vbeln                   " +MOD-0002 - Satya
+            AND vbak~auart IN so_auart                           " +MOD-0002 - Satya
+            AND vbak~vkorg IN so_vkorg
+            AND vbak~vtweg IN so_vtweg
+            AND vbap~pstyv IN so_pstyv
+            AND vbap~werks IN so_werks
+            AND lgort      IN so_lgort
+            AND vbap~matkl IN so_matkl
+            AND mtart      IN so_mtart
+            AND augru      IN so_augru
+            AND vbap~abgru = '  '                           "MOD-001
+* Begin of insert MOD-003
+            AND vbak~vbtyp = 'C'.
+* End of insert MOD-003
+* Don't continue selection of no result returned
+    CHECK sy-subrc EQ 0.
+
+    SORT it_vbap BY vbeln posnr.
+
+* Create lists of unique material numbers and SO numbers found in IT_VBAP
+    LOOP AT it_vbap.
+      lt_matnr-matnr = it_vbap-matnr.
+      APPEND lt_matnr.
+      lt_vbeln-vbeln = it_vbap-vbeln.
+      APPEND lt_vbeln.
+    ENDLOOP.
+    SORT lt_matnr BY matnr.
+    DELETE ADJACENT DUPLICATES FROM lt_matnr COMPARING matnr.
+    SORT lt_vbeln BY vbeln.
+    DELETE ADJACENT DUPLICATES FROM lt_vbeln COMPARING vbeln.
+
+* Get schedule lines
+    SELECT      vbeln posnr etenr ettyp edatu wmeng
+           INTO TABLE it_vbep
+           FROM vbep
+            FOR ALL ENTRIES IN lt_vbeln
+          WHERE vbeln = lt_vbeln-vbeln.
+
+* Get Vendors
+    SELECT      matnr werks zeord lifnr flifn
+           INTO TABLE it_eord
+           FROM eord
+            FOR ALL ENTRIES IN lt_matnr
+          WHERE matnr EQ lt_matnr-matnr.
+    SORT it_eord BY matnr werks flifn.
+
+* Get plant parameters
+    SELECT      *
+           INTO TABLE it_em_plant
+           FROM yse_em_plant.                           "#EC CI_NOWHERE
+    SORT it_em_plant BY werks.
+
+  ENDIF.                       "insert MOD-004
+*Begin of insert MOD-004
+  IF cb_get EQ 'X'.
+    REFRESH: it_kp01.
+    SELECT *
+    FROM   yse_mm_kp01
+    INTO   TABLE it_kp01
+    WHERE  auart IN so_auart
+    AND    pstyv IN so_pstyv
+    AND    vkorg IN so_vkorg
+    AND    vtweg IN so_vtweg
+    AND    werks IN so_werks
+    AND    lgort IN so_lgort
+    AND    matkl IN so_matkl
+    AND    edatu EQ p_vdatu
+    AND    augru IN so_augru.
+  ENDIF.
+*End   of insert MOD-004
+ENDFORM.                    " SELECT_DATA
+
+*&---------------------------------------------------------------------*
+*&      Form  PROCESS_DATA
+*&---------------------------------------------------------------------*
+FORM process_data .
+
+* First determine the items to be displayed
+  PERFORM build_out_table.
+* For those items, determine the availability
+  PERFORM determine_avl.
+
+ENDFORM.                    " PROCESS_DATA
+
+*&---------------------------------------------------------------------*
+*&      Form  DISPLAY_DATA
+*&---------------------------------------------------------------------*
+FORM display_data .
+
+  IF sy-batch EQ space.
+    CALL SCREEN '0100'.
+  ELSE.
+*    PERFORM send2spool. "comment MOD-004
+*Begin of insert MOD-004
+    IF cb_upd EQ 'X'.
+      REFRESH: it_kp01.
+      CLEAR: wa_kp01.
+      LOOP AT it_out.
+        MOVE-CORRESPONDING it_out TO wa_kp01.
+        READ TABLE it_vbap WITH KEY vbeln = wa_kp01-vbeln
+                                    posnr = wa_kp01-posnr.
+        IF sy-subrc EQ 0.
+          MOVE it_vbap-mtpos TO wa_kp01-pstyv.
+          MOVE it_vbap-lgort TO wa_kp01-lgort.
+        ENDIF.
+        APPEND wa_kp01 TO it_kp01.
+        CLEAR: wa_kp01.
+      ENDLOOP.
+      IF NOT it_kp01 IS INITIAL.
+        MODIFY yse_mm_kp01 FROM TABLE it_kp01.
+        IF sy-subrc EQ 0.
+          COMMIT WORK.
+          WRITE:/ 'The table YSE_MM_KP01 has been updated with the below Documents and Line items'.
+          SKIP 1.
+          CLEAR: wa_kp01.
+          WRITE:/1 'Document Number',
+                 20 'Line Item'.
+          LOOP AT it_kp01 INTO wa_kp01.
+            WRITE:/1 wa_kp01-vbeln,
+                   20 wa_kp01-posnr.
+            CLEAR: wa_kp01.
+          ENDLOOP.
+        ELSE.
+          ROLLBACK WORK.
+          WRITE:/ 'No entries updated in the table YSE_MM_KP01 due to an error while updating table'.
+          EXIT.
+        ENDIF.
+      ELSE.
+        WRITE:/ 'No entries updated in the table YSE_MM_KP01,No data exist for selection criteria'.
+        EXIT.
+      ENDIF.
+    ELSEIF cb_upd NE 'X' AND cb_get NE 'X'.
+      PERFORM send2spool.
+    ENDIF.
+*End of insert MOD-004
+  ENDIF.
+
+ENDFORM.                    " DISPLAY_DATA
+
+*&---------------------------------------------------------------------*
+*&      Form  SEND2SPOOL
+*&---------------------------------------------------------------------*
+FORM send2spool.
+
+  DATA:
+    fnam             LIKE rlgrap-filename,
+    it_dd03l         LIKE dd03l OCCURS 0 WITH HEADER LINE,
+    it_dd04t         LIKE dd04t OCCURS 0 WITH HEADER LINE,
+    it_outxls(4096)  TYPE c OCCURS 0,
+    wa_outxls(4096)  TYPE c.
+
+  CONSTANTS:
+    c_tab TYPE c VALUE cl_abap_char_utilities=>horizontal_tab.
+
+  IF cb_get NE 'X'.    "insert MOD-004
+* Get fields of structure 'YSE_SL_SCRAP_OUT'
+    IF lt_kp01_new[] IS INITIAL. "+MOD-008
+    SELECT *
+           FROM dd03l
+           INTO TABLE it_dd03l
+          WHERE tabname = 'YSE_SD_KP01_OUTPUT'.
+
+* Get the descriptions of the fields in the structure
+    SELECT *
+           FROM dd04t
+           INTO TABLE it_dd04t
+            FOR ALL ENTRIES IN it_dd03l
+          WHERE rollname EQ it_dd03l-rollname
+            AND ddlanguage EQ 'EN'.
+
+* Build filename
+    CONCATENATE '/var/load/' sy-sysid '/UK/original/YSE_KP01_'
+                gv_unam '_' gv_udat '_' gv_utim '.TXT'
+           INTO fnam.
+
+* Make the output table ; delimited
+    CALL FUNCTION 'SAP_CONVERT_TO_CSV_FORMAT'
+      TABLES
+        i_tab_sap_data       = it_out
+      CHANGING
+        i_tab_converted_data = it_outxls
+      EXCEPTIONS
+        conversion_failed    = 1
+        OTHERS               = 2.
+    IF sy-subrc <> 0.
+      MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+              WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+    ENDIF.
+
+* Open file
+    OPEN DATASET fnam FOR OUTPUT IN TEXT MODE ENCODING DEFAULT.
+    IF sy-subrc <> 0.
+      WRITE 'Error opening file. Action aborted.'(100).
+      EXIT.
+    ENDIF.
+* Write header line
+    CLEAR wa_outxls.
+    SORT it_dd03l BY position.
+    LOOP AT it_dd03l.
+      READ TABLE it_dd04t WITH KEY rollname = it_dd03l-rollname.
+      IF wa_outxls IS INITIAL.
+        wa_outxls = it_dd04t-reptext.
+      ELSE.
+        CONCATENATE wa_outxls c_tab it_dd04t-reptext INTO wa_outxls.
+      ENDIF.
+    ENDLOOP.
+    TRANSFER wa_outxls TO fnam.
+
+* Process lines
+    LOOP AT it_outxls INTO wa_outxls.
+      REPLACE ALL OCCURRENCES OF ';' IN wa_outxls WITH c_tab.
+      TRANSFER wa_outxls TO fnam.
+    ENDLOOP.
+
+    CLOSE DATASET fnam.
+
+    WRITE: 'Report output written to file:'(101),
+           fnam.
+
+*  ENDIF.        "insert MOD-004   "-MOD-008
+*Begin of Insertion by MOD-008
+  ELSE.
+    SELECT *
+           FROM dd03l
+           INTO TABLE it_dd03l
+          WHERE tabname = 'YSE_SD_KP01_OUTPUT_NEW'.
+
+* Get the descriptions of the fields in the structure
+    SELECT *
+           FROM dd04t
+           INTO TABLE it_dd04t
+            FOR ALL ENTRIES IN it_dd03l
+          WHERE rollname EQ it_dd03l-rollname
+            AND ddlanguage EQ 'EN'.
+
+* Build filename
+    CONCATENATE '/var/load/' sy-sysid '/UK/original/YSE_KP01_'
+                gv_unam '_' gv_udat '_' gv_utim '.TXT'
+           INTO fnam.
+
+* Make the output table ; delimited
+    CALL FUNCTION 'SAP_CONVERT_TO_CSV_FORMAT'
+      TABLES
+        i_tab_sap_data       = lt_kp01_new
+      CHANGING
+        i_tab_converted_data = it_outxls
+      EXCEPTIONS
+        conversion_failed    = 1
+        OTHERS               = 2.
+    IF sy-subrc <> 0.
+      MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+              WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+    ENDIF.
+
+* Open file
+    OPEN DATASET fnam FOR OUTPUT IN TEXT MODE ENCODING DEFAULT.
+    IF sy-subrc <> 0.
+      WRITE 'Error opening file. Action aborted.'(100).
+      EXIT.
+    ENDIF.
+* Write header line
+    CLEAR wa_outxls.
+    SORT it_dd03l BY position.
+    LOOP AT it_dd03l.
+      READ TABLE it_dd04t WITH KEY rollname = it_dd03l-rollname.
+      IF wa_outxls IS INITIAL.
+        wa_outxls = it_dd04t-reptext.
+      ELSE.
+        CONCATENATE wa_outxls c_tab it_dd04t-reptext INTO wa_outxls.
+      ENDIF.
+    ENDLOOP.
+    TRANSFER wa_outxls TO fnam.
+
+* Process lines
+    LOOP AT it_outxls INTO wa_outxls.
+      REPLACE ALL OCCURRENCES OF ';' IN wa_outxls WITH c_tab.
+      TRANSFER wa_outxls TO fnam.
+    ENDLOOP.
+
+    CLOSE DATASET fnam.
+
+    WRITE: 'Report output written to file:'(101),
+           fnam.
+ ENDIF.
+  ENDIF.
+*  End of Insertion by MOD-008
+ENDFORM.                    " SEND2SPOOL
+
+*&---------------------------------------------------------------------*
+*&      Form  BUILD_OUT_TABLE
+*&---------------------------------------------------------------------*
+FORM build_out_table .
+
+  DATA:
+      lv_sobkz LIKE resb-sobkz,
+      ls_vbep  LIKE LINE OF it_vbep.
+
+  DATA:  lv_bsark LIKE vbkd-bsark.                          " +Mod-002
+
+  IF cb_get NE 'X'.         "insert MOD-004
+* Eliminate schedule lines
+*   - which are not the first ones for a specific item
+*   - which are not according to req. del date from selection screen
+    SORT it_vbep BY vbeln posnr etenr.
+*** MOD-001 * begin ***
+*  LOOP AT it_vbep.
+*    IF it_vbep-vbeln EQ ls_vbep-vbeln AND it_vbep-posnr EQ ls_vbep-posnr.
+*      DELETE it_vbep.
+*    ELSEIF NOT it_vbep-edatu EQ p_vdatu.
+*      DELETE it_vbep.
+*    ENDIF.
+*    ls_vbep = it_vbep.
+*  ENDLOOP.
+    DELETE ADJACENT DUPLICATES FROM it_vbep
+                               COMPARING vbeln posnr.
+    DELETE it_vbep WHERE edatu NE p_vdatu.
+*** MOD-001 * end ***
+
+* Process the item lines
+    LOOP AT it_vbap.
+
+*   Clear output structure
+      CLEAR it_out.
+*   Move fields with same name
+      MOVE-CORRESPONDING it_vbap TO it_out.
+*   Map PGC
+      it_out-pgc = it_vbap-prdha+4(4).
+*   Map stock policy
+      IF it_vbap-dismm EQ 'Z5'.
+        it_out-stockpol = 'ST'.
+      ELSEIF it_vbap-dismm EQ 'Z6' OR it_vbap-dismm EQ 'Z7'.
+        it_out-stockpol = 'NS'.
+      ENDIF.
+*   Map Distribution mode
+      IF it_vbap-mtpos = 'ZDTC'.
+        it_out-distri_mode = 'DTC'.
+      ELSEIF it_vbap-mtpos = 'NORM' AND it_vbap-mvgr4 = space.
+        it_out-distri_mode = 'NDTC'.
+      ELSEIF it_vbap-mtpos = 'NORM' AND it_vbap-mvgr4 = 'LCL'.
+        it_out-distri_mode = 'LCL'.
+      ENDIF.
+
+*   Get schedule line
+      READ TABLE it_vbep WITH KEY vbeln = it_out-vbeln
+                                  posnr = it_out-posnr
+                         BINARY SEARCH.
+*   If schedule line of the item not found (didn't meet date condition)
+      IF sy-subrc NE 0.
+*     Skip the item line
+        CONTINUE.
+*   If schedule line found
+      ELSE.
+*     Fill "requested delivery date"
+        it_out-edatu = it_vbep-edatu.
+*     Set DTC/SFS depending on schedule line type
+* Begin of change MOD-003
+*      IF it_vbep-ettyp = 'Z2'.
+        IF it_vbep-ettyp = 'ZB' OR it_vbep-ettyp = 'Z4' OR it_vbep-ettyp = 'Z5'.
+*        SELECT SINGLE sobkz
+*                 INTO lv_sobkz
+*                 FROM resb
+*                WHERE rsnum = it_vbap-zz_aso_rsnum
+*                  AND rspos = it_vbap-zz_aso_rspos.  "#EC CI_SEL_NESTED
+*        IF sy-subrc EQ 0.
+*          IF lv_sobkz = 'E'.
+*            it_out-dtc_sfs = 'DTC'.
+*          ELSE.
+*            it_out-dtc_sfs = 'SFS'.
+*          ENDIF.
+*        ENDIF.
+*      ELSEIF it_vbep-ettyp = 'ZB'.
+* End of change MOD-003
+          it_out-dtc_sfs = 'DTC'.
+        ELSE.
+          it_out-dtc_sfs = 'SFS'.
+        ENDIF.
+
+      ENDIF.
+
+*   Get plant parameters for warehouse type
+      READ TABLE it_em_plant WITH KEY werks = it_out-werks
+                             BINARY SEARCH.
+      IF sy-subrc EQ 0.
+        it_out-whtype = it_em_plant-whtype.
+      ENDIF.
+
+*   Get vendor
+      READ TABLE it_eord WITH KEY matnr = it_out-matnr
+                                  werks = it_out-werks
+                                  flifn = 'X'
+                         BINARY SEARCH.
+      IF sy-subrc NE 0.
+        READ TABLE it_eord WITH KEY matnr = it_out-matnr
+                                    werks = it_out-werks
+                                    flifn = space
+                           BINARY SEARCH.
+      ENDIF.
+      IF sy-subrc EQ 0.
+        it_out-lifnr = it_eord-lifnr.
+      ENDIF.
+
+*   Set block flags
+      IF it_vbap-cmgst EQ 'B' OR it_vbap-cmgst EQ 'C'.
+        it_out-cre_block = 'X'.
+      ENDIF.
+      IF it_vbap-lsstk EQ 'B' OR it_vbap-lsstk EQ 'C'.
+        it_out-del_block = 'X'.
+      ENDIF.
+
+* Begin Mod-002 - get Customer PO Type - Satya 05/Aug/2009
+      CLEAR lv_bsark.
+      SELECT SINGLE bsark
+               INTO lv_bsark
+               FROM vbkd
+              WHERE vbeln = it_out-vbeln
+                AND posnr = it_out-posnr.
+      it_out-bsark = lv_bsark.
+* End Mod-002 - get Customer PO Type
+
+      APPEND it_out.
+
+    ENDLOOP.
+
+  ENDIF.           "insert MOD-004
+
+* Begin of MOD-005
+  LOOP AT it_out.
+    SELECT SINGLE kunnr FROM vbak
+             INTO it_out-kunnr
+            WHERE vbeln = it_out-vbeln
+              AND vkorg = it_out-vkorg.
+    IF sy-subrc = 0.
+      MODIFY it_out.
+    ENDIF.
+  ENDLOOP.
+* End of MOD-005
+ENDFORM.                    " BUILD_OUT_TABLE
+
+*&---------------------------------------------------------------------*
+*&      Form  DETERMINE_AVL
+*&---------------------------------------------------------------------*
+FORM determine_avl.
+
+  DATA:
+     BEGIN OF lt_mara OCCURS 0,
+       matnr LIKE marc-matnr,
+     END OF lt_mara,
+     BEGIN OF lt_marc OCCURS 0,
+       matnr LIKE marc-matnr,
+       werks LIKE marc-werks,
+     END OF lt_marc,
+     BEGIN OF lt_mard OCCURS 0,
+       matnr LIKE mard-matnr,
+       werks LIKE mard-werks,
+       lgort LIKE mard-lgort,
+       labst LIKE mard-labst,
+     END OF lt_mard,
+     BEGIN OF lt_vbfa OCCURS 0,
+       vbelv   LIKE vbfa-vbelv,
+       posnv   LIKE vbfa-posnv,
+       vbeln   LIKE vbfa-vbeln,
+       posnn   LIKE vbfa-posnn,
+       vbtyp_n LIKE vbfa-vbtyp_n,
+     END OF lt_vbfa,
+     BEGIN OF lt_lips OCCURS 0,
+       vbeln LIKE lips-vbeln,
+       posnr LIKE lips-posnr,
+       lfimg LIKE lips-lfimg,
+       wbstk LIKE vbuk-wbstk,
+     END OF lt_lips,
+     BEGIN OF lt_mard_aggr OCCURS 0,
+       matnr LIKE mard-matnr,
+       werks LIKE mard-werks,
+       labst LIKE mard-labst,
+     END OF lt_mard_aggr,
+     BEGIN OF lt_vbap_all OCCURS 0,
+       vbeln       LIKE vbap-vbeln,
+       posnr       LIKE vbap-posnr,
+       ABGRU       LIKE vbap-ABGRU,"Reason for rejection of quotations and sales orders +MOD-006
+       erdat       LIKE vbap-erdat,
+       matnr       LIKE vbap-matnr,
+       werks       LIKE vbap-werks,
+       lgort       LIKE vbap-lgort,
+       pstyv       LIKE vbap-pstyv,
+       lprio       LIKE vbap-lprio,
+       kwmeng      LIKE vbap-kwmeng,
+       kwmeng_open LIKE vbap-kwmeng,
+       edatu       LIKE vbep-edatu,
+       available   TYPE c,
+     END OF lt_vbap_all,
+     BEGIN OF lt_vbep_all OCCURS 0,
+       vbeln LIKE vbep-vbeln,
+       posnr LIKE vbep-posnr,
+       etenr LIKE vbep-etenr,
+       ettyp LIKE vbep-ettyp,
+       edatu LIKE vbep-edatu,
+       wmeng LIKE vbep-wmeng,
+     END OF lt_vbep_all,
+     ls_vbep_all LIKE LINE OF lt_vbep_all.
+* Begin of insert MOD-003
+  DATA: lv_vbtyp TYPE vbtyp.
+* End of insert MOD-003
+
+  RANGES:
+    lr_lgort FOR mard-lgort.
+
+**Begin of insertion MOD-006
+  CONSTANTS : lc_cn07(4)  TYPE c VALUE 'CN07',
+              lc_dtc(3)   TYPE c VALUE 'DTC',
+              lc_240(3)   TYPE c VALUE '240',
+              lc_ab(2)    TYPE c VALUE 'AB',
+              lc_130(3)   TYPE c VALUE '130',
+              lc_v        TYPE c VALUE 'V',
+              lc_1        TYPE c VALUE '1'.
+
+  data : lv_qty TYPE BBMNG.
+
+  TYPES : BEGIN OF ty_ekpo_all,
+            EBELN TYPE EBELN,
+            EBELP TYPE EBELP,
+            LOEKZ TYPE ELOEK,"Deletion Indicator in Purchasing Document
+            STATU TYPE ASTAT,
+            AEDAT TYPE PAEDT,
+            MENGE TYPE BSTMG,
+            vbelv TYPE VBELN_VON,
+            posnv TYPE POSNR_VON,
+           END OF ty_ekpo_all.
+  DATA : it_ekpo_all TYPE STANDARD TABLE OF ty_ekpo_all,
+         lw_ekpo_all type ty_ekpo_all.
+
+  TYPES :BEGIN OF ty_ekes ,
+      EBELN    TYPE ebeln,
+      EBELP    TYPE ebelp,
+      ETENS    TYPE etens,
+      EBTYP    TYPE ebtyp, "Confirmation Category
+      EINDT    TYPE BBEIN, "Confirmation delivery data
+      menge    TYPE BBMNG, "Quantity as Per Vendor Confirmation
+      XBLNR    TYPE XBLNR_LONG, "Reference Document Number
+     END OF ty_ekes.
+  DATA :lt_ekes TYPE STANDARD TABLE OF ty_ekes,
+        lw_ekes TYPE ty_ekes,
+        lw_ekes1 TYPE ty_ekes.
+  DATA : lt_ekes_final TYPE STANDARD TABLE OF ty_ekes.
+*Begin of insertion MOD-006
+  TYPES :    BEGIN OF ty_ekpo ,
+        EBELN   TYPE EBELN,
+        EBELP   TYPE EBELP,
+        LOEKZ   TYPE ELOEK,
+        STATU   TYPE ASTAT,
+        AEDAT   TYPE PAEDT,  "+MOD-007
+        MENGE   TYPE BSTMG,  "+MOD-007
+      END OF ty_ekpo,
+        BEGIN OF ty_vbfa1 ,
+        vbelv   TYPE VBELN_VON,
+        posnv   TYPE POSNR_VON,
+        vbeln   TYPE VBELN_NACH,
+        posnn   TYPE POSNR_NACH,
+        vbtyp_n TYPE VBTYP_N,
+       END OF ty_vbfa1.
+
+  DATA : lt_ekpo TYPE STANDARD TABLE OF ty_ekpo,
+         lt_vbfa1 TYPE STANDARD TABLE OF ty_vbfa1,
+         lw_ekpo TYPE ty_ekpo,
+         lw_vbfa1 TYPE ty_vbfa1.
+
+*End of insertion MOD-006
+
+
+
+
+*End of insertion MOD-006
+
+  IF cb_get NE 'X'.             "insert MOD-004
+* First build table of unique materials and plant materials based on output table
+    LOOP AT it_out.
+      lt_mara-matnr = it_out-matnr.
+      APPEND lt_mara.
+      lt_marc-matnr = it_out-matnr.
+      lt_marc-werks = it_out-werks.
+      APPEND lt_marc.
+    ENDLOOP.
+
+    SORT:
+      lt_mara BY matnr,
+      lt_marc BY matnr werks.
+    DELETE ADJACENT DUPLICATES FROM lt_marc COMPARING ALL FIELDS.
+    DELETE ADJACENT DUPLICATES FROM lt_mara COMPARING matnr.
+
+* If no materials found in the order lines, leave them all to "not available"
+    CHECK:
+      NOT lt_mara[] IS INITIAL,
+      NOT lt_marc[] IS INITIAL.
+
+* Select unrestricted stock
+* First add storage location 1000 when required
+    lr_lgort[] = so_lgort[].
+    IF NOT lr_lgort[] IS INITIAL AND '   ' IN lr_lgort.
+      lr_lgort-sign   = 'I'.
+      lr_lgort-option = 'EQ'.
+      lr_lgort-low    = '1000'.
+      APPEND lr_lgort.
+    ENDIF.
+* Then get stock
+    SELECT      matnr werks lgort labst
+           INTO TABLE lt_mard
+           FROM mard
+            FOR ALL ENTRIES IN lt_mara
+          WHERE matnr EQ lt_mara-matnr
+            AND lgort IN lr_lgort.
+* Aggregate the stock to plant level
+    LOOP AT lt_mard.
+      READ TABLE lt_marc WITH KEY matnr = lt_mard-matnr
+                                  werks = lt_mard-werks
+                         BINARY SEARCH.
+      IF sy-subrc EQ 0.
+        MOVE-CORRESPONDING lt_mard TO lt_mard_aggr.
+        COLLECT lt_mard_aggr.
+      ENDIF.
+    ENDLOOP.
+* If no stock found, leave all items to "not available"
+    CHECK NOT lt_mard_aggr[] IS INITIAL.
+
+* Get all order items with any of the previously selected materials
+    SELECT      vapma~vbeln vapma~posnr
+                vbap~ABGRU "+MOD-006
+                vbap~erdat vapma~matnr vapma~werks vbap~lgort pstyv lprio kwmeng kwmeng AS kwmeng_open
+           INTO TABLE lt_vbap_all
+           FROM vapma
+           JOIN vbap
+             ON vapma~vbeln EQ vbap~vbeln
+            AND vapma~posnr EQ vbap~posnr
+*** MOD-003 * begin insert ***
+           JOIN vbak
+             ON vapma~vbeln EQ vbak~vbeln
+*** MOD-003 * End insert ***
+
+*** MOD-001 * begin insert ***
+           JOIN vbup
+             ON vbap~vbeln EQ vbup~vbeln  AND
+                vbap~posnr EQ vbup~posnr
+*** MOD-001 * end insert ***
+            FOR ALL entries IN lt_mara
+          WHERE vapma~matnr EQ lt_mara-matnr            "#EC CI_NOFIELD
+*** MOD-001 * begin insert ***
+*          AND vbap~lgort  IN lr_lgort                   "-Mod-002
+*          AND vbap~pstyv  IN so_pstyv                   "-Mod-002
+            AND vbap~abgru  = '  '
+            AND ( vbup~gbsta = 'A' OR vbup~gbsta = 'B' )
+*** MOD-003 * begin insert ***
+            AND vbak~vbtyp = 'C'.
+*** MOD-003 * end insert ***
+
+*** MOD-001 * end insert ***
+*         AND WERKS EQ LT_MARC-WERKS.         "#EC CI_NOFIELD
+
+* There should always be lines (at least those which were already selected to be output)
+* CHECK NOT LT_VBAP_ALL[] IS INITIAL.
+
+* Eliminate records for which no match in LT_MARC (now including WERKS)
+*                   or where StLoc conflicts with selection parameter
+*                   or item category conflicts with selection parameter
+    LOOP AT lt_vbap_all.
+*** Begin of Mod-002 * revert the change of Mod-001 for Performance -> Satya
+*** MOD-001 * begin comment ***
+*   Check storage location of the order line
+
+      IF NOT lt_vbap_all-lgort IN lr_lgort.
+        DELETE lt_vbap_all.
+        CONTINUE.
+      ENDIF.
+*   Check item category
+      IF NOT lt_vbap_all-pstyv IN so_pstyv.
+        DELETE lt_vbap_all.
+        CONTINUE.
+      ENDIF.
+*** MOD-001 * end comment ***
+*** End of Mod-002 * Revert comments from Mod-001 <- Satya
+
+*   Check plant of the order line
+      READ TABLE lt_marc WITH KEY matnr = lt_vbap_all-matnr
+                                  werks = lt_vbap_all-werks
+                         BINARY SEARCH.
+      IF sy-subrc NE 0.
+        DELETE lt_vbap_all.
+      ENDIF.
+    ENDLOOP.
+
+* Get schedule lines for the remaining orders
+    SELECT      vbeln posnr etenr ettyp edatu wmeng
+           INTO TABLE lt_vbep_all
+           FROM vbep
+            FOR ALL ENTRIES IN lt_vbap_all
+          WHERE vbeln = lt_vbap_all-vbeln.
+
+* Eliminate schedule lines which are not the first ones for a specific item
+* <! - which are not according to req. del date from selection screen >
+    SORT lt_vbep_all BY vbeln posnr etenr.
+*** MOD-001 * begin ***
+*  LOOP AT lt_vbep_all.
+*    IF lt_vbep_all-vbeln EQ ls_vbep_all-vbeln AND lt_vbep_all-posnr EQ ls_vbep_all-posnr.
+*      DELETE lt_vbep_all.
+**    ELSEIF LT_VBEP_ALL-EDATU GT P_VDATU.
+**      DELETE LT_VBEP_ALL.
+*    ENDIF.
+*    ls_vbep_all = lt_vbep_all.
+*  ENDLOOP.
+    DELETE ADJACENT DUPLICATES FROM lt_vbep_all
+                               COMPARING vbeln posnr.
+*** MOD-001 * end ***
+
+* Add requested delivery date to LT_VBAP_ALL
+    LOOP AT lt_vbap_all.
+      READ TABLE lt_vbep_all WITH KEY vbeln = lt_vbap_all-vbeln
+                                       posnr = lt_vbap_all-posnr
+                              BINARY SEARCH.
+      IF sy-subrc EQ 0.
+        lt_vbap_all-edatu = lt_vbep_all-edatu.
+        MODIFY lt_vbap_all.
+      ELSE.
+        DELETE lt_vbap_all.
+      ENDIF.
+    ENDLOOP.
+
+* Read VBFA for the order items to find delivered qty's
+    SELECT      vbelv posnv vbeln posnn vbtyp_n
+           INTO TABLE lt_vbfa
+           FROM vbfa
+            FOR ALL ENTRIES IN lt_vbap_all
+          WHERE vbelv   EQ lt_vbap_all-vbeln
+            AND posnv   EQ lt_vbap_all-posnr
+            AND vbtyp_n EQ 'J'.
+**Begin of insertion MOD-006
+*Extracting Purchase orders for sales documents
+    IF LT_VBAP_ALL[] IS NOT INITIAL.
+      SELECT VBELV
+             POSNV
+             VBELN
+             POSNN
+             VBTYP_N
+             INTO TABLE LT_VBFA1
+             FROM VBFA
+             FOR ALL ENTRIES IN LT_VBAP_ALL
+             WHERE VBELV   EQ LT_VBAP_ALL-VBELN
+             AND   POSNV   EQ LT_VBAP_ALL-POSNR
+             AND   VBTYP_N EQ lc_v.
+      IF SY-SUBRC = 0.
+        SORT LT_VBFA1 BY VBELN POSNN.
+*Extracting purchase documents item data
+        select  EBELN
+                EBELP
+                LOEKZ "Deletion Indicator in Purchasing Document
+                STATU
+                AEDAT "+MOD-007
+                MENGE "+MOD-007
+                FROM EKPO
+                INTO TABLE lt_ekpo
+                FOR ALL ENTRIES IN lt_vbfa1
+                WHERE ebeln eq lt_vbfa1-vbeln
+                AND   statu eq lt_vbfa1-vbtyp_n.
+
+        if sy-subrc eq 0.
+
+          delete lt_ekpo WHERE LOEKZ NE ' '.
+          sort lt_ekpo by ebeln ebelp.
+
+          LOOP AT lt_ekpo into lw_ekpo.
+            lw_ekpo_all-ebeln = lw_ekpo-ebeln.
+            lw_ekpo_all-EBELP = lw_ekpo-EBELP.
+            lw_ekpo_all-LOEKZ = lw_ekpo-LOEKZ.
+            lw_ekpo_all-STATU = lw_ekpo-STATU.
+            lw_ekpo_all-aedat = lw_ekpo-aedat."+MOD-007
+            lw_ekpo_all-menge = lw_ekpo-menge."+MOD-007
+            READ TABLE lt_vbfa1 into lw_vbfa1
+                                with key vbeln = lw_ekpo-ebeln
+                                         posnn = lw_ekpo-ebelp
+                                          BINARY SEARCH.
+            if sy-subrc IS INITIAL.
+              lw_ekpo_all-vbelv = lw_vbfa1-vbelv. "Sales order
+              lw_ekpo_all-posnv = lw_vbfa1-posnv. "Sales order item number
+            endif.
+            APPEND lw_ekpo_all to it_ekpo_all.
+            clear: lw_ekpo_all,lw_ekpo,lw_vbfa1.
+          ENDLOOP.
+
+*Extracting confirmation quantity for vendor and reference
+          select  EBELN
+                  EBELP
+                  ETENS
+                  EBTYP
+                  EINDT
+                  menge
+                  XBLNR
+                  FROM EKES
+                  INTO TABLE lt_ekes
+                  FOR ALL ENTRIES IN lt_ekpo
+                  WHERE ebeln eq lt_ekpo-ebeln
+                  AND   ebelp eq lt_ekpo-ebelp
+                  AND   ebtyp eQ lc_ab.
+          if sy-subrc = 0.
+            sort lt_ekes by ebeln ebelp.
+            CLEAR :lv_qty,lw_ekes.
+            LOOP AT lt_ekes into lw_ekes.
+              lw_ekes1 = lw_ekes.
+              if lw_ekes1-ebtyp EQ lc_ab and
+                 ( lw_ekes1-xblnr eq lc_130 or  lw_ekes1-xblnr eq lc_240 ) and
+                 ( lw_ekes1-EINDT LE p_vdatu ).
+                lv_qty = lv_qty + lw_ekes1-menge.
+              endif.
+              at END OF ebelp.
+                lw_ekes1-menge = lv_qty.
+                APPEND lw_ekes1 to lt_ekes_final.
+                clear: lv_qty,lw_ekes,lw_ekes.
+              ENDAT.
+            ENDLOOP.
+          endif.
+        endif.
+      endif.
+    endif.
+**End of insertion MOD-006
+
+* Document flow table can be empty, processing needs to continue (i.e. determine the
+* orders which can be delivered)
+    IF NOT lt_vbfa[] IS INITIAL.
+*   Get delivered quantities and delivery status for doc flow entries
+      SELECT      lips~vbeln posnr lfimg vbuk~wbstk
+             INTO TABLE lt_lips
+             FROM lips
+             JOIN vbuk
+               ON vbuk~vbeln EQ lips~vbeln
+              FOR ALL entries IN lt_vbfa
+            WHERE lips~vbeln EQ lt_vbfa-vbeln
+              AND lips~posnr EQ lt_vbfa-posnn.
+    ENDIF.
+
+    SORT:
+      lt_vbfa     BY vbeln posnn,
+      lt_vbap_all BY vbeln posnr.
+
+* Subtract delivered qty's from the order items' open qty's
+    LOOP AT lt_lips.
+*   Don't consider the qty if the dlvry doc's "Total Goods Mvt Stat" = C ~ Completely processed
+      CHECK lt_lips-wbstk = 'C'.
+*   Get preceding order item number
+      READ TABLE lt_vbfa WITH KEY vbeln = lt_lips-vbeln
+                                  posnn = lt_lips-posnr
+                         BINARY SEARCH.
+*   When found
+      IF sy-subrc EQ 0.
+*     Get the order line
+        READ TABLE lt_vbap_all WITH KEY vbeln = lt_vbfa-vbelv
+                                        posnr = lt_vbfa-posnv
+                               BINARY SEARCH.
+*     When found
+        IF sy-subrc EQ 0.
+          lt_vbap_all-kwmeng_open = lt_vbap_all-kwmeng_open - lt_lips-lfimg.
+          MODIFY lt_vbap_all INDEX sy-tabix.
+        ENDIF.
+
+      ENDIF.
+
+    ENDLOOP.
+
+    SORT lt_vbap_all BY matnr werks edatu lprio.
+
+* Subtract open order qty's from stock and set avly flag appropriately for each order line
+    LOOP AT lt_vbap_all.
+
+*   If item is fully delivered
+      IF lt_vbap_all-kwmeng_open LE 0.
+*     It should be marked available
+        lt_vbap_all-available = '1'.
+
+*   If item is NOT fully delivered
+      ELSE.
+*     Get the stock
+        READ TABLE lt_mard_aggr WITH KEY matnr = lt_vbap_all-matnr
+                                         werks = lt_vbap_all-werks
+                                BINARY SEARCH.
+*     When stock found
+        IF sy-subrc EQ 0.
+*       If stock is enough for current order item
+          IF lt_mard_aggr-labst GE lt_vbap_all-kwmeng_open.
+*         Mark item available
+            lt_vbap_all-available = '1'.
+*         Subtract order open qty from stock
+            lt_mard_aggr-labst = lt_mard_aggr-labst - lt_vbap_all-kwmeng_open.
+          ELSE.
+*         Leave available mark empty, but set stock to zero
+*          lt_mard_aggr-labst = 0.               "MOD-001
+          ENDIF.
+          MODIFY lt_mard_aggr INDEX sy-tabix.
+*     When stock NOT found
+        ELSE.
+*       Leave available mark empty
+        ENDIF.
+      ENDIF.
+      MODIFY lt_vbap_all.
+    ENDLOOP.
+
+    SORT lt_vbap_all BY vbeln posnr.
+**Begin of insertion MOD-006
+    sort it_ekpo_all by vbelv posnv ebeln ebelp.
+    sort lt_vbfa1 by vbelv vbeln posnn.
+    sort lt_ekes by ebeln ebelp.
+**End of insertion MOD-006
+* Update the lines being output with appropriate available mark
+    LOOP AT it_out.
+*   Get the corresponding line in LT_VBAP_ALL
+      READ TABLE lt_vbap_all WITH KEY vbeln = it_out-vbeln
+                                      posnr = it_out-posnr
+                             BINARY SEARCH.
+      IF sy-subrc EQ 0.
+        IF lt_vbap_all-available IS INITIAL.
+          it_out-available = '0'.
+        ELSE.
+          it_out-available = '1'.
+        ENDIF.
+      ELSE.
+*** MOD-001 * begin insert ***
+        IF it_out-gbsta = 'C'.
+          it_out-available = '1'.
+        ELSE.
+*** MOD-001 * end insert ***
+          it_out-available = '0'.
+        ENDIF.                                              "MOD-001
+      ENDIF.
+
+*Begin of insertion MOD-006
+      if lt_vbap_all-available is INITIAL.
+        if it_out-vkorg EQ lc_cn07 and it_out-DTC_SFS EQ lc_dtc.
+
+          if lt_vbap_all-ABGRU is NOT INITIAL.
+            lt_vbap_all-available = '0'.
+          else.
+*Reading all purchase order items associated with sales order and it's item combination
+            LOOP AT it_ekpo_all into lw_ekpo_all
+                                          WHERE vbelv EQ it_out-vbeln
+                                            AND posnv EQ it_out-posnr.
+              if lw_ekpo_all is NOT INITIAL.
+
+                READ TABLE lt_ekes_final into lw_ekes with key ebeln = lw_ekpo_all-ebeln
+                                            ebelp = lw_ekpo_all-ebelp
+                                            BINARY SEARCH.
+                if sy-subrc = 0.
+                  if ( lw_ekes-EBTYP EQ lc_ab ) and
+                     ( lw_ekes-XBLNR Eq lc_130 or lw_ekes-XBLNR Eq lc_240 ) and
+                     ( lw_ekes-EINDT LE p_vdatu ).
+                    lv_qty = lv_qty + lw_ekes-menge.
+                  endif.
+                endif.
+              endif.
+              CLEAR: lw_ekes,lw_ekpo_all.
+            ENDLOOP.
+
+            if lv_qty GE it_out-menge.
+              it_out-available = lc_1.
+              clear lv_qty.
+            endif.
+          endif.
+
+        endif.
+      ENDIF.
+*  End of insertion MOD -006
+      MODIFY it_out.
+      CLEAR : lv_qty. "+MOD-006
+    ENDLOOP.
+
+  ENDIF.               "insert MOD-004
+*Begion of insertion MOD-007
+  sort: it_out by vkorg dtc_sfs,
+        it_vbap by vbeln posnr,
+        it_ekpo_all by vbelv posnv.
+
+  READ TABLE it_out with key   vkorg = c_cn07
+                             DTC_SFS = c_dtc
+                             BINARY SEARCH.
+  if sy-subrc is INITIAL.
+     loop at it_out.
+       MOVE-CORRESPONDING it_out to lw_kp01_new.
+        READ TABLE it_ekpo_all into lw_ekpo_all
+                               with key vbelv = it_out-vbeln
+                                        posnv = it_out-posnr
+                                        BINARY SEARCH.
+           if sy-subrc IS INITIAL.
+             lw_kp01_new-EBELN    = lw_ekpo_all-EBELN.
+             lw_kp01_new-EBELP    = lw_ekpo_all-EBELP.
+             lw_kp01_new-LOEKZ    = lw_ekpo_all-LOEKZ.
+             lw_kp01_new-AEDAT    = lw_ekpo_all-AEDAT.
+             lw_kp01_new-MENGE_PO = lw_ekpo_all-MENGE.
+             endif.
+             APPEND lw_kp01_new to lt_kp01_new.
+             CLEAR : lw_kp01_new,lw_ekpo_all,it_vbap,it_out.
+       ENDLOOP.
+
+    ENDIF.
+*End of insertion MOD-007
+ENDFORM.                    " DETERMINE_AVL

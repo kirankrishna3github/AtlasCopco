@@ -1,0 +1,387 @@
+***********************************************************************************
+* Program ID           : YSE_FICO_REVENUE_EXTRACT                                 *
+* Program Title        : Revenue extract for PCA/COPA periodic reconciliation     *
+* Author               : Pierre Melin                                             *
+* Date                 : 09/01/2007                                               *
+* Change Request Number:                                                          *
+* Description          : Each period end after the service and sales order        *
+*                        settlements have completed this extract can be run. The  *
+*                        output will be processed via access to ensure that the   *
+*                        balance in COPA and PCA match. If there is a mismatch    *
+*                        then the reconciliation process should show all          *
+*                        unmatched objects. This extract should be able to        *
+*                        download to a presentation server or a data server in    *
+*                        case of long runtimes.                                   *
+*=================================================================================*
+* Copied From         : (Cloned Program)                                          *
+* Title               : (Program Title)                                           *
+* Other Related obj   : (Object names)                                            *
+*=================================================================================*
+* Change History Log                                                              *
+*---------------------------------------------------------------------------------*
+* Mod. no.|  Date    | Name           | Correction Number  | Change Reference #   *
+*---------------------------------------------------------------------------------*
+* MOD-001 |dd/mm/yyyy| xxxxxxxxxxxxxx | XXXXxxxxxx         |   XXXXxxxxxx         *
+*                                                                                 *
+* Description:                                                                    *
+*---------------------------------------------------------------------------------*
+* MOD-002 |dd/mm/yyyy| xxxxxxxxxxxxxx | XXXXxxxxxx                                *
+*                                                                                 *
+* Description:                                                                    *
+***********************************************************************************
+
+REPORT  yse_fico_revenue_extract.
+
+
+TABLES :  glpca,         "EC-PCA: Actual Line Items
+          ce11000,       "Atlas Copco Operatin
+          t001.          "Company Codes
+
+
+*  PCA internal Table for download
+DATA : BEGIN OF i_glpca OCCURS 0,
+        poper LIKE glpca-poper,
+        ryear LIKE glpca-ryear,
+        rprctr LIKE glpca-rprctr,
+        kdauf LIKE glpca-kdauf,
+        kdpos LIKE glpca-kdpos,
+        aufnr LIKE glpca-aufnr,
+        rbukrs LIKE glpca-rbukrs,
+        hsl    LIKE glpca-hsl,
+       END OF i_glpca,
+
+* COPA internal table for download
+       BEGIN OF i_copa OCCURS 0,
+        perde LIKE ce11000-perde,
+        gjahr LIKE ce11000-gjahr,
+        prctr LIKE ce11000-prctr,
+        kaufn LIKE ce11000-kaufn,
+        kdpos LIKE ce11000-kdpos,
+        rkaufnr LIKE ce11000-rkaufnr,
+        vv100 LIKE ce11000-vv100,
+       END OF i_copa.
+
+* work variables to create file text lines
+DATA : w_line(255) TYPE c,
+       w_vv100(15) TYPE c,
+* variables to get result of conversion routine
+       w_rvers LIKE glpca-rvers,
+       w_paledger LIKE ce11000-paledger.
+
+
+
+
+*******************************************************************
+*  SELECTION SCREEN                                               *
+*******************************************************************
+
+SELECTION-SCREEN BEGIN OF BLOCK bl1 WITH FRAME.
+PARAMETERS : p_file(150),        "frontend file path for download
+             p_server(150).      "server file path for download
+SELECTION-SCREEN END OF BLOCK bl1.
+
+SELECTION-SCREEN BEGIN OF BLOCK bl2 WITH FRAME.
+PARAMETERS : p_kokrs LIKE glpca-kokrs OBLIGATORY MEMORY ID cac,      "Controlling Area
+             p_bukrs LIKE t001-bukrs OBLIGATORY MEMORY ID buk.       "Company Code
+
+SELECT-OPTIONS : s_rrcty FOR glpca-rrcty OBLIGATORY,                 "Record Type
+                 s_vrgar FOR ce11000-vrgar OBLIGATORY MEMORY ID vga, "Record Type
+                 s_poper FOR glpca-poper OBLIGATORY MEMORY ID popr,  "Posting Period
+                 s_ryear FOR glpca-ryear OBLIGATORY  MEMORY ID gjr,  "Fiscal Year
+                 s_racct FOR glpca-racct OBLIGATORY ,                " Cost/revenue element
+                 s_rprctr FOR glpca-rprctr MEMORY ID prc,            " Profit Center
+                 s_kdauf FOR glpca-kdauf MEMORY ID aun,              " Sales Order Number
+                 s_kdpos FOR glpca-kdpos MEMORY ID kpo,              " Item number in Sales Order
+                 s_aufnr FOR glpca-aufnr MEMORY ID anr               " Order Number
+                 .
+SELECTION-SCREEN END OF BLOCK bl2.
+
+
+*******************************************************************
+*   AT SELECTION-SCREEN EVENT                                     *
+*******************************************************************
+
+
+AT SELECTION-SCREEN.
+* check if path is correctly filled
+  IF ( p_file IS INITIAL AND p_server IS INITIAL ) OR
+  ( NOT p_file IS INITIAL ) AND ( NOT p_server IS INITIAL ).
+    MESSAGE text-002 TYPE 'E'.
+  ELSE.
+* check company code
+    SELECT SINGLE * FROM t001 WHERE bukrs EQ p_bukrs
+      AND ktopl EQ 'SCOA'
+    .
+    IF sy-subrc <> 0.
+      MESSAGE text-001 TYPE 'E'.
+    ELSE.
+* check if sales document item has to be filled
+      IF NOT s_kdauf[] IS INITIAL AND s_kdpos[] IS INITIAL.
+        MESSAGE text-005 TYPE 'E'.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_file.
+* dialog box for frontend file path
+  CALL FUNCTION 'WS_FILENAME_GET'
+    EXPORTING
+      def_filename     = p_file
+      def_path         = '\'
+      mask             = ',*.*,*.csv;*.txt.'
+      mode             = 'O'
+      title            = text-005
+    IMPORTING
+      filename         = p_file
+    EXCEPTIONS
+      inv_winsys       = 01
+      no_batch         = 02
+      selection_cancel = 03
+      selection_error  = 04.
+
+
+***********************************************************************
+*  START-OF-SELECTION EVENT                                           *
+***********************************************************************
+
+START-OF-SELECTION.
+
+  CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+    EXPORTING
+      input  = '0  '
+    IMPORTING
+      output = w_rvers.
+
+* get data pca
+  SELECT poper ryear rprctr kdauf kdpos aufnr rbukrs hsl
+    INTO TABLE i_glpca
+    FROM glpca
+    WHERE rbukrs EQ p_bukrs
+    AND   kokrs EQ p_kokrs
+    AND   ryear IN s_ryear
+    AND   poper IN s_poper
+    AND   rprctr IN s_rprctr
+    AND   racct  IN s_racct
+    AND   kdauf IN s_kdauf
+    AND   kdpos IN s_kdpos
+    AND   aufnr IN s_aufnr
+    AND   rldnr EQ '8A'
+    AND   rvers EQ w_rvers
+    .
+  CALL FUNCTION 'CONVERSION_EXIT_LEDBO_INPUT'
+    EXPORTING
+      input         = '10'
+    IMPORTING
+      output        = w_paledger
+    EXCEPTIONS
+      invalid_input = 1
+      OTHERS        = 2.
+
+
+*get data copa
+  SELECT perde gjahr prctr kaufn kdpos rkaufnr vv100
+    INTO TABLE i_copa
+    FROM ce11000
+    WHERE bukrs = p_bukrs
+    AND   kokrs = p_kokrs
+    AND   vrgar IN s_vrgar
+    AND   gjahr IN s_ryear
+    AND   perde IN s_poper
+    AND   prctr IN s_rprctr
+    AND   kaufn IN s_kdauf
+    AND   kdpos IN s_kdpos
+    AND   rkaufnr IN s_aufnr
+    AND paledger EQ w_paledger
+    .
+
+  IF p_file IS INITIAL.
+    PERFORM download_server.
+  ELSE.
+    PERFORM download_gui.
+  ENDIF.
+
+************************************************************************
+*   FORMS DEFINITION                                                   *
+************************************************************************
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  DOWNLOAD_SERVER
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM download_server .
+
+  DATA : wl_file1(50) TYPE c,
+         wl_file2(50) TYPE c.
+
+* build filename 1
+  wl_file1 = p_server.
+  REPLACE '.' INTO wl_file1 WITH '_1.'.
+
+  OPEN DATASET wl_file1 FOR OUTPUT IN TEXT MODE ENCODING DEFAULT.
+
+*transfer pca data
+  LOOP AT i_glpca.
+* transform into characters
+    WRITE i_glpca-hsl TO w_vv100.   "#EC *
+    w_line+0(3) = i_glpca-poper .
+    w_line+3(4) = i_glpca-ryear .
+    w_line+7(10) = i_glpca-rprctr .
+    w_line+17(10) = i_glpca-kdauf .
+    w_line+27(6) = i_glpca-kdpos .
+    w_line+33(12) = i_glpca-aufnr.
+    w_line+45(4) = i_glpca-rbukrs.
+    w_line+49 = w_vv100.
+
+    TRANSFER w_line TO wl_file1.
+  ENDLOOP.
+* close file 1
+
+  CLOSE DATASET wl_file1.
+
+  WRITE :/ wl_file1, text-003.
+
+* build filename 2
+  wl_file2 = p_server.
+  REPLACE '.' INTO wl_file2 WITH '_2.'.
+
+  OPEN DATASET wl_file2 FOR OUTPUT IN TEXT MODE ENCODING DEFAULT.
+* transfer data
+  LOOP AT i_copa.
+* transform into characters
+    WRITE i_copa-vv100 TO w_vv100. "#EC *
+    w_line+0(3) = i_copa-perde.
+    w_line+3(4) = i_copa-gjahr.
+    w_line+7(10) = i_copa-prctr.
+    w_line+17(10) = i_copa-kaufn.
+    w_line+27(6) = i_copa-kdpos.
+    w_line+33(12) = i_copa-rkaufnr.
+    w_line+45 = w_vv100.
+
+    TRANSFER w_line TO wl_file2.
+  ENDLOOP.
+* close file 2
+  CLOSE DATASET wl_file2.
+
+  WRITE :/ wl_file2, text-003.
+
+ENDFORM.                    " DOWNLOAD_SERVER
+*&---------------------------------------------------------------------*
+*&      Form  DOWNLOAD_GUI
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM download_gui .
+
+  DATA :  wl_file1 TYPE string.
+  DATA :  wl_file2 TYPE string.
+* build filename 1
+  wl_file1 = p_file.
+  REPLACE '.' INTO wl_file1 WITH '_1.'.
+* download table into file 1
+  CALL FUNCTION 'GUI_DOWNLOAD'
+    EXPORTING
+      filename                = wl_file1
+    TABLES
+      data_tab                = i_glpca
+    EXCEPTIONS
+      file_write_error        = 1
+      no_batch                = 2
+      gui_refuse_filetransfer = 3
+      invalid_type            = 4
+      no_authority            = 5
+      unknown_error           = 6
+      header_not_allowed      = 7
+      separator_not_allowed   = 8
+      filesize_not_allowed    = 9
+      header_too_long         = 10
+      dp_error_create         = 11
+      dp_error_send           = 12
+      dp_error_write          = 13
+      unknown_dp_error        = 14
+      access_denied           = 15
+      dp_out_of_memory        = 16
+      disk_full               = 17
+      dp_timeout              = 18
+      file_not_found          = 19
+      dataprovider_exception  = 20
+      control_flush_error     = 21
+      OTHERS                  = 22.
+
+  IF sy-subrc = 0.
+    WRITE :/ wl_file1,  text-003.
+  ELSE.
+    WRITE :/ text-004.
+  ENDIF.
+
+*build filename 2
+  wl_file2 = p_file.
+  REPLACE '.' INTO wl_file2 WITH '_2.'.
+
+* download table into file 2
+  CALL FUNCTION 'GUI_DOWNLOAD'
+    EXPORTING
+      filename                = wl_file2
+    TABLES
+      data_tab                = i_copa
+    EXCEPTIONS
+      file_write_error        = 1
+      no_batch                = 2
+      gui_refuse_filetransfer = 3
+      invalid_type            = 4
+      no_authority            = 5
+      unknown_error           = 6
+      header_not_allowed      = 7
+      separator_not_allowed   = 8
+      filesize_not_allowed    = 9
+      header_too_long         = 10
+      dp_error_create         = 11
+      dp_error_send           = 12
+      dp_error_write          = 13
+      unknown_dp_error        = 14
+      access_denied           = 15
+      dp_out_of_memory        = 16
+      disk_full               = 17
+      dp_timeout              = 18
+      file_not_found          = 19
+      dataprovider_exception  = 20
+      control_flush_error     = 21
+      OTHERS                  = 22.
+
+  IF sy-subrc = 0.
+    WRITE :/ wl_file2, text-003.
+  ELSE.
+    WRITE :/ text-004.
+  ENDIF.
+
+ENDFORM.                    " DOWNLOAD_GUI
+
+*Text symbol text£º
+*001:Company code incorrect
+*002:Please fill in presentation file id or server file id (not both)
+*003:Created
+*004:Error creating file
+
+*005:Please fill in sales document item
+*Selection text£º
+*P_BUKRS:D       Company Code
+*P_FILE:        Presentation file ID
+*P_KOKRS:D       Controlling Area
+*P_SERVER:        Server file ID
+*S_AUFNR:D       Order
+*S_KDAUF:D       Sales Order
+*S_KDPOS:D       Sales order item
+*S_POPER:D       Posting Period
+*S_RACCT:        Revenue elements
+*S_RPRCTR:D       Profit Center
+*S_RRCTY:        GLPCA Record Type
+*S_RYEAR:D       Fiscal Year
+*S_VRGAR:        COPA Record Type

@@ -1,0 +1,147 @@
+*----------------------------------------------------------------------*
+***INCLUDE YSE_EM_EXC_MGT_RUN_F01 .
+*----------------------------------------------------------------------*
+
+*&---------------------------------------------------------------------*
+*&      Form  fill_exception_branch
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM FILL_EXCEPTION_BRANCH .
+
+* Loop over materials => determine parameters for materials
+  LOOP AT I_MARC.
+    CLEAR I_LOG.
+    PERFORM GET_ORDER_LINES_BRANCH.
+    MOVE-CORRESPONDING I_MARC TO I_LOG.
+*   Get mat description (was initially read from internal tab, but selecting descr with a
+*   a range of mat's, was limited to x thousand)
+*    READ TABLE I_MAKT WITH KEY MATNR = I_MARC-MATNR BINARY SEARCH.
+*    IF SY-SUBRC EQ 0.
+*      I_LOG-MAKTX = I_MAKT-MAKTX.
+*    ENDIF.
+    SELECT SINGLE MAKTX
+             FROM MAKT
+             INTO I_LOG-MAKTX
+           WHERE MATNR EQ I_MARC-MATNR
+             AND SPRAS EQ SY-LANGU.
+    IF SY-SUBRC NE 0.
+      CLEAR I_LOG-MAKTX.
+    ENDIF.
+    I_LOG-HIST = V_HISTORY.
+    I_LOG-NRLINES = V_SO12.
+    I_LOG-CUSTOPO = I_MARC-DISMM.
+*   Get MATPLANT
+    CLEAR YSE_EM_MATPLANT.
+    SELECT SINGLE *
+             FROM yse_em_matplant
+            WHERE matnr EQ i_marc-matnr
+              AND werks EQ p_werks.
+    I_LOG-CULSFL  = YSE_EM_MATPLANT-LOTSIZE_IND.
+
+*   START
+    PERFORM GET_MAT_STCOST.
+    PERFORM MATERIAL_FORECAST.
+
+*** 0. Only for not "stock on request"
+    IF I_MARC-MAXLZ EQ 0.
+
+*** * If  Orderlines (12 mth for resp whs) * X >= LCL lines
+*     AND Stock policy = Not stocked
+*     AND Order lines (4 mh) * factor (4 mth) * X >= LCL lines
+      IF      V_X12 GE YSE_EM_WHSTYPAR-LCLLINES
+          AND ( I_MARC-DISMM EQ C_LNS OR I_MARC-DISMM EQ C_CNS )
+          AND V_X4 GE YSE_EM_WHSTYPAR-LCLLINES.
+*       Set exception A01
+        PERFORM SET_EM_MSG USING 'A01'.
+*       Calculate SS, ROP, lot size, DMSV
+        PERFORM CALCULATE_PARAMETERS.
+*** * If  Order lines (12 mth for resp whs) * X < LCL lines
+*     AND Stock policy = Stocked
+      ELSEIF  V_X12 LT YSE_EM_WHSTYPAR-LCLLINES
+          AND I_MARC-DISMM EQ C_ST.
+***   * If order lines (4 mth) * factor (4 mth) * X < LCL lines
+        IF V_X4 LT YSE_EM_WHSTYPAR-LCLLINES.
+*         Set exception A02
+          PERFORM SET_EM_MSG USING 'A02'.
+          PERFORM CALCULATE_PARS_LIGHT.
+        ELSE.
+*         Calculate SS, ROP, lot size, DMSV
+          PERFORM CALCULATE_PARAMETERS.
+        ENDIF.
+*** * If  Stock policy = Stocked
+      ELSEIF  I_MARC-DISMM EQ C_ST.
+*       Calculate SS, ROP, lot size, DMSV
+        PERFORM CALCULATE_PARAMETERS.
+      ENDIF.
+    ENDIF.
+    IF NOT I_LOG-EXTYPNR IS INITIAL.
+      APPEND I_LOG.
+    ENDIF.
+  ENDLOOP.
+ENDFORM.                    " FILL_EXCEPTION_BRANCH
+
+*&---------------------------------------------------------------------*
+*&      Form  get_order_lines_branch
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM get_order_lines_branch .
+
+* V_SO12 = sum of all sales lines over the last 12 months from temp file
+*        = number of sales lines over the last 12 months
+* V_SO6 = sum of all sales lines over the last 6 months from temp file
+* V_SO4 = sum of all sales lines over the last 4 months from temp file
+* V_SO2 = sum of all sales lines over the last 2 months from temp file
+
+* V_012 = number of months over the last 12 months in temp file where
+*         sales quantity ne 0
+* V_006 = number of months over the last 6 months in temp file where
+*         sales quantity ne 0
+* v_history = total sales qty over 12 months
+
+  CLEAR: v_so12, v_so6, v_so4, v_so2, v_012, v_006, v_history, v_x12, v_x4.
+
+  LOOP AT i_temp WHERE matnr EQ i_marc-matnr.
+    v_history = v_history + i_temp-zmeng.
+    IF i_temp-period GE v_period2.
+      v_so12 = v_so12 + i_temp-zline.
+      v_so4 = v_so4 + i_temp-zline.
+    ELSEIF i_temp-period GE v_period4.
+      v_so12 = v_so12 + i_temp-zline.
+      v_so4 = v_so4 + i_temp-zline.
+    ELSE.
+      v_so12 = v_so12 + i_temp-zline.
+    ENDIF.
+  ENDLOOP.
+
+* get decision parameters
+  CLEAR YSE_EM_MATSO.
+  SELECT SINGLE *
+  FROM yse_em_matso
+  WHERE matnr EQ i_marc-matnr
+  AND vkorg EQ p_vkorg.
+
+  CLEAR YSE_EM_WHSTYPAR.
+  SELECT SINGLE *
+  FROM yse_em_whstypar
+  WHERE vkorg  EQ p_vkorg
+    AND whtype EQ 'B'.
+
+* v_X12 = Orderlines (12month) * X
+* v_X4  = Orderlines (4mth) * factor(4mth) * X
+*  X = alternate % if special = intial in YSE_EM_MATSO
+*  X = breakdown % if special = not intial in YSE_EM_MATSO
+
+  IF yse_em_matso-spec IS INITIAL.
+    v_x12 = v_so12 * yse_em_whstypar-brkperc.
+    v_x4 = v_so4 * yse_em_whstypar-mulfac4 * yse_em_whstypar-brkperc.
+  ELSE.
+    v_x12 = v_so12 * yse_em_whstypar-altperc.
+    v_x4 = v_so4 * yse_em_whstypar-mulfac4 * yse_em_whstypar-altperc.
+  ENDIF.
+
+ENDFORM.                    " get_order_lines_branch

@@ -1,0 +1,656 @@
+*&---------------------------------------------------------------------*
+*& Report  YSE_AUTOMON_ORD_COMPL
+*&---------------------------------------------------------------------*
+*& Visitour/SAP closed orders alignment
+*&---------------------------------------------------------------------*
+*  Author                : Anda Wu
+*  Date                  : 10.03.2014
+*  Change Request Number : CR3186
+*  Transport request Nr. :
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD.NR. |   DATE     | NAME               | CORRECT. NR| CHANGE REF. *
+*----------------------------------------------------------------------*
+* MOD-001 | 01.01.9999 |                    | CD1K9..... | CR....      *
+************************************************************************
+REPORT  yse_automon_ord_compl.
+*&---------------------------------------------------------------------*
+*&                    TYPES
+*&---------------------------------------------------------------------*
+TYPES: BEGIN OF ty_aufk,
+         aufnr        TYPE aufnr,
+         objnr        TYPE j_objnr,
+         iwerk        TYPE iwerk,
+       END OF ty_aufk,
+       BEGIN OF ty_jest,
+         objnr        TYPE j_objnr,
+         status       TYPE j_status,
+       END OF ty_jest,
+       BEGIN OF ty_prev,
+         text1(13)        TYPE c,
+       END OF ty_prev,
+       BEGIN OF ty_vt,
+        aufnr        TYPE aufnr,
+        servtype     TYPE yservtype,
+      END OF ty_vt,
+      BEGIN OF ty_out,
+        aufnr        TYPE aufnr,
+        status_vt    TYPE yservtype,
+        iwerk        TYPE afih-iwerk,
+        status_sap   TYPE j_stext,
+        status_usr   TYPE j_stext,
+        selkz        TYPE xfeld,
+        zzcol        TYPE col_code,
+      END OF ty_out,
+      BEGIN OF ty_vtin,
+        line(50)   TYPE c,
+      END OF ty_vtin.
+
+*&---------------------------------------------------------------------*
+*&                  INTERNAL TABLES
+*&---------------------------------------------------------------------*
+DATA: gt_vt     TYPE STANDARD TABLE OF ty_vt,
+      gt_out_cnf    TYPE STANDARD TABLE OF ty_out,
+      gt_out_pcnf   TYPE STANDARD TABLE OF ty_out,
+      gt_prev   TYPE STANDARD TABLE OF ty_prev,
+      gt_aufk   TYPE STANDARD TABLE OF ty_aufk,
+      gt_jest_cnf   TYPE STANDARD TABLE OF ty_jest,
+      gt_jest_pcnf   TYPE STANDARD TABLE OF ty_jest.
+
+*&---------------------------------------------------------------------*
+*&                  WORKAREA
+*&---------------------------------------------------------------------*
+DATA: gs_prev   TYPE ty_prev,
+      gs_aufk   TYPE ty_aufk,
+      gs_vt     TYPE ty_vt,
+      gs_out    TYPE ty_out,
+      gs_directory  TYPE epsf-epsdirnam
+                    VALUE '/var/load/xxx/UK/read/',
+      gs_jest   TYPE ty_jest.
+
+*&---------------------------------------------------------------------*
+*&                   VARIABLES
+*&---------------------------------------------------------------------*
+DATA: gv_stat_line       TYPE j_stext,
+      gv_error           TYPE xfeld,
+      gv_flag(1)         TYPE c,
+      gv_stat_line_usr   TYPE j_stext,
+      gv_text            TYPE char80,
+      gv_objnr           TYPE j_objnr,
+      gv_cnt_sent        TYPE i,
+      gv_logsys          TYPE tbdlst-logsys,
+      gv_pfile           TYPE epsf-epspath.   "epsfilnam.
+
+*&---------------------------------------------------------------------*
+*&                  CONSTANTS
+*&---------------------------------------------------------------------*
+CONSTANTS:  c_e                             VALUE 'E',
+*            c_s                             VALUE 'S',
+            c_status_2   TYPE c             VALUE '2',
+            c_status_1   TYPE c             VALUE '1',
+            c_x                             VALUE 'X',
+            c_mestyp     TYPE  edidc-mestyp VALUE 'YSE_VT_ORD_COMPL',
+            c_idoc_type  TYPE  edidc-idoctp VALUE 'YSE_VT_ORD_COMPL',
+            c_segm(16)   TYPE c             VALUE 'YSE_VT_ORD_COMPL',
+            c_ls(2)      TYPE c             VALUE 'LS',
+            c_stat_pcnf  TYPE j_status      VALUE 'I0010',
+            c_stat_cnf   TYPE j_status      VALUE 'I0009',
+            c_stat_clsd  TYPE j_status      VALUE 'I0046'.
+
+*&---------------------------------------------------------------------*
+*&  Selection screen                                                   *
+*&---------------------------------------------------------------------*
+* Input file
+PARAMETERS: p_infile TYPE  epsfilnam LOWER CASE OBLIGATORY,
+            p_mdate  TYPE  filemoddat DEFAULT sy-datum OBLIGATORY.
+
+*&---------------------------------------------------------------------*
+*&  Main program                                                       *
+*&---------------------------------------------------------------------*
+START-OF-SELECTION.
+
+* Read input file from Visitour
+  PERFORM read_file.
+
+* Get SAP data
+  PERFORM get_sap_data.
+
+* Compare input from VisiTour with SEO in SAP
+  PERFORM compare_data.
+
+  DELETE ADJACENT DUPLICATES FROM gt_out_cnf.
+* Display differences
+  IF gt_out_cnf[] IS INITIAL
+    AND gt_out_pcnf[] IS INITIAL.
+    MESSAGE i001(00) WITH 'No completed orders exists'(i01).
+  ELSE.
+    IF gt_out_cnf[] IS NOT INITIAL.
+      PERFORM send_cnf_vt.
+    ENDIF.
+    IF gt_out_pcnf[] IS NOT INITIAL.
+      PERFORM send_pcnf_vt.
+    ENDIF.
+  ENDIF.
+
+END-OF-SELECTION.
+  PERFORM proc_log_out.
+
+*&---------------------------------------------------------------------*
+*&      Form  READ_FILE
+*&---------------------------------------------------------------------*
+*       Read input file
+*----------------------------------------------------------------------*
+FORM read_file .
+
+  DATA: ls_retcd  LIKE sy-subrc.                  " return code
+* Logical system
+  CALL FUNCTION 'OWN_LOGICAL_SYSTEM_GET'
+    IMPORTING
+      own_logical_system             = gv_logsys
+    EXCEPTIONS
+      own_logical_system_not_defined = 1
+      OTHERS                         = 2.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE  c_e NUMBER sy-msgno
+         WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+    EXIT.
+  ENDIF.
+
+  REPLACE 'xxx' IN gs_directory WITH gv_logsys(3).
+  CONCATENATE gs_directory p_infile INTO gv_pfile.
+
+* Check the date of the file
+  PERFORM check_date.
+  IF NOT gv_error IS INITIAL.
+    MESSAGE s001(00)
+      DISPLAY LIKE c_e
+      WITH 'No file exsit on the date'(t03)
+           p_mdate.
+    LEAVE LIST-PROCESSING.
+  ENDIF.
+
+* FILE READ FROM APPLICATION SERVER
+  PERFORM get_from_appl USING   gv_pfile
+                                ls_retcd.
+  IF ls_retcd <> 0.
+    MESSAGE e001(00)
+      WITH 'Failed to get data from application server'(t04).
+  ENDIF.
+
+* Store in an internal table
+  LOOP AT gt_prev INTO gs_prev.
+    CLEAR gs_vt.
+    SPLIT gs_prev AT cl_abap_char_utilities=>horizontal_tab
+      INTO gs_vt-aufnr gs_vt-servtype.
+    PERFORM add_zeros USING gs_vt-aufnr.
+    APPEND gs_vt TO gt_vt.
+  ENDLOOP.
+
+  SORT gt_vt BY aufnr.
+  DELETE ADJACENT DUPLICATES FROM gt_vt COMPARING aufnr.
+
+ENDFORM.                    " READ_FILE
+
+*&---------------------------------------------------------------------*
+*&      Form  ADD_ZEROS
+*&---------------------------------------------------------------------*
+*       Add leading zeros
+*----------------------------------------------------------------------*
+*      -->P_FIELD : field
+*----------------------------------------------------------------------*
+FORM add_zeros  USING    p_field.
+
+  CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+    EXPORTING
+      input  = p_field
+    IMPORTING
+      output = p_field.
+
+ENDFORM.                    " ADD_ZEROS
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_SAP_DATA
+*&---------------------------------------------------------------------*
+*       Get SAP data for Service Orders
+*----------------------------------------------------------------------*
+FORM get_sap_data .
+
+  CHECK NOT gt_vt[] IS INITIAL.
+* Get Service Order Header data
+  SELECT s~aufnr s~objnr h~iwerk INTO TABLE gt_aufk
+    FROM aufk AS s
+      INNER JOIN afih AS h
+      ON h~aufnr = s~aufnr
+      FOR ALL ENTRIES IN gt_vt
+      WHERE s~aufnr = gt_vt-aufnr.
+
+  CHECK NOT gt_aufk[] IS INITIAL.
+* Get Status data (for status 'Closed' and 'CNF')
+  SELECT objnr stat INTO TABLE gt_jest_cnf
+         FROM jest
+         FOR ALL ENTRIES IN gt_aufk
+         WHERE objnr = gt_aufk-objnr
+           AND    ( stat  = c_stat_clsd
+              OR    stat  = c_stat_cnf )
+           AND inact = ' '.
+* Get status data (for status 'PCNF')
+  SELECT objnr stat INTO TABLE gt_jest_pcnf
+         FROM jest
+         FOR ALL ENTRIES IN gt_aufk
+         WHERE objnr = gt_aufk-objnr
+           AND stat  = c_stat_pcnf
+           AND inact = ' '.
+
+ENDFORM.                    " GET_SAP_DATA
+
+*&---------------------------------------------------------------------*
+*&      Form  COMPARE_DATA
+*&---------------------------------------------------------------------*
+*       Compare input from VisiTour with SEO in SAP
+*----------------------------------------------------------------------*
+FORM compare_data .
+
+* Get the completed order in header level
+  LOOP AT gt_vt INTO gs_vt.
+    CLEAR: gv_flag.
+*   Progress indicator
+    gv_text = 'Order & is being processed'(i02).
+    REPLACE '&' WITH gs_vt-aufnr INTO gv_text.
+    CONDENSE gv_text.
+    CALL FUNCTION 'SAPGUI_PROGRESS_INDICATOR'
+      EXPORTING
+        text = gv_text.
+
+*   Get Service Order Header data (SAP)
+    CLEAR gs_aufk.
+    READ TABLE gt_aufk INTO gs_aufk
+      WITH KEY aufnr = gs_vt-aufnr.
+    CHECK sy-subrc = 0.
+    gv_objnr = gs_aufk-objnr.
+
+*   Get status 'Closed'
+    CLEAR gs_jest.
+    READ TABLE gt_jest_cnf INTO gs_jest
+      WITH KEY objnr = gv_objnr.
+    IF sy-subrc = 0.
+      gv_flag = 'C'.
+    ELSE.
+      READ TABLE gt_jest_pcnf INTO gs_jest
+        WITH KEY objnr = gv_objnr.
+      IF sy-subrc = 0.
+        gv_flag = 'P'.
+      ENDIF.
+    ENDIF.
+*   Check the order has status 'CNF' or 'CLSD' or PCNF
+    CHECK gv_flag IS NOT INITIAL.
+
+*   Get status line (System)
+    PERFORM get_status_line.
+
+*   Fill internal table for output
+    PERFORM fill_output.
+  ENDLOOP.
+
+ENDFORM.                    " COMPARE_DATA
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_STATUS_LINE
+*&---------------------------------------------------------------------*
+*       Get status line (System)
+*----------------------------------------------------------------------*
+FORM get_status_line .
+
+  CLEAR: gv_stat_line,
+         gv_stat_line_usr.
+
+  CALL FUNCTION 'STATUS_TEXT_EDIT'
+    EXPORTING
+      client                  = sy-mandt
+      flg_user_stat           = 'X'
+      objnr                   = gs_aufk-objnr
+      only_active             = 'X'
+      spras                   = c_e
+*      BYPASS_BUFFER           = ' '
+    IMPORTING
+*      ANW_STAT_EXISTING       =
+*      E_STSMA                 =
+      line                    = gv_stat_line
+      user_line               = gv_stat_line_usr
+*      STONR                   =
+   EXCEPTIONS
+     object_not_found        = 1
+     OTHERS                  = 2
+            .
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+ENDFORM.                    " GET_STATUS_LINE
+
+*&---------------------------------------------------------------------*
+*&      Form  FILL_OUTPUT
+*&---------------------------------------------------------------------*
+*       Fill internal table for output
+*----------------------------------------------------------------------*
+FORM fill_output .
+
+  gs_out-aufnr      = gs_vt-aufnr.
+  gs_out-status_vt  = gs_vt-servtype.
+  gs_out-iwerk      = gs_aufk-iwerk.
+  gs_out-status_sap = gv_stat_line.
+  gs_out-status_usr = gv_stat_line_usr.
+  IF gv_flag = 'C'.
+    APPEND gs_out TO gt_out_cnf.
+  ELSEIF gv_flag = 'P'.
+    APPEND gs_out TO gt_out_pcnf.
+  ENDIF.
+
+  CLEAR: gs_vt,
+         gv_stat_line,
+         gv_stat_line_usr.
+
+ENDFORM.                    " FILL_OUTPUT
+
+*&---------------------------------------------------------------------*
+*&      Form  SEND_CNF_VT
+*&---------------------------------------------------------------------*
+*       (Re)Send completed info to VisiTour
+*----------------------------------------------------------------------*
+FORM send_cnf_vt .
+
+  DATA: lv_aufnr        TYPE aufnr,
+        wa_vt_segm      TYPE yse_vt_ord_compl,
+        wa_edidc        TYPE edidc,
+        ls_edidd_data   TYPE edidd,
+        i_edidc_control_comm TYPE edidc OCCURS 1 WITH HEADER LINE,
+        lt_edidd_data   TYPE STANDARD TABLE OF  edidd.
+
+* Loop on the selected records
+  LOOP AT gt_out_cnf INTO gs_out.
+
+    CLEAR: wa_vt_segm, lv_aufnr.
+    REFRESH: lt_edidd_data,i_edidc_control_comm[].
+
+*   Progress indicator
+    gv_text = 'Order & is being processed'(i02).
+    REPLACE '&' WITH gs_out-aufnr INTO gv_text.
+    CONDENSE gv_text.
+    CALL FUNCTION 'SAPGUI_PROGRESS_INDICATOR'
+      EXPORTING
+        text = gv_text.
+
+*   Get SAP data
+    READ TABLE gt_aufk INTO gs_aufk
+      WITH KEY aufnr = gs_out-aufnr.
+    CHECK sy-subrc = 0.
+
+*   Find receiving partner
+    SELECT SINGLE rcvprn INTO wa_edidc-rcvprn
+           FROM edp13
+           WHERE mestyp = c_mestyp.
+
+*   Polulate Control Record
+    wa_edidc-mestyp =  c_mestyp.
+    wa_edidc-idoctp =  c_idoc_type.
+    wa_edidc-rcvprt =  c_ls.
+
+*   Create Idoc
+    WRITE gs_out-aufnr TO lv_aufnr NO-ZERO.
+    wa_vt_segm-extid = lv_aufnr.
+    wa_vt_segm-status = c_status_2.
+    wa_vt_segm-iwerk  = gs_out-iwerk.
+    ls_edidd_data-segnam  = c_segm.
+    ls_edidd_data-sdata   = wa_vt_segm.
+    APPEND ls_edidd_data TO lt_edidd_data .
+
+*   Generate Idoc
+    CALL FUNCTION 'MASTER_IDOC_DISTRIBUTE'
+      EXPORTING
+        master_idoc_control            = wa_edidc
+      TABLES
+        communication_idoc_control     = i_edidc_control_comm
+        master_idoc_data               = lt_edidd_data
+      EXCEPTIONS
+        error_in_idoc_control          = 1
+        error_writing_idoc_status      = 2
+        error_in_idoc_data             = 3
+        sending_logical_system_unknown = 4
+        OTHERS                         = 5.
+    IF sy-subrc <> 0.
+      MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+              WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+    ENDIF.
+
+    CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+      EXPORTING
+        wait = 'X'.
+*
+    CALL FUNCTION 'EDI_DOCUMENT_DEQUEUE_LATER'
+      EXPORTING
+        docnum                 = i_edidc_control_comm-docnum
+      EXCEPTIONS
+        idoc_is_not_to_dequeue = 1
+        OTHERS                 = 2.
+    IF sy-subrc <> 0.
+      MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+              WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+    ENDIF.
+    gv_cnt_sent = gv_cnt_sent + 1.
+
+  ENDLOOP.
+
+ENDFORM.                    " SEND_CNF_VT
+
+*
+FORM get_from_appl USING p_infile p_subrc.
+
+  DATA: ls_prev TYPE ty_prev.
+  OPEN DATASET p_infile FOR INPUT IN TEXT MODE ENCODING DEFAULT.
+  IF sy-subrc <> 0.
+    WRITE: / text-e03, p_infile.
+    p_subrc = 4.
+    EXIT.
+  ENDIF.
+
+  REFRESH gt_prev.
+
+  DO.
+    READ DATASET p_infile INTO ls_prev.
+    IF sy-subrc <> 0.
+      EXIT.
+    ENDIF.
+    APPEND ls_prev TO gt_prev.
+  ENDDO.
+  CLOSE DATASET p_infile.
+
+ENDFORM.                    " GET_FROM_APPL
+
+*&---------------------------------------------------------------------*
+*&      Form  CHECK_DATE
+*&---------------------------------------------------------------------*
+*       Check the date of the file
+*----------------------------------------------------------------------*
+FORM check_date .
+
+  DATA: lv_mtime    TYPE p  DECIMALS 0,
+        lv_time(10) TYPE c,
+        lv_mdate    TYPE sydatum.
+
+  CLEAR gv_error.
+
+  CALL FUNCTION 'EPS_GET_FILE_ATTRIBUTES'
+    EXPORTING
+      file_name              = p_infile
+      dir_name               = gs_directory
+    IMPORTING
+      file_mtime             = lv_mtime
+    EXCEPTIONS
+      read_directory_failed  = 1
+      read_attributes_failed = 2
+      OTHERS                 = 3.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+  PERFORM p6_to_date_time_tz IN PROGRAM rstr0400
+                             USING lv_mtime
+                                   lv_time
+                                   lv_mdate.
+
+  IF lv_mdate NE p_mdate.
+    MESSAGE ID 'YSE_GENERAL' TYPE 'E' NUMBER '000'
+            WITH 'Wrong date of input file'(e02) lv_mdate.
+    gv_error = c_x.
+  ENDIF.
+
+ENDFORM.                    " CHECK_DATE
+*&---------------------------------------------------------------------*
+*&      Form  PROC_LOG_OUT
+*&---------------------------------------------------------------------*
+*       Display the process result
+*----------------------------------------------------------------------*
+FORM proc_log_out .
+
+  MESSAGE i001(00) WITH 'Number of Orders sent to VisiTour :'(i03)
+                      gv_cnt_sent.
+
+ENDFORM.                    " PROC_LOG_OUT
+*&---------------------------------------------------------------------*
+*&      Form  SEND_PCNF_VT
+*&---------------------------------------------------------------------*
+*       (Re)Send Partially confirmed line info to VisiTour
+*----------------------------------------------------------------------*
+FORM send_pcnf_vt .
+  TYPES:  BEGIN OF lty_afvc,
+            aufnr   TYPE afko-aufnr,
+            aufpl   TYPE afko-aufpl,
+            aplzl   TYPE afvc-aplzl,
+            vornr   TYPE afvc-vornr,
+            steus   TYPE afvc-steus,
+          END OF lty_afvc.
+
+  DATA:  lv_aufnr        TYPE aufnr,
+         lv_objnr_oper    TYPE jest-objnr,
+         wa_vt_segm      TYPE yse_vt_ord_compl,
+         wa_edidc        TYPE edidc,
+         ls_edidd_data   TYPE edidd,
+         lt_afvc         TYPE STANDARD TABLE OF lty_afvc,
+         ls_afvc         TYPE lty_afvc,
+         i_edidc_control_comm TYPE edidc OCCURS 1 WITH HEADER LINE,
+         lt_edidd_data   TYPE STANDARD TABLE OF  edidd.
+
+  CHECK gt_out_pcnf IS NOT INITIAL.
+  SELECT    afko~aufnr
+            afko~aufpl
+            afvc~aplzl
+            afvc~vornr
+            afvc~steus
+    INTO CORRESPONDING FIELDS OF TABLE lt_afvc
+    FROM afko
+      INNER JOIN afvc
+      ON afko~aufpl =  afvc~aufpl
+    FOR ALL entries IN gt_out_pcnf
+    WHERE afko~aufnr = gt_out_pcnf-aufnr.
+
+* Loop on the selected records
+  LOOP AT gt_out_pcnf INTO gs_out.
+
+*   Progress indicator
+    gv_text = 'Order & is being processed'(i02).
+    REPLACE '&' WITH gs_out-aufnr INTO gv_text.
+    CONDENSE gv_text.
+    CALL FUNCTION 'SAPGUI_PROGRESS_INDICATOR'
+      EXPORTING
+        text = gv_text.
+
+    LOOP AT lt_afvc INTO ls_afvc
+      WHERE aufnr = gs_out-aufnr
+        AND steus = 'ZCO3'.
+      CLEAR: wa_vt_segm, lv_aufnr.
+      REFRESH: lt_edidd_data,i_edidc_control_comm[].
+      CONCATENATE 'OV' ls_afvc-aufpl ls_afvc-aplzl
+        INTO lv_objnr_oper.
+      CALL FUNCTION 'STATUS_CHECK'
+        EXPORTING
+          objnr             = lv_objnr_oper
+          status            = c_stat_cnf   " CNF
+        EXCEPTIONS
+          object_not_found  = 1
+          status_not_active = 2
+          OTHERS            = 3.
+      IF sy-subrc <> 0.
+        CONTINUE.
+      ENDIF.
+*     Find receiving partner
+      SELECT SINGLE rcvprn INTO wa_edidc-rcvprn
+             FROM edp13
+             WHERE mestyp = c_mestyp.
+
+*     Polulate Control Record
+      wa_edidc-mestyp =  c_mestyp.
+      wa_edidc-idoctp =  c_idoc_type.
+      wa_edidc-rcvprt =  c_ls.
+
+*     Create Idoc
+      WRITE gs_out-aufnr TO lv_aufnr NO-ZERO.
+      CONCATENATE lv_aufnr '/' ls_afvc-vornr
+        INTO wa_vt_segm-extid.
+      wa_vt_segm-status = c_status_1.
+      wa_vt_segm-iwerk  = gs_out-iwerk.
+      ls_edidd_data-segnam  = c_segm.
+      ls_edidd_data-sdata   = wa_vt_segm.
+      APPEND ls_edidd_data TO lt_edidd_data .
+
+*     Generate Idoc
+      CALL FUNCTION 'MASTER_IDOC_DISTRIBUTE'
+        EXPORTING
+          master_idoc_control            = wa_edidc
+        TABLES
+          communication_idoc_control     = i_edidc_control_comm
+          master_idoc_data               = lt_edidd_data
+        EXCEPTIONS
+          error_in_idoc_control          = 1
+          error_writing_idoc_status      = 2
+          error_in_idoc_data             = 3
+          sending_logical_system_unknown = 4
+          OTHERS                         = 5.
+      IF sy-subrc <> 0.
+        MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+                WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+      ENDIF.
+
+      CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+        EXPORTING
+          wait = 'X'.
+*
+      CALL FUNCTION 'EDI_DOCUMENT_DEQUEUE_LATER'
+        EXPORTING
+          docnum                 = i_edidc_control_comm-docnum
+        EXCEPTIONS
+          idoc_is_not_to_dequeue = 1
+          OTHERS                 = 2.
+      IF sy-subrc <> 0.
+        MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+                WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+      ENDIF.
+      gv_cnt_sent = gv_cnt_sent + 1.
+    ENDLOOP.
+  ENDLOOP.
+
+ENDFORM.                    " SEND_PCNF_VT
+
+*Text symbol text£º
+*E02:Wrong date of input file
+*E03:Can't open file:
+*I01:No completed orders exists
+*I02:Order & is being processed
+*I03:Number of Orders sent to VisiTour :
+*T03:No file exsit on the date
+
+*T04:Failed to get data from application server
+*Selection text£º
+*P_INFILE:        Input fileName
+*P_MDATE:        Date of last change

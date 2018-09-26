@@ -1,0 +1,527 @@
+*&---------------------------------------------------------------------*
+*&  Include           YSE_VISA_AB_CLEAN_FORMS                          *
+*&---------------------------------------------------------------------*
+
+*&---------------------------------------------------------------------*
+*&      Form  DATA_GET
+*&---------------------------------------------------------------------*
+FORM data_get .
+
+  RANGES:
+    lr_ebelp FOR it_ekbe-ebelp,
+    lr_zekkn FOR it_ekbe-zekkn.
+*MOD-003 ADD BEGIN
+  DATA: lt_clean        TYPE STANDARD TABLE OF yse_visa_ab_hist,
+        lt_temp_clean   TYPE STANDARD TABLE OF yse_visa_ab_hist,
+        lv_packsize     TYPE I.
+  lv_packsize = 20000.
+*MOD-003 ADD END
+
+* Get confirmations from YSE_VISA_AB_HIST
+  SELECT      yse_visa_ab_hist~mandt
+              docnum
+              yse_visa_ab_hist~ebeln
+              ebelp
+              credat
+              cretim
+              ebtyp
+              matnr
+              bstmg
+              eindt
+              yse_visa_ab_hist~bukrs
+              yse_visa_ab_hist~ekorg
+              idtnr
+              xblnr
+              bbein
+              wmeng
+              bbmng
+              plifz
+              meins
+              erdat
+              erzeit
+              yse_visa_ab_hist~aedat
+              aezeit
+              status
+              text
+         INTO TABLE lt_clean PACKAGE SIZE lv_packsize
+         FROM yse_visa_ab_hist
+         JOIN ekko
+           ON ekko~ebeln EQ yse_visa_ab_hist~ebeln
+*       WHERE DOCNUM                  IN S_DOCNUM
+        WHERE yse_visa_ab_hist~ebeln  IN s_ebeln
+*         AND CREDAT                  IN S_CREDAT
+*         AND EBTYP                   IN S_EBTYP
+*         AND BUKRS                   IN S_BUKRS
+          AND yse_visa_ab_hist~ekorg  IN s_ekorg
+          AND lifnr                   IN s_lifnr
+          AND erdat                   IN s_erdat
+          AND yse_visa_ab_hist~aedat  IN s_aedat
+          AND status                  IN s_status.
+
+    IF NOT lt_clean IS INITIAL.
+      APPEND LINES OF lt_clean TO it_clean.
+*  **begin of mod-003 del
+*  *   Get ordered qty, delivery and invoice status for *all* items of prev sel orders
+*      SELECT      ebeln ebelp menge elikz erekz
+*                  loekz                                       "MOD-001
+*             INTO TABLE it_ekpo
+*             FROM ekpo
+*              FOR ALL ENTRIES IN it_clean
+*            WHERE ebeln EQ it_clean-ebeln.
+*  **end of mod-003 del
+*     Get delivery and invoicing history for *all* items of prev sel orders
+*      SELECT      ebeln ebelp zekkn vgabe gjahr belnr buzei menge shkzg
+*             INTO TABLE it_ekbe
+*             FROM ekbe
+*              FOR ALL ENTRIES IN it_clean
+*            WHERE ebeln EQ it_clean-ebeln
+*              AND ebelp IN lr_ebelp  "Range is empty, so all items will be returned, but this will be more performant
+*              AND zekkn IN lr_zekkn
+*              AND vgabe IN ('1', '2').
+*  **end of mod-003 del
+*  *********Begin of MOD-002  MOD ****************************
+*  *   Get full history for selected items
+*      SELECT      *
+*             INTO TABLE it_hist
+*             FROM yse_visa_ab_hist
+*              FOR ALL ENTRIES IN it_clean
+*            WHERE ebeln EQ it_clean-ebeln.
+        SORT lt_clean BY ebeln.
+        DELETE ADJACENT DUPLICATES FROM lt_clean COMPARING ebeln.
+***   Begin of MOD-003 ADD
+*       Get ordered qty, delivery and invoice status for *all* items of prev sel orders
+        SELECT      ebeln ebelp menge elikz erekz
+                    loekz
+               INTO TABLE it_ekpo
+               FROM ekpo
+                FOR ALL ENTRIES IN lt_clean
+              WHERE ebeln EQ lt_clean-ebeln.
+*   Get delivery and invoicing history for *all* items of prev sel orders
+        SELECT      ebeln ebelp zekkn vgabe gjahr belnr buzei menge shkzg
+               INTO TABLE it_ekbe
+               FROM ekbe
+                FOR ALL ENTRIES IN lt_clean
+              WHERE ebeln EQ lt_clean-ebeln
+                AND ebelp IN lr_ebelp  "Range is empty, so all items will be returned, but this will be more performant
+                AND zekkn IN lr_zekkn
+                AND vgabe IN ('1', '2').
+***   End of MOD-003 ADD
+*       Get full history for selected items
+        SELECT      *
+           INTO TABLE it_hist
+           FROM yse_visa_ab_hist
+            FOR ALL ENTRIES IN lt_clean
+          WHERE ebeln EQ lt_clean-ebeln.
+***   Begin of MOD-003 ADD
+        PERFORM DATA_PROCESS.
+***   End of MOD-003 ADD
+        REFRESH: lt_clean,it_clean,it_ekbe,it_ekpo.
+      endif.
+*  *********End of MOD-002  MOD   ****************************
+    ENDSELECT.
+    PERFORM ARCHIVE_MAPPING.
+* Update database table
+    IF p_test EQ space.
+      DELETE yse_visa_ab_hist FROM TABLE it_clean_show.
+    ENDIF.
+  ENDFORM.                    " DATA_GET
+
+*&---------------------------------------------------------------------*
+*&      Form  DATA_PROCESS
+*&---------------------------------------------------------------------*
+FORM data_process .
+
+* Aggregate delivered and invoiced quantities per PO item
+  PERFORM build_poi_qtys.
+  FREE it_ekbe.                                             "MOD-001.
+
+* Analyse, per PO, whether all items are fully del'd and inv'd
+  PERFORM build_poi_status.
+  FREE it_ekpo.                                             "MOD-001
+
+* Analyse, per PO, whether all status messages are selected for deletion
+  PERFORM build_his_analysis.
+
+* For every entry selected for deletion
+  LOOP AT it_clean.
+
+*   Check if all history lines for the PO are selected for deletion
+    READ TABLE it_his_status WITH KEY ebeln = it_clean-ebeln
+                             BINARY SEARCH.
+    IF sy-subrc EQ 0.
+      DELETE it_clean.
+      CONTINUE.
+    ENDIF.
+
+*   Check if full PO is closed
+    READ TABLE it_poi_status WITH KEY ebeln = it_clean-ebeln
+                             BINARY SEARCH.
+    IF sy-subrc NE 0 OR it_poi_status-closed EQ space.
+      DELETE it_clean.
+      CONTINUE.
+    ENDIF.
+
+  ENDLOOP.
+  APPEND LINES OF it_clean to it_clean_show.
+
+ENDFORM.                    " DATA_PROCESS
+
+*&---------------------------------------------------------------------*
+*&      Form  BUILD_POI_STATUS
+*&---------------------------------------------------------------------*
+FORM build_poi_status .
+
+  DATA: lv_prev_ebeln LIKE it_poi_status-ebeln.
+
+* Start processing the PO numbers in IT_CLEAN
+  SORT it_clean BY ebeln.
+  SORT it_ekpo BY ebeln ebelp.                              "MOD-001
+
+  LOOP AT it_clean.
+
+*   Check PO number is different from previous one
+    CHECK it_clean-ebeln NE lv_prev_ebeln.
+    lv_prev_ebeln        = it_clean-ebeln.
+    it_poi_status-ebeln  = it_clean-ebeln.
+    it_poi_status-closed = 'X'.
+
+*   Loop over the PO's items
+    LOOP AT it_ekpo WHERE ebeln EQ it_clean-ebeln.
+*     Check if item is marked for deletion                  "MOD-001
+      CHECK it_ekpo-loekz NE 'L'.                           "MOD-001
+
+*     If the item doesn't have the "fully delivered" flag set
+      IF it_ekpo-elikz NE 'X'.
+*       Get the delivered qty from ekbe, aggregated/totalled in IT_POI_DELIVERED
+        READ TABLE it_poi_delivered WITH KEY ebeln = it_ekpo-ebeln
+                                             ebelp = it_ekpo-ebelp
+                                    BINARY SEARCH.
+*       If no delivered qty found in history, or the qty is not equal to ordered qty
+        IF sy-subrc NE 0 OR it_poi_delivered-menge NE it_ekpo-menge.
+*         Item is not closed
+          CLEAR it_poi_status-closed.
+          EXIT.
+        ENDIF.
+      ENDIF.
+
+*     If the item doesn't have the "fully invoiced" flag set
+      IF it_ekpo-erekz NE 'X'.
+*       Get the invoiced qty from ekbe, aggregated/totalled in IT_POI_INVOICED
+        READ TABLE it_poi_invoiced WITH KEY ebeln = it_ekpo-ebeln
+                                            ebelp = it_ekpo-ebelp
+                                   BINARY SEARCH.
+*       If no invoiced qty found in history, or the qty is not equal to ordered qty
+        IF sy-subrc NE 0 OR it_poi_invoiced-menge NE it_ekpo-menge.
+*         Item is not closed
+          CLEAR it_poi_status-closed.
+          EXIT.
+        ENDIF.
+      ENDIF.
+    ENDLOOP.
+
+*   Save PO items status
+    APPEND it_poi_status.
+
+  ENDLOOP.
+
+ENDFORM.                    " BUILD_POI_STATUS
+
+*&---------------------------------------------------------------------*
+*&      Form  BUILD_HIS_ANALYSIS
+*&---------------------------------------------------------------------*
+FORM build_his_analysis .
+
+  SORT:
+    it_hist  BY docnum,
+    it_clean BY docnum.
+
+* For every history line selected
+  LOOP AT it_hist.
+
+*   Find same entry in clean
+    READ TABLE it_clean WITH KEY docnum = it_hist-docnum
+                        BINARY SEARCH.
+*   If not found, add PO number to table with PO's for which
+*   not all history is selected by parameters
+    IF sy-subrc NE 0.
+      it_his_status-ebeln = it_hist-ebeln.
+      APPEND it_his_status.
+    ENDIF.
+
+  ENDLOOP.
+
+  SORT it_his_status BY ebeln.
+  DELETE ADJACENT DUPLICATES FROM it_his_status.
+
+ENDFORM.                    " BUILD_HIS_ANALYSIS
+
+*&---------------------------------------------------------------------*
+*&      Form  BUILD_ALV
+*&---------------------------------------------------------------------*
+FORM build_alv .
+
+  DATA: lv_offline TYPE int4.
+
+* If container is still initial
+  IF go_cont IS INITIAL.
+
+*   Get fieldcatalog
+*   Fetch the field catalog for structure
+    CALL FUNCTION 'LVC_FIELDCATALOG_MERGE'
+      EXPORTING
+        i_buffer_active  = ' '
+        i_structure_name = 'YSE_VISA_AB_CLEAN_OUT'
+      CHANGING
+        ct_fieldcat      = it_fcat.
+
+    CALL METHOD cl_gui_alv_grid=>offline
+      RECEIVING
+        e_offline = lv_offline.
+
+    IF lv_offline IS INITIAL.
+*     Create the container
+      CREATE OBJECT go_cont
+        EXPORTING
+          repid    = sy-repid
+          dynnr    = sy-dynnr
+          lifetime = cntl_lifetime_dynpro
+          ratio    = 95
+          side     = cl_gui_docking_container=>dock_at_bottom.
+    ENDIF.
+
+*   Create the ALV control
+    CREATE OBJECT go_alv
+      EXPORTING
+        i_parent = go_cont.
+
+*   Create Event handler control
+    CREATE OBJECT go_evth.
+
+*   Enable events on ALV
+    SET HANDLER go_evth->handle_double_click FOR go_alv.
+
+*   Optimize column width
+    gs_layout-cwidth_opt = 'X'.
+
+*   Set for display
+    CALL METHOD go_alv->set_table_for_first_display
+      EXPORTING
+        i_save          = 'A'
+        is_layout       = gs_layout
+      CHANGING
+        it_outtab       = it_clean_show[]
+        it_fieldcatalog = it_fcat[].
+
+  ENDIF.    " GO_CONT IS INITIAL
+
+ENDFORM.                    " BUILD_ALV
+
+*&---------------------------------------------------------------------*
+*&      Form  ARCHIVE_MAPPING
+*&---------------------------------------------------------------------*
+FORM archive_mapping .
+
+  DATA:
+    lv_ebeln LIKE ekko-ebeln,
+    lv_subrc LIKE sy-subrc,
+    lwa_poheader  TYPE bapimepoheader,
+    lwa_poheaderx TYPE bapimepoheaderx,
+
+    BEGIN OF lt_ebeln   OCCURS 0,
+      ebeln LIKE ekko-ebeln,
+    END OF lt_ebeln,
+
+    BEGIN OF lt_map OCCURS 0,
+      ebeln  LIKE ekko-ebeln,
+      ebelp  LIKE ekpo-ebelp,
+      etenr  LIKE eket-etenr,
+      ekorg  LIKE ekko-ekorg,
+      bukrs  LIKE ekko-bukrs,
+      lifnr  LIKE ekko-lifnr,
+      ihrez  LIKE ekko-ihrez,
+      licha  LIKE eket-licha,
+    END OF lt_map,
+
+    lt_map_his    TYPE yse_po_map_his OCCURS 0 WITH HEADER LINE,
+    lt_poitem     TYPE bapimepoitem   OCCURS 0 WITH HEADER LINE,
+    lt_poitemx    TYPE bapimepoitemx  OCCURS 0 WITH HEADER LINE,
+    lt_return     TYPE bapiret2       OCCURS 0 WITH HEADER LINE.
+
+
+  CHECK p_test EQ space.
+
+* Build table of unique PO numbers that are about to be cleaned up from AB_HIST
+  CHECK NOT it_clean_show[] IS INITIAL.
+  LOOP AT it_clean_show.
+    lt_ebeln-ebeln = it_clean_show-ebeln.
+    APPEND lt_ebeln.
+  ENDLOOP.
+
+* Make list unique/sorted
+  SORT lt_ebeln BY ebeln.
+  DELETE ADJACENT DUPLICATES FROM lt_ebeln COMPARING ebeln.
+
+* Select current mapping for all items of these PO's
+  SELECT      ekko~ebeln ekpo~ebelp etenr ekorg ekko~bukrs lifnr ihrez licha
+         INTO TABLE lt_map
+         FROM ekko
+         JOIN ekpo
+           ON ekpo~ebeln EQ ekko~ebeln
+         JOIN eket
+           ON eket~ebeln EQ ekpo~ebeln
+          AND eket~ebelp EQ ekpo~ebelp
+          FOR ALL entries IN lt_ebeln
+        WHERE ekko~ebeln EQ lt_ebeln-ebeln
+          AND eket~etenr EQ ( SELECT MAX( etenr ) FROM eket WHERE ebeln EQ ekpo~ebeln AND ebelp EQ ekpo~ebelp ).
+  SORT lt_map BY ebeln ebelp.
+
+* Loop over those item mappings
+  LOOP AT lt_map.
+
+*   ******************************
+*   When arriving at new PO number
+*   ******************************
+    AT NEW ebeln.
+*     Clear structures and tables for the BAPI
+      CLEAR: lwa_poheader, lwa_poheaderx.
+      REFRESH: lt_return, lt_poitem, lt_poitemx.
+    ENDAT.
+
+*   *************
+*   For any entry
+*   *************
+*   ** Add it to the tables for the bapi **
+*   Check that current entry has a mapping in IHREZ LICHA to begin with
+    CHECK lt_map-ihrez NE space AND lt_map-licha NE space.
+*   Clear IHREZ and set flag
+    lwa_poheader-ref_1    = space.
+    lwa_poheaderx-ref_1   = 'X'.
+*   Define item to be updated
+    lt_poitem-po_item     = lt_map-ebelp.
+    lt_poitemx-po_item    = lt_map-ebelp.
+*   Clear Vendor batch and set flag
+    lt_poitem-vendrbatch  = space.
+    lt_poitemx-vendrbatch = 'X'.
+*   Append item and it's flags
+    APPEND: lt_poitem, lt_poitemx.
+*   ** Add entry to the table holding mapping backup (or MAP_HIS)
+    MOVE-CORRESPONDING lt_map TO lt_map_his.
+    lt_map_his-etenr = 0.
+    SELECT MAX( etenr )
+           FROM yse_po_map_his
+           INTO lt_map_his-etenr
+          WHERE ebeln EQ lt_map-ebeln
+            AND ebelp EQ lt_map-ebelp.
+    lt_map_his-etenr = lt_map_his-etenr + 1.
+    lt_map_his-credat = sy-datum.
+    lt_map_his-cretim = sy-uzeit.
+    APPEND lt_map_his.
+
+*   *************************
+*   At the end of a PO number
+*   *************************
+    AT END OF ebeln.
+*     Have the update done if any item needs updating
+      IF NOT lt_poitem[] IS INITIAL.
+        CALL FUNCTION 'BAPI_PO_CHANGE'
+          EXPORTING
+            purchaseorder = lt_map-ebeln
+            poheader      = lwa_poheader
+            poheaderx     = lwa_poheaderx
+          TABLES
+            return        = lt_return
+            poitem        = lt_poitem
+            poitemx       = lt_poitemx.
+*       If an error occurred
+        READ TABLE lt_return WITH KEY type = 'E'.
+        IF sy-subrc EQ 0. " error found
+**         Remove the entries from LT_MAP_HIS (removing the mapping failed so no need to keep history)
+*          DELETE LT_MAP_HIS WHERE EBELN EQ LT_MAP-EBELN.
+*         Write list with update failure
+          WRITE: / 'Failed to remove IHREZ/LICHA mapping from PO', lt_map-ebeln.
+*       If no error occured updating the PO
+        ELSE.
+*         Commit the PO update
+          CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+            EXPORTING
+              wait   = 'X'
+            IMPORTING
+              return = lt_return.
+        ENDIF.
+      ENDIF.
+    ENDAT.
+  ENDLOOP.
+
+* Save removed mapping to MAP_HIS
+  MODIFY yse_po_map_his FROM lt_map_his.
+
+ENDFORM.                    " ARCHIVE_MAPPING
+
+*&---------------------------------------------------------------------*
+*&      Form  BUILD_POI_QTYS
+*&---------------------------------------------------------------------*
+FORM build_poi_qtys .
+
+* Loop over PO item history to come up with 1 delivered qty and 1 invoiced qty
+  CLEAR: it_poi_delivered, it_poi_invoiced, it_poi_delivered[], it_poi_invoiced[].
+
+  SORT it_ekbe BY ebeln ebelp vgabe shkzg.
+
+  LOOP AT it_ekbe.
+
+*   If history line is a delivery
+    IF it_ekbe-vgabe EQ '1'.
+*     If we reached a new PO item
+      IF it_poi_delivered-ebeln NE it_ekbe-ebeln OR it_poi_delivered-ebelp NE it_ekbe-ebelp.
+*       If a line has already been prepared
+        IF NOT it_poi_delivered-ebeln IS INITIAL AND NOT it_poi_delivered-ebelp IS INITIAL.
+*         First save the total for the previous PO item
+          APPEND it_poi_delivered.
+*         Initialise the totalling header line for a new po
+          CLEAR it_poi_delivered.
+        ENDIF.
+*       Put the PO item identifiers in the totalling header line
+        it_poi_delivered-ebeln = it_ekbe-ebeln.
+        it_poi_delivered-ebelp = it_ekbe-ebelp.
+      ENDIF.
+*     Now process the quantity
+      IF it_ekbe-shkzg = 'S'.
+        it_poi_delivered-menge = it_poi_delivered-menge + it_ekbe-menge.
+      ELSEIF it_ekbe-shkzg = 'H'.
+        it_poi_delivered-menge = it_poi_delivered-menge - it_ekbe-menge.
+      ENDIF.
+    ELSEIF it_ekbe-vgabe EQ '2'.
+*     If we reached a new PO item
+      IF it_poi_invoiced-ebeln NE it_ekbe-ebeln OR it_poi_invoiced-ebelp NE it_ekbe-ebelp.
+*       If a line has already been prepared
+        IF NOT it_poi_invoiced-ebeln IS INITIAL AND NOT it_poi_invoiced-ebelp IS INITIAL.
+*         First save the total for the previous PO item
+          APPEND it_poi_invoiced.
+*         Initialise the totalling header line for a new po
+          CLEAR it_poi_invoiced.
+        ENDIF.
+*       Put the PO item identifiers in the totalling header line
+        it_poi_invoiced-ebeln = it_ekbe-ebeln.
+        it_poi_invoiced-ebelp = it_ekbe-ebelp.
+      ENDIF.
+*     Now process the quantity
+      IF it_ekbe-shkzg = 'S'.
+        it_poi_invoiced-menge = it_poi_invoiced-menge + it_ekbe-menge.
+      ELSEIF it_ekbe-shkzg = 'H'.
+        it_poi_invoiced-menge = it_poi_invoiced-menge - it_ekbe-menge.
+      ENDIF.
+
+    ENDIF.
+
+  ENDLOOP.
+
+* Save the totalling lines if they are not initial (in that case, they contain the total for the last
+* processed PO item history.
+  IF NOT it_poi_delivered-ebeln IS INITIAL AND NOT it_poi_delivered-ebelp IS INITIAL.
+    APPEND it_poi_delivered.
+  ENDIF.
+  IF NOT it_poi_invoiced-ebeln IS INITIAL AND NOT it_poi_invoiced-ebelp IS INITIAL.
+    APPEND it_poi_invoiced.
+  ENDIF.
+
+ENDFORM.                    " BUILD_POI_QTYS

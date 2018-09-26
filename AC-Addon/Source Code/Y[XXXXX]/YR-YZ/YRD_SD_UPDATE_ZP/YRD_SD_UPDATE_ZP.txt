@@ -1,0 +1,345 @@
+*&---------------------------------------------------------------------*
+*& Report  YRD_SD_UPDATE_ZP
+*&
+*&---------------------------------------------------------------------*
+*&
+*&
+*&---------------------------------------------------------------------*
+
+REPORT  yrd_sd_update_zp NO STANDARD PAGE HEADING LINE-SIZE 255.
+
+
+TYPES: BEGIN OF ty_upload,
+        vbeln TYPE vbap-vbeln,
+       END OF ty_upload.
+
+DATA: it_upload TYPE STANDARD TABLE OF ty_upload,
+      wa_upload TYPE ty_upload,
+      it_upload1 TYPE STANDARD TABLE OF ty_upload WITH HEADER LINE,
+      itab      TYPE STANDARD TABLE OF alsmex_tabline WITH HEADER LINE.
+
+SELECTION-SCREEN BEGIN OF BLOCK bk1 WITH FRAME TITLE text-001.
+PARAMETERS: pcfile LIKE rlgrap-filename.
+SELECTION-SCREEN END OF BLOCK bk1.
+
+
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR pcfile.
+  PERFORM pc_file_help.
+
+START-OF-SELECTION.
+  PERFORM excel_into_intab.
+  PERFORM updata_so.
+
+
+
+
+
+
+
+
+
+
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  PC_FILE_HELP
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM pc_file_help .
+
+  CALL FUNCTION 'WS_FILENAME_GET'
+    EXPORTING
+      def_filename     = ''
+      def_path         = 'C:\ '
+      mask             = ',ExcelÎÄ¼þ(*.XLS;*.XLSX),*.XLS;*.XLSX,'
+      mode             = 'O'
+      title            = 'UPLOAD'
+    IMPORTING
+      filename         = pcfile
+*     RC               =
+    EXCEPTIONS
+      inv_winsys       = 1
+      no_batch         = 2
+      selection_cancel = 3
+      selection_error  = 4
+      OTHERS           = 5.
+
+ENDFORM.                    " PC_FILE_HELP
+*&---------------------------------------------------------------------*
+*&      Form  EXCEL_INTO_INTAB
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM excel_into_intab .
+
+  FIELD-SYMBOLS: <wa_itab> TYPE alsmex_tabline.
+  CALL FUNCTION 'ALSM_EXCEL_TO_INTERNAL_TABLE'
+    EXPORTING
+      filename    = pcfile
+      i_begin_col = 1
+      i_begin_row = 1
+      i_end_col   = 1
+      i_end_row   = 9999
+    TABLES
+      intern      = itab.
+  IF sy-subrc <> 0.
+* Implement suitable error handling here
+  ENDIF.
+
+  SORT itab BY row.
+  DELETE itab WHERE row = '0001'.  "Delete Excel Title
+
+  LOOP AT itab ASSIGNING <wa_itab>.
+    CASE <wa_itab>-col.
+      WHEN '0001'.
+        wa_upload-vbeln = <wa_itab>-value.
+    ENDCASE.
+    AT END OF row.
+      APPEND wa_upload TO it_upload.
+      CLEAR wa_upload.
+    ENDAT.
+  ENDLOOP.
+
+ENDFORM.                    " EXCEL_INTO_INTAB
+*&---------------------------------------------------------------------*
+*&      Form  UPDATA_SO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM updata_so .
+
+  DATA: lines TYPE i.
+  DATA: length TYPE i.
+
+  DATA: it_ekkn TYPE TABLE OF ekkn WITH HEADER LINE,
+        it_vbfa TYPE TABLE OF vbfa WITH HEADER LINE,
+        wa_vbpa_we TYPE vbpa,
+        wa_vbpa_zp TYPE vbpa,
+        wa_vbak_rdc TYPE vbak,
+        wa_vbpa_rdc TYPE vbpa.
+  DATA: BEGIN OF it_return OCCURS 0,
+         vbeln TYPE vbak-vbeln,
+         mark  TYPE c,
+        END OF it_return.
+
+
+* CHECK SO
+  LOOP AT it_upload INTO wa_upload.
+    CLEAR: length.
+    length = STRLEN( wa_upload-vbeln ).
+    IF length <> '10'.
+      UNPACK wa_upload-vbeln TO wa_upload-vbeln.
+      MODIFY it_upload FROM wa_upload.
+    ENDIF.
+  ENDLOOP.
+
+
+*UPDATE SO
+  LOOP AT it_upload INTO wa_upload.
+    CLEAR: wa_vbpa_we,wa_vbpa_zp,it_ekkn,it_ekkn[].
+    "Get CC so Partner WE/ZP
+    SELECT SINGLE * FROM vbpa INTO wa_vbpa_we
+     WHERE vbeln = wa_upload-vbeln
+       AND posnr = '000000'
+       AND parvw = 'WE'.
+    SELECT SINGLE * FROM vbpa INTO wa_vbpa_zp
+     WHERE vbeln = wa_upload-vbeln
+       AND posnr = '000000'
+       AND parvw = 'ZP'.
+
+    "From CC so number to Get CC po number
+    SELECT * FROM ekkn INTO TABLE it_ekkn
+     WHERE vbeln = wa_upload-vbeln.
+    IF sy-subrc = 0.
+      SORT it_ekkn BY ebeln ebelp.
+      DELETE ADJACENT DUPLICATES FROM it_ekkn COMPARING ebeln.
+
+      LOOP AT it_ekkn.
+        CLEAR:wa_vbak_rdc.
+        "From CC po number to Get RDC so number
+        SELECT SINGLE * FROM vbak INTO wa_vbak_rdc
+         WHERE auart = 'ZOR'
+           AND vkorg = 'CN06'
+           AND bstnk = it_ekkn-ebeln.
+        IF sy-subrc = 0.
+***CC Partner WE NAME/ADDRESS CHANGE SYNC RDC**********************************
+          CLEAR: wa_vbpa_rdc.
+          SELECT SINGLE * FROM vbpa INTO wa_vbpa_rdc
+           WHERE vbeln = wa_vbak_rdc-vbeln
+             AND posnr = '000000'
+             AND parvw = 'WE'.
+          IF wa_vbpa_we-adrnr <> wa_vbpa_rdc-adrnr.
+            wa_vbpa_rdc-adrnr = wa_vbpa_we-adrnr.
+            MODIFY vbpa FROM wa_vbpa_rdc.
+            CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'.
+            IF sy-subrc = 0.
+              it_return-vbeln = wa_vbak_rdc-vbeln.
+              it_return-mark = 'S'.
+              APPEND it_return.
+            ENDIF.
+          ELSE.
+            IF wa_vbak_rdc-kunnr = '0102000098'.
+              wa_vbpa_rdc-kunnr = '1000037458'.
+            ELSEIF wa_vbak_rdc-kunnr = '0102000610'.
+              wa_vbpa_rdc-kunnr = '1000037459'.
+            ELSEIF wa_vbak_rdc-kunnr = '0103000080'.
+              wa_vbpa_rdc-kunnr = '1000037460'.
+            ENDIF.
+
+            MODIFY vbpa FROM wa_vbpa_rdc.
+            CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'.
+            IF sy-subrc = 0.
+              it_return-vbeln = wa_vbak_rdc-vbeln.
+              it_return-mark = 'S'.
+              APPEND it_return.
+            ENDIF.
+
+          ENDIF.
+***CC Partner ZP NAME3/TELPHONE/MOBILE CHANGE SYNC RDC*************************
+          CLEAR: wa_vbpa_rdc.
+          SELECT SINGLE * FROM vbpa INTO wa_vbpa_rdc
+           WHERE vbeln = wa_vbak_rdc-vbeln
+             AND posnr = '000000'
+             AND parvw = 'ZP'.
+          IF wa_vbpa_zp-adrnr <> wa_vbpa_rdc-adrnr OR
+             wa_vbpa_zp-adrnp <> wa_vbpa_rdc-adrnp.
+
+            wa_vbpa_rdc-adrnr = wa_vbpa_zp-adrnr.
+            wa_vbpa_rdc-adrnp = wa_vbpa_zp-adrnp.
+            MODIFY vbpa FROM wa_vbpa_rdc.
+            CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'.
+            IF sy-subrc = 0.
+              it_return-vbeln = wa_vbak_rdc-vbeln.
+              it_return-mark = 'S'.
+              APPEND it_return.
+            ENDIF.
+          ELSE.
+            IF wa_vbak_rdc-kunnr = '0102000098'.
+              wa_vbpa_rdc-parnr = '135362'.
+            ELSEIF wa_vbak_rdc-kunnr = '0102000610'.
+              wa_vbpa_rdc-parnr = '135364'.
+            ELSEIF wa_vbak_rdc-kunnr = '0103000080'.
+              wa_vbpa_rdc-parnr = '135365'.
+            ENDIF.
+
+            MODIFY vbpa FROM wa_vbpa_rdc.
+            CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'.
+            IF sy-subrc = 0.
+              it_return-vbeln = wa_vbak_rdc-vbeln.
+              it_return-mark = 'S'.
+              APPEND it_return.
+            ENDIF.
+          ENDIF.
+
+
+          "From RDC so number to Get RDC Dlv number
+          CLEAR: it_vbfa,it_vbfa[].
+          SELECT * FROM vbfa INTO TABLE it_vbfa
+           WHERE vbelv = wa_vbak_rdc-vbeln
+             AND vbfa~vbtyp_n = 'J'.
+          IF sy-subrc = 0.
+            SORT it_vbfa BY vbeln.
+            DELETE ADJACENT DUPLICATES FROM it_vbfa COMPARING vbeln.
+
+            LOOP AT it_vbfa.
+***CC Partner WE NAME/ADDRESS CHANGE SYNC RDC**********************************
+              CLEAR: wa_vbpa_rdc.
+              SELECT SINGLE * FROM vbpa INTO wa_vbpa_rdc
+               WHERE vbeln = it_vbfa-vbeln
+                 AND posnr = '000000'
+                 AND parvw = 'WE'.
+              IF wa_vbpa_we-adrnr <> wa_vbpa_rdc-adrnr.
+
+                wa_vbpa_rdc-adrnr = wa_vbpa_we-adrnr.
+                MODIFY vbpa FROM wa_vbpa_rdc.
+                CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'.
+                IF sy-subrc = 0.
+                  it_return-vbeln = wa_vbak_rdc-vbeln.
+                  it_return-mark = 'S'.
+                  APPEND it_return.
+                ENDIF.
+              ELSE.
+                IF wa_vbak_rdc-kunnr = '0102000098'.
+                  wa_vbpa_rdc-kunnr = '1000037458'.
+                ELSEIF wa_vbak_rdc-kunnr = '0102000610'.
+                  wa_vbpa_rdc-kunnr = '1000037459'.
+                ELSEIF wa_vbak_rdc-kunnr = '0103000080'.
+                  wa_vbpa_rdc-kunnr = '1000037460'.
+                ENDIF.
+
+                MODIFY vbpa FROM wa_vbpa_rdc.
+                CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'.
+                IF sy-subrc = 0.
+                  it_return-vbeln = wa_vbak_rdc-vbeln.
+                  it_return-mark = 'S'.
+                  APPEND it_return.
+                ENDIF.
+              ENDIF.
+***CC Partner ZP NAME3/TELPHONE/MOBILE CHANGE SYNC RDC*************************
+              CLEAR: wa_vbpa_rdc.
+              SELECT SINGLE * FROM vbpa INTO wa_vbpa_rdc
+               WHERE vbeln = it_vbfa-vbeln
+                 AND posnr = '000000'
+                 AND parvw = 'ZP'.
+              IF wa_vbpa_zp-adrnr <> wa_vbpa_rdc-adrnr OR
+                 wa_vbpa_zp-adrnp <> wa_vbpa_rdc-adrnp.
+
+                wa_vbpa_rdc-adrnr = wa_vbpa_zp-adrnr.
+                wa_vbpa_rdc-adrnp = wa_vbpa_zp-adrnp.
+                MODIFY vbpa FROM wa_vbpa_rdc.
+                CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'.
+                IF sy-subrc = 0.
+                  it_return-vbeln = wa_vbak_rdc-vbeln.
+                  it_return-mark = 'S'.
+                  APPEND it_return.
+                ENDIF.
+              ELSE.
+                IF wa_vbak_rdc-kunnr = '0102000098'.
+                  wa_vbpa_rdc-parnr = '135362'.
+                ELSEIF wa_vbak_rdc-kunnr = '0102000610'.
+                  wa_vbpa_rdc-parnr = '135364'.
+                ELSEIF wa_vbak_rdc-kunnr = '0103000080'.
+                  wa_vbpa_rdc-parnr = '135365'.
+                ENDIF.
+
+                MODIFY vbpa FROM wa_vbpa_rdc.
+                CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'.
+                IF sy-subrc = 0.
+                  it_return-vbeln = wa_vbak_rdc-vbeln.
+                  it_return-mark = 'S'.
+                  APPEND it_return.
+                ENDIF.
+              ENDIF.
+            ENDLOOP.
+          ENDIF.
+
+        ENDIF.
+      ENDLOOP.
+    ENDIF.
+
+  ENDLOOP.
+
+
+* End of processing
+  SORT it_return BY vbeln.
+  DELETE ADJACENT DUPLICATES FROM it_return COMPARING vbeln.
+  DESCRIBE TABLE it_return LINES lines.
+  IF lines IS NOT INITIAL.
+    WRITE: 'End of processing:', lines, 'rows updated'.
+  ENDIF.
+
+ENDFORM.                    " UPDATA_SO
+
+*Selection text£º
+*PCFILE:        Excle File

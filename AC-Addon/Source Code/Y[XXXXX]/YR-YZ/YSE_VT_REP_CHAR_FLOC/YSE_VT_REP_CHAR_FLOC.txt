@@ -1,0 +1,446 @@
+*&---------------------------------------------------------------------*
+*& Report  YSE_VT_REP_CHAR_FLOC
+*&
+*&---------------------------------------------------------------------*
+*&                                                                     *
+*& Report with Characteristics for Functional Locations                *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+*  Author                : Jules Smets
+*  Date                  : 09.03.2012
+*  Change Request Number : CR2459
+*  Transport request Nr. : CD1K970679
+*----------------------------------------------------------------------*
+*                                                                      *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD.NR. | DATE       | NAME           | CORRECTION NR. | CHANGE REF. *
+*----------------------------------------------------------------------*
+* MOD-000 |            |                | CD1K......     | CR....      *
+*----------------------------------------------------------------------*
+
+************************************************************************
+
+REPORT  yse_vt_rep_char_floc.
+
+TABLES: iflo,
+        ausp,
+        cabnt.
+
+* ALV grid
+TYPE-POOLS: slis.
+
+* Internal table with plants
+DATA: BEGIN OF it_wrk  OCCURS 0,
+        iwerk     TYPE iwerk,
+      END OF it_wrk.
+
+* Internal table with functional locations
+DATA: BEGIN OF it_iflo  OCCURS 0,
+        tplnr     TYPE tplnr,
+        iwerk     TYPE iwerk,
+        ingrp     TYPE ingrp,
+        pltxt     TYPE pltxt,
+      END OF it_iflo.
+DATA: wa_iflo  LIKE LINE OF it_iflo.
+
+* Internal table with output lines
+DATA: BEGIN OF it_out  OCCURS 0,
+        tplnr     TYPE tplnr,
+        pltxt     TYPE pltxt,
+        iwerk     TYPE iwerk,
+        ingrp     TYPE ingrp,
+        chars     TYPE atbez,
+        value     TYPE atwrt,
+      END OF it_out.
+DATA: wa_out  LIKE LINE OF it_out.
+
+* Internal table with classificaton data
+DATA: BEGIN OF it_clobjdat OCCURS 0.
+        INCLUDE STRUCTURE clobjdat.
+DATA: END OF it_clobjdat.
+
+* Internal table with classes
+DATA: BEGIN OF it_class OCCURS 0.
+        INCLUDE STRUCTURE sclass.
+DATA: END OF it_class.
+
+DATA: xv_variant         LIKE disvariant,
+      xv_variant_flag    TYPE c,
+      xv_sd_alv_variant  LIKE disvariant,
+      xt_fcat            TYPE slis_t_fieldcat_alv,
+      ls_fcat            LIKE LINE OF xt_fcat,
+      xt_alv_sort        TYPE slis_t_sortinfo_alv,
+      ls_alv_sort        LIKE LINE OF xt_alv_sort,
+      xv_user_command    TYPE slis_formname  VALUE 'USER_COMMAND',
+      xv_variant_save    TYPE c              VALUE 'U',
+      xv_layout          TYPE slis_layout_alv.
+
+DATA: gv_object       TYPE objnum,
+      gv_atinn        TYPE atinn,
+      gv_col(10)      TYPE n,
+      gv_repid        LIKE sy-repid.
+
+CONSTANTS: c_atnam_permi    TYPE atnam       VALUE 'ZAM_PERMITS',
+           c_atnam_longi    TYPE atnam       VALUE 'ZAM_LONGITUDE',
+           c_atnam_latit    TYPE atnam       VALUE 'ZAM_LATITUDE',
+           c_cltype_003     TYPE klassenart  VALUE '003',
+           c_objtab_iflot   TYPE tabelle     VALUE 'IFLOT',
+           c_e              TYPE xfeld       VALUE 'E',
+           c_x              TYPE xfeld       VALUE 'X'.
+
+* Selections
+SELECTION-SCREEN  BEGIN OF BLOCK sel  WITH FRAME  TITLE text-s01.
+SELECT-OPTIONS: so_iwerk  FOR iflo-iwerk  OBLIGATORY
+                              MEMORY ID iwk,
+                so_ingrp  FOR iflo-ingrp,
+                so_tplnr  FOR iflo-tplnr.
+SELECTION-SCREEN SKIP.
+PARAMETERS: p_permi  AS CHECKBOX  DEFAULT 'X',
+            p_longi  AS CHECKBOX,
+            p_latit  AS CHECKBOX.
+SELECTION-SCREEN SKIP.
+PARAMETERS: p_fill   AS CHECKBOX.
+SELECTION-SCREEN  END OF BLOCK sel.
+
+
+*----------------------------------------------------------------------*
+* On the selection screen                                              *
+*----------------------------------------------------------------------*
+AT SELECTION-SCREEN.
+
+  PERFORM  check_authorization.
+
+
+*&---------------------------------------------------------------------*
+*&  Main program                                                       *
+*&---------------------------------------------------------------------*
+START-OF-SELECTION.
+
+* Statistics for transaction / program
+  CALL METHOD ycl_statistics=>record_transaction.
+
+* Build & display list
+  PERFORM select_data.
+  PERFORM alv_fcat.
+  PERFORM alv_layout.
+  PERFORM alv_sort.
+  PERFORM alv_display.
+
+
+*&---------------------------------------------------------------------*
+*&  Forms                                                              *
+*&---------------------------------------------------------------------*
+
+*&---------------------------------------------------------------------*
+*&      FORM  CHECK_AUTHORIZATION
+*&---------------------------------------------------------------------*
+*       Check authorizations
+*----------------------------------------------------------------------*
+FORM check_authorization .
+
+  SELECT werks FROM t001w
+               INTO TABLE it_wrk
+               WHERE werks IN so_iwerk.
+
+  LOOP AT it_wrk.
+    AUTHORITY-CHECK OBJECT 'I_IWERK'
+             ID 'TCD'   FIELD sy-tcode
+             ID 'IWERK' FIELD it_wrk-iwerk.
+    IF sy-subrc = 4.
+*     No authorisation to display data
+      MESSAGE ID 'YSE_GENERAL' TYPE 'E' NUMBER '010' WITH it_wrk-iwerk.
+      EXIT.
+    ELSEIF sy-subrc <> 0.
+*     Error checking authorization.
+      MESSAGE ID 'YSE_GENERAL' TYPE 'E' NUMBER '004'.
+      EXIT.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    " CHECK_AUTHORIZATION
+
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_DATA
+*&---------------------------------------------------------------------*
+*       Select data
+*----------------------------------------------------------------------*
+FORM select_data .
+
+  REFRESH: it_iflo,
+           it_out.
+
+* Select Function Locations
+  SELECT tplnr iwerk ingrp pltxt
+         INTO TABLE it_iflo
+         FROM iflo
+         WHERE tplnr IN so_tplnr
+           AND iwerk IN so_iwerk
+           AND ingrp IN so_ingrp.
+  SORT it_iflo.
+
+  CHECK NOT it_iflo[] IS INITIAL.
+
+* Fill output table
+  LOOP AT it_iflo.
+
+*   Get characteristics
+    PERFORM get_characteristics.
+    CHECK NOT it_clobjdat[] IS INITIAL.
+
+*   Fill output line
+    PERFORM fill_line.
+
+  ENDLOOP.
+
+ENDFORM.                    " SELECT_DATA
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_CHARACTERISTICS
+*&---------------------------------------------------------------------*
+*       Get characteristics
+*----------------------------------------------------------------------*
+FORM get_characteristics .
+
+  CLEAR it_clobjdat[].
+
+  MOVE it_iflo-tplnr TO gv_object.
+
+* Get functional location configuration
+  CALL FUNCTION 'CLAF_CLASSIFICATION_OF_OBJECTS'
+    EXPORTING
+      classtype          = c_cltype_003
+      object             = gv_object
+      objecttable        = c_objtab_iflot
+    TABLES
+      t_class            = it_class
+      t_objectdata       = it_clobjdat
+    EXCEPTIONS
+      no_classification  = 1
+      no_classtypes      = 2
+      invalid_class_type = 3
+      OTHERS             = 4.
+
+  IF sy-subrc <> 0.
+*    MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*            WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+  ENDIF.
+
+ENDFORM.                    " GET_CHARACTERISTICS
+
+*&---------------------------------------------------------------------*
+*&      Form  FILL_LINE
+*&---------------------------------------------------------------------*
+*       Fill output line
+*----------------------------------------------------------------------*
+FORM fill_line .
+
+  CLEAR it_out.
+
+* Function Location data
+  MOVE-CORRESPONDING it_iflo TO it_out.
+
+* Characteristics
+  LOOP AT it_clobjdat.
+    CASE it_clobjdat-atnam.
+      WHEN c_atnam_permi.
+        IF NOT p_permi IS INITIAL.
+          PERFORM fill_chars.
+        ENDIF.
+      WHEN c_atnam_longi.
+        IF NOT p_longi IS INITIAL.
+          PERFORM fill_chars.
+        ENDIF.
+      WHEN c_atnam_latit.
+        IF NOT p_latit IS INITIAL.
+          PERFORM fill_chars.
+        ENDIF.
+    ENDCASE.
+  ENDLOOP.
+
+ENDFORM.                    " FILL_LINE
+
+*&---------------------------------------------------------------------*
+*&      Form  FILL_CHARS
+*&---------------------------------------------------------------------*
+*       Fill line with Charactristic
+*----------------------------------------------------------------------*
+FORM fill_chars .
+
+  IF NOT p_fill IS INITIAL.
+    CHECK it_clobjdat-ausp1 CN ' ?'.
+  ENDIF.
+  it_out-chars = it_clobjdat-smbez.
+  it_out-value = it_clobjdat-ausp1.
+  APPEND it_out.
+
+ENDFORM.                    " FILL_CHARS
+
+*&---------------------------------------------------------------------*
+*&      Form  ALV_FCAT
+*&---------------------------------------------------------------------*
+*       ALV field catalog
+*----------------------------------------------------------------------*
+FORM alv_fcat .
+*
+** Create Fieldcatalogue from internal table
+** CALL FUNCTION 'REUSE_ALV_FIELDCATALOG_MERGE' ...
+
+  CLEAR gv_col.
+
+* Field definitions
+  PERFORM add_field USING 'TPLNR'  30  'Functional Location'(t01) 'X'.
+  PERFORM add_field USING 'PLTXT'  40  'Description'(t02)         ' '.
+  PERFORM add_field USING 'IWERK'   6  'Plant'(t03)               ' '.
+  PERFORM add_field USING 'INGRP'   6  'PlGrp'(t04)               ' '.
+  PERFORM add_field USING 'CHARS'  30  'Characteristic'(t05)      ' '.
+  PERFORM add_field USING 'VALUE'  30  'Value'(t06)               ' '.
+
+ENDFORM.                    " ALV_FCAT
+
+*&---------------------------------------------------------------------*
+*&      Form  ADD_FIELD
+*&---------------------------------------------------------------------*
+*       Add field to field catalog
+*----------------------------------------------------------------------*
+FORM add_field  USING    p_field
+                         p_len
+                         p_descr
+                         p_hotsp.
+
+  gv_col = gv_col + 1.
+
+  CLEAR ls_fcat.
+  ls_fcat-col_pos    = gv_col.
+  ls_fcat-fieldname  = p_field.
+  ls_fcat-outputlen  = p_len.
+  ls_fcat-seltext_l  = p_descr.
+  ls_fcat-seltext_m  = p_descr.
+  ls_fcat-seltext_s  = p_descr.
+  ls_fcat-fix_column = 'X'.
+  ls_fcat-emphasize  = 'X'.
+  ls_fcat-hotspot    = p_hotsp.
+
+  APPEND ls_fcat TO xt_fcat.
+
+ENDFORM.                    " ADD_FIELD
+
+*&---------------------------------------------------------------------*
+*&      Form  ALV_LAYOUT
+*&---------------------------------------------------------------------*
+*       Modify ALV layout
+*----------------------------------------------------------------------*
+FORM alv_layout .
+
+  xv_layout-zebra = c_x.
+*  xv_layout-colwidth_optimize = c_x.
+*  xv_layout-smalltitle = 'X'.
+*  xv_layout-grid_title = 'title'.
+
+ENDFORM.                    " ALV_LAYOUT
+
+*----------------------------------------------------------------------*
+*       Form  ALV_SORT
+*----------------------------------------------------------------------*
+*       Sort ALV layout
+*----------------------------------------------------------------------*
+FORM alv_sort.
+
+* Function location
+  ls_alv_sort-spos      = '1'.
+  ls_alv_sort-fieldname = 'TPLNR'.
+  ls_alv_sort-up        = 'X'.
+  APPEND ls_alv_sort TO xt_alv_sort.
+* Description
+  ls_alv_sort-spos      = '1'.
+  ls_alv_sort-fieldname = 'PLTXT'.
+  ls_alv_sort-up        = 'X'.
+  APPEND ls_alv_sort TO xt_alv_sort.
+
+ENDFORM.                    " ALV_SORT
+
+*&---------------------------------------------------------------------*
+*&      Form  ALV_DISPLAY
+*&---------------------------------------------------------------------*
+*       Display ALV grid
+*----------------------------------------------------------------------*
+FORM alv_display .
+
+*  xv_sd_alv_variant = xv_variant.
+  gv_repid = sy-repid.
+
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+    EXPORTING
+      i_callback_program      = gv_repid
+      i_callback_user_command = xv_user_command
+*      i_callback_top_of_page  = 'ALV_TOP'
+      i_grid_title            = 'Functional Location Characteristics'(h01)
+      is_layout               = xv_layout
+      it_fieldcat             = xt_fcat
+      it_sort                 = xt_alv_sort
+      i_default               = 'X'
+      i_save                  = 'A'
+*      is_variant              = xv_sd_alv_variant
+      i_screen_start_column   = 0
+      i_screen_start_line     = 0
+      i_screen_end_column     = 0
+      i_screen_end_line       = 0
+    TABLES
+      t_outtab                = it_out
+    EXCEPTIONS
+      program_error           = 1
+      OTHERS                  = 2.
+
+  IF sy-subrc NE 0.
+*   message id sy-msgid type sy-msgty number sy-msgno
+*           with sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+
+ENDFORM.                    " ALV_DISPLAY
+
+*&---------------------------------------------------------------------*
+*&   Form  USER_COMMAND
+*&---------------------------------------------------------------------*
+*    Process user command
+*----------------------------------------------------------------------*
+FORM user_command USING ucomm    LIKE sy-ucomm
+                        selfield TYPE slis_selfield.
+
+*-- Check function code
+  CASE ucomm.
+    WHEN '&IC1'.
+*     Select hotspot
+      IF NOT selfield-value IS INITIAL.
+        CASE selfield-fieldname.
+          WHEN 'TPLNR'.
+*           Show Functional Location
+            CLEAR wa_out.
+            READ TABLE it_out INDEX selfield-tabindex INTO wa_out.
+            SET PARAMETER ID 'IFL' FIELD wa_out-tplnr.
+            CALL TRANSACTION 'IL03' AND SKIP FIRST SCREEN.
+        ENDCASE.
+      ENDIF.
+  ENDCASE.
+
+ENDFORM.                    " USER_COMMAND
+
+*Text symbol text£º
+*H01:Functional Location Characteristics
+*S01:Selections
+*T01:Functional Location
+*T02:Description
+*T03:Plant
+*T04:PlGrp
+*T05:Characteristic
+
+*T06:Value
+*Selection text£º
+*P_FILL:        Only filled characteristics
+*P_LATIT:        Latitude
+*P_LONGI:        Longitude
+*P_PERMI:        Permits
+*SO_INGRP:D       .
+*SO_IWERK:D       .
+*SO_TPLNR:D       .

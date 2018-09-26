@@ -1,0 +1,164 @@
+REPORT  ZREPRESB.
+*----------------------------------------------------------------------*
+* This report corrects order reservations which still have the         *
+* requirements type 'SB' set from the planned order. This may          *
+* happen when an MRP-run is performed during a planned order           *
+* conversion.                                                          *
+*----------------------------------------------------------------------*
+TABLES: RESB, AFKO,  AFVC, IONR,TCOKO, afpo, plaf.
+
+
+DATA: BEGIN OF RESB_T OCCURS 0.
+        INCLUDE STRUCTURE RESB.
+DATA: END OF RESB_T.
+DATA: BEGIN OF AFKO_T OCCURS 0.
+        INCLUDE STRUCTURE AFKO.
+DATA: END OF AFKO_T.
+DATA: COUNTER TYPE I.
+data: l_plnum like plaf-plnum.
+data: begin of lt_plaf occurs 0.
+        include structure plaf.
+data: end of lt_plaf.
+PARAMETER: TESTMODE DEFAULT 'X'.
+SELECT-OPTIONS ORDERNR FOR AFKO-AUFNR.
+
+SELECT * FROM AFKO INTO CORRESPONDING FIELDS OF TABLE AFKO_T
+                     WHERE AUFNR IN ORDERNR.
+
+LOOP AT AFKO_T.
+  refresh resb_t.
+  SELECT * FROM RESB INTO TABLE RESB_T
+                   WHERE RSNUM EQ AFKO_T-RSNUM
+                   AND   BDART = 'SB'.
+* Planauftragsnummer merken
+  select single plnum from afpo into l_plnum
+                     where aufnr eq afko_t-aufnr.
+* Bringt Report ¨¹berhaupt etwas?
+  IF NOT RESB_T[] IS INITIAL.
+
+    LOOP AT RESB_T.
+      CLEAR afvc.
+      IF NOT resb_t-vornr IS INITIAL.
+        SELECT SINGLE * FROM afvc WHERE aufpl = afko_t-aufpl
+                                  AND   aplfl = resb_t-plnfl
+                                  AND   vornr = resb_t-vornr.
+      ENDIF.
+      IF afvc IS INITIAL.
+        SELECT SINGLE * FROM afvc WHERE aufpl = afko_t-aufpl
+                                  AND   aplfl = '000000'.
+      ENDIF.
+
+      RESB_T-BDART = 'AR'.
+      RESB_T-PLNFL = AFVC-APLFL.
+      RESB_T-VORNR = AFVC-VORNR.
+      RESB_T-APLZL = AFVC-APLZL.
+      clear resb_t-plnum.
+* Komponente freigegeben? -> dann xwaok setzen
+      IF resb_t-schgt IS INITIAL AND
+         resb_t-dbskz IS INITIAL AND
+         resb_t-vorab IS INITIAL AND
+         resb_t-txtps IS INITIAL AND
+         resb_t-dumps IS INITIAL AND
+         resb_t-kzkup IS INITIAL AND
+         NOT resb_t-matnr IS INITIAL.
+        IF NOT resb_t-objnr IS INITIAL.
+          CALL FUNCTION 'STATUS_CHECK'
+            EXPORTING
+              objnr             = resb_t-objnr
+              status            = 'I0002'
+            EXCEPTIONS
+              object_not_found  = 01
+              status_not_active = 02.
+        ELSE.
+          sy-subrc = 1.
+        ENDIF.
+        IF sy-subrc = 1.
+* Statusobject of component does not exist -> check if
+* allocated operation is released
+          CALL FUNCTION 'STATUS_CHECK'
+               EXPORTING
+                    OBJNR             = AFVC-OBJNR
+                    STATUS            = 'I0002'
+               EXCEPTIONS
+                    OBJECT_NOT_FOUND  = 01
+                    STATUS_NOT_ACTIVE = 02.
+        ENDIF.
+        IF SY-SUBRC IS INITIAL.
+          RESB_T-XWAOK = 'X'.
+        ENDIF.
+      ENDIF.
+      RESB_T-AUFNR = AFKO_T-AUFNR.
+      RESB_T-AUFPL = AFKO_T-AUFPL.
+*....Bewegungsart setzen
+      SELECT SINGLE * FROM TCOKO WHERE ARBGE EQ 'CO'.
+      IF RESB_T-SHKZG EQ 'S'.
+        MOVE TCOKO-WN_BWART TO RESB_T-BWART.
+        IF NOT RESB_T-KZKUP IS INITIAL.
+          MOVE TCOKO-WE_BWART TO RESB_T-BWART.
+        ENDIF.
+      ELSE.
+        MOVE TCOKO-WA_BWART TO RESB_T-BWART.
+      ENDIF.
+      IF TESTMODE IS INITIAL.
+* Objektnummer ermitteln
+        IONR-OBART    = 'OK'.
+        IONR-OBJID    = RESB_T-RSNUM.
+        IONR-OBJID+10 = RESB_T-RSPOS.
+        IONR-OBJID+14 = RESB_T-RSART.
+        RESB_T-OBJNR         = IONR.
+
+        CALL FUNCTION 'STATUS_CHECK'
+             EXPORTING
+                  OBJNR             = RESB_T-OBJNR
+                  STATUS            = 'I0013'
+             EXCEPTIONS
+                  OBJECT_NOT_FOUND  = 1
+                  STATUS_NOT_ACTIVE = 2
+                  OTHERS            = 3.
+
+* Objekt schon vorhanden?
+        IF SY-SUBRC EQ 1.
+          CALL FUNCTION 'STATUS_OBJECT_CREATE'
+               EXPORTING
+                    OBJNR = RESB_T-OBJNR
+                    OBTYP = 'OKP'
+               IMPORTING
+                    OBJNR = RESB_T-OBJNR.
+        ENDIF.
+
+        UPDATE RESB FROM RESB_T.
+      ELSE.
+        IF COUNTER EQ 0.
+          WRITE: / 'order ',AFKO_T-AUFNR,' needs to be fixed.'.
+          WRITE: 'Please run report without testmode!'.
+          COUNTER = 1.
+        ENDIF.
+      ENDIF.
+      WRITE: / RESB_T-AUFNR,RESB_T-RSNUM, RESB_T-RSPOS, RESB_T-MATNR.
+    ENDLOOP.
+* Pr¨¹fen ob der Planauftrag zu l#schen ist
+    select single * from plaf where plnum eq l_plnum.
+    if sy-subrc is initial and afko_t-rsnum = plaf-rsnum.
+      lt_plaf = plaf.
+      append lt_plaf.
+      IF TESTMODE IS INITIAL.
+        CALL FUNCTION 'MD_LOESCHEN_PLANAUFTRAG'
+          TABLES
+            IPLAF          = LT_PLAF.
+       refresh lt_plaf.
+       clear l_plnum.
+      else.
+        write: / 'Planned order', lt_plaf-plnum, 'has to be deleted'.
+        write: / 'Run this report without testmode'.
+      endif.
+    endif.
+  ELSE.
+    WRITE: / 'The order',AFKO_T-AUFNR,'is ok or can`t be fixed',
+    'with this report'.
+  ENDIF.
+ENDLOOP.
+COMMIT WORK.
+
+*Selection text£º
+*ORDERNR:D       .
+*TESTMODE:        Testmode

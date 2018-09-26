@@ -1,0 +1,1108 @@
+*&---------------------------------------------------------------------*
+*&  Include           YSE_ITEMLIST_BE_RETURNED_FRM                     *
+*&---------------------------------------------------------------------*
+
+*&---------------------------------------------------------------------*
+*&      Form  FILL_RANGES
+*&---------------------------------------------------------------------*
+FORM FILL_RANGES .
+
+  R_BWART_RECEIPT-SIGN = 'I'.
+  R_BWART_RECEIPT-OPTION = 'EQ'.
+  R_BWART_RECEIPT-LOW = '101'.
+  APPEND R_BWART_RECEIPT.
+  R_BWART_RECEIPT-LOW = '651'.
+  APPEND R_BWART_RECEIPT.
+  R_BWART_RECEIPT-LOW = '634'.
+  APPEND R_BWART_RECEIPT.
+
+  R_BWART_ISSUE-SIGN = 'I'.
+  R_BWART_ISSUE-OPTION = 'EQ'.
+  R_BWART_ISSUE-LOW = '261'.
+  APPEND R_BWART_ISSUE.
+  R_BWART_ISSUE-LOW = '601'.
+  APPEND R_BWART_ISSUE.
+  R_BWART_ISSUE-LOW = '633'.
+  APPEND R_BWART_ISSUE.
+
+  R_BWART_ALL[] = R_BWART_RECEIPT[].
+  APPEND LINES OF R_BWART_ISSUE TO R_BWART_ALL.
+
+ENDFORM.                    " FILL_RANGES
+
+*&---------------------------------------------------------------------*
+*&      Form  INPUTHELP_VARIANT
+*&---------------------------------------------------------------------*
+FORM INPUTHELP_VARIANT.
+
+  DATA:
+    LV_VARIANT_SAVE TYPE C VALUE 'U',
+    LV_EXIT.
+
+  CLEAR LV_EXIT.
+  WA_VARIANT-REPORT    = SY-REPID.
+
+  CALL FUNCTION 'REUSE_ALV_VARIANT_F4'
+    EXPORTING
+      IS_VARIANT    = WA_VARIANT
+      I_SAVE        = LV_VARIANT_SAVE
+    IMPORTING
+      E_EXIT        = LV_EXIT
+      ES_VARIANT    = WA_VARIANT
+    EXCEPTIONS
+      NOT_FOUND     = 1
+      PROGRAM_ERROR = 2
+      OTHERS        = 3.
+
+  IF SY-SUBRC IS INITIAL AND LV_EXIT IS INITIAL.
+    P_VAR              = WA_VARIANT-VARIANT.
+  ENDIF.
+
+ENDFORM.                    " INPUTHELP_VARIANT
+
+*&---------------------------------------------------------------------*
+*&      Form  INPUTHELP_WERKS
+*&---------------------------------------------------------------------*
+FORM INPUTHELP_WERKS .
+
+  SELECT      A~WERKS A~WHTYPE A~WHSTDES B~NAME1
+         INTO CORRESPONDING FIELDS OF TABLE IT_PLANT
+         FROM YSE_EM_PLANT AS A
+        INNER JOIN T001W AS B
+           ON A~WERKS = B~WERKS
+        WHERE B~SPRAS EQ 'E'.
+
+  CALL FUNCTION 'F4IF_INT_TABLE_VALUE_REQUEST'
+    EXPORTING
+      RETFIELD        = 'WERKS'
+      WINDOW_TITLE    = 'Selections'(030)
+      VALUE_ORG       = 'S'
+    TABLES
+      VALUE_TAB       = IT_PLANT
+      RETURN_TAB      = IT_RETURN_TAB
+    EXCEPTIONS
+      PARAMETER_ERROR = 1
+      NO_VALUES_FOUND = 2
+      OTHERS          = 3.
+
+  IF SY-SUBRC EQ 0.
+    READ TABLE IT_RETURN_TAB INDEX 1.
+    P_WERKS = IT_RETURN_TAB-FIELDVAL.
+  ENDIF.
+
+ENDFORM.                    " INPUTHELP_WERKS
+
+*&---------------------------------------------------------------------*
+*&      Form  check_authorization
+*&---------------------------------------------------------------------*
+FORM CHECK_AUTHORIZATION .
+
+  AUTHORITY-CHECK OBJECT 'M_MATE_WRK'
+           ID 'ACTVT' DUMMY
+           ID 'WERKS' FIELD P_WERKS.
+
+  IF SY-SUBRC = 4.
+*   No authorisation to display data from Sales Organisation p_vkorg
+    MESSAGE ID 'YSE_GENERAL' TYPE 'E' NUMBER '008' WITH P_WERKS.
+  ELSEIF SY-SUBRC <> 0.
+*   Error checking authorization.
+    MESSAGE ID 'YSE_GENERAL' TYPE 'E' NUMBER '004'.
+  ENDIF.
+
+ENDFORM.                    " CHECK_AUTHORIZATION
+
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_DATA
+*&---------------------------------------------------------------------*
+FORM SELECT_DATA .
+
+* Set global period variables to cover the past 12 months (used in YR consumption to
+* calculate "KEEP")
+  PERFORM GET_12_MONTH_PERIOD.
+* Get additional parameters (Related salesorg, parameters of the relevant warehousetype)
+  PERFORM SELECT_ADD_PARAMETERS.
+* Get stock for the materials (and other material details)
+  PERFORM SELECT_MATERIAL_STOCK.
+* Get additional data (vendor, price, ...)
+  PERFORM SELECT_ADD_DATA.
+
+ENDFORM.                    " SELECT_DATA
+
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_ADD_PARAMETERS
+*&---------------------------------------------------------------------*
+FORM SELECT_ADD_PARAMETERS.
+
+  DATA:
+    LV_WHTYPE   LIKE YSE_EM_PLANT-WHTYPE.
+
+* Get related SOrg (based on provided plant) for use in the rest of the program
+  SELECT      T001W~WERKS YSE_PO_SORG_PORG~VKORG
+         INTO TABLE IT_VKORG
+         FROM T001W
+         JOIN YSE_PO_SORG_PORG
+           ON YSE_PO_SORG_PORG~EKORG EQ T001W~EKORG
+        WHERE T001W~WERKS EQ P_WERKS.
+  READ TABLE IT_VKORG INDEX 1.
+  IF SY-SUBRC EQ 0.
+    P_VKORG = IT_VKORG-VKORG.
+  ENDIF.
+
+* Get warehousetype
+  SELECT SINGLE WHTYPE
+           INTO LV_WHTYPE
+           FROM YSE_EM_PLANT
+          WHERE WERKS EQ P_WERKS.
+
+* Get parameters for the warehouse type
+  SELECT SINGLE *
+           FROM YSE_EM_WHSTYPAR
+           INTO WA_EM_WHSTYPAR
+          WHERE VKORG EQ P_VKORG
+            AND WHTYPE EQ LV_WHTYPE.
+
+  IF SY-SUBRC NE 0.
+    MESSAGE E006 WITH 'YSE_EM_WHSTYPAR'.
+    EXIT.
+  ENDIF.
+
+* Get currency for related company code
+  SELECT SINGLE WAERS
+           INTO GV_WAERS
+           FROM T001K
+           JOIN T001
+             ON T001~BUKRS EQ T001K~BUKRS
+          WHERE BWKEY EQ P_WERKS.
+
+ENDFORM.                    " SELECT_ADD_PARAMETERS
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_12_MONTH_PERIOD
+*&---------------------------------------------------------------------*
+FORM GET_12_MONTH_PERIOD.
+
+  DATA:
+    LV_ENDAT LIKE SY-DATUM,
+    LV_ABDAT LIKE SY-DATUM,
+    LV_N2(4)         TYPE C.
+
+* Set last day of last month in LV_ENDAT
+  MOVE SY-DATUM TO LV_ENDAT.
+  MOVE '01' TO LV_ENDAT+6.
+  LV_ENDAT = LV_ENDAT - 1.
+
+* Subtract 11 months and put result into LV_ABDAT
+  LV_N2 = '-11'.
+  CALL FUNCTION 'MONTH_PLUS_DETERMINE'
+    EXPORTING
+      MONTHS  = LV_N2
+      OLDDATE = LV_ENDAT
+    IMPORTING
+      NEWDATE = LV_ABDAT.
+
+* Put the dates in periods
+  GV_ENPER = LV_ENDAT(6).
+  GV_ABPER = LV_ABDAT(6).
+
+ENDFORM.                    " GET_12_MONTH_PERIOD
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_MATERIAL_MEMO
+*&---------------------------------------------------------------------*
+FORM GET_MATERIAL_MEMO.
+
+  DATA:
+    LV_TDNAME LIKE THEAD-TDNAME,
+    IT_LINES  LIKE TLINE OCCURS 0 WITH HEADER LINE.
+
+  LV_TDNAME(18)   = IT_MARD-MATNR.
+  LV_TDNAME+19(4) = IT_MARD-WERKS.
+
+  CALL FUNCTION 'READ_TEXT'
+    EXPORTING
+      ID                      = 'LTXT'
+      LANGUAGE                = 'E'
+      NAME                    = LV_TDNAME
+      OBJECT                  = 'MDTXT'
+    TABLES
+      LINES                   = IT_LINES
+    EXCEPTIONS
+      ID                      = 1
+      LANGUAGE                = 2
+      NAME                    = 3
+      NOT_FOUND               = 4
+      OBJECT                  = 5
+      REFERENCE_CHECK         = 6
+      WRONG_ACCESS_TO_ARCHIVE = 7
+      OTHERS                  = 8.
+  IF SY-SUBRC NE 0.
+    CLEAR IT_OUTPUT-MATNR_MEMO.
+  ENDIF.
+  READ TABLE IT_LINES INDEX 1.
+  IF SY-SUBRC EQ 0.
+    IT_OUTPUT-MATNR_MEMO = IT_LINES-TDLINE.
+  ENDIF.
+
+ENDFORM.                    " GET_MATERIAL_MEMO
+
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_MATERIAL_STOCK
+*&---------------------------------------------------------------------*
+FORM SELECT_MATERIAL_STOCK.
+
+* Get the stock of materials in scope using selection parameters
+  SELECT      MARC~MATNR MARC~WERKS MARD~LGORT
+              MARC~DISMM MARD~LABST MARC~EISBE
+              MARC~MAXLZ MARC~MMSTA MARC~MMSTD
+              MARA~PRDHA MAKT~MAKTX MVKE~MTPOS
+              MVKE~MVGR4 MARA~MATKL MARA~ERSDA
+              MARC~NFMAT
+         INTO TABLE IT_MARD
+         FROM MARC
+        INNER JOIN MARD
+           ON MARC~MATNR = MARD~MATNR
+          AND MARC~WERKS = MARD~WERKS
+        INNER JOIN MARA
+           ON MARC~MATNR = MARA~MATNR
+        INNER JOIN MAKT
+           ON MARC~MATNR = MAKT~MATNR
+        INNER JOIN MVKE
+           ON MARC~MATNR = MVKE~MATNR
+        WHERE MARC~WERKS EQ P_WERKS
+          AND MARC~MAXLZ NE '1'
+          AND (    MARC~MATNR IN S_MATNR
+                OR MARC~NFMAT IN S_MATNR )
+          AND MARA~MATKL IN S_MATKL
+          AND MAKT~SPRAS EQ 'E'
+          AND MVKE~VKORG EQ P_VKORG
+          AND MVKE~VTWEG EQ '01'
+          AND MARD~LGORT EQ '1000'.
+
+* Create list of unique material numbers which are superseded (to get the exhaust condition)
+  CLEAR:
+    IT_MATNR, IT_MATNR[].
+  LOOP AT IT_MARD WHERE NFMAT NE SPACE.
+    IT_MATNR-MATNR = IT_MARD-MATNR.
+    APPEND IT_MATNR.
+  ENDLOOP.
+  SORT IT_MATNR BY MATNR.
+  DELETE ADJACENT DUPLICATES FROM IT_MATNR.
+
+* Get conditions from KONDD for selected materals (to know whether exhaust or not)
+  SELECT      KAPPL KSCHL VKORG VTWEG MATWA DATBI KOTD002~KNUMH
+              SMATN SUGRD
+         INTO TABLE IT_KONDD
+         FROM KOTD002
+         JOIN KONDD
+           ON KOTD002~KNUMH EQ KONDD~KNUMH
+          FOR ALL ENTRIES IN IT_MATNR
+        WHERE KAPPL EQ 'V'
+          AND KSCHL EQ 'Z002'
+          AND VKORG EQ P_VKORG
+          AND VTWEG EQ '01'
+          AND MATWA EQ IT_MATNR-MATNR
+          AND DATBI EQ '99991231'
+          AND SUGRD EQ 'Z001'.
+  SORT IT_KONDD BY MATWA SMATN.
+
+* >> BEGIN OF INSERT MOD001 REF# CR122
+  IT_TEMP[] = IT_MARD[].
+
+  IF NOT IT_TEMP[] IS INITIAL.
+    LOOP AT IT_TEMP .
+        IT_TEMP-OBJECTID = IT_TEMP-MATNR.
+        MODIFY IT_TEMP INDEX SY-TABIX  TRANSPORTING OBJECTID.
+    ENDLOOP.
+
+* Select values from CDPOS table
+    IF NOT IT_MARD[] IS INITIAL.
+      SELECT MANDANT OBJECTCLAS OBJECTID CHANGENR
+                            TABNAME TABKEY FNAME CHNGIND
+                                  FROM CDPOS INTO TABLE IT_CDPOS
+                                       FOR ALL ENTRIES IN IT_TEMP[]
+                                          WHERE OBJECTCLAS   = 'MATERIAL'
+                                          AND   OBJECTID     = IT_TEMP-OBJECTID
+                                          AND   TABNAME      = 'MVKE'.
+
+      SORT IT_CDPOS BY OBJECTID .
+      DELETE IT_CDPOS WHERE TABKEY+21(2) NE 'CN'.
+* select values from CDHDR based on CDPOS
+      IF NOT IT_CDPOS[] IS INITIAL.
+        SELECT MANDANT OBJECTCLAS OBJECTID CHANGENR UDATE
+                                 FROM CDHDR INTO TABLE IT_CDHDR
+                                        FOR ALL ENTRIES IN IT_CDPOS
+                                            WHERE OBJECTCLAS   =  'MATERIAL'
+                                             AND  OBJECTID     =  IT_CDPOS-OBJECTID
+                                             AND  CHANGENR     =  IT_CDPOS-CHANGENR.
+        SORT IT_CDHDR BY OBJECTID UDATE.
+
+      ENDIF.
+
+    ENDIF.
+
+  ENDIF.
+* >> END   OF INSERT MOD001 REF# CR122
+
+ENDFORM.                    " SELECT_MATERIAL_STOCK
+
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_ADD_DATA
+*&---------------------------------------------------------------------*
+FORM SELECT_ADD_DATA.
+
+  DATA:
+    BEGIN OF LT_EBELN_KEEP OCCURS 0,
+      EBELN LIKE MSEG-EBELN,
+    END OF LT_EBELN_KEEP,
+    BEGIN OF LT_EBELN_RECEIPT OCCURS 0,
+      EBELN LIKE MSEG-EBELN,
+    END OF LT_EBELN_RECEIPT,
+    BEGIN OF LT_VBELN_KEEP OCCURS 0,
+      VBELN LIKE MSEG-MBLNR,
+    END OF LT_VBELN_KEEP,
+    BEGIN OF LT_VBELN_ISSUE OCCURS 0,
+      VBELN LIKE VBFA-VBELN,
+    END OF LT_VBELN_ISSUE.
+
+* Vendor information
+  SELECT      MATNR WERKS ZEORD LIFNR FLIFN
+         INTO TABLE IT_EORD
+         FROM EORD
+          FOR ALL ENTRIES IN IT_MARD
+        WHERE MATNR EQ IT_MARD-MATNR
+          AND WERKS EQ P_WERKS.
+  SORT IT_EORD BY MATNR WERKS FLIFN.
+
+* Standard cost of materials
+  SELECT      MATNR BWKEY BWTAR STPRS
+         INTO TABLE IT_MBEW
+         FROM MBEW
+          FOR ALL ENTRIES IN IT_MARD
+        WHERE MATNR EQ IT_MARD-MATNR
+          AND BWKEY EQ P_WERKS.
+  SORT IT_MBEW BY MATNR BWKEY.
+
+* Create list of unique material numbers which are not superseded (to calc allocations)
+  CLEAR:
+    IT_MATNR, IT_MATNR[].
+  LOOP AT IT_MARD WHERE NFMAT EQ SPACE.
+    IT_MATNR-MATNR = IT_MARD-MATNR.
+    APPEND IT_MATNR.
+  ENDLOOP.
+  SORT IT_MATNR BY MATNR.
+  DELETE ADJACENT DUPLICATES FROM IT_MATNR.
+
+* Get allocations for the not superseded materials
+  CALL FUNCTION 'YSE_GET_ALLOCATIONS'
+    EXPORTING
+      WERKS    = P_WERKS
+      VKORG    = P_VKORG
+      EISBE    = P_EISBE
+      LGORT    = '1000'
+    TABLES
+      IT_ALLOC = IT_ALLOC
+      IT_MATNR = IT_MATNR
+      R_PSTYV  = S_PSTYV.
+  SORT IT_ALLOC BY MATNR.
+
+* Get sales history (to calculate 1 year consumption)
+* Selection of allowed plants per sales organisation
+  SELECT      *
+         FROM TVKWZ
+         INTO TABLE IT_TVKWZ
+        WHERE VKORG EQ P_VKORG
+          AND WERKS EQ P_WERKS.
+* If plant is allowed for salesorg
+  IF SY-SUBRC EQ 0.
+*   Get all branch warehouses/plants for which this one is responsible
+    IF WA_EM_WHSTYPAR-WHTYPE = 'C'.
+      SELECT      *
+             INTO TABLE IT_EM_PL_CENTR
+             FROM YSE_EM_PL_CENTR
+            WHERE CWERKS = P_WERKS.
+    ELSE.
+      IT_EM_PL_CENTR-BWERKS = P_WERKS.
+      APPEND IT_EM_PL_CENTR.
+    ENDIF.
+*   With all the branch plants (could be only one, if a branch plant was provided)
+    IF SY-SUBRC EQ 0.
+
+*     Get the sales districts for which the plants are responsible
+      SELECT      *
+             INTO TABLE IT_EM_PL_DISTR
+             FROM YSE_EM_PL_DISTR
+              FOR ALL ENTRIES IN IT_EM_PL_CENTR
+            WHERE WERKS EQ IT_EM_PL_CENTR-BWERKS.
+
+*     Loop over the sales districts found for the branches and fill range with sales districts
+      R_BZIRK-SIGN   = 'I'.
+      R_BZIRK-OPTION = 'EQ'.
+      LOOP AT  IT_EM_PL_DISTR.
+*       Check if the dependant plant is allowed for the sales org
+        R_BZIRK-LOW    = IT_EM_PL_DISTR-BZIRK.
+        APPEND R_BZIRK.
+      ENDLOOP.
+    ENDIF.
+  ENDIF.
+
+* Add history for dependant sales districts
+  READ TABLE R_BZIRK INDEX 1.
+  IF SY-SUBRC EQ 0.
+    SELECT      *
+           INTO TABLE IT_EM_SOHIST
+           FROM YSE_EM_SOHIST
+          WHERE VKORG  EQ P_VKORG
+            AND BZIRK  IN R_BZIRK
+            AND PERIOD BETWEEN GV_ABPER AND GV_ENPER.
+    SELECT *
+           FROM YSE_EM_SOHISTMIG
+          WHERE PERIOD BETWEEN GV_ABPER AND GV_ENPER
+            AND VKORG  EQ P_VKORG
+            AND BZIRK IN R_BZIRK.
+      IT_EM_SOHIST = YSE_EM_SOHISTMIG.
+      COLLECT IT_EM_SOHIST.
+    ENDSELECT.
+  ENDIF.
+* Aggregate per material over a whole year
+  SORT IT_EM_SOHIST BY MATNR.
+  LOOP AT IT_EM_SOHIST.
+    MOVE-CORRESPONDING IT_EM_SOHIST TO IT_EM_SOHIST_AGGR.
+    COLLECT IT_EM_SOHIST_AGGR.
+  ENDLOOP.
+
+* Get special indicator for materials
+  SELECT *
+         INTO TABLE IT_EM_MATSO
+         FROM YSE_EM_MATSO
+          FOR ALL ENTRIES IN IT_MARD
+        WHERE MATNR = IT_MARD-MATNR
+          AND VKORG = P_VKORG.
+  SORT IT_EM_MATSO BY MATNR VKORG.
+
+* **************************************************************************************************
+* TVO: New logic is just after the commented lines: process monitor showed that at least 2 hours of
+*      the total running time was spent selecting from MSEG. Therefore trying to combine into 1
+*      select and further refinement in later processing
+* **************************************************************************************************
+** Receipt dates from MKPF/MSEG
+*  SELECT      MKPF~MBLNR MKPF~MJAHR MSEG~ZEILE MKPF~BUDAT MSEG~BWART MSEG~MATNR
+*         INTO TABLE IT_MSEG
+*         FROM MSEG
+*         JOIN MKPF
+*           ON MKPF~MBLNR = MSEG~MBLNR
+*          AND MKPF~MJAHR = MSEG~MJAHR
+*         JOIN EKKO
+*           ON MSEG~EBELN = EKKO~EBELN
+*          FOR ALL ENTRIES IN IT_MARD
+*        WHERE MSEG~BWART IN R_BWART_RECEIPT
+*          AND MSEG~MATNR EQ IT_MARD-MATNR
+*          AND WERKS EQ P_WERKS
+*          AND BSART NE 'ZUB1'
+*          AND LGORT EQ '1000'.
+** Issue dates from MKPF/MSEG
+*  SELECT      MKPF~MBLNR MKPF~MJAHR MSEG~ZEILE MKPF~BUDAT MSEG~BWART MSEG~MATNR
+*    APPENDING TABLE IT_MSEG
+*         FROM MSEG
+*         JOIN MKPF
+*           ON MKPF~MBLNR = MSEG~MBLNR
+*          AND MKPF~MJAHR = MSEG~MJAHR
+*         JOIN VBFA
+*           ON MSEG~MBLNR = VBFA~VBELN
+*         JOIN LIKP
+*           ON VBFA~VBELV = LIKP~VBELN
+*          FOR ALL ENTRIES IN IT_MARD
+*        WHERE MSEG~BWART IN R_BWART_ISSUE
+*          AND MSEG~MATNR EQ IT_MARD-MATNR
+*          AND MSEG~WERKS EQ P_WERKS
+*          AND LGORT      EQ '1000'
+*          AND VBTYP_N    EQ 'R'          " Document flow: Follow up doc is "Goods mvt"
+*          AND VBTYP_V    EQ 'J'          " Document flow: Preced doc is "Delivery"
+*          AND LFART      NE 'NL'.
+** Sort the table by date descending
+*  SORT IT_MSEG BY BUDAT DESCENDING.
+
+
+* New logic starts here/ get all goods movements
+  SELECT      MKPF~MBLNR MKPF~MJAHR MSEG~ZEILE MKPF~BUDAT MSEG~BWART MSEG~MATNR MSEG~EBELN
+         INTO TABLE IT_MSEG
+         FROM MSEG
+         JOIN MKPF
+           ON MKPF~MBLNR = MSEG~MBLNR
+          AND MKPF~MJAHR = MSEG~MJAHR
+          FOR ALL ENTRIES IN IT_MARD
+        WHERE MSEG~BWART IN R_BWART_ALL
+          AND MSEG~MATNR EQ IT_MARD-MATNR
+          AND WERKS EQ P_WERKS
+          AND LGORT EQ '1000'.
+
+* Build tables with PO numbers for receipts and with Goods Mvt numbers for issues
+  LOOP AT IT_MSEG.
+    IF IT_MSEG-BWART IN R_BWART_RECEIPT.
+      LT_EBELN_RECEIPT-EBELN = IT_MSEG-EBELN.
+      APPEND LT_EBELN_RECEIPT.
+    ELSEIF IT_MSEG-BWART IN R_BWART_ISSUE.
+      LT_VBELN_ISSUE-VBELN = IT_MSEG-MBLNR.
+      APPEND LT_VBELN_ISSUE.
+    ENDIF.
+  ENDLOOP.
+  SORT:
+    LT_EBELN_RECEIPT BY EBELN,
+    LT_VBELN_ISSUE   BY VBELN.
+  DELETE ADJACENT DUPLICATES FROM:
+    LT_EBELN_RECEIPT,
+    LT_VBELN_ISSUE.
+* Check the PO type for receipts (internal orders don't count)
+  SELECT      EBELN
+         INTO TABLE LT_EBELN_KEEP
+         FROM EKKO
+          FOR ALL ENTRIES IN LT_EBELN_RECEIPT
+        WHERE EBELN EQ LT_EBELN_RECEIPT-EBELN
+          AND BSART NE 'ZUB1'.
+  SORT LT_EBELN_KEEP BY EBELN.
+* Check the delivery type preceding the currently selected good mvt's
+  SELECT      VBFA~VBELN
+         INTO TABLE LT_VBELN_KEEP
+         FROM VBFA
+         JOIN LIKP
+           ON VBFA~VBELV = LIKP~VBELN
+          FOR ALL ENTRIES IN LT_VBELN_ISSUE
+        WHERE VBFA~VBELN EQ LT_VBELN_ISSUE-VBELN
+          AND VBTYP_N    EQ 'R'          " Document flow: Follow up doc is "Goods mvt"
+          AND VBTYP_V    EQ 'J'          " Document flow: Preced doc is "Delivery"
+          AND LFART      NE 'NL'.
+  SORT LT_VBELN_KEEP BY VBELN.
+
+* Issue and receipt dates from YSE_SURPLUS_HD01
+  SELECT      *
+         FROM YSE_SURPLUS_HD01
+         INTO TABLE IT_SURPLUS
+          FOR ALL ENTRIES IN IT_MARD
+        WHERE MATNR EQ IT_MARD-MATNR
+          AND WERKS EQ P_WERKS
+          AND LGORT EQ '1000'.
+  SORT IT_SURPLUS BY BUDAT DESCENDING.
+
+* Add MSEG (goods mvt data) to surplus table, which than holds all receipts and issue dates
+  LOOP AT IT_MSEG.
+    IT_SURPLUS-MATNR = IT_MSEG-MATNR.
+    IT_SURPLUS-WERKS = P_WERKS.
+    IT_SURPLUS-LGORT = '1000'.
+*   When receipt
+    IF IT_MSEG-BWART IN R_BWART_RECEIPT.
+      IT_SURPLUS-ZMOVT = 'R'.
+*     Check if PO type is correct
+      READ TABLE LT_EBELN_KEEP WITH KEY EBELN = IT_MSEG-EBELN BINARY SEARCH.
+      IF SY-SUBRC EQ 0.
+        IT_SURPLUS-BUDAT = IT_MSEG-BUDAT.
+        APPEND IT_SURPLUS.
+      ENDIF.
+*   When issue
+    ELSEIF IT_MSEG-BWART IN R_BWART_ISSUE.
+      IT_SURPLUS-ZMOVT = 'I'.
+*     Check preceding delivery type
+      READ TABLE LT_VBELN_KEEP WITH KEY VBELN = IT_MSEG-MBLNR BINARY SEARCH.
+      IF SY-SUBRC EQ 0.
+        IT_SURPLUS-BUDAT = IT_MSEG-BUDAT.
+        APPEND IT_SURPLUS.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+* Sort the issue and receipt data
+  SORT IT_SURPLUS BY MATNR ASCENDING BUDAT DESCENDING.
+* Process all dates to keep only 1 issue and 1 receipt date per material
+  LOOP AT IT_SURPLUS.
+*   When receipt
+    IF IT_SURPLUS-ZMOVT = 'R'.
+*     When we don't have a receipt date for the material yet
+      IF IT_SURPLUS-MATNR NE IT_REC-MATNR.
+*       Keep the date (due to sorting, it will be the most recent receipt)
+        IT_REC-MATNR = IT_SURPLUS-MATNR.
+        IT_REC-BUDAT = IT_SURPLUS-BUDAT.
+        APPEND IT_REC.
+      ENDIF.
+*   When issue
+    ELSEIF IT_SURPLUS-ZMOVT = 'I'.
+*     When we don't have a issue date for the material yet
+      IF IT_SURPLUS-MATNR NE IT_ISS-MATNR.
+*       Keep the date (due to sorting, it will be the most recent receipt)
+        IT_ISS-MATNR = IT_SURPLUS-MATNR.
+        IT_ISS-BUDAT = IT_SURPLUS-BUDAT.
+        APPEND IT_ISS.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+* Select data for open PO quantity
+  SELECT      EBELN EBELP MENGE MATNR
+         INTO TABLE IT_EKPO
+         FROM EKPO
+          FOR ALL ENTRIES IN IT_MARD
+        WHERE MATNR EQ IT_MARD-MATNR
+          AND WERKS EQ P_WERKS
+          AND ( LGORT EQ '1000'
+          OR  LGORT EQ '' )
+          AND ELIKZ EQ SPACE
+          AND LOEKZ NE 'L'.
+  SELECT      EBELN EBELP ZEKKN VGABE GJAHR BELNR BUZEI MENGE BPMNG SHKZG
+         FROM EKBE
+         INTO TABLE IT_EKBE
+          FOR ALL ENTRIES IN IT_EKPO
+        WHERE EBELN EQ IT_EKPO-EBELN
+          AND VGABE EQ '1'.
+
+ENDFORM.                    " SELECT_ADD_DATA
+
+*&---------------------------------------------------------------------*
+*&      Form  PROCESS_DATA
+*&---------------------------------------------------------------------*
+FORM PROCESS_DATA.
+
+* Sort MARD so that first the not superseded materials are added to the output table
+  SORT IT_MARD BY NFMAT.
+
+* Process all the stock lines
+  LOOP AT IT_MARD.
+
+*   If material is superseded
+    IF IT_MARD-NFMAT NE SPACE.
+
+*     Find the exhaust condition
+      READ TABLE IT_KONDD WITH KEY MATWA = IT_MARD-MATNR
+                                   SMATN = IT_MARD-NFMAT
+                          BINARY SEARCH.
+
+*     If Z001 (exhaust) condition found, this stock should be added to superseding material
+      IF SY-SUBRC EQ 0.
+
+*       Update the superseding material with this material's stock
+        PERFORM OUTPUT_UPD_SUPERSEDING_MAT.
+
+*     Exhaust condition not found, so add the superseded material by itself
+      ELSE.
+
+        PERFORM OUTPUT_ADD_MAT.
+
+      ENDIF.   " Look for exhaust condition
+
+*   If material is not superseded
+    ELSE.
+
+*     Just add it to the output
+      PERFORM OUTPUT_ADD_MAT.
+
+    ENDIF.     " Superseeded material or not
+
+  ENDLOOP.
+
+* Calculate Return/scrap qty and value, retrieve history quantity etc
+  PERFORM CALC_QTY_TO_KEEP.
+
+ENDFORM.                    " PROCESS_DATA
+
+*&---------------------------------------------------------------------*
+*&      Form  OUTPUT_UPD_SUPERSEDING_MAT
+*&---------------------------------------------------------------------*
+FORM OUTPUT_UPD_SUPERSEDING_MAT.
+
+  DATA:
+    LV_INDEX LIKE SY-TABIX.
+
+* Get the entry from the output table which details the superseding material (it should exist)
+  READ TABLE IT_OUTPUT WITH KEY MATNR = IT_MARD-NFMAT.
+* If entry for superseding material exists, update it
+  IF SY-SUBRC EQ 0.
+    LV_INDEX = SY-TABIX.
+*   Add stock
+    IT_OUTPUT-LABST        = IT_OUTPUT-LABST        + IT_MARD-LABST.
+    IT_OUTPUT-SUPERS_STOCK = IT_OUTPUT-SUPERS_STOCK + IT_MARD-LABST.
+*   Update "superseded material"
+    IF IT_OUTPUT-SUPERS_MATNR IS INITIAL.
+      IT_OUTPUT-SUPERS_MATNR = IT_MARD-MATNR.
+    ELSE.
+      IT_OUTPUT-SUPERS_MATNR = '*'.
+    ENDIF.
+*   Update last receipt date
+    PERFORM GET_LAST_DATES_FOR_MAT.
+*   Update Open PO quantity
+    PERFORM GET_OPEN_PO_QTY.
+*   Modify the record
+    MODIFY IT_OUTPUT INDEX LV_INDEX.
+
+* If no entry exists for the superseding material, add this superseded material
+  ELSE.
+    PERFORM OUTPUT_ADD_MAT.
+
+  ENDIF. " Look for output line of superseding material
+
+ENDFORM.                    " OUTPUT_UPD_SUPERSEDING_MAT
+
+*&---------------------------------------------------------------------*
+*&      Form  OUTPUT_ADD_MAT
+*&---------------------------------------------------------------------*
+FORM OUTPUT_ADD_MAT .
+
+  CLEAR IT_OUTPUT.
+
+* 1.Get vendor
+  READ TABLE IT_EORD WITH KEY MATNR = IT_MARD-MATNR
+                              WERKS = IT_MARD-WERKS
+                              FLIFN = 'X'
+                     BINARY SEARCH.
+* If not found
+  IF SY-SUBRC NE 0.
+*   Try without "Default vendor flag"
+    READ TABLE IT_EORD WITH KEY MATNR = IT_MARD-MATNR
+                                WERKS = IT_MARD-WERKS
+                       BINARY SEARCH.
+  ENDIF.
+* If either of the above succesfull
+  IF SY-SUBRC EQ 0.
+*   Write vendor number
+    IT_OUTPUT-LIFNR = IT_EORD-LIFNR.
+  ENDIF.
+
+* 2.Stock policy
+  IF IT_MARD-DISMM = 'Z5'.
+    IT_OUTPUT-DISMM = 'ST'.
+  ELSEIF IT_MARD-DISMM = 'Z6' OR IT_MARD-DISMM = 'Z7'.
+    IT_OUTPUT-DISMM = 'NS'.
+  ENDIF.
+
+* 3.Distribution mode
+  IF IT_MARD-MTPOS = 'ZDTC'.
+    IT_OUTPUT-DISTRI_MODE = 'DTC'.
+  ELSEIF IT_MARD-MTPOS = 'NORM' AND IT_MARD-MVGR4 = ''.
+    IT_OUTPUT-DISTRI_MODE = 'NDTC'.
+  ELSEIF IT_MARD-MTPOS = 'NORM' AND IT_MARD-MVGR4 = 'LCL'.
+    IT_OUTPUT-DISTRI_MODE = 'LCL'.
+  ENDIF.
+
+* 4.Material master data
+  IT_OUTPUT-MATKL = IT_MARD-MATKL.
+  IT_OUTPUT-PGC   = IT_MARD-PRDHA+4(4).
+  IT_OUTPUT-MATNR = IT_MARD-MATNR.
+  IT_OUTPUT-MAKTX = IT_MARD-MAKTX.
+  IT_OUTPUT-LABST = IT_MARD-LABST.
+  IT_OUTPUT-MMSTA = IT_MARD-MMSTA.
+  IT_OUTPUT-MMSTD = IT_MARD-MMSTD.
+
+* >> BEGIN OF INSERT MOD001 REF# CR122
+  IF IT_MARD-WERKS+0(2) EQ 'CN'.
+    CLEAR LS_CDHDR.
+    READ TABLE IT_CDHDR INTO LS_CDHDR WITH KEY OBJECTID = IT_MARD-MATNR.
+    IF SY-SUBRC = 0.
+      IT_OUTPUT-ERSDA = LS_CDHDR-UDATE.
+    ENDIF.
+  ELSE.
+    IT_OUTPUT-ERSDA = IT_MARD-ERSDA.
+  ENDIF.
+* >> END   OF INSERT MOD001 REF# CR122
+
+* 5.Standard price
+  READ TABLE IT_MBEW WITH KEY MATNR = IT_MARD-MATNR BINARY SEARCH.
+  IF SY-SUBRC EQ 0.
+    IT_OUTPUT-STPRS = IT_MBEW-STPRS.
+  ENDIF.
+
+* 6.Currency and plant (fixed values for the plant from the selection screen)
+  IT_OUTPUT-WAERS = GV_WAERS.
+  IT_OUTPUT-WERKS = P_WERKS.
+
+* 7.Material memo
+  PERFORM GET_MATERIAL_MEMO.
+
+* 8.Last receipt date
+  PERFORM GET_LAST_DATES_FOR_MAT.
+
+* 9.Open PO quantity
+  PERFORM GET_OPEN_PO_QTY.
+
+* 10.History calc (1 year consumption)
+  CLEAR IT_EM_SOHIST_AGGR.
+  READ TABLE IT_EM_SOHIST_AGGR WITH KEY MATNR = IT_MARD-MATNR BINARY SEARCH.
+  IT_OUTPUT-ZMENG = IT_EM_SOHIST_AGGR-ZMENG.
+
+* Append line
+  APPEND IT_OUTPUT.
+
+ENDFORM.                    " OUTPUT_ADD_MAT
+
+*&---------------------------------------------------------------------*
+*&      Form  CALC_QTY_TO_KEEP
+*&---------------------------------------------------------------------*
+FORM CALC_QTY_TO_KEEP.
+
+  DATA:
+    LV_FACTOR    TYPE P DECIMALS 2,
+    LV_NET_STOCK LIKE IT_OUTPUT-LABST.
+
+* Do a loop on resulttable to calculate the "keep" value, which can only be calculated
+* after stock is cumulated (supersession: stock of superseded items should be used in
+* calculations, however allocations of superseded materials are not relevant).
+  LOOP AT IT_OUTPUT.
+
+*   Get allocations for current material
+    CLEAR IT_ALLOC.
+    READ TABLE IT_ALLOC WITH KEY MATNR = IT_OUTPUT-MATNR BINARY SEARCH.
+    IT_OUTPUT-ALL_QTY = IT_ALLOC-ALLOC_QUANTITY.
+
+*   Depending on MRP type (stock policy), when "Not stocked" (Z6 or Z7)
+    IF IT_OUTPUT-DISMM EQ 'NS'.
+*     Calculate "Stock - Allocations"
+      LV_NET_STOCK = IT_OUTPUT-LABST - IT_ALLOC-ALLOC_QUANTITY.
+*     If the above is greater then 0
+      IF LV_NET_STOCK > 0.
+*       Calculate KEEP
+        IT_OUTPUT-KEEP = IT_ALLOC-ALLOC_QUANTITY.
+*       Calculate Return/Scrap quantity
+        IT_OUTPUT-RETURN_QTY = IT_OUTPUT-LABST - IT_OUTPUT-KEEP.
+*       Calculate Return/Scrap value
+        IT_OUTPUT-RETURN_VALUE = IT_OUTPUT-RETURN_QTY * IT_OUTPUT-STPRS.
+*       Update record
+        MODIFY IT_OUTPUT.
+*     If the above is less then 0, don't select the line
+      ELSE.
+        DELETE IT_OUTPUT.
+      ENDIF.
+
+*   Depending on MRP type (stock policy), when "Stocked" (Z5)
+    ELSEIF IT_OUTPUT-DISMM EQ 'ST'.
+
+*     Set N factor depending on whtype, when chosen plant is "Central"
+      IF WA_EM_WHSTYPAR-WHTYPE = 'C'.
+
+*       Set N factor depending on distribution mode
+        IF IT_OUTPUT-DISTRI_MODE = 'LCL'.
+          LV_FACTOR = 2.
+        ELSE.
+          LV_FACTOR = 1.
+        ENDIF.
+
+*     Set N factor depending on whtype, when chosen plant is "Branch"
+      ELSEIF WA_EM_WHSTYPAR-WHTYPE = 'B'.
+
+*       Get special indicator for the material
+        CLEAR IT_EM_MATSO.
+        READ TABLE IT_EM_MATSO WITH KEY MATNR = IT_OUTPUT-MATNR BINARY SEARCH.
+
+*       If Special is set, then use Alternate percentage
+        IF IT_EM_MATSO-SPEC NE SPACE.
+          LV_FACTOR = WA_EM_WHSTYPAR-ALTPERC.
+*       Else use breakdown percentage
+        ELSE.
+          LV_FACTOR = WA_EM_WHSTYPAR-BRKPERC.
+        ENDIF.
+
+      ENDIF.
+
+*     Calculate "stock - alloc - (N * year consumption)
+      LV_NET_STOCK = IT_OUTPUT-LABST - IT_ALLOC-ALLOC_QUANTITY - ( LV_FACTOR *  IT_OUTPUT-ZMENG ).
+*     If the above is greater then 0
+      IF LV_NET_STOCK > 0.
+*       Calculate KEEP
+        IT_OUTPUT-KEEP = IT_ALLOC-ALLOC_QUANTITY + ( LV_FACTOR * IT_OUTPUT-ZMENG ).
+*       Calculate Return/Scrap quantity
+        IT_OUTPUT-RETURN_QTY = IT_OUTPUT-LABST - IT_OUTPUT-KEEP.
+*       Calculate Return/Scrap value
+        IT_OUTPUT-RETURN_VALUE = IT_OUTPUT-RETURN_QTY * IT_OUTPUT-STPRS.
+*       Update record
+        MODIFY IT_OUTPUT.
+      ELSE.
+        DELETE IT_OUTPUT.
+      ENDIF.
+
+    ENDIF.
+
+  ENDLOOP.
+
+ENDFORM.                    " CALC_QTY_TO_KEEP
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_LAST_DATES_FOR_MAT
+*&---------------------------------------------------------------------*
+FORM GET_LAST_DATES_FOR_MAT.
+
+** Set the last receipt date from MSEG
+*  CLEAR IT_MSEG.
+*  LOOP AT IT_MSEG WHERE MATNR EQ IT_MARD-MATNR
+*                    AND BWART IN R_BWART_RECEIPT.
+*    EXIT.
+*  ENDLOOP.
+*  IF SY-SUBRC EQ 0 AND IT_MSEG-BUDAT GT IT_OUTPUT-LAST_REC_DATE.
+*    IT_OUTPUT-LAST_REC_DATE = IT_MSEG-BUDAT.
+*  ENDIF.
+*
+** Set the last receipt date from YSE_SURPLUS_HD01
+*  CLEAR IT_SURPLUS.
+*  LOOP AT IT_SURPLUS WHERE MATNR EQ IT_MARD-MATNR
+*                       AND ZMOVT EQ 'R'.
+*    EXIT.
+*  ENDLOOP.
+*  IF SY-SUBRC EQ 0 AND IT_SURPLUS-BUDAT GT IT_OUTPUT-LAST_REC_DATE.
+*    IT_OUTPUT-LAST_REC_DATE = IT_SURPLUS-BUDAT.
+*  ENDIF.
+*
+** Set the last issue date from MSEG
+*  CLEAR IT_MSEG.
+*  LOOP AT IT_MSEG WHERE MATNR EQ IT_MARD-MATNR
+*                    AND BWART IN R_BWART_ISSUE.
+*    EXIT.
+*  ENDLOOP.
+*  IF SY-SUBRC EQ 0 AND IT_MSEG-BUDAT GT IT_OUTPUT-LAST_ISS_DATE.
+*    IT_OUTPUT-LAST_ISS_DATE = IT_MSEG-BUDAT.
+*  ENDIF.
+*
+** Set the last issue date from YSE_SURPLUS_HD01
+*  CLEAR IT_SURPLUS.
+*  LOOP AT IT_SURPLUS WHERE MATNR EQ IT_MARD-MATNR
+*                       AND ZMOVT EQ 'I'.
+*    EXIT.
+*  ENDLOOP.
+*  IF SY-SUBRC EQ 0 AND IT_SURPLUS-BUDAT GT IT_OUTPUT-LAST_ISS_DATE.
+*    IT_OUTPUT-LAST_ISS_DATE = IT_SURPLUS-BUDAT.
+*  ENDIF.
+
+  READ TABLE IT_REC WITH KEY MATNR = IT_MARD-MATNR BINARY SEARCH.
+  IF SY-SUBRC EQ 0 AND IT_REC-BUDAT GT IT_OUTPUT-LAST_REC_DATE.
+    IT_OUTPUT-LAST_REC_DATE = IT_REC-BUDAT.
+  ENDIF.
+
+  READ TABLE IT_ISS WITH KEY MATNR = IT_MARD-MATNR BINARY SEARCH.
+  IF SY-SUBRC EQ 0 AND IT_ISS-BUDAT GT IT_OUTPUT-LAST_ISS_DATE.
+    IT_OUTPUT-LAST_ISS_DATE = IT_ISS-BUDAT.
+  ENDIF.
+
+
+ENDFORM.                    " GET_LAST_DATES_FOR_MAT
+
+*&---------------------------------------------------------------------*
+*&      Form  GET_OPEN_PO_QTY
+*&---------------------------------------------------------------------*
+FORM GET_OPEN_PO_QTY .
+
+  DATA:
+    LV_TOT_QTY LIKE IT_EKBE-MENGE,
+    LV_REC_QTY LIKE IT_EKBE-MENGE.
+
+  CLEAR LV_REC_QTY.
+  CLEAR LV_TOT_QTY.
+* Note: logic from YSE_STOCK_ALARM_LIST was used (and reworked) in this program to
+*       determine when a PO item is considered "Open"
+
+* Loop over PO items with the current material (ELIKZ is space thanks to select statement)
+  LOOP AT IT_EKPO
+          WHERE MATNR EQ IT_MARD-MATNR.
+*     Clear history counter for this PO item
+    LV_TOT_QTY = LV_TOT_QTY + IT_EKPO-MENGE.
+
+*     Loop over history for this PO item
+    LOOP AT IT_EKBE
+          WHERE EBELN EQ IT_EKPO-EBELN
+          AND EBELP EQ IT_EKPO-EBELP.
+**       Add to total quantity if Debit/credit indicator is ...
+*        IF IT_EKBE-SHKZG EQ 'S'.
+*          LV_TOT_QTY = LV_TOT_QTY + IT_EKBE-MENGE.
+**       Subtract from total quantity if Debit/credit indicator is ...
+*        ELSE.   " = 'H'
+*          LV_TOT_QTY = LV_TOT_QTY - IT_EKBE-MENGE.
+*        ENDIF.
+*      LV_TOT_QTY = LV_TOT_QTY - IT_EKBE-MENGE.
+      LV_REC_QTY = LV_REC_QTY + IT_EKBE-MENGE.
+    ENDLOOP.
+*      IT_OUTPUT-OPEN_PO_QTY = LV_TOT_QTY.
+    IT_OUTPUT-OPEN_PO_QTY = LV_TOT_QTY - LV_REC_QTY.
+**     If history exceeds ordered quantity, PO item is closed
+*      IF LV_TOT_QTY >= IT_EKPO-MENGE.
+**       Closed
+*      ELSE.
+**     Open
+*      IT_OUTPUT-OPEN_PO_QTY = IT_OUTPUT-OPEN_PO_QTY + IT_EKPO-MENGE.
+*      ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    " GET_OPEN_PO_QTY
+
+*&---------------------------------------------------------------------*
+*&      Form  SEND2SPOOL
+*&---------------------------------------------------------------------*
+FORM SEND2SPOOL .
+
+  DATA:
+    FNAM             LIKE RLGRAP-FILENAME,
+    IT_DD03L         LIKE DD03L OCCURS 0 WITH HEADER LINE,
+    IT_DD04T         LIKE DD04T OCCURS 0 WITH HEADER LINE,
+    IT_OUTXLS(4096)  TYPE C OCCURS 0,
+    WA_OUTXLS(4096)  TYPE C.
+
+  CONSTANTS:
+    C_TAB TYPE C VALUE CL_ABAP_CHAR_UTILITIES=>HORIZONTAL_TAB.
+
+* Get fields of structure 'YSE_SL_SCRAP_OUT'
+  SELECT *
+         FROM DD03L
+         INTO TABLE IT_DD03L
+        WHERE TABNAME = 'YSE_SL_SCRAP_OUT'.
+
+* Get the descriptions of the fields in the structure
+  SELECT *
+         FROM DD04T
+         INTO TABLE IT_DD04T
+          FOR ALL ENTRIES IN IT_DD03L
+        WHERE ROLLNAME EQ IT_DD03L-ROLLNAME
+          AND DDLANGUAGE EQ 'EN'.
+
+* Build filename
+  V_DAT = SY-DATUM.
+  V_TIM = SY-UZEIT.
+  USER_NAME = SY-UNAME.
+  CONCATENATE '/var/load/' SY-SYSID '/UK/original/YSE_SCRAP_'
+              USER_NAME '_' V_DAT '_' V_TIM '.TXT'
+         INTO FNAM.
+
+* Make the output table ; delimited
+  CALL FUNCTION 'SAP_CONVERT_TO_CSV_FORMAT'
+    TABLES
+      I_TAB_SAP_DATA       = IT_OUTPUT
+    CHANGING
+      I_TAB_CONVERTED_DATA = IT_OUTXLS
+    EXCEPTIONS
+      CONVERSION_FAILED    = 1
+      OTHERS               = 2.
+  IF SY-SUBRC <> 0.
+    MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+            WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+  ENDIF.
+
+* Open file
+  OPEN DATASET FNAM FOR OUTPUT IN TEXT MODE ENCODING DEFAULT.
+  IF SY-SUBRC <> 0.
+    WRITE 'Error opening file. Action aborted.'.
+    EXIT.
+  ENDIF.
+
+* Write header line
+  CLEAR WA_OUTXLS.
+  SORT IT_DD03L BY POSITION.
+  LOOP AT IT_DD03L.
+    READ TABLE IT_DD04T WITH KEY ROLLNAME = IT_DD03L-ROLLNAME.
+    IF WA_OUTXLS IS INITIAL.
+      WA_OUTXLS = IT_DD04T-REPTEXT.
+    ELSE.
+      CONCATENATE WA_OUTXLS C_TAB IT_DD04T-REPTEXT INTO WA_OUTXLS.
+    ENDIF.
+  ENDLOOP.
+  TRANSFER WA_OUTXLS TO FNAM.
+
+* Process lines
+  LOOP AT IT_OUTXLS INTO WA_OUTXLS.
+    REPLACE ALL OCCURRENCES OF ';' IN WA_OUTXLS WITH C_TAB.
+    TRANSFER WA_OUTXLS TO FNAM.
+  ENDLOOP.
+
+  CLOSE DATASET FNAM.
+
+  WRITE: 'Report output written to file: ',
+         FNAM.
+
+ENDFORM.                    " SEND2SPOOL

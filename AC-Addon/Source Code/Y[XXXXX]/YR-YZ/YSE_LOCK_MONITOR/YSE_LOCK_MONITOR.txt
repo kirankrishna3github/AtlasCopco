@@ -1,0 +1,203 @@
+*&---------------------------------------------------------------------*
+*& Report  YSE_LOCK_MONITOR
+*&
+*& Author:   Johnny Wu
+*& Date:  12/13/2012
+*&---------------------------------------------------------------------*
+*&
+*& Description: Find FICO Lock issue. Used SSO internally
+*&
+*&---------------------------------------------------------------------*
+*& Request No  Date    Programmer  Revision
+*&---------------------------------------------------------------------*
+*& CD1K974247 12/13/12 SSCJWU      Initial transport                   *
+*&
+*&---------------------------------------------------------------------*
+
+report  yse_lock_monitor.
+
+*----------------------------------------------------------------------*
+*                            TABLES                                    *
+*----------------------------------------------------------------------*
+type-pools: abap.
+tables: tbtco, tbtcp.
+
+*----------------------------------------------------------------------*
+*                            VARIABLES                                 *
+*----------------------------------------------------------------------*
+data: gt_tbtco type table of tbtco,
+      gt_wpinfo  type table of wpinfo.
+*----------------------------------------------------------------------*
+*                          SELECTION SCREEN VARIABLES                  *
+*----------------------------------------------------------------------*
+
+selection-screen: begin of block b1 with frame title text-001.
+select-options: s_jname for tbtco-jobname.
+selection-screen: end of block b1.
+
+start-of-selection.
+  perform check_job.
+
+*&---------------------------------------------------------------------*
+*&      Form  check_job
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+form check_job .
+  data: ls_tbtco type tbtco,
+        lt_tbtco_used type table of tbtco,
+        lv_exit type boolean,
+        lv_datum like sy-datum.
+
+  lv_datum = sy-datum.
+  do.
+    lv_exit = abap_true.
+
+    wait up to 2 seconds.
+
+    clear: gt_tbtco.
+    select jobname jobcount status from tbtco
+                  into corresponding fields of table gt_tbtco
+                  where jobname in s_jname and sdlstrtdt = lv_datum.
+
+    loop at gt_tbtco into ls_tbtco.
+      if ls_tbtco-status <> 'A' and ls_tbtco-status <> 'F'.
+        "Not all jobs are finished or cancelled. Continue to check.
+        lv_exit = abap_false.
+      endif.
+
+      if ls_tbtco-status = 'A'. "Job is cancelled.
+        read table lt_tbtco_used transporting no fields
+                      with key jobname = ls_tbtco-jobname
+                               jobcount = ls_tbtco-jobcount.
+
+        if sy-subrc = 0."Already output
+          continue.
+        endif.
+
+        perform output using ls_tbtco.
+        append ls_tbtco to lt_tbtco_used.
+      endif.
+    endloop.
+
+    if lv_exit = abap_true.
+      exit.
+    endif.
+  enddo.
+
+endform.                    " check_job
+*&---------------------------------------------------------------------*
+*&      Form  get_sm50
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+form get_sm50 .
+  clear: gt_wpinfo.
+  call function 'TH_WPINFO'
+* EXPORTING
+*   SRVNAME          = ' '
+*   WITH_CPU         = 0
+    tables
+      wplist           = gt_wpinfo
+ exceptions
+   send_error       = 1
+   others           = 2.
+
+  if sy-subrc <> 0.
+
+  endif.
+
+endform.                    " get_sm50
+*&---------------------------------------------------------------------*
+*&      Form  output
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+form output using p_tbtco type tbtco.
+  data: lt_enq type table of seqg3,
+        ls_enq type seqg3.
+
+  data: lv_gname    like  seqg3-gname,
+        lv_garg     like  seqg3-garg,
+        lv_guname   like  seqg3-guname,
+        lv_subrc    like  sy-subrc.
+
+  data: ls_wpinfo type wpinfo.
+
+  "Check whether table COIX_DATA40 is locked or not.
+  write: /.
+  write: /1(32) 'Jobname', 35(8) 'Jobcount', 45(10) 'Canceled', 56(10) sy-uzeit.
+  write: /1(32) p_tbtco-jobname, 35(8) p_tbtco-jobcount.
+  write: /.
+  "  lv_gname = 'COIX_DATA40'.
+  clear: lt_enq.
+
+  clear: lv_guname, lv_gname, lv_garg.
+  call function 'ENQUEUE_READ'
+    exporting
+      gclient               = sy-mandt
+      guname                = lv_guname
+      gname                 = lv_gname
+      garg                  = lv_garg
+    importing
+      subrc                 = lv_subrc
+    tables
+      enq                   = lt_enq" gname = lv_gname
+    exceptions
+      communication_failure = 1
+      system_failure        = 2
+      others                = 3.
+  if sy-subrc <> 0.
+    message id sy-msgid type sy-msgty number sy-msgno
+            with sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  endif.
+
+  write:/1(5) 'SM12', 10(10) sy-uzeit, 22(5) 'SUBRC', 28(2) sy-subrc.
+  write:/1(12)   'UserNmae',
+         15(8)   'LockDate',
+         25(6)   'Time',
+         32(1)   'M',
+         34(15)  'LockTable',
+         50(50)  'LockArgument'.
+
+  loop at lt_enq into ls_enq.
+    write:/1(12)   ls_enq-guname, "user nmae
+           15(8)   ls_enq-gtdate, "Lock date
+           25(6)   ls_enq-gttime, "Lock time
+           32(1)   ls_enq-gmode, "Lock mode
+           34(15)  ls_enq-gname, " Lock Table
+           50(50)  ls_enq-garg. "Lock Argument
+  endloop.
+
+
+  perform get_sm50.
+
+  write: / .
+  write:/1(5) 'SM50', 10(10) sy-uzeit.
+  write: /1(3) 'Typ',
+          5(12) 'User',
+          18(6) 'Time',
+          25(40)  'Report',
+          66(30) 'Table'.
+
+  loop at gt_wpinfo into ls_wpinfo where wp_bname is not initial.
+    write: /1(3) ls_wpinfo-wp_typ,"Type
+           5(12) ls_wpinfo-wp_bname, "User
+           18(6) ls_wpinfo-wp_eltime, "Time
+           25(40)  ls_wpinfo-wp_report,"Report
+           66(30) ls_wpinfo-wp_table. "Table
+  endloop.
+  uline.
+endform.                    " output
+
+*Text symbol text£º
+*001:Selection Criteria

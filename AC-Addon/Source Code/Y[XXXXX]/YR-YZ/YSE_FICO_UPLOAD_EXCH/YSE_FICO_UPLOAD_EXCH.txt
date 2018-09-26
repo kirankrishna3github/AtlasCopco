@@ -1,0 +1,925 @@
+*&---------------------------------------------------------------------*
+*& Report  YSE_FICO_UPLOAD_EXCH                                        *
+*& Adapted Copy of Report RFTBFF00                                     *
+*& Adapted by           : Erik Walravens                               *
+*& Date                 : 18.04.2007                                   *
+*& Development Number   : D308                                         *
+*& Change Request Number: CD1K914039                                   *
+*&---------------------------------------------------------------------*
+*& Author: A. Gebauer      22.05.1996                                  *
+*&---------------------------------------------------------------------*
+*& Description:                                                        *
+*& Einlesen von externen Marktdaten aus Datei in die R/3 Stammdaten    *
+*&                                                                     *
+*& Author:       A.Gebauer                                             *
+*& Change:       Anzeige/WS_UPLOAD                                     *
+*& Date  :       02.09.1996                                            *
+*&                                                                     *
+*& Author:       R.Zadro                                               *
+*& Change:       #nderung des Einleseformats                           *
+*&               Umschl¨¹sselung der Marktdaten                         *
+*& Date  :       17.10.1996                                            *
+*&                                                                     *
+*& Author:       R.Zadro                                               *
+*& Change:       Forwards                                              *
+*& Date  :       17.10.1996                                            *
+*&                                                                     *
+*& Author:       A.Gebauer                                             *
+*& Change:       ListViewer                                            *
+*& Date  :       16.02.1999                                            *
+*&                                                                     *
+*& Author:       A.Gebauer                                             *
+*& Change:       Mengenorientierung                                    *
+*& Date:         18.11.1999                                            *
+*&                                                                     *
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME     |CORR.NUMBER| CHANGE REFERENCE         *
+*----------------------------------------------------------------------*
+* MOD-001 |25.11.2009|M.Jacobs  |CD1K952218 |inputfile tab delimited   *
+*----------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+REPORT  YSE_FICO_UPLOAD_EXCH no standard page heading.
+*report   rftbff00  no standard page heading.
+
+*------------------ Constants -----------------------------------------*
+constants: false value ' '.
+
+*------------------ type pool market data -----------------------------*
+type-pools trgfm.
+
+*------------------ database tables -----------------------------------*
+tables: vtbdff.
+
+*------------------ List Viewer ---------------------------------------*
+type-pools: slis.
+data: alv_variant like disvariant.
+data: h_exit(1).
+data: alv_name_thead    type slis_tabname value 'THEAD',
+      alv_name_titem    type slis_tabname value 'TITEM'.
+data: alv_reprep_id     type slis_reprep_id.
+
+
+*------------------ internal tables -----------------------------------*
+* interne Tabelle f¨¹r Marktdatenbank
+data:  begin of sap_vtb_market occurs 100.    "/ Schnittstelle
+        include structure vtb_market.
+data:  end of sap_vtb_market.
+
+* interne Tabelle f¨¹r fehlerhafte Datafeed-Customizing-Requests
+data:   begin of error_sap_answer occurs 1.
+        include structure vtb_market.
+data:   end of error_sap_answer.
+
+* interne Tabelle f¨¹r Dynpro "Select-Options"
+data  begin of dynpfields occurs 1.
+        include structure dynpread.
+data  end   of dynpfields.
+
+
+*------------------ internal variables --------------------------------*
+data  fileshort like authb-filename.
+data  datum_txt(10).
+data  datum like sy-datum.
+data  filestring type string.
+DATA  lv_kurst TYPE kurst_curr.  " tb_prpty.
+
+* Fehlertabelle in Datei schreiben
+data: error_rec type trgfm_error_rec_type occurs 100 with header line.
+
+*------------------ interne Tabelle f¨¹r DateiHeader--------------------*
+data  begin of header_rec occurs 20.
+data  text(70).
+data  end   of header_rec.
+
+
+*------------------ ranges --------------------------------------------*
+ranges sop_scl for vtb_market-sclass.
+
+* Interne Tabelle zum Speichern der Datei durch den Funktions-
+* baustein 'WS_UPLOAD'
+data: input_rec type trgfm_extern_rec_type occurs 500 with header line.
+
+* Interne Tabelle zum sichern der orginal Marktdaten f¨¹r Erstellung der
+* Fehlerdatei
+data: marktdaten_orginal type trgfm_extern_rec_type occurs 500 with
+                        header line.
+
+data  save_subrc like sy-subrc.
+data  save_tabix like sy-tabix.
+
+* begin of insertion MOD-001
+CONSTANTS : c_x(1)      type c value 'X',
+            con_tab     type c value cl_abap_char_utilities=>HORIZONTAL_TAB.
+TYPES: BEGIN OF ty_upload,
+         v_text(100)  TYPE c,            " FILE UPLOAD TEXT
+       END OF ty_upload.
+DATA: gt_upload TYPE STANDARD TABLE OF ty_upload
+                INITIAL SIZE 0 WITH HEADER LINE.
+* end of insertion MOD-001
+
+************************************************************************
+*                   selection parameters                               *
+************************************************************************
+*                           Eingabe                                    *
+selection-screen begin of block 1 with frame title text-100.
+parameters: file like rlgrap-filename obligatory memory id FFMEM.
+parameters: pcupload like filefeed-uploadx default 'X'.
+selection-screen begin of line.                 " AG 18.11.99 begin
+selection-screen comment 1(25) text-130.
+selection-screen position 33.
+parameters:      par_prs  radiobutton group noti default 'X'.
+selection-screen comment (12) text-131.
+parameters:      par_men  radiobutton group noti.
+selection-screen comment (15) text-132.
+selection-screen end of line.                   " AG 18.11.99 end
+
+selection-screen end   of block 1.
+************************************************************************
+*                         Datenlieferant                               *
+selection-screen begin of block feedname with frame title text-003.
+selection-screen begin of line.
+parameters:      par_rfn  radiobutton group feed default 'X'.
+parameters:      par_feed like vtb_ffs-rfeedname memory id 002.
+selection-screen end of line.
+selection-screen begin of line.
+parameters:      par_rfd  radiobutton group feed.
+selection-screen comment 3(40) text-114.
+selection-screen end of line.
+selection-screen end of block feedname.
+************************************************************************
+*                              Fehlerdatei                             *
+selection-screen begin of block errorfile with frame title text-115.
+parameters: log      like filefeed-log    default    'X'.
+parameters: logfile  like rlgrap-filename obligatory default
+                                                'C:\SAPPCADM\error.log'.
+parameters: logdwnld like filefeed-downloadx default 'X'.
+selection-screen end   of block errorfile.
+************************************************************************
+*                               Sonstiges                              *
+selection-screen begin of block 2 with frame title text-101.
+parameters: par_tst   as checkbox default 'X'.
+*----------------------------------------------------------------------*
+selection-screen begin of line.
+selection-screen comment 1(25) text-110.
+selection-screen position 33.
+parameters:      par_dsal  radiobutton group disp default 'X'.
+selection-screen comment (10) text-111.
+parameters:      par_dsfl  radiobutton group disp.
+selection-screen comment (10) text-112.
+parameters:      par_dsok  radiobutton group disp.
+selection-screen comment (25) text-113.
+selection-screen end of line.
+parameters: par_var like disvariant-variant.
+selection-screen end   of block 2.
+************************************************************************
+*                   selection parameters end                           *
+************************************************************************
+
+
+*------------------ initialization ------------------------------------*
+initialization.
+* Pr¨¹fe, ob Bearbeitung erlaubt
+*  authority-check object 'F_T_TRANSB'  "/ ge#ndert 04.12.95 Geb
+*                  id 'TCD' field  'TBDM'.
+*  if sy-subrc ne 0.
+*    message a172(00) with 'TBDM'.
+*  endif.
+
+*  authority-check object 'F_T_TRANSB'     " Changed 18.04.07 EWA
+*                  id 'TCD' field  'YSE_UPLOAD_EXCH'.
+*  if sy-subrc ne 0.
+*    message a172(00) with 'TBDM'.
+*  endif.
+
+
+* ALV Variants - get active one
+  clear alv_variant.
+  alv_variant-report = sy-repid.
+  call function 'REUSE_ALV_VARIANT_DEFAULT_GET'
+       exporting
+            i_save     = 'A'           "/ user specific save available
+       changing
+            cs_variant = alv_variant
+       exceptions
+            not_found  = 1.
+  if sy-subrc = 0.
+    par_var = alv_variant-variant.
+  endif.
+
+* set ALV parameters for selection callback
+  clear alv_reprep_id.
+  alv_reprep_id-tool = 'RT'.
+  alv_reprep_id-onam = sy-repid.
+
+*----------------------------------------------------------------------*
+*------------------  F4-Help for filename -----------------------------*
+at selection-screen on value-request for file.
+* die zu aktualisierenden Felder in Tabelle schreiben
+  clear dynpfields.
+  refresh dynpfields.
+  dynpfields-fieldname = 'PCUPLOAD'.
+  append dynpfields.
+
+  dynpfields-fieldname = 'FILE'.
+  append dynpfields.
+
+
+* Funktionsbaustein, der die Felder aus dem Selektionsdynpro aktualis.
+  call function 'DYNP_VALUES_READ'
+       exporting
+            dyname               = 'YSE_FICO_UPLOAD_EXCH'
+            dynumb               = '1000'
+            translate_to_upper   = 'X'
+       tables
+            dynpfields           = dynpfields
+       exceptions
+            invalid_abapworkarea = 1
+            invalid_dynprofield  = 2
+            invalid_dynproname   = 3
+            invalid_dynpronummer = 4
+            invalid_request      = 5
+            no_fielddescription  = 6
+            invalid_parameter    = 7
+            undefind_error       = 8
+            others               = 9.
+* aktualisierte Feldwerte auslesen
+  loop at dynpfields.
+    if dynpfields-fieldname = 'PCUPLOAD'.
+      pcupload = dynpfields-fieldvalue.
+    endif.
+    if dynpfields-fieldname = 'FILE'.
+      file = dynpfields-fieldvalue.
+    endif.
+  endloop.
+
+* Nur bei PC-upload darf F4-Hilfe f¨¹r Dateinamen aufgerufen werden
+  if pcupload = 'X'.
+    call function 'WS_FILENAME_GET'
+         exporting
+              mask             = ',*.*,*.*.'
+              mode             = 'O'
+              title            = text-002
+              DEF_FILENAME     = file
+         importing
+              filename         = file
+         exceptions
+              inv_winsys       = 1
+              no_batch         = 2
+              selection_cancel = 3
+              selection_error  = 4
+              others           = 5.
+    if sy-subrc = 1.
+      message w573(t2).
+*    Dateiselektion nicht m#glich (falsche Windows-Version)
+    endif.
+  else.
+    message i574(t2).
+*    Eingabehilfe nur bei Upload der Datei von einem PC
+  endif.
+
+*------------------  F4-Help for logfile  -----------------------------*
+at selection-screen on value-request for logfile.
+* die zu aktualisierenden Felder in Tabelle schreiben
+  clear dynpfields.
+  refresh dynpfields.
+  dynpfields-fieldname = 'LOGDWNLD'.
+  append dynpfields.
+* Funktionsbaustein zur Aktualisierung der Dynpro-Felder aufrufen
+  call function 'DYNP_VALUES_READ'
+       exporting
+            dyname               = 'YSE_FICO_UPLOAD_EXCH'
+            dynumb               = '1000'
+            translate_to_upper   = 'X'
+       tables
+            dynpfields           = dynpfields
+       exceptions
+            invalid_abapworkarea = 1
+            invalid_dynprofield  = 2
+            invalid_dynproname   = 3
+            invalid_dynpronummer = 4
+            invalid_request      = 5
+            no_fielddescription  = 6
+            invalid_parameter    = 7
+            undefind_error       = 8
+            others               = 9.
+* Auswerten der aktualisierten Felder
+  loop at dynpfields.
+    if dynpfields-fieldname = 'LOGDWNLD'.
+      logdwnld =  dynpfields-fieldvalue.
+    endif.
+  endloop.
+* nur bei Pc-Download darf F4-Hilfe aufgerufen werden.
+  if logdwnld = 'X'.
+    call function 'WS_FILENAME_GET'
+         exporting
+              mask             = ',*.*,*.*.'
+              mode             = 'S'
+              title            = text-002
+         importing
+              filename         = logfile
+         exceptions
+              inv_winsys       = 1
+              no_batch         = 2
+              selection_cancel = 3
+              selection_error  = 4
+              others           = 5.
+    if sy-subrc = 1.
+      message i573(t2).
+*    Dateiselektion nicht m#glich (falsche Windows-Version)
+    endif.
+  else.  "/ tue nichts, da Basis keine Fehlermeldung in F4 zul##t
+*    message w574(t2).
+*    Eingabehilfe nur bei Upload der Datei von einem PC
+  endif.
+
+*------------------  Check feedname -----------------------------------*
+at selection-screen on block feedname.
+* #berpr¨¹fe Feed/Workmodus, ob zul#ssig
+  if  ( not par_feed is initial ) and ( par_rfn = 'X' ).
+    select * from vtbdff
+           where rfeedname  = par_feed
+           and   source     = 'D'.
+    endselect.
+    if sy-subrc ne 0.
+      message e575(t2) with par_feed.
+*   Feedname & unbekannt
+    endif.
+  endif.
+
+*------------------  Variant Value/Check ------------------------------*
+at selection-screen on value-request for par_var.
+  call function 'REUSE_ALV_VARIANT_F4'
+       exporting
+            is_variant          = alv_variant
+            i_tabname_header    = alv_name_thead
+            i_tabname_item      = alv_name_titem
+*           it_default_fieldcat =
+            i_save              = 'A'
+       importing
+            e_exit              = h_exit
+            es_variant          = alv_variant
+       exceptions
+            not_found           = 1.
+  if sy-subrc = 1.
+    message id sy-msgid type 'S' number sy-msgno
+            with sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  elseif h_exit = space.
+    par_var = alv_variant-variant.
+  endif.
+
+at selection-screen on par_var.
+  if not par_var is initial.
+    alv_variant-variant = par_var.
+    alv_variant-report  = sy-repid.
+    call function 'REUSE_ALV_VARIANT_EXISTENCE'
+         exporting
+              i_save     = 'A'
+         changing
+              cs_variant = alv_variant.
+  endif.
+
+************************************************************************
+*                           Programmablauf                             *
+************************************************************************
+start-of-selection.
+
+* set alv_variant
+  if not par_var is initial.
+    alv_variant-variant = par_var.
+  endif.
+
+* Einlesen Datei Pr#sentationsserver
+  if pcupload = 'X'.
+*   bei Upload vom Pr#sentationsserver ist keine Berechtigung
+*   zum Dateizugriff auf Applikationsserver n#tig.
+**  zuerst Berechtigungspr¨¹fung
+*    move file to fileshort.            "/ Konvertierung erforderlich
+*    call function 'AUTHORITY_CHECK_DATASET'
+*         exporting
+*              activity         = 'READ'
+*              filename         = fileshort
+*         exceptions
+*              no_authority     = 1
+*              activity_unknown = 2
+*              others           = 3.
+*    if sy-subrc eq 1.
+*      message e541(t2) with file.
+**   Keine Berechtigung f¨¹r das Lesen der Datei &
+*    endif.
+
+* expliziter Cast wegen unterschiedlichen Typen
+    move file to filestring.
+
+* Funktionsbaustein zum Upload der Pc-Datei auf den Pr#sentationsserver
+    call function 'GUI_UPLOAD'
+         exporting
+              filename                = filestring
+              filetype                = 'ASC'
+         tables
+* begin of change MOD-001
+*              data_tab                = input_rec
+              data_tab                = gt_upload
+* end of change MOD-001
+         exceptions
+              FILE_OPEN_ERROR         = 1
+              FILE_READ_ERROR         = 2
+              NO_BATCH                = 3
+              GUI_REFUSE_FILETRANSFER = 4
+              INVALID_TYPE            = 5
+              NO_AUTHORITY            = 6
+              UNKNOWN_ERROR           = 7
+              BAD_DATA_FORMAT         = 8
+              HEADER_NOT_ALLOWED      = 9
+              SEPARATOR_NOT_ALLOWED   = 10
+              HEADER_TOO_LONG         = 11
+              UNKNOWN_DP_ERROR        = 12
+              ACCESS_DENIED           = 13
+              DP_OUT_OF_MEMORY        = 14
+              DISK_FULL               = 15
+              DP_TIMEOUT              = 16
+              OTHERS                  = 17.
+    if sy-subrc ne 0.
+      message i516(t2) with file.
+* Datei & konnte nicht ge#ffnet werden.
+      leave list-processing.
+    endif.
+
+* begin of insertion MOD-001
+
+  loop at gt_upload.
+    SPLIT gt_upload AT CON_TAB
+     into input_rec-sclass
+          input_rec-RKEY1
+          input_rec-RKEY2
+          input_rec-SINSTRUMNT
+          input_rec-DDATE
+          input_rec-TTIME
+          input_rec-VALUE
+          input_rec-CURRENCY
+          input_rec-FFACT
+          input_rec-TFACT
+          input_rec-MKIND
+          input_rec-SSTATS
+          input_rec-ERROR.
+    append input_rec.
+    clear input_rec.
+  endloop.
+
+* end of insertion MOD-001
+*   Check if for all records in input_rec the user has
+*   authorization to upload the involved rate type.
+    LOOP AT input_rec.
+
+*     Check if currency field not empty
+      IF input_rec-sinstrumnt IS INITIAL.
+        CONTINUE.
+      ENDIF.
+
+      lv_kurst = input_rec-sinstrumnt.
+      AUTHORITY-CHECK OBJECT 'Z_KURST'
+        ID 'KURST' FIELD LV_KURST
+        ID 'ACTVT' FIELD '02'.
+
+      IF sy-subrc NE 0.
+        message e594(t2) WITH input_rec-sinstrumnt.
+      ENDIF.
+    ENDLOOP.  " input_rec
+
+  else.
+* Einlesen Datei Applikationsserver
+*  zuerst Berechtigungspr¨¹fung
+    move file to fileshort.            "/ Konvertierung erforderlich
+    call function 'AUTHORITY_CHECK_DATASET'
+         exporting
+              activity         = 'READ'
+              filename         = fileshort
+         exceptions
+              no_authority     = 1
+              activity_unknown = 2
+              others           = 3.
+    if sy-subrc eq 1.
+      message e541(t2) with file.
+*   Keine Berechtigung f¨¹r das Lesen der Datei &
+    endif.
+
+*  dann Einlesevorgang
+    call function 'TB_FILEFEED_UNIXFILE_UPLOAD'
+         exporting
+              file     = file
+         tables
+              data_tab = input_rec
+         exceptions
+              no_file  = 1
+              others   = 2.
+    if sy-subrc ne 0.
+      if sy-batch is initial.
+        message i516(t2) with file.
+* Datei & konnte nicht ge#ffnet werden.
+        leave list-processing.
+      else.   " Batchlauf
+*       Im Batch echter Fehler, da Folgejobs reagieren m¨¹ssen
+*       (Bemerkung: Batch ist nur auf Applikations-Server sinnvoll)
+        message e516(t2) with file.
+* Datei & konnte nicht ge#ffnet werden.
+      endif.
+    endif.
+  endif.
+
+*Aufbereiten
+*Alle S#tze, die nicht dem Einleseformat entsprechen werden gl#scht.
+  delete input_rec where sclass ne '01' and  " Devisen
+                         sclass ne '02' and  " Wertpapiere
+                         sclass ne '03' and  " Referenzzinss#tze
+                         sclass ne '04' and  " Indices
+                         sclass ne '21' and  " SWAP-S#tze
+                         sclass ne '##' and  " Kommentar
+                         sclass ne '90'.     " Datenlieferant
+
+*Interne Tabelle f¨¹llen mit den orginal Datens#tzen aus der Marktdaten-
+* Datei. Ist erforderlich, um nach der Umschl¨¹sselung fehlerhafte
+* orginal Datens#tze zu ermitteln.
+  insert lines of input_rec into marktdaten_orginal index 1.
+  delete marktdaten_orginal where sclass = '90'  " Datenlieferant
+                            or    sclass = '##'. " Kommentar
+
+*Umschl¨¹sseln
+  call function 'TB_FILEFEED_CONVERT'
+       exporting
+            richtung        = 'X'
+            headerinfo      = par_rfd
+       tables
+            extern          = input_rec
+            intern          = sap_vtb_market
+       changing
+            lieferant       = par_feed
+       exceptions
+            no_lieferant    = 1
+            no_headerinfo   = 2
+            wrong_lieferant = 3
+            others          = 4.
+*Auswertung der Exceptions
+  save_subrc = sy-subrc.
+  case save_subrc.
+    when 1.
+* wird im Funktionsbaustein abgefangen.
+*   Kein Datenlieferant. #bernahme der Daten ohne Umschl¨¹sselung.
+    when 2.
+      message i579(t2).
+*   Datei enth#lt keine Header-Info. Lieferant bitte manuell eingeben.
+      leave list-processing.           " Zur¨¹ck zum Selektions-Dynpro
+    when 3.
+      message i580(t2) with par_feed.
+*   Datenlieferant & ist nicht im SAP-System bekannt.
+      leave list-processing.           " Zur¨¹ck zum Selektions-Dynpro
+  endcase.
+
+* preis und mengenorientierung " AG 18.11.99 begin
+    data: ukurs type P decimals 5.
+    constants: con_zero_ukurs type p decimals 5 value 0. "/AG 30.11.00
+
+    loop at sap_vtb_market where sclass = '01' and sstats is initial.
+                                       " AG 18.10.00
+      ukurs = sap_vtb_market-value.
+      if ukurs > con_zero_ukurs and par_men = 'X'.
+        ukurs = ukurs * -1.
+        sap_vtb_market-value  = ukurs.
+        sap_vtb_market-mquote = 'X'.   "/ line added 18.10.2000 GeA
+        modify sap_vtb_market.
+      endif.
+    endloop.
+* preis und mengenorientierung " AG 18.11.99 end
+
+* Pr¨¹fe zuerst, ob Bearbeitung erlaubt (Pflegeberechtigung)
+    loop at sap_vtb_market.            "/ construct sop_scl
+      move 'I'      to sop_scl-sign.
+      move 'EQ'     to sop_scl-option.
+      move sap_vtb_market-sclass to sop_scl-low.
+      move sap_vtb_market-sclass to sop_scl-high.
+      collect sop_scl.                 "/ duplicates NOT
+    endloop.                           "/ construct sop_scl
+    call function 'TB_DATAFEED_AUTHORITY_CHECKS'
+         tables
+              sop_scl = sop_scl.
+* Initialisieren der Fehlertabellen
+    refresh error_sap_answer. clear error_sap_answer.
+
+
+* #berpr¨¹fe die Requests
+    call function 'TB_DATAFEED_CHECK_CUSTOMIZING'
+         tables
+              sap_cust       = sap_vtb_market
+              error_sap_cust = error_sap_answer
+         exceptions
+              error_found    = 1
+              others         = 2.
+
+* wenn ok., dann update
+    call function 'TB_DATAFEED_R3TABLES_UPDATE'
+         exporting
+              filesource   = 'X'
+              test_only    = par_tst
+         tables
+              sap_answer   = sap_vtb_market
+         exceptions
+              update_error = 1
+              others       = 2.
+    if sy-subrc <> 0.
+      message i503(t2).
+    endif.
+
+* Volas sind in dieser Dateischnittstelle nicht bekannt
+  perform clear_volas.
+
+* Wenn LogDatei erstellt werden soll
+  if log ='X'.
+*Errorlog-Datei Header schreiben.
+    perform write_header.
+* Fehlerdatei schreiben
+    perform write_errorlog.
+  endif.
+
+*------------------ Ausgabe -------------------------------------------*
+  if par_dsal ne 'X'.                  "/ display part only.
+    if par_dsfl = 'X'.                 "/ display errors only.
+      loop at sap_vtb_market where sstats is initial.
+        delete sap_vtb_market.
+      endloop.
+    else.                              "/ display ok-req only.
+      loop at sap_vtb_market where not sstats is initial.
+        delete sap_vtb_market.
+      endloop.
+    endif.
+  endif.
+
+* Anzeige Marktdaten
+    call function 'TB_DATAFEED_SHOW_MARKET_DATA'
+         exporting
+              flg_datafeed = false
+              alv_variant  = alv_variant
+              reprep_id    = alv_reprep_id
+         tables
+              market_data  = sap_vtb_market.
+
+*&---------------------------------------------------------------------*
+*&      Form  WRITE_ERRORLOG
+*&---------------------------------------------------------------------*
+* Alle Eintr#ge aus der sap_vtb_market, die einen Fehlertext enthalten,*
+* werden in die Tabelle error_rec geschrieben.                         *
+* Es wird der entsprechende Satz aus der marktdaten_orginal ermittelt! *
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+form write_errorlog.
+  clear    error_rec.
+  refresh  error_rec.
+
+  loop at sap_vtb_market where not ( sstats is initial ).
+    save_tabix = sy-tabix.
+    error_rec-sclass      = '##'.
+    error_rec-sstats      = sap_vtb_market-sstats.
+    error_rec-error       = sap_vtb_market-error.
+    append error_rec.
+
+* Es wird der entsprechende Satz aus der marktdaten_orginal ermittelt,
+* da in der Fehler-Log-Datei der nicht umgeschl¨¹sselte Datensatz
+* ausgegeben wird
+    clear error_rec.
+    read table marktdaten_orginal into error_rec index save_tabix.
+    append error_rec.
+  endloop.
+
+*Falls logfile auf den PC geschrieben werden soll.
+  if logdwnld = 'X'.
+
+* expilziter cast wegen Typkonflikt
+    move logfile to filestring.
+
+    call function 'GUI_DOWNLOAD'
+         exporting
+          filename            = filestring
+          filetype            = 'ASC'
+          append              = 'X'
+         tables
+          data_tab            = error_rec
+         exceptions
+          FILE_WRITE_ERROR              = 1
+          NO_BATCH                      = 2
+          GUI_REFUSE_FILETRANSFER       = 3
+          INVALID_TYPE                  = 4
+          NO_AUTHORITY                  = 5
+          UNKNOWN_ERROR                 = 6
+          HEADER_NOT_ALLOWED            = 7
+          SEPARATOR_NOT_ALLOWED         = 8
+          FILESIZE_NOT_ALLOWED          = 9
+          HEADER_TOO_LONG               = 10
+          DP_ERROR_CREATE               = 11
+          DP_ERROR_SEND                 = 12
+          DP_ERROR_WRITE                = 13
+          UNKNOWN_DP_ERROR              = 14
+          ACCESS_DENIED                 = 15
+          DP_OUT_OF_MEMORY              = 16
+          DISK_FULL                     = 17
+          DP_TIMEOUT                    = 18
+          FILE_NOT_FOUND                = 19
+          DATAPROVIDER_EXCEPTION        = 20
+          CONTROL_FLUSH_ERROR           = 21
+          OTHERS                        = 22.
+
+    perform ws_download_error.
+  else.
+*Falls logfile auf den Applikationsserver geschrieben werden soll.
+*    perform write_header.
+    loop at error_rec.
+      transfer error_rec to logfile.
+    endloop.
+* Datei wieder schlie#en
+    close dataset logfile.
+  endif.
+
+endform.                               " WRITE_ERRORLOG
+
+*&---------------------------------------------------------------------*
+*&      Form  WRITE_HEADER
+*&---------------------------------------------------------------------*
+*       text                                                           *
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+form write_header.
+* Fill Heder_Rec
+  perform fill_header_rec.
+  if logdwnld = 'X'.
+
+    move logfile to filestring.
+
+    call function 'GUI_DOWNLOAD'
+         exporting
+          filename                = filestring
+          filetype                = 'ASC'
+         tables
+          data_tab                = header_rec
+         EXCEPTIONS
+          FILE_WRITE_ERROR        = 1
+          NO_BATCH                = 2
+          GUI_REFUSE_FILETRANSFER = 3
+          INVALID_TYPE            = 4
+          NO_AUTHORITY            = 5
+          UNKNOWN_ERROR           = 6
+          HEADER_NOT_ALLOWED      = 7
+          SEPARATOR_NOT_ALLOWED   = 8
+          FILESIZE_NOT_ALLOWED    = 9
+          HEADER_TOO_LONG         = 10
+          DP_ERROR_CREATE         = 11
+          DP_ERROR_SEND           = 12
+          DP_ERROR_WRITE          = 13
+          UNKNOWN_DP_ERROR        = 14
+          ACCESS_DENIED           = 15
+          DP_OUT_OF_MEMORY        = 16
+          DISK_FULL               = 17
+          DP_TIMEOUT              = 18
+          FILE_NOT_FOUND          = 19
+          DATAPROVIDER_EXCEPTION  = 20
+          CONTROL_FLUSH_ERROR     = 21
+          OTHERS                  = 22.
+
+    save_subrc = sy-subrc.
+*Auswertung SY-SUBRC
+    perform ws_download_error.
+  else.
+* Datei zum schreiben #ffnen
+    open dataset logfile for output in text mode encoding default.
+    if sy-subrc ne 0.         "/ Datei konnte nicht ge#ffnet werden
+      message i516(t2) with logfile.
+* Datei & konnte nicht ge#ffnet werden!
+      leave list-processing.
+    endif.
+    loop at header_rec.
+      transfer header_rec to logfile.
+    endloop.
+  endif.
+endform.                               " WRITE_HEADER
+
+*&---------------------------------------------------------------------*
+*&      Form  FILL_HEADER_REC
+*&---------------------------------------------------------------------*
+*       text                                                           *
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+form fill_header_rec.
+
+  datum = sy-datum.
+*     Datum konvertieren von TTMMYYYY nach YYYYMMTT konvertieren
+  move datum(4)   to datum_txt+6(4).   "/ Jahr
+  datum_txt+5(1) = '.'.
+  move datum+4(2) to datum_txt+3(2).   "/ Monat
+  datum_txt+2(1) = '.'.
+  move datum+6(2) to datum_txt(2)  .   "/ Tag
+
+  clear header_rec.
+  refresh header_rec.
+  header_rec-text = text-116.
+  append header_rec.
+  header_rec-text = text-117.
+  append header_rec.
+  header_rec-text = text-118.
+  header_rec-text+25(40) = file.
+  append header_rec.
+  header_rec-text = text-119.
+  header_rec-text+25(20) = datum_txt.
+  append header_rec.
+  header_rec-text = text-120.
+  header_rec-text+25(20) = sy-uname.
+  append header_rec.
+  header_rec-text = text-121.
+  append header_rec.
+  header_rec-text = text-122.
+  append header_rec.
+  header_rec-text = text-124.
+  append header_rec.
+* Headerinfo in Datei schreiben (Datenlieferant)
+  header_rec-text = text-125.
+  replace '&' with par_feed into header_rec-text.
+  append header_rec.
+endform.                               " FILL_HEADER_REC
+
+*&---------------------------------------------------------------------*
+*&      Form  WS_DOWNLOAD_ERROR
+*&---------------------------------------------------------------------*
+*       text                                                           *
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+form ws_download_error.
+  if save_subrc <> 0.
+    message i516(t2) with logfile.     " Dann Fehler im Dateinamen
+* Datei & konnte nicht ge#ffnet werden!
+    leave list-processing.             " Zur¨¹ck zum Selektions-Dynpro
+  endif.
+endform.                               " WS_DOWNLOAD_ERROR
+*&---------------------------------------------------------------------*
+*&      Form  CLEAR_VOLAS
+*&---------------------------------------------------------------------*
+*       text                                                           *
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+form clear_volas.
+  loop at sap_vtb_market where sclass <> '01'
+                         and   sclass <> '02'
+                         and   sclass <> '03'
+                         and   sclass <> '04'
+                         and   sclass <> '21'.
+    sap_vtb_market-sstats  = 'E'.
+    sap_vtb_market-error   = text-123.
+    replace '&' with sap_vtb_market-sclass
+                into sap_vtb_market-error.
+    modify sap_vtb_market.
+  endloop.
+
+endform.                               " CLEAR_VOLAS
+
+*Text symbol text£º
+*002:PC file
+*003:Data provider
+*100:Input
+*101:Output control
+*110:Output list of results
+*111:All
+*112:Errors
+*113:Correct results
+*114:Generate automatically from file
+*115:Error file
+*116:###Market data file interface: error log##############################
+*117:##                                                                  ##
+*118:## Market data file                                                 ##
+*119:## Created on:                                                      ##
+*120:## Created by:                                                      ##
+*121:##                                                                  ##
+*122:######################################################################
+*123:Instrument class & unknown
+*124:## Data provider
+*125:90&
+*130:Exchange rates
+*131:direct quot.
+
+*132:indirect quotation
+*Selection text£º
+*FILE:        File name
+*LOG:        Generate error file
+*LOGDWNLD:        Download
+*LOGFILE:        File name
+*PAR_DSAL:        Whole results list
+*PAR_DSFL:        Display error log
+*PAR_DSOK:        Display correct market data
+*PAR_FEED:        Name
+*PAR_RFD:        Determine provider
+*PAR_RFN:        Provider specified
+*PAR_TST:        Test run
+*PAR_VAR:        Layout
+*PCUPLOAD:        Upload

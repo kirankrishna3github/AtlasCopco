@@ -1,0 +1,392 @@
+*&---------------------------------------------------------------------*
+*& Report  YAM_HR_DELIVER_MONTHLY_REPORT                               *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+*&  This program will execute the program RPCEDTD0 for given variant   *
+*&  The spool-number of the report and given email-address will be     *
+*&  given to pgm YAM_HR_EMAIL_SPOOL_IN_HTML, which will deliver the    *
+*&  report as HTML attachment to an email                              *
+*&---------------------------------------------------------------------*
+*&  B.De.bruyne  200901 - added international payroll (will probably   *
+*&                        be used by other countries (no SI/TAX)       *
+*&---------------------------------------------------------------------*
+
+
+REPORT  yam_hr_monthly_report_htm.
+*----------------------------------------------------------------------*
+*  Declaration of SYSTEM TABLES                                        *
+*----------------------------------------------------------------------*
+TABLES: tsp01. " Spool Requests
+
+*----------------------------------------------------------------------*
+*  TYPES DEFINITIONS                                                   *
+*----------------------------------------------------------------------*
+TYPES: BEGIN OF t_tsp01.
+        INCLUDE STRUCTURE tsp01.
+TYPES: END OF t_tsp01.
+*----------------------------------------------------------------------*
+*  Declaration of INTERNAL TABLES                                      *
+*----------------------------------------------------------------------*
+*DATA: it_tbtcp TYPE STANDARD TABLE OF t_tbtcp INITIAL SIZE 0,
+*      wa_tbtcp TYPE t_tbtcp.
+DATA: it_tsp01 TYPE STANDARD TABLE OF t_tsp01 INITIAL SIZE 0,
+      wa_tsp01 TYPE t_tsp01.
+DATA: i_params TYPE STANDARD TABLE OF rsparams WITH HEADER LINE.
+
+
+* Error management
+DATA: messtab TYPE STANDARD TABLE OF bdcmsgcoll WITH HEADER LINE.
+*----------------------------------------------------------------------*
+*  Declaration of VARIABLES                                            *
+*----------------------------------------------------------------------*
+DATA: rc LIKE sy-subrc.
+
+* 03-04-2008 INS BEGIN
+DATA: params LIKE pri_params,
+      lv_max_page_width TYPE i,
+      lv_page_width TYPE i,
+      valid    TYPE c,
+      lv_paart(50),
+      lv_linsz(10),
+      lv_linct(10).
+
+DATA: ws_spool_num  LIKE tsp01-rqident,
+      ws_spool_name LIKE tsp01-rq2name.
+
+* Management errors
+DATA: l_mstring TYPE string.
+DATA: g_error(1) VALUE ' '.
+
+
+
+*----------------------------------------------------------------------*
+*  Selection screen                                                    *
+*----------------------------------------------------------------------*
+SELECTION-SCREEN BEGIN OF BLOCK 0 WITH FRAME.
+  SELECTION-SCREEN BEGIN OF LINE.
+    SELECTION-SCREEN COMMENT (7) text-001
+                       FOR FIELD p_var.
+    SELECTION-SCREEN POSITION 15.
+    PARAMETERS: p_var LIKE rsvar-variant OBLIGATORY.
+  SELECTION-SCREEN END OF LINE.
+
+  SELECTION-SCREEN BEGIN OF LINE.
+    SELECTION-SCREEN COMMENT (7) text-002
+                       FOR FIELD p_sub.
+    SELECTION-SCREEN POSITION 15.
+    PARAMETERS: p_sub LIKE sodocchgi1-obj_descr.
+  SELECTION-SCREEN END OF LINE.
+
+  SELECTION-SCREEN BEGIN OF LINE.
+    SELECTION-SCREEN COMMENT (8) text-003
+                      FOR FIELD p_mailto.
+    SELECTION-SCREEN POSITION 15.
+    PARAMETERS: p_mailto LIKE somlreci1-receiver.
+  SELECTION-SCREEN END OF LINE.
+
+  SELECTION-SCREEN BEGIN OF LINE.
+    SELECTION-SCREEN COMMENT (8) text-004
+                      FOR FIELD p_mailcc.
+    SELECTION-SCREEN POSITION 15.
+    PARAMETERS: p_mailcc LIKE somlreci1-receiver.
+  SELECTION-SCREEN END OF LINE.
+SELECTION-SCREEN END OF BLOCK 0.
+
+
+START-OF-SELECTION.
+*******************
+
+  CLEAR g_error.
+  CLEAR ws_spool_name.
+
+* check whether the variant p_var exist for pgm RPCEDTD0
+  PERFORM variant_exists.
+  IF g_error = 'X'.
+    PERFORM error_management.
+    EXIT.
+  ENDIF.
+
+  ws_spool_name = p_var.
+  CALL FUNCTION 'GET_PRINT_PARAMETERS'
+    EXPORTING
+      destination            = 'LOCL'
+      immediately            = ' '
+      release                = ' '
+      new_list_id            = 'X'
+      no_dialog              = 'X'
+      line_count             = 65
+      line_size              = 82
+      list_name              = ws_spool_name
+      expiration             = 1
+    IMPORTING
+      out_parameters         = params
+      valid                  = valid
+    EXCEPTIONS
+      archive_info_not_found = 1
+      invalid_print_params   = 2
+      invalid_archive_params = 3
+      OTHERS                 = 4.
+  IF sy-subrc <> 0.
+     g_error = 'X'.
+     messtab-msgspra = sy-langu.     " language
+     messtab-msgid   = 'YAM_AFRU'.   " class
+     messtab-msgnr   = '020'.        " number
+     messtab-msgv1   = sy-subrc.
+     APPEND messtab. CLEAR messtab.
+  ENDIF.
+
+  IF g_error = 'X'.
+     PERFORM error_management.
+     EXIT.
+  ENDIF.
+
+  IF valid <> space.
+    lv_linct = params-linct.
+    lv_linsz = params-linsz.
+    CONCATENATE 'X_' lv_linct '_' lv_linsz INTO lv_paart.
+    CONDENSE lv_paart NO-GAPS.
+    SHIFT lv_paart LEFT DELETING LEADING space.
+    params-paart = lv_paart+0(16).
+
+*   RPCEDT?0 is executed and results are stored into the spool
+    CASE p_var(2).                                          "BDB 200901
+      WHEN 'DE'.      " Germany                             "BDB 200901
+        SUBMIT rpcedtd0 USING SELECTION-SET p_var
+                    TO SAP-SPOOL WITHOUT SPOOL DYNPRO
+                    SPOOL PARAMETERS params
+                    AND RETURN.
+      WHEN OTHERS.   " International                        "BDB 200901
+        SUBMIT rpcedtx0 USING SELECTION-SET p_var
+                    TO SAP-SPOOL WITHOUT SPOOL DYNPRO
+                    SPOOL PARAMETERS params
+                    AND RETURN.
+    ENDCASE.                                                "BDB 200901
+  ENDIF.
+
+  IF sy-batch = 'X'.
+     COMMIT WORK AND WAIT.
+  ENDIF.
+*--------------------------------------------------------------
+*   the report is created and exists in the spool, now we
+*   are going to send the report in HTML format as attachment
+*   to an email.
+*--------------------------------------------------------------
+    IF p_mailto IS NOT INITIAL.
+*      get the spool-number.
+       PERFORM get_spool_request.
+       CHECK ( g_error IS INITIAL ).
+
+*      call the program with correct parameters
+       PERFORM fill_variant TABLES i_params.
+       CHECK ( g_error IS INITIAL ).
+
+       SUBMIT YAM_HR_EMAIL_SPOOL_IN_HTML
+          WITH  SELECTION-TABLE i_params
+          TO SAP-SPOOL WITHOUT SPOOL DYNPRO
+*         SPOOL PARAMETERS params
+          AND RETURN.
+
+    ENDIF.   " if p_mailto is not initial.
+
+*&---------------------------------------------------------------------*
+*&      Form  fill_variant2  (YAM_HR_EMAIL_SPOOL_IN_HTML)
+*&---------------------------------------------------------------------*
+FORM fill_variant  TABLES p_i_variant STRUCTURE i_params.
+*  DATA: i_data TYPE STANDARD TABLE OF rsparams WITH HEADER LINE.
+   DATA: tmp_spool_num(10).
+
+  Refresh i_params.
+
+  clear i_params.
+  i_params-selname = 'S_SPOOL'.
+  i_params-kind = 'S'.
+  i_params-sign = 'I'.
+  i_params-option = 'EQ'.
+  MOVE ws_spool_num TO tmp_spool_num.
+  i_params-low = tmp_spool_num.     " spoolnumber
+  APPEND i_params.
+
+  clear i_params.
+  i_params-selname = 'P_DES'.
+  i_params-kind = 'P'.
+  i_params-low = p_sub.             " subject of email
+  APPEND i_params.
+
+  clear i_params.
+  i_params-selname = 'S_EMAILS'.
+  i_params-kind = 'S'.
+  i_params-sign = 'I'.
+  i_params-option = 'EQ'.
+  i_params-low = p_mailto.         " email receiver 1
+  APPEND i_params.
+
+  if p_mailcc IS NOT INITIAL.
+     clear i_params.
+     i_params-selname = 'S_EMAILS'.
+     i_params-kind = 'S'.
+     i_params-sign = 'I'.
+     i_params-option = 'EQ'.
+     i_params-low = p_mailcc.      " email receiver 2
+     APPEND i_params.
+  endif.
+
+ENDFORM.                    " fill_variant2
+
+*&---------------------------------------------------------------------*
+*&      Form  variant_exists
+*&---------------------------------------------------------------------*
+*   Variant existence check
+*----------------------------------------------------------------------*
+FORM variant_exists.
+  CASE p_var(2).                                            "BDB 200901
+    WHEN 'DE'.      " Germany                               "BDB 200901
+        CALL FUNCTION 'RS_VARIANT_EXISTS'
+         EXPORTING
+           report              = 'RPCEDTD0'
+           variant             = p_var
+        IMPORTING
+           r_c                 = rc
+        EXCEPTIONS
+           not_authorized      = 1
+           no_report           = 2
+           report_not_existent = 3
+           report_not_supplied = 4
+           OTHERS              = 5.
+    WHEN OTHERS.   " International                          "BDB 200901
+        CALL FUNCTION 'RS_VARIANT_EXISTS'
+         EXPORTING
+           report              = 'RPCEDTX0'                 "BDB 200901
+           variant             = p_var
+        IMPORTING
+           r_c                 = rc
+        EXCEPTIONS
+           not_authorized      = 1
+           no_report           = 2
+           report_not_existent = 3
+           report_not_supplied = 4
+           OTHERS              = 5.
+  ENDCASE.                                                  "BDB 200901
+
+  IF rc <> 0.
+    g_error = 'X'.
+    messtab-msgspra = sy-langu.    " language
+    messtab-msgid   = 'YAM_AFRU'.  " class
+* Variant DE-TIMESHEETS for RPTEDT00 program does not exist.
+    messtab-msgnr   = 'Variant DE-TIMESHEETS for RPTEDT00 program does not exist'(008).       " number
+    APPEND messtab. CLEAR messtab.
+  ENDIF.
+
+ENDFORM.                    " variant_exists
+
+*&---------------------------------------------------------------------*
+*&      Form error_management
+*&---------------------------------------------------------------------*
+FORM error_management .
+  LOOP AT messtab.
+    SELECT SINGLE text FROM t100
+                       INTO l_mstring
+                       WHERE ( sprsl = messtab-msgspra ) AND
+                             ( arbgb = messtab-msgid ) AND
+                             ( msgnr = messtab-msgnr ).
+    IF sy-subrc = 0.
+      IF l_mstring CS '&1'.
+        REPLACE '&1' WITH messtab-msgv1 INTO l_mstring.
+        REPLACE '&2' WITH messtab-msgv2 INTO l_mstring.
+        REPLACE '&3' WITH messtab-msgv3 INTO l_mstring.
+        REPLACE '&4' WITH messtab-msgv4 INTO l_mstring.
+      ELSE.
+        REPLACE '&' WITH messtab-msgv1 INTO l_mstring.
+        REPLACE '&' WITH messtab-msgv2 INTO l_mstring.
+        REPLACE '&' WITH messtab-msgv3 INTO l_mstring.
+        REPLACE '&' WITH messtab-msgv4 INTO l_mstring.
+      ENDIF.
+
+      CONDENSE l_mstring.
+    ELSE.
+
+    ENDIF.
+    WRITE l_mstring.
+
+  ENDLOOP.
+
+ENDFORM.                    " management_errors
+
+*&---------------------------------------------------------------------*
+*& Form  get_spool_request
+*&      Retrieves the correct spool-number. This is depending whether
+*&      program is submitted in foreground or background.
+*& returns: ws_spool_num
+*&---------------------------------------------------------------------*
+FORM get_spool_request .
+  ws_spool_num = 0.
+
+  IF sy-batch = 'X'.
+*     We need the second register because in batch mode, it generates an
+*     extra spool request that it's the first register.
+    SELECT * UP TO 2 ROWS
+           INTO wa_tsp01
+           FROM tsp01
+           WHERE rqclient = sy-mandt         AND
+                 rq1name  = 'LOCL'           AND
+                 rq2name  = ws_spool_name    AND
+                 rqowner  = sy-uname
+           ORDER BY rqident DESCENDING
+                    rqcretime DESCENDING.
+    ENDSELECT.
+    IF sy-subrc <> 0.
+      g_error = 'X'.
+      messtab-msgspra = sy-langu.     " language
+      messtab-msgid   = 'YAM_AFRU'.   " class
+      messtab-msgnr   = '009'.        " number
+      messtab-msgv2   = sy-subrc.
+      APPEND messtab. CLEAR messtab.
+      EXIT.
+    ENDIF.
+
+  ELSE.
+    SELECT * UP TO 1 ROWS
+      INTO wa_tsp01
+      FROM tsp01
+      WHERE rqclient = sy-mandt       AND
+            rq1name  = 'LOCL'         AND
+            rq2name = ws_spool_name   AND
+            rqowner  = sy-uname
+      ORDER BY rqident DESCENDING
+               rqcretime DESCENDING.
+    ENDSELECT.
+    IF sy-subrc <> 0.
+      g_error = 'X'.
+      messtab-msgspra = sy-langu.     " language
+      messtab-msgid   = 'YAM_AFRU'.   " class
+      messtab-msgnr   = '009'.        " number
+      messtab-msgv2   = sy-subrc.
+      APPEND messtab. CLEAR messtab.
+      EXIT.
+    ENDIF.
+  ENDIF.
+
+  ws_spool_num = wa_tsp01-rqident.
+ENDFORM.                    " get_spool_request
+
+*Text symbol text£º
+*001:Variant
+*002:Subject
+*003:Email to
+*004:Email cc
+*005:Result of the sendprocess:
+*006:Successfully sent to all recipients.
+*007:Could not send to:
+*008:Successfully sent to all other recipients.
+*009:No permission to sent to the specified amount of recipients !
+*010:Document could not be sent to any recipient !
+*011:No permission to send !
+*012:Error while sending.
+*013:Variant
+*014:for RPCEDTD0 program does not exist
+
+*015:Remuneration statement
+*Selection text£º
+*P_MAILCC:        Email cc
+*P_MAILTO:        Email to
+*P_SUB:        Subject
+*P_VAR:        Variant

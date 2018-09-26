@@ -1,0 +1,321 @@
+*&---------------------------------------------------------------------*
+*& Report  YSE_EQUI_STAT_CORRECT_DISTR                                 *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+*&                                                                     *
+*&  Correction of equipment user status (for distributors)             *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+*  Author                : Jules Smets
+*  Date                  : 16.03.2010
+*  Change Request Number : CR0797
+*  Transport request Nr. : CD1K955336
+*----------------------------------------------------------------------*
+*                                                                      *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD. NR.| DATE       | NAME          | CORRECTION NR.| CHANGE REF. # *
+*----------------------------------------------------------------------*
+* MOD-001 | xx/xx/xxxx | X             | CD1K9xxxxx    | CRxxxx        *
+*         | Text                                                       *
+*----------------------------------------------------------------------*
+
+REPORT  yse_equi_stat_correct_distr MESSAGE-ID yam_re.
+
+* Tables
+TABLES : v_equi, ihpa, knvv, tj30t, jest.
+
+* Global definitions
+DATA: BEGIN OF gt_equi OCCURS 0,
+        equnr           TYPE equnr,
+        kdgrp           TYPE kdgrp,
+      END OF gt_equi.
+
+DATA: BEGIN OF i_logtab OCCURS 0,
+        cod(1)     TYPE c,
+        msg(119)   TYPE c,
+      END OF i_logtab.
+
+DATA : g_msg(120)       TYPE c,
+       g_estat          LIKE  tj30t-estat,
+       g_objnr          LIKE  jest-objnr.
+
+DATA: t_tj30t  TYPE TABLE OF tj30t  WITH HEADER LINE.
+
+DATA: BEGIN OF t_stat  OCCURS 0,
+        txt04  LIKE tj30t-txt04,
+      END OF t_stat.
+
+DATA: BEGIN OF gs_stat,
+        zind(1)         TYPE c,
+        zoem(1)         TYPE c,
+      END OF gs_stat.
+
+RANGES: r_txt04  FOR tj30t-txt04.
+
+* Global constants
+CONSTANTS: c_x             TYPE c           VALUE 'X',
+           c_equipment(10) TYPE c           VALUE 'EQUIPMENT',
+           c_99991231(8)   TYPE c           VALUE '99991231',
+           c_statprof      LIKE tj30t-stsma VALUE 'ZAM00004',
+           c_zind          LIKE tj30t-txt04 VALUE 'ZIND',  "In distrib.
+           c_zoem          LIKE tj30t-txt04 VALUE 'ZOEM',  "OEM
+           c_obj(2)        TYPE c           VALUE 'IE',
+           c_soldto(2)     TYPE c           VALUE 'AG',
+           c_dc(2)         TYPE c           VALUE 'DC',  "Dealer
+           c_hc(2)         TYPE c           VALUE 'HC',  "Wholes./Retail
+           c_co(2)         TYPE c           VALUE 'CO',  "Contractor
+           c_oe(2)         TYPE c           VALUE 'OE'.  "OEM company
+
+*.................. Layout selection screen............................*
+SELECTION-SCREEN BEGIN OF BLOCK b1  WITH FRAME  TITLE text-b01.
+SELECT-OPTIONS:
+  s_bukrs   FOR v_equi-bukrs  NO-EXTENSION  NO INTERVALS,
+  s_vkorg   FOR v_equi-vkorg  NO-EXTENSION  NO INTERVALS,
+  s_equnr   FOR v_equi-equnr  MATCHCODE OBJECT equi.
+SELECTION-SCREEN END OF BLOCK b1.
+
+*
+*..................  SCREEN PROCESSING  ...............................*
+AT SELECTION-SCREEN.
+
+* Check if Company or Sales Organization is selected
+  IF s_bukrs[] IS INITIAL  AND
+     s_vkorg[] IS INITIAL.
+    MESSAGE e147
+            WITH 'Please select a Company or a Sales Organization'(e05).
+  ENDIF.
+
+*
+*..................  MAIN PROGRAM  ....................................*
+
+START-OF-SELECTION.
+
+  CALL METHOD ycl_statistics=>record_transaction.
+
+  PERFORM build_status_range.
+
+* Select the relevant equipments
+  SELECT e~equnr c~kdgrp
+         INTO TABLE gt_equi
+         FROM v_equi AS e
+              INNER JOIN ihpa AS p
+                         ON e~objnr = p~objnr
+              INNER JOIN knvv AS c
+                         ON p~parnr = c~kunnr  AND
+                            e~vkorg = c~vkorg  AND
+                            e~vtweg = c~vtweg  AND
+                            e~spart = c~spart
+         WHERE e~equnr   IN s_equnr
+           AND e~bukrs   IN s_bukrs
+           AND e~vkorg   IN s_vkorg
+           AND e~eqart    = c_equipment
+           AND e~datbi    = c_99991231
+           AND e~spras    = sy-langu
+           AND p~parvw    = c_soldto
+           AND p~kzloesch = ' '
+           AND ( c~kdgrp = c_dc  OR
+                 c~kdgrp = c_hc  OR
+                 c~kdgrp = c_co  OR
+                 c~kdgrp = c_oe ).
+
+  IF gt_equi[] IS INITIAL.
+    g_msg = text-e03.
+    PERFORM add_message_to_tab USING g_msg ' '.
+  ELSE.
+    PERFORM update_equi_status.
+  ENDIF.
+
+  PERFORM write_results.
+
+*
+*..................  FORMS  ...........................................*
+
+*&---------------------------------------------------------------------*
+*&      Form  BUILD_STATUS_RANGE
+*&---------------------------------------------------------------------*
+*       Build status selection range
+*----------------------------------------------------------------------*
+FORM build_status_range .
+
+  CLEAR r_txt04.
+
+  r_txt04-option = 'EQ'.
+  r_txt04-sign   = 'I'.
+  r_txt04-low    = c_zind.
+  APPEND r_txt04.
+  r_txt04-low    = c_zoem.
+  APPEND r_txt04.
+
+  SORT r_txt04.
+
+ENDFORM.                    " BUILD_STATUS_RANGE
+
+*&---------------------------------------------------------------------*
+*&      Form  update_equi_status
+*&---------------------------------------------------------------------*
+*       Update equipment status
+*----------------------------------------------------------------------*
+FORM update_equi_status.
+
+* Get the statusses to be processed
+  SELECT * INTO TABLE t_tj30t
+           FROM tj30t
+           WHERE stsma = c_statprof
+             AND txt04 IN r_txt04
+             AND spras = sy-langu.
+
+  SORT t_tj30t BY txt04.
+
+* Process selected equipments
+  LOOP AT gt_equi.
+
+    CONCATENATE c_obj gt_equi-equnr INTO g_objnr.
+
+*   Get the concerned statusses (per equipment)
+    CLEAR t_stat[].
+    CLEAR: gs_stat.
+
+    SELECT t~txt04 INTO TABLE t_stat
+                   FROM jest AS j
+                   INNER JOIN tj30t AS t
+                              ON j~stat = t~estat
+                   WHERE j~objnr = g_objnr
+                     AND j~inact = ' '
+                     AND t~txt04 IN r_txt04
+                     AND t~spras = sy-langu.
+
+    LOOP AT t_stat.
+      CASE t_stat-txt04.
+        WHEN c_zind.
+          gs_stat-zind = c_x.
+        WHEN c_zoem.
+          gs_stat-zoem = c_x.
+      ENDCASE.
+    ENDLOOP.
+
+*   Activate equipment status when needed
+    IF gt_equi-kdgrp = c_dc  OR
+       gt_equi-kdgrp = c_hc.
+      IF gs_stat-zind IS INITIAL.
+*       In distributor
+        PERFORM set_status USING c_zind.
+      ENDIF.
+    ELSE.
+      IF gt_equi-kdgrp = c_co  OR
+         gt_equi-kdgrp = c_oe.
+        IF gs_stat-zoem IS INITIAL.
+*         OEM
+          PERFORM set_status USING c_zoem.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+  ENDLOOP.
+
+ENDFORM.                    "update_equi_status
+
+*&---------------------------------------------------------------------*
+*&      Form  set_status
+*&---------------------------------------------------------------------*
+*       Activate equipment status
+*----------------------------------------------------------------------*
+*      -->P_STATUS : Equipment status
+*----------------------------------------------------------------------*
+FORM set_status USING p_status.
+
+  CLEAR: g_objnr,
+         g_estat.
+
+* Get status code
+  READ TABLE t_tj30t WITH KEY txt04 = p_status
+                     BINARY SEARCH.
+  IF sy-subrc = 0.
+    g_estat = t_tj30t-estat.
+  ENDIF.
+
+  CONCATENATE c_obj gt_equi-equnr INTO g_objnr.
+
+  CALL FUNCTION 'STATUS_CHANGE_EXTERN'
+    EXPORTING
+*      check_only                = ' '
+      client                    = sy-mandt
+      objnr                     = g_objnr
+      user_status               = g_estat
+*      set_inact                 = ' '
+*      SET_CHGKZ                 =
+*      no_check                  = ' '
+*    IMPORTING
+*      STONR                     =
+    EXCEPTIONS
+      object_not_found          = 1
+      status_inconsistent       = 2
+      status_not_allowed        = 3
+      OTHERS                    = 4.
+
+  IF sy-subrc = 0.
+    COMMIT WORK AND WAIT.
+    g_msg = text-i02.
+  ELSE.
+    g_msg = text-e02.
+  ENDIF.
+
+  REPLACE '&1' WITH p_status INTO g_msg.
+  REPLACE '&2' WITH gt_equi-equnr INTO g_msg.
+  PERFORM add_message_to_tab USING g_msg ' '.
+
+ENDFORM.                    "set_status
+
+*&---------------------------------------------------------------------*
+*&      Form  add_message_to_tab
+*&---------------------------------------------------------------------*
+*       Add modification message to log table
+*----------------------------------------------------------------------*
+*      -->P_MSG : Message
+*      -->P_COD : Processing code
+*----------------------------------------------------------------------*
+FORM add_message_to_tab USING p_msg p_cod.
+
+  i_logtab-msg = p_msg.
+  i_logtab-cod = p_cod.
+  APPEND i_logtab.
+  CLEAR i_logtab.
+
+ENDFORM.                    "add_message_to_tab
+
+*&---------------------------------------------------------------------*
+*&      Form  write_results
+*&---------------------------------------------------------------------*
+*       Modification log
+*----------------------------------------------------------------------*
+FORM write_results.
+
+  LEAVE TO LIST-PROCESSING.
+
+  LOOP AT i_logtab.
+    IF i_logtab-cod = ' '.
+      WRITE: / i_logtab-msg.
+    ELSE.
+      FORMAT COLOR COL_NEGATIVE.
+      WRITE: /13 i_logtab-msg.
+      FORMAT RESET.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    "write_results
+
+*Text symbol text£º
+*E01:Equipment &2 : status &1 NOT reset
+*E02:Equipment &2 : status &1 NOT set
+*E03:No equipments found for this selection
+*E05:Please select a Company or a Sales Organization
+*I01:Equipment &2 : status &1 reset
+
+*I02:Equipment &2 : status &1 set
+*Selection text£º
+*P_BUKRS:        Company
+*P_VKORG:        Sales Organization
+*S_BUKRS:        Company
+*S_EQUNR:        Equipment
+*S_VKORG:        Sales Organization

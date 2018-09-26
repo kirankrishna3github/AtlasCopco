@@ -1,0 +1,504 @@
+*&---------------------------------------------------------------------*
+*&      Form  CREATE_IDOCS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_MESSAGE_TYPE  text
+*      -->P_C_LS  text
+*      -->P_BUKRS  text
+*      <--P_RESULT  text
+*----------------------------------------------------------------------*
+FORM create_idocs USING p_message_type
+                        p_ls
+                        p_bukrs.
+
+  DATA: f_last,
+        h_counter TYPE i,
+        h_total_idocs TYPE i,
+        h_total_lines TYPE i,
+        h_calc(16) TYPE p DECIMALS 10,
+        beg_idx    TYPE syindex,
+        end_idx    TYPE syindex.
+
+  CONSTANTS: c_split TYPE i VALUE '950'.
+
+
+* FIND RECEIVING PARTNER
+  SELECT SINGLE rcvprn idoctyp
+  INTO  (wa_edidc-rcvprn, wa_edidc-idoctp)
+  FROM edp13
+  WHERE mestyp = p_message_type.
+** Polulate Control Record
+  wa_edidc-mestyp =  p_message_type.
+*  wa_edidc-idoctp =  p_idoc_type.
+  wa_edidc-rcvprt =  p_ls.
+
+* Read Data
+
+  IF sy-subrc EQ 0.
+
+    CLEAR i_edidd_data_epay[].
+    PERFORM fill_data TABLES i_edidd_data_epay
+                      USING p_message_type
+                            p_bukrs.
+
+    IF NOT i_edidd_data_epay[] IS INITIAL.
+      LOOP AT i_edidd_data_epay.
+        AT FIRST.
+          MOVE sy-tabix TO beg_idx.
+        ENDAT.
+
+        ADD 1 TO h_counter.
+        MOVE sy-tabix TO end_idx.
+        AT LAST.
+          f_last = 'X'.
+        ENDAT.
+
+        i_edidd_data = i_edidd_data_epay.
+        APPEND i_edidd_data.
+
+        IF f_last EQ 'X' OR
+           h_counter EQ c_split.
+          CALL FUNCTION 'MASTER_IDOC_DISTRIBUTE'
+            EXPORTING
+              master_idoc_control            = wa_edidc
+            TABLES
+              communication_idoc_control     = i_edidc_control_comm
+              master_idoc_data               = i_edidd_data
+            EXCEPTIONS
+              error_in_idoc_control          = 1
+              error_writing_idoc_status      = 2
+              error_in_idoc_data             = 3
+              sending_logical_system_unknown = 4
+              OTHERS                         = 5.
+
+          IF sy-subrc EQ 0.
+            CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'.
+
+            WRITE : / 'Idoc type',p_message_type, 'generated '.
+            IF cb_acci EQ 'X'.
+              PERFORM update_table_yse_epay_acci USING beg_idx end_idx.
+              beg_idx = end_idx + 1.
+            ENDIF.
+          ELSE.
+            WRITE : / 'Idoc type',p_message_type, ' in Error '.
+          ENDIF.
+          CLEAR: h_counter, i_edidd_data.
+          REFRESH: i_edidd_data.
+        ENDIF.
+      ENDLOOP.
+
+    ELSE.
+      WRITE : / 'Idoc type ',p_message_type, ' No data found '.
+    ENDIF.
+  ELSE.
+    WRITE : / 'Idoc type ',p_message_type, ' Check Partner Profiles '.
+  ENDIF.
+
+
+ENDFORM.                    "create_idocs
+*&---------------------------------------------------------------------*
+*&      Form  FILL_DATA
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_I_EDIDD_DATA  text
+*      -->P_P_MESSAGE_TYPE  text
+*      -->P_P_BUKRS  text
+*----------------------------------------------------------------------*
+FORM fill_data  TABLES l_data STRUCTURE edidd
+                USING  p_mes_type TYPE edipmestyp
+                       p_bukrs    TYPE bukrs.
+
+
+  CLEAR l_data.
+
+* Get Terms Of payment
+  IF p_mes_type EQ c_mestyp_epay.
+    SELECT t1~zterm  t2~ztagg text1
+    INTO CORRESPONDING FIELDS OF TABLE  it_t052
+    FROM t052 AS t1
+    JOIN t052u AS t2 ON t1~zterm EQ t2~zterm
+    WHERE koart NE 'D'
+    AND spras EQ c_spras
+    AND t1~zterm LIKE 'Y%'.
+
+    CLEAR l_data[].
+    LOOP AT it_t052 INTO wa_t052.
+      CLEAR l_data.
+      MOVE p_bukrs TO wa_t052-bukrs.
+      l_data-segnam  = c_segment_epay.
+      l_data-sdata   = wa_t052.
+      APPEND l_data.
+    ENDLOOP.
+  ENDIF.
+
+
+*Get the currencies
+  IF p_mes_type EQ c_mestyp_curr.
+
+    SELECT t1~fcurr  t1~tcurr t1~gdatu  t1~ukurs
+    INTO CORRESPONDING FIELDS OF TABLE  it_tcurr
+    FROM tcurr AS t1
+     WHERE KURST EQ P_ECURR       " CR1424
+*    WHERE kurst EQ 'D'           " CR1424
+    AND   (  tcurr EQ ls_t001-waers )
+    AND   gdatu EQ ( SELECT MIN( gdatu )
+                     FROM tcurr AS t2
+                      WHERE KURST EQ P_ECURR   "CR1424
+*                     WHERE kurst EQ 'D'       "CR1424
+                     AND ( t2~tcurr EQ ls_t001-waers )
+                      AND t1~fcurr EQ t2~fcurr ).
+
+    CLEAR l_data[].
+    LOOP AT it_tcurr.
+      CLEAR l_data.
+      CALL FUNCTION 'CONVERSION_EXIT_INVDT_OUTPUT'
+        EXPORTING
+          input  = it_tcurr-gdatu
+        IMPORTING
+          output = wa_tcurr_char-gdatu.
+
+      MOVE: it_tcurr-fcurr TO wa_tcurr_char-fcurr,
+            it_tcurr-tcurr TO wa_tcurr_char-tcurr,
+            it_tcurr-ukurs TO wa_tcurr_char-ukurs,
+            p_bukrs        TO wa_tcurr_char-bukrs.
+
+      CONDENSE wa_tcurr_char-ukurs NO-GAPS.
+      l_data-segnam  = c_segment_curr.
+      l_data-sdata   = wa_tcurr_char.
+      APPEND l_data.
+    ENDLOOP.
+  ENDIF.
+
+* Cost Center Info
+  IF p_mes_type EQ c_mestyp_ccinfo.
+    SELECT t1~bukrs t1~kostl t2~ltext
+    INTO TABLE  it_tccinfo
+    FROM csks AS t1
+    JOIN cskt AS t2 ON t1~kokrs EQ t2~kokrs AND t1~kostl EQ t2~kostl AND t1~datbi EQ t2~datbi
+    WHERE t1~kostl IN s_costl1
+*    AND   t2~datbi IN s_cc_dat
+    AND  t2~datbi  GT sy-datum
+    AND   t1~bukrs EQ p_bukrs.
+
+
+    CLEAR l_data[].
+    LOOP AT it_tccinfo INTO wa_tccinfo.
+      l_data-segnam  = c_segment_ccinfo.
+      l_data-sdata   = wa_tccinfo.
+      APPEND l_data.
+    ENDLOOP.
+  ENDIF.
+
+
+* Booked Invoices Not Paid
+  IF p_mes_type EQ c_mestyp_paib.
+    SELECT bukrs lifnr xblnr belnr augbl augdt
+     INTO TABLE  it_paid
+     FROM bsik AS t1
+     WHERE bukrs EQ p_bukrs
+*** MOD-001 * begin ***
+*     AND budat IN s_bi_dat
+     AND cpudt IN s_bi_dat
+*** MOD-001 * end ***
+     AND blart IN s_bi_brt
+     AND zuonr IN s_bi_znr.
+
+    LOOP AT it_paid INTO wa_paid.
+      l_data-segnam  = c_segment_paib.
+      l_data-sdata   = wa_paid.
+      APPEND l_data.
+    ENDLOOP.
+  ENDIF.
+
+
+* Paid Invoices with clearing Date and document Number
+  IF p_mes_type EQ c_mestyp_paid.
+
+    SELECT bukrs lifnr xblnr belnr augbl augdt
+     INTO TABLE  it_paid
+     FROM bsak AS t1
+     WHERE bukrs EQ p_bukrs
+****Begin of MOD-003***MOD*****
+*     AND budat IN s_pi_dat
+     AND augdt IN s_pi_dat
+****Begin of MOD-003***MOD*****
+     AND blart IN s_pi_brt
+     AND zuonr IN s_pi_znr.
+
+    LOOP AT it_paid INTO wa_paid.
+      l_data-segnam  = c_segment_paid.
+      l_data-sdata   = wa_paid.
+      APPEND l_data.
+    ENDLOOP.
+  ENDIF.
+
+* Account Information merged with Cost Center
+  IF p_mes_type EQ c_mestyp_acci.
+
+*select Account information
+    SELECT t2~mandt bukrs t2~saknr  txt50 fstag func_area
+           t2~xloeb t2~xspeb t1~xloev t1~xspeb
+     INTO TABLE  it_acci
+     FROM  skb1 AS t2
+     JOIN ska1 AS t1 ON t1~saknr = t2~saknr
+     JOIN skat AS t3 ON t2~saknr = t3~saknr AND t1~ktopl = t3~ktopl
+     WHERE bukrs EQ p_bukrs
+     AND T2~SAKNR IN S_SAKNR "CD1K970876
+     AND spras   EQ c_spras
+     AND fstag IN s_fstag
+     AND func_area IN s_fkber.
+    .
+*select Cost Center
+    SELECT t1~bukrs t1~kostl t2~ltext t1~datbi t1~kosar t1~func_area
+    INTO TABLE  it_tccinfo
+    FROM csks AS t1
+    JOIN cskt AS t2 ON t1~kokrs EQ t2~kokrs AND t1~kostl EQ t2~kostl AND t1~datbi EQ t2~datbi
+    WHERE t1~kostl IN s_costl2
+    AND  t1~bukrs EQ p_bukrs
+    AND  t2~datbi  GT sy-datum.
+
+    IF p_bukrs EQ 'POLA' AND  '0009000000'  IN s_costl2.
+* add default 9000000 as a Cost Center
+
+      MOVE: '0009000000' TO wa_tccinfo-kostl,
+            p_bukrs   TO wa_tccinfo-bukrs,
+            'Default Cost Center' TO wa_tccinfo-ltext.
+      APPEND wa_tccinfo TO it_tccinfo.
+    ENDIF.
+
+* Merge the иж internal tables
+* it_acci_mer
+    PERFORM merge_tables.
+    PERFORM read_db USING p_bukrs.
+    PERFORM compare_tables.
+
+* perform fill table for Idoc Generation
+    LOOP AT it_acci_mer_idoc INTO wa_acci_mer.
+      CLEAR wa_acci_idoc.
+      l_data-segnam  = c_segment_acci.
+      MOVE-CORRESPONDING wa_acci_mer TO wa_acci_idoc.
+      l_data-sdata   = wa_acci_idoc.
+      APPEND l_data.
+    ENDLOOP.
+  ENDIF.
+
+* Get Dimension Information
+  IF p_mes_type EQ c_mestyp_dim.
+    SELECT bukrs  pernr sname
+    INTO CORRESPONDING FIELDS OF TABLE  it_dim
+    FROM pa0001
+    WHERE bukrs EQ p_bukrs.
+
+    CLEAR l_data[].
+    LOOP AT it_dim INTO wa_dim.
+      CLEAR l_data.
+      l_data-segnam  = c_segment_dim.
+      l_data-sdata   = wa_dim.
+      APPEND l_data.
+    ENDLOOP.
+  ENDIF.
+
+
+ENDFORM.                      " FILL_DATA
+*&---------------------------------------------------------------------*
+*&      Form  MERGE_TABLES
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM merge_tables .
+
+  CLEAR it_acci_mer[].
+  LOOP AT it_acci INTO wa_acci.
+    LOOP AT it_tccinfo INTO wa_tccinfo.
+      MOVE-CORRESPONDING wa_acci    TO wa_acci_mer.
+*      MOVE-CORRESPONDING wa_tccinfo TO wa_acci_mer.
+      MOVE wa_tccinfo-bukrs TO wa_acci_mer-bukrs.
+      MOVE wa_tccinfo-kostl TO wa_acci_mer-kostl.
+      MOVE wa_tccinfo-kosar TO wa_acci_mer-kosar.
+      MOVE wa_tccinfo-func_area TO wa_acci_mer-func_area_c.
+      APPEND wa_acci_mer TO it_acci_mer.
+    ENDLOOP.
+  ENDLOOP.
+
+ENDFORM.                    " MERGE_TABLES
+*&---------------------------------------------------------------------*
+*&      Form  READ_DB
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM read_db  USING lv_bukrs.
+
+  SELECT *
+  INTO TABLE it_epay_acci
+  FROM yse_epay_acci
+  WHERE bukrs EQ lv_bukrs.
+
+
+ENDFORM.                    " READ_DB
+*&---------------------------------------------------------------------*
+*&      Form  COMPARE_TABLES
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM compare_tables .
+  LOOP AT it_acci_mer INTO wa_acci_mer .
+* allowed combinations ?
+    IF ( NOT wa_acci_mer-func_area IS INITIAL AND
+         wa_acci_mer-kosar = c_z AND
+         wa_acci_mer-func_area_c IS INITIAL ) OR
+       ( NOT wa_acci_mer-func_area IS INITIAL AND
+         wa_acci_mer-kosar = c_z AND
+         wa_acci_mer-func_area = wa_acci_mer-func_area_c ) OR
+       ( NOT wa_acci_mer-func_area IS INITIAL AND
+         wa_acci_mer-kosar = c_w AND
+         wa_acci_mer-func_area_c IS INITIAL ) OR                   "CR1127 EXTUVE
+       ( wa_acci_mer-func_area IS INITIAL AND                       "CR1127 EXTUVE
+         wa_acci_mer-kosar ne c_z AND                               "CR1127 EXTUVE
+         NOT wa_acci_mer-func_area_c IS INITIAL ) OR                "CR1127 EXTUVE
+
+       ( wa_acci_mer-func_area IS INITIAL AND                       "CR1127 EXTUVE
+         wa_acci_mer-kosar ne c_z AND                               "CR1127 EXTUVE
+         wa_acci_mer-func_area_c IS INITIAL ) OR                    "CR1127 EXTUVE
+
+       ( wa_acci_mer-func_area IS INITIAL AND
+         wa_acci_mer-kostl between '7701001' and '7709004' AND      "CR1127 EXTUVE
+         wa_acci_mer-kosar ne 'Z'  AND                              "CR1127 EXTUVE
+         wa_acci_mer-func_area_c IS INITIAL ) OR
+       ( wa_acci_mer-func_area IS INITIAL AND
+         wa_acci_mer-kostl between '7701001' and '7709004' AND      "CR1127 EXTUVE
+         wa_acci_mer-kosar ne 'Z'  AND                              "CR1127 EXTUVE
+         NOT wa_acci_mer-func_area_c IS INITIAL ) .
+
+      READ TABLE it_epay_acci
+        WITH TABLE KEY mandt = wa_acci_mer-mandt
+                bukrs = wa_acci_mer-bukrs
+                kostl = wa_acci_mer-kostl
+                saknr = wa_acci_mer-saknr.
+      IF sy-subrc EQ 0.
+        READ TABLE it_acci
+          WITH KEY mandt = wa_acci_mer-mandt
+                   saknr = wa_acci_mer-saknr
+                   INTO wa_acci.
+* check if account is blocked,deleted ...
+        IF ( wa_acci-xloeb EQ 'X' OR wa_acci-xspeba EQ 'X' OR
+             wa_acci-xloev EQ 'X' OR wa_acci-xspebb EQ 'X' ) AND
+             it_epay_acci-status EQ 'D'.     "CR1127  EXTUVE
+*            it_epay_acci-status NE 'D'.     "CR1127  EXTUVE
+          MOVE: sy-datum TO wa_acci_mer-erdat,
+                sy-uzeit TO wa_acci_mer-erzet,
+                'D' TO wa_acci_mer-status.
+          APPEND wa_acci_mer TO it_acci_mer_idoc .
+          CONTINUE.
+        ENDIF.
+* check if account is unblocked,undeleted ...
+        IF  wa_acci-xloeb IS INITIAL  AND wa_acci-xspeba IS INITIAL AND
+            wa_acci-xloev IS INITIAL AND wa_acci-xspebb IS INITIAL  AND
+*            it_epay_acci-status EQ 'D'.     "CR1127  EXTUVE
+            it_epay_acci-status NE 'D'.      "CR1127  EXTUVE
+          MOVE: sy-datum TO wa_acci_mer-erdat,
+                sy-uzeit TO wa_acci_mer-erzet,
+                'U' TO wa_acci_mer-status.
+          APPEND wa_acci_mer TO it_acci_mer_idoc .
+        ENDIF.
+* check if something changed
+        IF wa_acci_mer-txt50 NE it_epay_acci-txt50
+          OR wa_acci_mer-fstag NE it_epay_acci-fstag
+          OR wa_acci_mer-func_area NE it_epay_acci-func_area.
+* update
+* data must be sent with Idoc
+          MOVE: sy-datum TO wa_acci_mer-erdat,
+                sy-uzeit TO wa_acci_mer-erzet,
+                'U' TO wa_acci_mer-status.
+          APPEND wa_acci_mer TO it_acci_mer_idoc .
+        ENDIF.
+      ELSE.
+* new record
+* data must be sent with Idoc
+        MOVE: sy-datum TO wa_acci_mer-erdat,
+              sy-uzeit TO wa_acci_mer-erzet,
+              'I' TO wa_acci_mer-status.
+        APPEND wa_acci_mer TO it_acci_mer_idoc .
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+ENDFORM.                    " COMPARE_TABLES
+
+*&---------------------------------------------------------------------*
+*&      Form  UPDATE_TABLE
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM update_table_yse_epay_acci USING lv_beg_idx TYPE syindex
+                                      lv_end_idx TYPE syindex.
+  DATA: it_lv_acci_mer_idoc TYPE TABLE OF yse_epay_acci.
+
+  LOOP AT it_acci_mer_idoc INTO wa_acci_mer.
+*  WHERE index BETWEEN lv_beg_idx AND lv_end_idx.
+    IF sy-tabix BETWEEN lv_beg_idx AND lv_end_idx.
+      APPEND wa_acci_mer TO it_lv_acci_mer_idoc.
+    ENDIF.
+  ENDLOOP.
+  MODIFY yse_epay_acci FROM TABLE it_lv_acci_mer_idoc.
+
+ENDFORM.                    " UPDATE_TABLE
+*&---------------------------------------------------------------------*
+*&      Form  DELETE_DB
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM delete_db .
+
+  DATA: it_epay_acci_del TYPE SORTED TABLE OF yse_epay_acci
+             WITH UNIQUE KEY mandt bukrs kostl saknr
+             WITH HEADER LINE.
+  DATA: cnt       TYPE i,
+        committed TYPE i,
+        total     TYPE i.
+
+  SELECT *
+  INTO TABLE it_epay_acci_del
+  FROM yse_epay_acci
+  WHERE bukrs EQ p_bukrs.
+
+  total = sy-dbcnt.
+
+
+  LOOP AT it_epay_acci_del.
+    cnt = cnt + 1.
+    DELETE FROM yse_epay_acci
+    WHERE bukrs EQ it_epay_acci_del-bukrs
+    AND   kostl EQ it_epay_acci_del-kostl
+    AND   saknr EQ it_epay_acci_del-saknr.
+    IF cnt GT 1000.
+      CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'.
+      committed = committed + cnt.
+      cnt = 0.
+      CALL FUNCTION 'PROGRESS_INDICATOR'
+        EXPORTING
+          i_text      = text-001
+          i_processed = committed      "&1% (&2 of &3) der Projekte wurden gel#scht
+          i_total     = total.
+*     I_OUTPUT_IMMEDIATELY       =
+    ENDIF.
+  ENDLOOP.
+
+  CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'.
+
+ENDFORM.                    " DELETE_DB

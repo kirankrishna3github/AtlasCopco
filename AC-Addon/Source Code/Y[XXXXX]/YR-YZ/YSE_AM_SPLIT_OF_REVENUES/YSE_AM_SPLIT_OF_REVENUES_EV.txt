@@ -1,0 +1,173 @@
+*&---------------------------------------------------------------------*
+*&  Include           YSE_SPLIT_OF_REVENUES_EV                         *
+*&---------------------------------------------------------------------*
+
+*----------------------------------------------------------------------*
+*  At selection screen                                                 *
+*----------------------------------------------------------------------*
+
+AUTHORITY-CHECK OBJECT 'V_VBAK_VKO'
+                      ID 'VKORG' FIELD so_vkorg-low
+                      ID 'VTWEG' FIELD P_VTWEG
+                      ID 'SPART' DUMMY
+                      ID 'ACTVT' DUMMY.
+
+  IF SY-SUBRC = 4.
+*   No authorisation to display data from Sales Organisation p_vkorg
+    MESSAGE ID 'YSE_AM' TYPE 'E' NUMBER '000' WITH so_vkorg-low P_VTWEG.
+  ELSEIF SY-SUBRC <> 0.
+*   Error checking authorization.
+    MESSAGE ID 'YSE_AM' TYPE 'E' NUMBER '001'.
+  ENDIF.
+
+
+*----------------------------------------------------------------------*
+*  Start-of-selection                                                  *
+*----------------------------------------------------------------------*
+start-of-selection.
+constants: gc_beltp type BP_INOUT value 1,
+           gc_wrttp type co_wrttp value '04',
+           gc_acparts type acpos value 'Z04',
+           gc_acoth type acpos value 'Z07'.
+data: ls_lsm type pmco,
+      ls_oth type pmco,
+      ls_parts type pmco.
+
+data: lv_index(2) type n,
+      lv_wrt(5) type c.
+
+field-symbols: <fs_wrt> type BP_WPL.
+
+ranges: lr_acpos for pmco-acpos.
+lr_acpos-sign = 'I'.
+lr_acpos-option = 'EQ'.
+lr_acpos-low = 'Z08'.     "Subcontracting costs
+append lr_acpos.
+
+lr_acpos-low = 'Z09'.     "Mileage costs
+append lr_acpos.
+
+lr_acpos-low = 'Z03'.     "Labour costs
+append lr_acpos.
+
+
+*First select all relevant sales orders
+
+select vbak~vbeln vbak~vkorg vbak~vtweg vbak~kunnr vbak~waerk vbap~posnr vbap~netwr vbap~kwmeng
+  into corresponding fields of table gt_order_detail
+  from vbak inner join vbap
+  on vbak~vbeln eq vbap~vbeln
+  where vbak~kunnr in so_kunnr
+  and vbak~vkorg in so_vkorg
+  and vbak~vtweg eq p_vtweg
+  and vbak~vbeln in so_vbeln
+  and vbak~auart in so_auart.
+
+if sy-subrc ne 0.
+  message S000(yse_split_of_rev).
+  exit.
+endif.
+
+*Show progress
+CALL FUNCTION 'SAPGUI_PROGRESS_INDICATOR'
+    EXPORTING
+      TEXT = 'Data being selected'(098).
+
+*Select actual costs etc per line item
+loop at gt_order_detail assigning <fs_order_detail>.
+
+  select single objnr bukrs from aufk into (<fs_order_detail>-objnr, <fs_order_detail>-bukrs)  "#EC CI_NOFIELD
+    where kdauf eq <fs_order_detail>-vbeln
+    and kdpos eq <fs_order_detail>-posnr.
+*Select company code currency
+  select single waers from t001 into <fs_order_detail>-waers
+  where bukrs eq <fs_order_detail>-bukrs.
+*Select parts costs
+  select * from pmco into ls_parts
+      where objnr eq <fs_order_detail>-objnr
+      and cocur eq <fs_order_detail>-waers
+      and beltp eq gc_beltp
+      and wrttp eq gc_wrttp
+      and acpos eq gc_acparts.
+      lv_index = 00.
+      do.
+        concatenate 'WRT' lv_index into lv_wrt.
+        assign component lv_wrt of structure ls_parts to <fs_wrt>.
+        if sy-subrc eq 0.
+          if not <fs_wrt> is initial and <fs_wrt> <> 0.
+            <fs_order_detail>-cost_parts = <fs_order_detail>-cost_parts + <fs_wrt>.
+            unassign <fs_wrt>.
+          endif.
+        else.
+          exit.
+        endif.
+        lv_index = lv_index + 1.
+      enddo.
+  endselect.
+*If any costs for parts have been found, we need to calculate the price of these costs if we would have sold them
+*For this we have to check table COEP, which will return the material(s) and the quantity used as parts
+  if sy-subrc eq 0.
+    perform get_parts_selling_price.
+  endif.
+*Select labor, subcontracting, mileage costs
+  select * from pmco into ls_lsm
+      where objnr eq <fs_order_detail>-objnr
+      and cocur eq <fs_order_detail>-waers
+      and beltp eq gc_beltp
+      and wrttp eq gc_wrttp
+      and acpos in lr_acpos.
+      lv_index = 00.
+      do.
+        concatenate 'WRT' lv_index into lv_wrt.
+        assign component lv_wrt of structure ls_lsm to <fs_wrt>.
+        if sy-subrc eq 0.
+          if not <fs_wrt> is initial and <fs_wrt> <> 0.
+            <fs_order_detail>-cost_lsm = <fs_order_detail>-cost_lsm + <fs_wrt>.
+            unassign <fs_wrt>.
+          endif.
+        else.
+          exit.
+        endif.
+        lv_index = lv_index + 1.
+      enddo.
+  endselect.
+
+*Select other costs
+  select * from pmco into ls_oth
+    where objnr eq <fs_order_detail>-objnr
+    and cocur eq <fs_order_detail>-waers
+    and beltp eq gc_beltp
+    and wrttp eq gc_wrttp
+    and acpos eq gc_acoth.
+      lv_index = 00.
+      do.
+        concatenate 'WRT' lv_index into lv_wrt.
+        assign component lv_wrt of structure ls_oth to <fs_wrt>.
+        if sy-subrc eq 0.
+          if not <fs_wrt> is initial and <fs_wrt> <> 0.
+            <fs_order_detail>-cost_oth = <fs_order_detail>-cost_oth + <fs_wrt>.
+            unassign <fs_wrt>.
+          endif.
+        else.
+          exit.
+        endif.
+        lv_index = lv_index + 1.
+      enddo.
+  endselect.
+*  perform get_conditions.
+  perform compute_calculated_fields.
+endloop.
+
+
+
+*----------------------------------------------------------------------*
+*  end-of-selection                                                    *
+*----------------------------------------------------------------------*
+end-of-selection.
+
+*loop at gt_order_detail assigning <fs_order_detail>.
+*  write: / <fs_order_detail>-vbeln, <fs_order_detail>-netpr, <fs_order_detail>-cost_parts, <fs_order_detail>-cost_lsm, <fs_order_detail>-cost_oth,
+*           <fs_order_detail>-mat_price, <fs_order_detail>-cust_price, <fs_order_detail>-disc1.
+*endloop.
+
+call screen 100.

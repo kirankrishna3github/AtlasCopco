@@ -1,0 +1,1133 @@
+*----------------------------------------------------------------------*
+* PROGRAM ID    : YSE_SLOC_EXTEND                                      *
+* PROGRAM TITLE : Extend material storage location                     *
+* AUTHOR        : Anda Wu                                              *
+* DATE          : 18/03/2013                                           *
+* DEVELOPMENT ID:                                                      *
+*                                                                      *
+* CHANGE REQUEST NUMBER:                                               *
+*                                                                      *
+* Program Description: Extend material storage location                *
+*                                                                      *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+*  DATE    | NAME     |TRANSPORT  | CR# and short Description          *
+*----------------------------------------------------------------------*
+*18/03/2013|Anda Wu   |CD1K975312 |CR 2836: Initial version            *
+*----------------------------------------------------------------------*
+* MOD-001: 23/01/2017| CD1K990762 |CR4129                              *
+*                            --YSE_SLOC_EXTEND Tcode dump              *
+*----------------------------------------------------------------------*
+
+REPORT  yse_sloc_extend_tmp.
+************************************************************************
+* TYPES                                                                *
+************************************************************************
+TYPES:  BEGIN OF ty_t001l,
+          werks     TYPE t001l-werks,
+          lgort     TYPE t001l-lgort,
+          lgobe     TYPE t001l-lgobe,
+        END OF ty_t001l,
+
+        BEGIN OF ty_mara,
+          matnr     TYPE mara-matnr,
+          mtart     TYPE mara-mtart,
+          pstat     TYPE char1,                  "Process Status
+          no_exist  TYPE char1,                  "Material not in plant
+        END OF ty_mara,
+
+        BEGIN OF ty_marc,
+          matnr     TYPE marc-matnr,
+          werks     TYPE marc-werks,
+          pstat     TYPE marc-pstat,
+        END OF ty_marc,
+
+        BEGIN OF ty_mard,
+          matnr     TYPE mard-matnr,
+          werks     TYPE mard-werks,
+          lgort     TYPE mard-werks,
+          pstat     TYPE mard-pstat,
+        END OF ty_mard.
+
+************************************************************************
+* TABLES                                                               *
+************************************************************************
+TABLES: mara,
+        t001l,
+        t001w. "+cdr
+
+************************************************************************
+* WORKAREA                                                             *
+************************************************************************
+DATA: gs_mara     TYPE ty_mara,
+      gs_marc     TYPE ty_marc,
+      gs_mard     TYPE ty_mard,
+      gs_t001w    TYPE t001w,
+      gs_bdcmsg   TYPE bdcmsgcoll.
+
+************************************************************************
+* INTERNAL TABLES                                                      *
+************************************************************************
+DATA:   gt_t001l    TYPE STANDARD TABLE OF t001l,    " Storage Locations
+        gt_t001l_tmp TYPE STANDARD TABLE OF t001l,
+        gt_message  TYPE scr_strings,                " Message table
+        gt_message2 TYPE scr_strings,                " Message table2
+        gt_bdcdata  TYPE STANDARD TABLE OF bdcdata,  " BDC data
+        gt_mara     TYPE STANDARD TABLE OF ty_mara,
+        gt_mard     TYPE STANDARD TABLE OF ty_mard,
+        gt_marc     TYPE STANDARD TABLE OF ty_marc,
+        gt_bdcmsg   TYPE STANDARD TABLE OF bdcmsgcoll,
+        gt_mard_temp TYPE STANDARD TABLE OF ty_mard.
+
+************************************************************************
+* VARIABLES                                                            *
+************************************************************************
+DATA:   gv_begin(2) TYPE n  VALUE '01',             "Begin index
+        gv_tabix    TYPE sy-tabix,
+        gv_succ(8)  TYPE c,
+        gv_total(8) TYPE c,
+        gv_total_pro(8)  TYPE c,
+        gv_error(8) TYPE c,
+        gv_bapi     TYPE c.
+
+************************************************************************
+* CONSTANTS                                                            *
+************************************************************************
+CONSTANTS: gc_mode_s    TYPE c VALUE 'S',
+           gc_bdc_mode  TYPE c VALUE 'N',              "EBDC mode
+           gc_msgty_e   TYPE c VALUE 'E',
+           gc_x          TYPE c VALUE 'X',
+           gc_max_item   TYPE i VALUE 10,
+           gc_max_mat(8) TYPE c VALUE '25000',
+           gc_date_low(2)  TYPE n VALUE '10',
+           gc_date_high(2) TYPE n VALUE '20'.
+************************************************************************
+* SELECTION-SCREEN                                                     *
+************************************************************************
+PARAMETERS:     p_werks TYPE t001w-werks." OBLIGATORY.
+SELECT-OPTIONS: so_werks FOR t001w-werks OBLIGATORY. "+cdr
+SELECT-OPTIONS: so_lgort FOR t001l-lgort ,"OBLIGATORY,
+                so_matnr FOR mara-matnr ."OBLIGATORY.
+*&---------------------------------------------------------------------*
+*& INITIALIZATION                                                      *
+*&---------------------------------------------------------------------*
+INITIALIZATION.
+* Do initialization
+  PERFORM frm_do_init.
+
+*&---------------------------------------------------------------------*
+*& AT SELECTION-SCREEN                                                 *
+*&---------------------------------------------------------------------*
+AT SELECTION-SCREEN.
+* Run date should between 10 and 20 in the weekend
+*  PERFORM frm_date_check.   "Removed at 20141231 CD1K984299
+
+* SCREEN CHECK
+  PERFORM frm_screen_check.
+
+*&---------------------------------------------------------------------*
+*& AT SELECTION-SCREEN  ON VALUE-REQUEST                               *
+*&---------------------------------------------------------------------*
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR: so_lgort-low.
+* F4-help Function Implementation for storage location
+  PERFORM f4_lgort_low.
+
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR: so_lgort-high.
+* F4-help Function Implementation for storage location
+  PERFORM f4_lgort_high.
+
+*&---------------------------------------------------------------------*
+*&  START-OF-SELECTION                                                 *
+*&---------------------------------------------------------------------*
+START-OF-SELECTION.
+
+  PERFORM frm_obl_check.
+*  AUTHORITY-CHECK
+  PERFORM frm_auth_check.
+
+  PERFORM frm_matnr_check.
+
+  IF gv_bapi IS INITIAL.
+*   Main process (BDC impl)
+    PERFORM frm_main_proc1.
+  ELSE.
+*   Main process (BAPI impl)
+    PERFORM frm_main_proc2.
+  ENDIF.
+
+* Get error process number
+  PERFORM get_error_no.
+
+* insert log head
+  PERFORM frm_log_head.
+
+*&---------------------------------------------------------------------*
+*&  END-OF-SELECTION                                                   *
+*&---------------------------------------------------------------------*
+END-OF-SELECTION.
+* Write process log
+  PERFORM frm_write_log.
+
+*&---------------------------------------------------------------------*
+*&      Form  FRM_SCREEN_CHECK
+*&---------------------------------------------------------------------*
+*       SCREEN CHECK
+*----------------------------------------------------------------------*
+FORM frm_screen_check .
+
+  DATA: lt_t001l        TYPE STANDARD TABLE OF t001l,
+        ls_t001l        TYPE t001l,
+        ls_message      TYPE string,
+        lv_index        TYPE sy-index.
+
+  REFRESH: gt_message2.
+* Check if the plant in selection-screen is valid
+  SELECT SINGLE *
+    FROM t001w
+    INTO gs_t001w
+    WHERE werks = so_werks-low. "p_werks.
+  IF sy-subrc <> 0.
+    MESSAGE e000(yse_sales_log)
+        WITH 'Please enter valid plant'(t01).
+  ENDIF.
+
+* Check if storage location exist in plant
+  SELECT *
+    FROM t001l
+    INTO TABLE gt_t001l
+*    WHERE werks = gs_t001w-werks. "-cdr
+    WHERE werks in so_werks. "+cdr
+  IF sy-subrc <> 0.
+    MESSAGE e000(yse_sales_log)
+        WITH 'No storage location exist in plant'(t02)
+             gs_t001w-werks.
+  ENDIF.
+
+* Check if input is valid
+  IF so_lgort IS NOT INITIAL.
+    LOOP AT so_lgort WHERE option = 'EQ'.
+      lv_index = sy-tabix.
+      SELECT *
+        FROM t001l
+        INTO TABLE lt_t001l
+*        WHERE werks = gs_t001w-werks "-cdr
+        WHERE werks in so_werks "+cdr
+          AND lgort = so_lgort-low.
+      IF sy-subrc <> 0.
+        MESSAGE e000(yse_sales_log)
+            WITH 'The storage location ['(t04)
+                 so_lgort-low
+                 '] not exist in plant'(t05)
+                 gs_t001w-werks
+            INTO ls_message.
+        CONCATENATE gc_msgty_e so_lgort-low ls_message
+          INTO ls_message
+          SEPARATED BY space.
+        APPEND ls_message TO gt_message2.
+*        DELETE so_lgort INDEX lv_index.
+      ENDIF.
+    ENDLOOP.
+
+    SELECT *
+      FROM t001l
+        INTO TABLE lt_t001l
+        WHERE werks = gs_t001w-werks
+          AND lgort IN so_lgort.
+    IF sy-subrc <> 0.
+      MESSAGE e000(yse_sales_log)
+          WITH 'Please enter valid storage location'(t03).
+    ENDIF.
+  ENDIF.
+
+  IF lt_t001l IS NOT INITIAL.
+    REFRESH: gt_t001l.
+    gt_t001l = lt_t001l.
+  ENDIF.
+
+ENDFORM.                    " FRM_SCREEN_CHECK
+*&---------------------------------------------------------------------*
+*&      Form  FRM_DO_INIT
+*&---------------------------------------------------------------------*
+*       Do initialization
+*----------------------------------------------------------------------*
+FORM frm_do_init .
+
+  CLEAR:    gs_marc  ,
+            gs_t001w,
+            gs_mard  ,
+            gs_bdcmsg  .
+
+  REFRESH:  gt_t001l    ,
+            gt_t001l_tmp ,
+            gt_message  ,
+            gt_bdcdata  ,
+            gt_mard     ,
+            gt_marc     ,
+            gt_bdcmsg   ,
+            gt_mard_temp .
+
+  CLEAR:    gv_begin,
+            gv_tabix.
+*  CLEAR gv_bapi.
+*  gv_bapi = 'X'.
+  gv_succ   = 0.
+  gv_total  = 0.
+  gv_error  = 0.
+
+ENDFORM.                    " FRM_DO_INIT
+
+*&---------------------------------------------------------------------*
+*&      Form  FRM_MAIN_PROC1
+*&---------------------------------------------------------------------*
+*       Main Process
+*----------------------------------------------------------------------*
+FORM frm_main_proc1 .
+
+  DATA: lv_text     TYPE char80,
+        lv_counter  TYPE string,
+        lv_matnr    TYPE string,
+        lv_t001l_lines TYPE i,
+        ls_message  TYPE string,
+        lv_index_c  TYPE string,
+        lv_times    TYPE i,
+        lv_begin    TYPE i,
+        lv_end      TYPE i,
+        lv1_times   TYPE P DECIMALS 2."+MOD-001
+
+* Progress indicator
+  CLEAR lv_text.
+  lv_text = 'Data is being selected'(i01).
+  CALL FUNCTION 'SAPGUI_PROGRESS_INDICATOR'
+    EXPORTING
+      text = lv_text.
+
+* Gain master data for subsequent process
+  PERFORM gain_master_data.
+
+* Check extent storage location quantity
+  DESCRIBE TABLE gt_t001l LINES lv_t001l_lines.
+*  lv_times = lv_t001l_lines DIV gc_max_item + 1. "-MOD-001
+*  Begin of Insertion by MOD-001
+  lv1_times = CEIL( lv_t001l_lines / gc_max_item ).
+  lv_times = lv1_times.
+*  End of Insertion by MOD-001
+  DO lv_times TIMES.
+    CLEAR: lv_begin, lv_end,lv_counter,lv_index_c,ls_message.
+    lv_index_c = sy-index.
+    ls_message = lv_times.
+    CONCATENATE lv_index_c '/' ls_message
+      INTO lv_index_c.
+    lv_begin = ( sy-index - 1 ) * gc_max_item + 1.
+    IF sy-index = lv_times.
+      lv_end   = lv_t001l_lines.
+    ELSE.
+      lv_end  = sy-index * gc_max_item.
+    ENDIF.
+    LOOP AT gt_mara INTO gs_mara WHERE no_exist IS INITIAL.
+      REFRESH: gt_t001l_tmp.
+      APPEND LINES OF gt_t001l FROM lv_begin TO lv_end
+        TO gt_t001l_tmp.
+      gv_tabix = sy-tabix.
+      lv_counter = lv_counter + 1.
+      CLEAR lv_text.
+      CONDENSE lv_counter.
+      lv_matnr = gs_mara-matnr.
+      SHIFT lv_matnr LEFT DELETING LEADING '0'.
+      CONDENSE lv_matnr.
+      lv_text = 'Material & (& of &) is being processed[&]'(i03).
+      REPLACE '&' WITH lv_matnr       INTO lv_text.
+      REPLACE '&' WITH lv_counter     INTO lv_text.
+      REPLACE '&' WITH gv_total_pro   INTO lv_text.
+      REPLACE '&' WITH lv_index_c     INTO lv_text.
+      CALL FUNCTION 'SAPGUI_PROGRESS_INDICATOR'
+        EXPORTING
+          text = lv_text.
+      CLEAR gs_marc.
+      READ TABLE gt_marc INTO gs_marc WITH KEY matnr = gs_mara-matnr.
+      IF sy-subrc <> 0.
+        ls_message = text-t07.
+        REPLACE '&' INTO ls_message WITH p_werks.
+        CONCATENATE gc_msgty_e gs_mara-matnr ls_message
+          INTO ls_message
+          SEPARATED BY space.
+        APPEND ls_message TO gt_message.
+        gs_mara-pstat = gc_x.
+        gs_mara-no_exist = gc_x.
+        MODIFY gt_mara INDEX gv_tabix FROM gs_mara TRANSPORTING pstat no_exist.
+        CONTINUE.
+      ENDIF.
+      IF gs_marc-pstat CS 'L'.
+        PERFORM frm_get_begin.
+      ENDIF.
+*     Delete the exist storage location
+      PERFORM frm_del_exist.
+*     If no storage location need to be extend
+      IF gt_t001l_tmp IS INITIAL.
+        CONTINUE.
+      ENDIF.
+*     Prepare the bdc data
+      PERFORM prepare_bdc_data.
+*     Run BDC
+      PERFORM frm_run_bdc.
+      REFRESH:  gt_bdcdata.
+      CLEAR:  gs_marc,
+              gv_begin,
+              gs_mara,
+              gv_tabix.
+    ENDLOOP.
+  ENDDO.
+
+ENDFORM.                    " FRM_MAIN_PROC1
+
+*&---------------------------------------------------------------------*
+*&      Form  PREPARE_BDC_DATA
+*&---------------------------------------------------------------------*
+*       Prepare the bdc data
+*----------------------------------------------------------------------*
+FORM prepare_bdc_data .
+
+  DATA: ls_bdcdata TYPE bdcdata,
+        ls_t001l   TYPE t001l,
+        lv_lgort_str TYPE string.
+  REFRESH: gt_bdcdata.
+* Screen 1
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    'SAPMM03M'  '0105'  gc_x  ''   ''
+           CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+  CLEAR ls_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    ''  ''  ''  'BDC_OKCODE'  '/00'
+          CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+  CLEAR  ls_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    ''  ''  ''  'RM03M-MATNR'  gs_marc-matnr
+          CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+  CLEAR  ls_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    ''  ''  ''  'RM03M-WERKS'  gs_marc-werks
+          CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+  CLEAR  ls_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    ''  ''  ''  'RM03M-LFLAG'  space
+          CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+  CLEAR  ls_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    ''  ''  ''  'RM03M-NFLAG'  gc_x
+          CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+  CLEAR  ls_bdcdata.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    ''  ''  ''  'MDAT1-KZ_AEND'  gc_x
+          CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+  CLEAR  ls_bdcdata.
+
+* Screen 2
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+           USING    'SAPMM03M'  '0195'  gc_x  ''   ''
+           CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+  CLEAR ls_bdcdata.
+  LOOP AT gt_t001l_tmp INTO ls_t001l.
+    gv_begin = gv_begin + 1.
+    CONCATENATE 'RM03M-LGORT(' gv_begin ')'
+      INTO lv_lgort_str.
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+         USING    ''  ''  ''  'BDC_CURSOR'  lv_lgort_str
+            CHANGING ls_bdcdata.
+    APPEND ls_bdcdata  TO gt_bdcdata.
+    CLEAR  ls_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+         USING    ''  ''  ''  lv_lgort_str  ls_t001l-lgort
+            CHANGING ls_bdcdata.
+    APPEND ls_bdcdata  TO gt_bdcdata.
+    CLEAR  ls_bdcdata.
+
+    PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+         USING    ''  ''  ''  'BDC_OKCODE'  '/00'
+            CHANGING ls_bdcdata.
+    APPEND ls_bdcdata  TO gt_bdcdata.
+    CLEAR  ls_bdcdata.
+  ENDLOOP.
+
+  PERFORM fill_bdcdata IN PROGRAM yam_common_routines
+       USING    ''  ''  ''  'BDC_OKCODE'  '=BU'
+          CHANGING ls_bdcdata.
+  APPEND ls_bdcdata  TO gt_bdcdata.
+  CLEAR  ls_bdcdata.
+
+ENDFORM.                    " PREPARE_BDC_DATA
+*&---------------------------------------------------------------------*
+*&      Form  F4_LGORT_LOW
+*&---------------------------------------------------------------------*
+*       F4 help for storage location low
+*----------------------------------------------------------------------*
+FORM f4_lgort_low .
+
+  DATA: lt_t001l_f4 TYPE STANDARD TABLE OF ty_t001l,
+        lt_return TYPE TABLE OF ddshretval,
+        ls_return TYPE ddshretval.
+
+  REFRESH: lt_t001l_f4,
+           lt_return.
+  CLEAR:   ls_return.
+
+  SELECT  werks
+          lgort
+          lgobe
+    FROM t001l
+    INTO TABLE lt_t001l_f4
+    WHERE werks = so_werks . "p_werks. "+cdr
+  SORT lt_t001l_f4.
+  DELETE ADJACENT DUPLICATES FROM lt_t001l_f4.
+
+  CALL FUNCTION 'F4IF_INT_TABLE_VALUE_REQUEST'
+    EXPORTING
+      retfield        = 'LGORT'
+      dynpprog        = sy-repid
+      dynprofield     = 'SO_LGORT-LOW'
+      value_org       = 'S'
+    TABLES
+      value_tab       = lt_t001l_f4
+      return_tab      = lt_return
+    EXCEPTIONS
+      parameter_error = 1
+      no_values_found = 2
+      OTHERS          = 3.
+  IF sy-subrc = 0.
+    READ TABLE lt_return INTO ls_return INDEX 1.
+    so_lgort-low = ls_return-fieldval.
+  ENDIF.
+
+ENDFORM.                    " F4_LGORT_LOW
+*&---------------------------------------------------------------------*
+*&      Form  F4_LGORT_HIGH
+*&---------------------------------------------------------------------*
+*       F4 help for storage location high
+*----------------------------------------------------------------------*
+FORM f4_lgort_high .
+
+  DATA: lt_t001l_f4 TYPE STANDARD TABLE OF ty_t001l,
+        lt_return TYPE TABLE OF ddshretval,
+        ls_return TYPE ddshretval.
+
+  REFRESH: lt_t001l_f4,
+           lt_return.
+  CLEAR:   ls_return.
+
+  REFRESH: lt_t001l_f4,
+           lt_return.
+  CLEAR:   ls_return.
+
+  SELECT  werks
+          lgort
+          lgobe
+    FROM t001l
+    INTO TABLE lt_t001l_f4
+    WHERE werks = so_werks. "p_werks."+cdr
+
+  SORT lt_t001l_f4.
+  DELETE ADJACENT DUPLICATES FROM lt_t001l_f4.
+  CALL FUNCTION 'F4IF_INT_TABLE_VALUE_REQUEST'
+    EXPORTING
+      retfield        = 'LGORT'
+      dynpprog        = sy-repid
+      dynprofield     = 'SO_LGORT-HIGH'
+      value_org       = 'S'
+    TABLES
+      value_tab       = lt_t001l_f4
+      return_tab      = lt_return
+    EXCEPTIONS
+      parameter_error = 1
+      no_values_found = 2
+      OTHERS          = 3.
+  IF sy-subrc = 0.
+    READ TABLE lt_return INTO ls_return INDEX 1.
+    so_lgort-high = ls_return-fieldval.
+  ENDIF.
+
+ENDFORM.                    " F4_LGORT_HIGH
+*&---------------------------------------------------------------------*
+*&      Form  GAIN_MASTER_DATA
+*&---------------------------------------------------------------------*
+*       Gain master data for subsequent process
+*----------------------------------------------------------------------*
+FORM gain_master_data .
+
+  RANGES: lr_matnr FOR mara-matnr,
+          lr_matnr_temp FOR mara-matnr.
+  DATA:   lv_matnr  TYPE mara-matnr,
+          ls_message  TYPE string.
+
+  APPEND LINES OF so_matnr TO lr_matnr_temp.
+
+  DO .
+    REFRESH: lr_matnr[].
+    CLEAR: lr_matnr.
+    APPEND LINES OF lr_matnr_temp FROM 1 TO 10000 TO lr_matnr.
+    IF lr_matnr[] IS INITIAL.
+      EXIT.
+    ENDIF.
+    SELECT matnr
+           werks
+           pstat
+      FROM marc
+      APPENDING TABLE gt_marc
+      WHERE matnr IN lr_matnr
+*        AND werks = gs_t001w-werks. "-cdr
+      AND werks in so_werks. "+cdr
+
+    SELECT matnr
+           werks
+           lgort
+           pstat
+      FROM mard
+      APPENDING TABLE gt_mard
+      WHERE matnr IN lr_matnr
+*        AND werks = gs_t001w-werks "-cdr
+      AND werks in so_werks "+cdr
+        AND lgort IN so_lgort.
+    DELETE lr_matnr_temp FROM 1 TO 10000.
+  ENDDO.
+
+  REFRESH: lr_matnr_temp[],lr_matnr[].
+
+  DESCRIBE TABLE gt_mara LINES gv_total.
+  gv_total_pro = gv_total.
+
+  SORT so_matnr[].
+  DELETE ADJACENT DUPLICATES FROM so_matnr.
+  LOOP AT so_matnr WHERE option = 'EQ'.
+    lv_matnr = so_matnr-low.
+    SHIFT lv_matnr LEFT DELETING LEADING '0'.
+    READ TABLE gt_mara TRANSPORTING NO FIELDS
+      WITH KEY matnr = so_matnr-low.
+    IF sy-subrc <> 0.
+      gv_total =  gv_total + 1.
+      ls_message = text-t15.
+      CONDENSE lv_matnr.
+      REPLACE '&' INTO ls_message WITH lv_matnr.
+      CONCATENATE gc_msgty_e lv_matnr ls_message
+        INTO ls_message
+        SEPARATED BY space.
+      APPEND ls_message TO gt_message.
+    ENDIF.
+  ENDLOOP.
+  CONDENSE: gv_total,gv_total_pro.
+
+ENDFORM.                    " GAIN_MASTER_DATA
+*&---------------------------------------------------------------------*
+*&      Form  FRM_RUN_BDC
+*&---------------------------------------------------------------------*
+*       Run BDC
+*----------------------------------------------------------------------*
+FORM frm_run_bdc .
+
+  DATA: ls_message  TYPE string,
+        lv_mode     TYPE c,
+        lv_error_flag TYPE c.
+
+  CLEAR: lv_error_flag.
+  REFRESH: gt_bdcmsg.
+  lv_mode = gc_bdc_mode.
+  CALL TRANSACTION 'MMSC' USING gt_bdcdata
+            MODE lv_mode UPDATE gc_mode_s
+            MESSAGES INTO gt_bdcmsg.
+  LOOP AT gt_bdcmsg INTO gs_bdcmsg WHERE msgtyp = gc_msgty_e.
+    MESSAGE ID gs_bdcmsg-msgid
+      TYPE gs_bdcmsg-msgtyp
+        NUMBER gs_bdcmsg-msgnr
+        WITH  gs_bdcmsg-msgv1
+              gs_bdcmsg-msgv2
+              gs_bdcmsg-msgv3
+              gs_bdcmsg-msgv4
+        INTO ls_message.
+    CONCATENATE gc_msgty_e gs_marc-matnr ls_message
+      INTO ls_message
+      SEPARATED BY space.
+    APPEND ls_message TO gt_message.
+    lv_error_flag = gc_x.
+  ENDLOOP.
+  IF lv_error_flag = gc_x.
+    gs_mara-pstat = gc_x.
+    MODIFY gt_mara INDEX gv_tabix FROM gs_mara TRANSPORTING pstat.
+  ENDIF.
+
+ENDFORM.                    " FRM_RUN_BDC
+*&---------------------------------------------------------------------*
+*&      Form  FRM_GET_BEGIN
+*&---------------------------------------------------------------------*
+*       Calculate the begain index
+*----------------------------------------------------------------------*
+FORM frm_get_begin.
+
+  CONSTANTS:  lc_status_l TYPE c VALUE 'L',
+              lc_status_d TYPE c VALUE 'D'.
+
+  LOOP AT gt_mard INTO gs_mard WHERE werks = gs_t001w-werks
+                  AND   matnr = gs_marc-matnr.
+    IF gs_marc-pstat CS lc_status_l.
+      IF    gs_mard-pstat = lc_status_d
+        OR  gs_mard-pstat = lc_status_l.
+        gv_begin = gv_begin + 1.
+      ENDIF.
+    ENDIF.
+    APPEND gs_mard TO gt_mard_temp.
+  ENDLOOP.
+*  DELETE gt_mard WHERE  werks = gs_t001w-werks
+*                  AND   matnr = gs_marc-matnr.
+
+ENDFORM.                    " FRM_GET_BEGIN
+*&---------------------------------------------------------------------*
+*&      Form  FRM_DEL_EXIST
+*&---------------------------------------------------------------------*
+*       Delete the exist storage location
+*----------------------------------------------------------------------*
+FORM frm_del_exist .
+
+  DATA: ls_t001l TYPE t001l.
+  LOOP AT gt_mard INTO gs_mard WHERE matnr = gs_mara-matnr.
+    READ TABLE gt_t001l_tmp INTO ls_t001l
+      WITH KEY lgort = gs_mard-lgort.
+    IF sy-subrc = 0.
+      DELETE TABLE gt_t001l_tmp FROM ls_t001l.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    " FRM_DEL_EXIST
+*&---------------------------------------------------------------------*
+*&      Form  FRM_LOG_HEAD
+*&---------------------------------------------------------------------*
+*       Insert log head
+*----------------------------------------------------------------------*
+FORM frm_log_head .
+
+  DATA: ls_message  TYPE string,
+        lv_index    TYPE i,
+        ls_t001l    TYPE t001l,
+        lv_lines    TYPE i,
+        lv_times    TYPE i,
+        lv_start    TYPE i,
+        lv_end      TYPE i,
+        lv_tab      TYPE char27,
+        lv_star_no  TYPE i VALUE 160,
+        lv_hifen(3) TYPE c VALUE '-'.
+
+  lv_index = 1.
+  CLEAR ls_message.
+  CONCATENATE   'Plant:'(t11)
+                gs_t001w-werks
+    INTO        ls_message.
+  INSERT ls_message INTO gt_message INDEX lv_index.
+  lv_index = lv_index + 1.
+
+  CLEAR ls_message.
+  ls_message = 'Extend to storage location: '(t12).
+  LOOP AT gt_t001l INTO ls_t001l FROM 1 TO 15.
+    IF sy-tabix = 1.
+      CONCATENATE ls_message ls_t001l-lgort INTO ls_message.
+    ELSE.
+      CONCATENATE ls_message lv_hifen ls_t001l-lgort  INTO ls_message.
+    ENDIF.
+  ENDLOOP.
+  INSERT ls_message INTO gt_message INDEX lv_index.
+  lv_index = lv_index + 1.
+
+  DESCRIBE TABLE gt_t001l LINES lv_lines.
+  IF lv_lines > 15.
+    lv_times = lv_lines / 15.
+    DO lv_times TIMES.
+      CLEAR ls_message.
+      lv_start = 15 * sy-index + 1.
+      lv_end   = 15 * ( sy-index + 1 ).
+      LOOP AT gt_t001l INTO ls_t001l FROM lv_start TO lv_end.
+        IF sy-tabix = 1.
+          CONCATENATE ls_message ls_t001l-lgort INTO ls_message.
+        ELSE.
+          CONCATENATE ls_message lv_hifen ls_t001l-lgort  INTO ls_message.
+        ENDIF.
+      ENDLOOP.
+      REPLACE '-' INTO ls_message WITH lv_tab.
+      INSERT ls_message INTO gt_message INDEX lv_index.
+      lv_index = lv_index + 1.
+    ENDDO.
+  ENDIF.
+
+  CONDENSE: gv_succ,gv_error.
+  ls_message = space.
+  INSERT ls_message INTO gt_message INDEX lv_index.
+  lv_index = lv_index + 1.
+
+  IF gt_message2 IS NOT INITIAL.
+    LOOP AT gt_message2 INTO ls_message.
+      INSERT ls_message INTO gt_message INDEX lv_index.
+      lv_index = lv_index + 1.
+    ENDLOOP.
+  ENDIF.
+
+  ls_message = space.
+  INSERT ls_message INTO gt_message INDEX lv_index.
+  lv_index = lv_index + 1.
+
+  CLEAR ls_message.
+  DO lv_star_no TIMES.
+    CONCATENATE '*' ls_message INTO ls_message.
+  ENDDO.
+  INSERT ls_message INTO gt_message INDEX lv_index.
+  lv_index = lv_index + 1.
+
+  CLEAR: ls_message.
+  CONCATENATE 'Total extend material:'(t08) gv_total
+    INTO ls_message SEPARATED BY space.
+  INSERT ls_message INTO gt_message INDEX lv_index.
+  lv_index = lv_index + 1.
+
+  CLEAR: ls_message.
+
+  CONCATENATE 'Successfully  extend:'(t09) gv_succ
+    INTO ls_message SEPARATED BY space.
+  INSERT ls_message INTO gt_message INDEX lv_index.
+  lv_index = lv_index + 1.
+
+  CLEAR: ls_message.
+  CONCATENATE 'Extend with error:'(t10) gv_error
+    INTO ls_message SEPARATED BY space.
+  INSERT ls_message INTO gt_message INDEX lv_index.
+  lv_index = lv_index + 1.
+
+  ls_message = space.
+  INSERT ls_message INTO gt_message INDEX lv_index.
+  lv_index = lv_index + 1.
+
+  CLEAR ls_message.
+  DO lv_star_no TIMES.
+    CONCATENATE '*' ls_message INTO ls_message.
+  ENDDO.
+  INSERT ls_message INTO gt_message INDEX lv_index.
+  lv_index = lv_index + 1.
+
+ENDFORM.                    " FRM_LOG_HEAD
+*&---------------------------------------------------------------------*
+*&      Form  FRM_WRITE_LOG
+*&---------------------------------------------------------------------*
+*       Write log
+*----------------------------------------------------------------------*
+FORM frm_write_log .
+
+  DATA: lv_text     TYPE string.
+  LOOP AT gt_message INTO lv_text.
+    IF lv_text  IS INITIAL.
+      SKIP.
+    ELSE.
+      WRITE: / lv_text.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    " FRM_WRITE_LOG
+*&---------------------------------------------------------------------*
+*&      Form  FRM_AUTH_CHECK
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM frm_auth_check .
+
+  AUTHORITY-CHECK OBJECT 'M_MATE_WRK'
+           ID 'ACTVT' DUMMY
+           ID 'WERKS' FIELD so_werks-low . "p_werks. "+cdr
+  IF sy-subrc <> 0.
+    MESSAGE s000(yse_sales_log) WITH text-015 so_werks-low  "p_werks "+cdr
+      DISPLAY LIKE 'E'.
+    LEAVE LIST-PROCESSING.
+  ENDIF.
+
+ENDFORM.                    " FRM_AUTH_CHECK
+*&---------------------------------------------------------------------*
+*&      Form  GET_ERROR_NO
+*&---------------------------------------------------------------------*
+*       Get error process number
+*----------------------------------------------------------------------*
+FORM get_error_no .
+
+  DATA: lt_mard     TYPE STANDARD TABLE OF ty_mard,
+        lt_mard_tmp TYPE STANDARD TABLE OF ty_mard,
+        lv_lines TYPE i,
+        ls_t001l  TYPE t001l.
+
+  RANGES: lr_matnr FOR mara-matnr,
+          lr_matnr_temp FOR mara-matnr.
+
+  APPEND LINES OF so_matnr TO lr_matnr_temp.
+
+  lr_matnr_temp = so_matnr.
+  DO .
+    REFRESH: lr_matnr[].
+    CLEAR: lr_matnr.
+    APPEND LINES OF lr_matnr_temp FROM 1 TO 10000 TO lr_matnr.
+    IF lr_matnr[] IS INITIAL.
+      EXIT.
+    ENDIF.
+    SELECT  matnr
+            werks
+            lgort
+            pstat
+      FROM mard
+      APPENDING TABLE lt_mard
+      WHERE matnr IN lr_matnr
+*        AND werks = p_werks "-cdr
+        AND werks in so_werks "+cdr
+        AND lgort IN so_lgort.
+    DELETE lr_matnr_temp FROM 1 TO 10000.
+  ENDDO.
+
+  LOOP AT gt_t001l INTO ls_t001l.
+    lt_mard_tmp = lt_mard.
+    DELETE lt_mard_tmp WHERE lgort <> ls_t001l-lgort.
+    DESCRIBE TABLE lt_mard_tmp LINES lv_lines.
+    IF sy-tabix = 1.
+      gv_succ = lv_lines.
+    ELSE.
+      IF lv_lines < gv_succ.
+        gv_succ = lv_lines.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+  gv_error = gv_total - gv_succ.
+
+  REFRESH: lr_matnr_temp[], lr_matnr[].
+
+ENDFORM.                    " GET_ERROR_NO
+*&---------------------------------------------------------------------*
+*&      Form  FRM_MAIN_PROC2
+*&---------------------------------------------------------------------*
+*       Main process (BAPI impl)
+*----------------------------------------------------------------------*
+FORM frm_main_proc2 .
+
+  DATA: lv_text     TYPE char80,
+        lv_counter  TYPE string,
+        lv_matnr    TYPE string,
+        ls_t001l    TYPE t001l,
+        ls_message  TYPE string,
+        ls_bapi_mard TYPE bapi_mard,
+        ls_bapi_mardx TYPE bapi_mardx,
+        ls_bapimathead  TYPE bapimathead,
+        ls_return TYPE bapiret2,
+        lv_index_c  TYPE string.
+
+* Progress indicator
+  CLEAR lv_text.
+  lv_text = 'Data is being selected'(i01).
+  CALL FUNCTION 'SAPGUI_PROGRESS_INDICATOR'
+    EXPORTING
+      text = lv_text.
+
+* Gain master data for subsequent process
+  PERFORM gain_master_data.
+
+  lv_index_c = '1/1'.
+  LOOP AT gt_mara INTO gs_mara WHERE no_exist IS INITIAL.
+    gt_t001l_tmp =  gt_t001l.
+    gv_tabix = sy-tabix.
+    lv_counter = lv_counter + 1.
+    CLEAR lv_text.
+    CONDENSE lv_counter.
+    lv_matnr = gs_mara-matnr.
+    SHIFT lv_matnr LEFT DELETING LEADING '0'.
+    CONDENSE lv_matnr.
+    lv_text = 'Material & (& of &) is being processed[&]'(i03).
+    REPLACE '&' WITH lv_matnr       INTO lv_text.
+    REPLACE '&' WITH lv_counter     INTO lv_text.
+    REPLACE '&' WITH gv_total_pro   INTO lv_text.
+    REPLACE '&' WITH lv_index_c     INTO lv_text.
+    CALL FUNCTION 'SAPGUI_PROGRESS_INDICATOR'
+      EXPORTING
+        text = lv_text.
+    CLEAR gs_marc.
+    READ TABLE gt_marc INTO gs_marc WITH KEY matnr = gs_mara-matnr.
+    IF sy-subrc <> 0.
+      ls_message = text-t07.
+      REPLACE '&' INTO ls_message WITH p_werks.
+      CONCATENATE gc_msgty_e gs_mara-matnr ls_message
+        INTO ls_message
+        SEPARATED BY space.
+      APPEND ls_message TO gt_message.
+      gs_mara-pstat = gc_x.
+      gs_mara-no_exist = gc_x.
+      MODIFY gt_mara INDEX gv_tabix FROM gs_mara TRANSPORTING pstat no_exist.
+      CONTINUE.
+    ENDIF.
+    REFRESH: gt_mard_temp .
+    gt_mard_temp = gt_mard.
+    DELETE gt_mard_temp WHERE  NOT ( werks = gs_t001w-werks
+                    AND   matnr = gs_marc-matnr ).
+    DELETE gt_mard WHERE  werks = gs_t001w-werks
+                    AND   matnr = gs_marc-matnr.
+*   Delete the exist storage location
+    PERFORM frm_del_exist.
+*   If no storage location need to be extend
+    IF gt_t001l_tmp IS INITIAL.
+      CONTINUE.
+    ENDIF.
+*   Run BDC
+    LOOP AT gt_t001l_tmp INTO ls_t001l.
+      ls_bapimathead-material = gs_mara-matnr.
+      ls_bapimathead-matl_type = gs_mara-mtart.
+      ls_bapimathead-storage_view = gc_x.
+      ls_bapi_mard-plant = ls_t001l-werks.  "p_werks. "-cdr
+      ls_bapi_mard-stge_loc = ls_t001l-lgort.
+      ls_bapi_mardx-plant = ls_t001l-werks.  "p_werks. "-cdr
+      ls_bapi_mardx-stge_loc = ls_t001l-lgort.
+      ls_bapi_mardx-del_flag = 'X'.
+      CALL FUNCTION 'BAPI_MATERIAL_SAVEDATA'
+        EXPORTING
+          headdata             = ls_bapimathead
+          storagelocationdata  = ls_bapi_mard
+          storagelocationdatax = ls_bapi_mardx
+        IMPORTING
+          return               = ls_return.
+      IF ls_return-type = 'E'.
+        MESSAGE ID ls_return-id
+          TYPE ls_return-type
+            NUMBER ls_return-number
+            WITH  ls_return-message_v1
+                  ls_return-message_v2
+                  ls_return-message_v3
+                  ls_return-message_v4
+            INTO ls_message.
+        CONCATENATE gc_msgty_e gs_marc-matnr ls_message
+          INTO ls_message
+          SEPARATED BY space.
+        APPEND ls_message TO gt_message.
+        gs_mara-pstat = gc_x.
+        MODIFY gt_mara INDEX gv_tabix FROM gs_mara TRANSPORTING pstat.
+      ENDIF.
+    ENDLOOP.
+    REFRESH:  gt_t001l_tmp.
+    CLEAR:  gs_marc,
+            gs_mara.
+  ENDLOOP.
+
+ENDFORM.                    " FRM_MAIN_PROC2
+*&---------------------------------------------------------------------*
+*&      Form  FRM_MATNR_CHECK
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM frm_matnr_check .
+
+  DATA: lv_mara_lines   TYPE i,
+        lv_text         TYPE char100.
+  RANGES: lr_matnr FOR mara-matnr,
+          lr_matnr_temp FOR mara-matnr.
+
+  APPEND LINES OF so_matnr TO lr_matnr_temp.
+
+  DO .
+    REFRESH: lr_matnr.
+    CLEAR : lr_matnr.
+    APPEND LINES OF lr_matnr_temp[] FROM 1 TO 10000 TO lr_matnr[].
+    IF lr_matnr[] IS INITIAL.
+      EXIT.
+    ENDIF.
+*   Check material numbers
+    SELECT  matnr
+            mtart
+      FROM mara
+      APPENDING TABLE gt_mara
+      WHERE matnr IN lr_matnr.
+    DESCRIBE TABLE gt_mara LINES lv_mara_lines.
+    IF lv_mara_lines > gc_max_mat.
+      lv_text = text-t06.
+      REPLACE '&' INTO lv_text WITH gc_max_mat.
+      MESSAGE e000(yse_sales_log) WITH lv_text.
+    ENDIF.
+    DELETE lr_matnr_temp FROM 1 TO 10000.
+  ENDDO.
+
+  REFRESH: lr_matnr_temp[], lr_matnr[].
+
+ENDFORM.                    " FRM_MATNR_CHECK
+*&---------------------------------------------------------------------*
+*&      Form  FRM_DATE_CHECK
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM frm_date_check .
+
+  DATA: lv_today(8) TYPE n.
+  lv_today = sy-datum.
+  IF   lv_today+6(2) < gc_date_low
+    OR lv_today+6(2) > gc_date_high.
+    MESSAGE  e000(yse_general)
+      WITH text-035
+            gc_date_low
+            text-036
+            gc_date_high.
+  ENDIF.
+
+ENDFORM.                    " FRM_DATE_CHECK
+*&---------------------------------------------------------------------*
+*&      Form  FRM_OBL_CHECK
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM frm_obl_check .
+
+  IF so_lgort IS INITIAL.
+    MESSAGE s000(yse_sales_log)
+      WITH 'Please enter the extend Storage Locations'(t20)
+    DISPLAY LIKE 'E'.
+    LEAVE LIST-PROCESSING.
+  ENDIF.
+
+  IF so_matnr IS INITIAL.
+    MESSAGE s000(yse_sales_log)
+      WITH 'Please enter Materials'(t21)
+      DISPLAY LIKE 'E'.
+    LEAVE LIST-PROCESSING.
+  ENDIF.
+ENDFORM.                    " FRM_OBL_CHECK
+
+*Text symbol text£º
+*015:You have no authorization to access plant:
+*035:Please do upload between month day
+*036:and
+*I01:Data is being selected
+*I03:Material & (& of &) is being processed[&]
+*T01:Please enter valid plant
+*T02:No storage location exist in plant
+*T03:Please enter valid storage location
+*T04:The storage location [
+*T05:] not exist in plant
+*T06:The max extendable material number is &
+*T07:The material is not exist in plant [&]
+*T08:Total extend material:
+*T09:Successfully  extend:
+*T10:Extend with error:
+*T11:Plant:
+*T12:Extend to storage location:
+*T15:The material  [&]  is not exist
+*T20:Please enter the extend Storage Locations
+
+*T21:Please enter Materials
+*Selection text£º
+*P_WERKS:D       .
+*SO_LGORT:D       .
+*SO_MATNR:D       .

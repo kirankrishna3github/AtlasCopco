@@ -1,0 +1,439 @@
+REPORT  YSE_UTILITY_REPORT no standard PAGE HEADING
+                           LINE-SIZE 255
+                           LINE-COUNT 58.
+*&_____________________________________________________________________*
+*  Description:                                                        *
+*  This report will be used to load reports from the presentation      *
+*  server and then submit them for performance analysis.
+*&_____________________________________________________________________*
+* Programmer Name |   Date   | Team ID  | Transport #  | Change ID#    *
+* Uzzawal V       |06/10/2009| EXTUVE   |              | Initial Version
+*&_____________________________________________________________________*
+* Modification History                                                 *
+*&_____________________________________________________________________*
+************************************************************************
+* tables
+************************************************************************
+TABLES: RLGRAP,           "Program Fields/Screen Fields for SAPLGRAP
+        INDX,             "System table INDX
+        TRDIR,            "System table TRDIR
+        VARIT,            "Variant Texts
+        VARID.            "Variant directory
+************************************************************************
+* internal tables
+************************************************************************
+DATA: BEGIN OF t_file_data OCCURS 0,
+        data(110) TYPE c.
+DATA: END OF t_file_data.
+*
+DATA: T_CODE(72) TYPE C OCCURS 100.
+*
+DATA: BEGIN OF t_textpool OCCURS 0.
+       INCLUDE STRUCTURE textpool.
+DATA: END OF t_textpool.
+*
+DATA: BEGIN OF t_data OCCURS 0,
+       code(100) TYPE c.
+DATA: END OF t_data.
+*
+DATA: BEGIN OF t_trdir OCCURS 0,
+       name LIKE trdir-name.
+DATA: END OF t_trdir.
+*
+CONSTANTS: c_sep(1) VALUE '|',
+          c_cnt(2) VALUE '13'.
+************************************************************************
+* local variables
+************************************************************************
+DATA:
+w_mask(80)    TYPE c,
+w_msg(240)    TYPE c,
+w_line        TYPE i,
+w_off         TYPE i,
+w_word(72)    TYPE c,
+w_filename    LIKE rlgrap-filename,
+w_repid       LIKE syst-repid.
+************************************************************************
+* ranges
+************************************************************************
+RANGES: R_NAME FOR TRDIR-NAME.
+************************************************************************
+* selection screen
+************************************************************************
+SELECTION-SCREEN BEGIN OF BLOCK block1 WITH FRAME TITLE text-001.
+SELECTION-SCREEN SKIP 1.
+* parameters
+PARAMETERS: P_FILE  LIKE RLGRAP-FILENAME OBLIGATORY DEFAULT TEXT-002.
+*SELECTION-SCREEN SKIP 1.
+*PARAMETERS: P_DEL   AS   CHECKBOX.
+SELECTION-SCREEN SKIP 1.
+SELECTION-SCREEN END OF BLOCK block1.
+************************************************************************
+* at selection screen
+************************************************************************
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_file.
+* get file directory details
+ PERFORM query_filename CHANGING p_file.
+************************************************************************
+* start of selection
+************************************************************************
+START-OF-SELECTION.
+* initialise variables and internal tables
+ PERFORM initialise_vars.
+* check authority object and system
+* perform check_authority.
+* check deletion flag set
+* IF NOT p_del IS INITIAL.
+** delete all reports associated with rice userids
+*   PERFORM delete_reports.
+* ELSE.
+* upload report from presentation server
+   PERFORM upload_report.
+* check subrc and have data
+   CHECK syst-subrc = 0 AND NOT t_file_data[] IS INITIAL.
+**log data changes
+   PERFORM LOG_DATA_CHANGES.
+* build and check code
+   PERFORM build_check_code.
+* check syntax check
+   CHECK syst-subrc = 0.
+* insert report into db
+   PERFORM insert_report.
+* run report
+   PERFORM run_report.
+* ENDIF.
+*---------------------------------------------------------------------*
+*       FORM build_source_code                                        *
+*---------------------------------------------------------------------*
+FORM build_source_code.
+* read first table entry
+ READ TABLE t_file_data INDEX 1.
+* check how report was downloaded to pc - via report zupdown1
+ IF syst-subrc = 0 AND t_file_data-data+0(4) = text-039.
+* process code downloaded via report
+   PERFORM process_code_report.
+* report downloaded via standard fm ws_download
+ ELSEIF syst-subrc = 0.
+* process code downloaded via fm
+   PERFORM process_code_fm.
+ ENDIF.
+* check subrc and have data
+ IF syst-subrc = 0 AND NOT t_data[] IS INITIAL.
+   t_code[] = t_data[].
+ ENDIF.
+ENDFORM.
+*---------------------------------------------------------------------*
+*       FORM insert_report                                            *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+FORM insert_report.
+* set report name
+ CONCATENATE text-020 syst-uname INTO w_repid.
+* check for report source code data
+ IF NOT t_code[] IS INITIAL.
+   INSERT REPORT w_repid FROM t_code.
+ ENDIF.
+* check for report text data
+ IF NOT t_textpool[] IS INITIAL.
+   INSERT TEXTPOOL w_repid FROM t_textpool LANGUAGE syst-langu.
+ ENDIF.
+ENDFORM.
+*---------------------------------------------------------------------*
+*       FORM run_report                                               *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+FORM run_report.
+ SUBMIT (w_repid) VIA SELECTION-SCREEN
+                  AND RETURN.
+* delete report
+* DELETE REPORT w_repid.
+** check subrc
+* IF syst-subrc = 0.
+*   SKIP.
+*   WRITE: / text-036, w_repid, text-019.
+* ENDIF.
+** delete texts and variants
+* PERFORM delete_texts USING w_repid.
+** if not tbl_log[] is initial.
+** insert  zreport_log from table tbl_log.
+** endif.
+ENDFORM.
+*---------------------------------------------------------------------*
+*       FORM upload_report                                            *
+*---------------------------------------------------------------------*
+*       ........                                                      *
+*---------------------------------------------------------------------*
+FORM upload_report.
+* upload report
+ CALL FUNCTION 'WS_UPLOAD'
+      EXPORTING
+           filename            = p_file
+           filetype            = 'ASC'
+      TABLES
+           data_tab            = t_file_data
+      EXCEPTIONS
+           file_open_error     = 1
+           file_read_error     = 2
+*           invalid_filesize    = 3
+           invalid_table_width = 4
+           invalid_type        = 5
+           no_batch            = 6
+           unknown_error       = 7
+           OTHERS              = 8.
+ SKIP.
+* check subrc
+ CASE syst-subrc.
+   WHEN 0.
+     WRITE:  / p_file, text-010.
+   WHEN 1.
+     WRITE:  / text-011, p_file.
+   WHEN 2.
+     WRITE:  / text-012, p_file.
+   WHEN 3.
+     WRITE:  / text-013, p_file.
+   WHEN 4.
+     WRITE:  / text-014, p_file.
+   WHEN 5.
+     WRITE:  / text-015, p_file.
+   WHEN 6.
+     WRITE:  / text-016, p_file.
+   WHEN 7.
+     WRITE:  / text-017, p_file.
+   WHEN OTHERS.
+     WRITE:  / text-018, p_file.
+ ENDCASE.
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  check_code
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM check_code.
+* check have data
+ CHECK NOT t_code[] IS INITIAL.
+* syntax check code
+ SYNTAX-CHECK FOR t_code MESSAGE w_msg LINE w_line WORD w_word
+                         OFFSET  w_off.
+* check subrc
+ IF syst-subrc <> 0.
+   SKIP.
+   WRITE: / text-030, w_line,
+          / w_msg,
+          / text-031, w_word, text-032, w_off.
+ ENDIF.
+ENDFORM.                    " check_code
+*&---------------------------------------------------------------------*
+*&      Form  initialise_vars
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM initialise_vars.
+ CLEAR: w_msg,
+        w_off,
+        w_line,
+        w_word,
+        w_repid,
+        t_file_data,
+        t_data,
+        t_code,
+        t_textpool,
+        t_trdir,
+        r_name.
+ REFRESH: t_file_data,
+          t_data,
+          t_code,
+          t_textpool,
+          t_trdir,
+          r_name.
+ENDFORM.                    " initialise_vars
+*&---------------------------------------------------------------------*
+*&      Form  query_filename
+*&---------------------------------------------------------------------*
+*      -->P_P_FILE  text
+*----------------------------------------------------------------------*
+FORM query_filename CHANGING p_file.
+* initialise filename variables
+ PERFORM initialise_file_vars.
+* get file directory details
+ CALL FUNCTION 'WS_FILENAME_GET'
+      EXPORTING
+           def_filename     = rlgrap-filename
+           def_path         = p_file
+           mask             = w_mask
+           mode             = text-006
+      IMPORTING
+           filename         = w_filename
+      EXCEPTIONS
+           inv_winsys       = 01
+           no_batch         = 02
+           selection_cancel = 03
+           selection_error  = 04.
+* check subrc
+ IF syst-subrc = 0.
+   p_file = w_filename.
+ ENDIF.
+ENDFORM.                    " query_filename
+*&---------------------------------------------------------------------*
+*&      Form  check_authority
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*FORM check_authority.
+** check authority object
+* AUTHORITY-CHECK OBJECT 'ZABAP'
+*          ID 'ACTVT' FIELD '16'.
+** check subrc
+* IF syst-subrc <> 0.
+** issue error message
+*   MESSAGE e017(zd) WITH text-037 text-038 text-042 text-043.
+* ENDIF.
+**
+** issue error message if system is production
+**  if syst-sysid+0(2) = text-007.
+**    message e017(zd) with text-008 text-041.
+**  endif.
+**
+*ENDFORM.                    " check_authority
+*&---------------------------------------------------------------------*
+*&      Form  delete_reports
+*&---------------------------------------------------------------------*
+*FORM delete_reports.
+** populate range with value zreport*
+* PERFORM populate_range.
+** get all reports with name prefix zreport*
+* SELECT name FROM trdir INTO TABLE t_trdir
+*             WHERE name IN r_name.
+** check subrc and entries
+* IF syst-subrc = 0 AND NOT t_trdir[] IS INITIAL.
+** delete entries
+*   PERFORM delete_report_entries.
+* ELSE.
+** write out that there are no reports to delete
+*   WRITE: / text-035.
+* ENDIF.
+*ENDFORM.                    " delete_reports
+*&---------------------------------------------------------------------*
+*&      Form  delete_texts
+*&---------------------------------------------------------------------*
+*      -->P_T_TRDIR_NAME  text
+*----------------------------------------------------------------------*
+*FORM delete_texts USING p_name.
+** delete all texts associated with report
+* DELETE TEXTPOOL p_name LANGUAGE syst-langu.
+** delete all variant texts associated with report
+* DELETE FROM varit WHERE report = p_name.
+** delete all variants associated with report
+* DELETE FROM varid WHERE report = p_name.
+*ENDFORM.                    " delete_texts
+*&---------------------------------------------------------------------*
+*&      Form  build_check_code
+*&---------------------------------------------------------------------*
+FORM build_check_code.
+* build source code for report
+ PERFORM build_source_code.
+* syntax check source code
+ PERFORM check_code.
+ENDFORM.                    " build_check_code
+*&---------------------------------------------------------------------*
+*&      Form  populate_range
+*&---------------------------------------------------------------------*
+FORM populate_range.
+ MOVE: text-009 TO r_name-low,
+       text-033 TO r_name-sign,
+       text-034 TO r_name-option.
+ APPEND r_name.
+ENDFORM.                    " populate_range
+*&---------------------------------------------------------------------*
+*&      Form  delete_report_entries
+*&---------------------------------------------------------------------*
+*FORM delete_report_entries.
+* SKIP.
+** loop at internal table
+* LOOP AT t_trdir.
+** delete report
+*   DELETE REPORT t_trdir-name.
+** delete texts and variants
+*   PERFORM delete_texts USING t_trdir-name.
+** write out deletion confirmation
+*   WRITE: / text-036, t_trdir-name, text-019.
+* ENDLOOP.
+*ENDFORM.                    " delete_report_entries
+*&---------------------------------------------------------------------*
+*&      Form  process_code_report
+*&---------------------------------------------------------------------*
+FORM process_code_report.
+* loop at internal table
+ LOOP AT t_file_data.
+* determine record type
+   CASE t_file_data-data+0(4).
+* report source code data
+     WHEN text-039.
+       MOVE: t_file_data-data+10(100) TO t_data-code.
+       APPEND t_data.
+       CLEAR: t_data.
+* report text data, e.g. text symbols, selection texts
+     WHEN text-040.
+       MOVE: t_file_data-data+10(100) TO t_textpool.
+       APPEND t_textpool.
+       CLEAR: t_textpool.
+     WHEN OTHERS.
+   ENDCASE.
+ ENDLOOP.
+ENDFORM.                    " process_code_report
+*&---------------------------------------------------------------------*
+*&      Form  process_code_fm
+*&---------------------------------------------------------------------*
+FORM process_code_fm.
+* loop at internal table
+ LOOP AT t_file_data.
+   MOVE: t_file_data-data TO t_data-code.
+   APPEND t_data.
+   CLEAR: t_data.
+ ENDLOOP.
+ENDFORM.                    " process_code_fm
+*&---------------------------------------------------------------------*
+*&      Form  initialise_file_vars
+*&---------------------------------------------------------------------*
+FORM initialise_file_vars.
+* clear variables
+ CLEAR: w_mask,
+        w_filename.
+* set mask
+ w_mask = text-003.
+ENDFORM.                    " initialise_file_vars
+*&---------------------------------------------------------------------*
+*&      Form  log_data_changes
+*&---------------------------------------------------------------------*
+FORM log_data_changes.
+ DATA: w_count(14) TYPE n.
+ DATA: W_SRTFD LIKE INDX-SRTFD.
+ DATA: C_SRTFD LIKE INDX-SRTFD VALUE 'ZREPLOG_%'.
+ DATA: BEGIN OF tbl_indx OCCURS 0,
+       srtfd LIKE indx-srtfd,
+       END OF tbl_indx.
+**This perfrom logs the changes in table INDX.It stores the uploaded
+**Program in from of clusters in the table.This can be read using the
+*import/export statement.
+**Get the maximum counter from table INDX.
+ SELECT srtfd FROM indx INTO TABLE tbl_indx
+      WHERE relid = 'ZR'
+      AND   srtfd LIKE c_srtfd.
+*
+ SORT  tbl_indx.
+ DELETE ADJACENT DUPLICATES FROM tbl_indx.
+ DESCRIBE TABLE tbl_indx LINES w_count.
+*
+ w_count = w_count + 1.
+*
+ indx-aedat = sy-datum.
+ indx-usera = sy-uname.
+ indx-pgmid = p_file.
+*
+ CONCATENATE 'ZREPLOG' '_' w_count INTO w_srtfd.
+ EXPORT t_file_data TO DATABASE indx(zr) ID w_srtfd.
+ENDFORM.                    " log_data_changes
+
+*Selection text£º
+*P_FILE:        File Name

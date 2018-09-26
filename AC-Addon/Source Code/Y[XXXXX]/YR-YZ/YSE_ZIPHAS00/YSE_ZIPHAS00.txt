@@ -1,0 +1,222 @@
+REPORT yse_ziphas00 .
+* Copy of ZIPHAS00 with extra selection screen on IWERK (plant)
+
+* Dieser Report stellt die IPHAS aus dem Systemstatus her.
+
+TABLES: viaufks, afvc, afih.
+
+DATA: BEGIN OF order_tab OCCURS 0,
+   aufnr LIKE afih-aufnr,
+   m_plant LIKE afih-iwerk,
+   iphas LIKE afih-iphas,
+   objnr LIKE aufk-objnr,
+   ftrmi LIKE afko-ftrmi.
+DATA: END OF order_tab.
+DATA: BEGIN OF order_tab_a OCCURS 0,
+   aufnr LIKE afih-aufnr,
+   m_plant LIKE afih-iwerk,
+   iphas LIKE afih-iphas,
+   objnr LIKE aufk-objnr,
+   ftrmi LIKE afko-ftrmi.
+DATA: END OF order_tab_a.
+
+DATA: BEGIN OF pre_read_tab OCCURS 1000,
+  objnr LIKE aufk-objnr.
+DATA: END OF pre_read_tab.
+DATA: i LIKE sy-tabix.
+
+
+PARAMETER: test DEFAULT 'X'.
+SELECT-OPTIONS: order FOR viaufks-aufnr,
+  m_plant FOR viaufks-iwerk.  "added for performance improvement and segregation
+
+
+IF test = space.
+  WRITE: / '*** UPDATE MODE ***'.
+ELSE.
+  WRITE: / '*** TEST MODE ***'.
+ENDIF.
+SKIP 3.
+
+* Auftr#ge einlesen
+SELECT aufnr iwerk iphas objnr ftrmi FROM viaufks INTO TABLE order_tab
+                                 WHERE aufnr IN ORDER AND iwerk IN m_plant.
+
+
+* Auftr#ge f¨¹r Statuspre_read zu 1000 Pakete lesen
+LOOP AT order_tab.
+  i = i + 1.
+  APPEND order_tab-objnr TO pre_read_tab.
+  APPEND order_tab       TO order_tab_a.
+  IF i > 999.
+    CLEAR i.
+*   Status pre_read
+    PERFORM status_pre_read.
+*   Status ¨¹berspr¨¹fen und IPHAS ggf. setzen
+    PERFORM action.
+
+    CALL FUNCTION 'STATUS_BUFFER_REFRESH'.
+    .
+  ENDIF.
+ENDLOOP.
+
+IF NOT order_tab_a[] IS INITIAL.
+  PERFORM status_pre_read.
+  PERFORM action.
+ENDIF.
+
+WRITE: / '***************+ END +*****************'.
+
+*&---------------------------------------------------------------------*
+*&      Form  status_pre_read
+*&---------------------------------------------------------------------*
+FORM status_pre_read.
+
+
+  CALL FUNCTION 'STATUS_PRE_READ'
+    TABLES
+      jsto_pre_tab = pre_read_tab.
+
+  CLEAR pre_read_tab[].
+
+ENDFORM.                               " action
+*&---------------------------------------------------------------------*
+*&      Form  action
+*&---------------------------------------------------------------------*
+FORM action.
+
+  DATA: status_iphas LIKE afih-iphas.
+  DATA: order_ftrmi LIKE afko-ftrmi.
+  DATA: ftrmi_update TYPE c.
+
+
+  LOOP AT order_tab_a.
+
+    CLEAR status_iphas.
+    CLEAR order_ftrmi.
+    CLEAR ftrmi_update.
+
+*   kaufm. abgeschlossen ?
+    PERFORM status_check USING 'I0046'.
+*   ja
+    IF sy-subrc = 0.
+* Umbau des Reports: Wenn Kunde noch alte Daten mit kfm. Abschluss
+* und iphas = 3 hat, kann der Einbau von HW 621813 zu Fehlern f¨¹hren
+* deshalb muss iphas dann immer auf 6 gesetzt werden
+*      case order_tab_a-iphas.          "AB 4.6
+*        when 6.
+*          status_iphas = 6.
+*        when 3.
+*          status_iphas = 3.
+*        when others.
+      IF sy-saprl(2) >= '46'.
+        status_iphas = 6.
+      ELSE.
+        status_iphas = 3.
+      ENDIF.
+*      endcase.
+    ELSE.
+*   techn. abgeschlossen ?
+      PERFORM status_check USING 'I0045'.
+*     ja
+      IF sy-subrc = 0.
+        status_iphas = 3.
+      ELSE.
+*   Freigegeben ?
+        PERFORM status_check USING 'I0002'.
+*       ja
+        IF sy-subrc = 0.
+          status_iphas = 2.
+          IF order_tab_a-ftrmi IS INITIAL.
+            order_ftrmi = sy-datum.
+            ftrmi_update = 'X'.
+          ENDIF.
+        ELSE.
+*         er#ffnet ?
+          PERFORM status_check USING 'I0001'.
+*         ja
+          IF sy-subrc = 0.
+            status_iphas = 0.
+          ENDIF.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+*   L#VM ?
+    PERFORM status_check USING 'I0076'.
+*   Ja
+    IF sy-subrc = 0.
+      status_iphas = 4.
+* start SAP 31.07.2006
+* L#VM set by archiving tool
+      IF status_iphas = 4 AND order_tab_a-iphas = 6.
+        status_iphas = 6.
+      ENDIF.
+* end SAP 31.07.2006
+
+    ENDIF.
+
+
+*   wenn AFIH anderes Ergebnis als Auftrag bringt ==>
+    IF order_tab_a-iphas <> status_iphas OR
+       NOT ftrmi_update IS INITIAL.
+      WRITE: / 'Status inconsistent ', order_tab_a-aufnr.
+      WRITE: 'Status derived: ' .
+      CASE status_iphas.
+        WHEN: 0.
+          WRITE: 'Created '.
+        WHEN: 2.
+          WRITE: 'Released and/or actual release date is set'.
+        WHEN: 3.
+          WRITE: 'tech. completed'.
+        WHEN: 4.
+          WRITE: 'Deleted'.
+        WHEN: 6.
+          WRITE: 'Completed'.
+      ENDCASE.
+
+*     Update AFIH mit richtiger Phase
+      IF test = space.
+        UPDATE afih SET iphas = status_iphas
+                        WHERE aufnr = order_tab_a-aufnr.
+        IF NOT ftrmi_update IS INITIAL.
+          UPDATE afko SET ftrmi = order_ftrmi
+                          WHERE aufnr = order_tab_a-aufnr.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+
+  ENDLOOP.
+
+  CLEAR order_tab_a[].
+
+
+ENDFORM.                               " action
+*&---------------------------------------------------------------------*
+*&      Form  status_check
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_0148   text
+*----------------------------------------------------------------------*
+FORM status_check USING    l_status LIKE jest-stat.
+
+  CALL FUNCTION 'STATUS_CHECK'
+    EXPORTING
+      objnr             = order_tab_a-objnr
+      status            = l_status
+    EXCEPTIONS
+      object_not_found  = 01
+      status_not_active = 02.
+
+  IF sy-subrc = 1.
+    WRITE: / 'Statusobject not found: ' , order_tab_a-aufnr.
+  ENDIF.
+
+
+ENDFORM.                               " status_check
+
+*Selection text£º
+*M_PLANT:D       .
+*ORDER:D       .
+*TEST:        Test

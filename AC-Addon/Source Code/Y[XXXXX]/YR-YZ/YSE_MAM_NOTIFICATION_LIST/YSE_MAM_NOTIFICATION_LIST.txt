@@ -1,0 +1,418 @@
+*&---------------------------------------------------------------------*
+*& Report  YSE_MAM_NOTIFICATION_LIST
+*&
+*&---------------------------------------------------------------------*
+*&                                                                     *
+*& MAM : Report with Notifications                                     *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+*  Author                : Jules Smets
+*  Date                  : 31.03.2010
+*  Change Request Number : CR0334
+*  Transport request Nr. : CD1K956758
+*----------------------------------------------------------------------*
+*                                                                      *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME     |CORRECTION NUMBER| CHANGE REFERENCE # *
+*----------------------------------------------------------------------*
+* MOD-001 |01.01.9999|          |CD1K9.....       |(Description)       *
+*----------------------------------------------------------------------*
+
+************************************************************************
+
+REPORT  yse_mam_notification_list.
+
+TABLES: viqmel,
+        jest.
+
+* ALV grid
+TYPE-POOLS: slis.
+
+* Internal table with plants
+DATA: BEGIN OF t_wrk  OCCURS 0,
+        werks     TYPE werks_d,
+      END OF t_wrk.
+
+* Internal table with notif. types
+DATA: BEGIN OF t_nt  OCCURS 0,
+        qmart      TYPE qmart,
+        qmartx     TYPE qmartx,
+      END OF t_nt.
+
+* Internal table with return for F4 (value selection)
+DATA: BEGIN OF it_return_tab  OCCURS 0.
+        INCLUDE STRUCTURE ddshretval.
+DATA: END OF it_return_tab.
+
+* Internal table with notifications
+DATA: BEGIN OF t_notif  OCCURS 0,
+        qmnum      TYPE qmnum,
+        qmart      TYPE qmart,
+        erdat      TYPE erdat,
+        qmnam      TYPE qmnam,
+        aufnr      TYPE aufnr,
+        vbeln      TYPE kdauf,
+        arbplwerk  TYPE qarbpwerks,
+        arbpl      TYPE lgwid,
+        equnr      TYPE equnr,
+        tplnr      TYPE tplnr,
+        objnr      TYPE qmobjnr,
+      END OF t_notif.
+
+* Internal Table with output lines
+DATA: BEGIN OF t_out  OCCURS 0,
+        qmnum      TYPE qmnum,
+        qmart      TYPE qmart,
+        erdat      TYPE erdat,
+        qmnam      TYPE qmnam,
+        statxt     TYPE j_stext,
+        aufnr      TYPE aufnr,
+        vbeln      TYPE kdauf,
+        arbplwerk  TYPE qarbpwerks,
+        arbpl      TYPE lgwid,
+        equnr      TYPE equnr,
+        tplnr      TYPE tplnr,
+*        ustatxt    TYPE j_stext,
+      END OF t_out.
+DATA: h_out  LIKE LINE OF t_out.
+
+DATA: xv_variant         LIKE disvariant,
+      xv_variant_flag    TYPE c,
+      xv_sd_alv_variant  LIKE disvariant,
+      xt_fcat            TYPE slis_t_fieldcat_alv,
+      ls_fcat            LIKE LINE OF xt_fcat,
+      xt_alv_sort        TYPE slis_t_sortinfo_alv,
+      xv_user_command    TYPE slis_formname  VALUE 'USER_COMMAND',
+      xv_variant_save    TYPE c              VALUE 'U',
+      xv_layout          TYPE slis_layout_alv.
+
+DATA: h_col(10)      TYPE n,
+      h_repid        LIKE sy-repid.
+
+* Constants
+CONSTANTS: c_mobi   TYPE j_status VALUE 'I0630',  "Data on Mobile Device
+           c_seed   TYPE qmart    VALUE 'X3',     "SEED: Egineer request
+           c_am     TYPE qmart    VALUE 'Z3',     "AM: Egineer request
+           c_x      TYPE xfeld    VALUE 'X',
+           c_blank  TYPE xfeld    VALUE ' '.
+
+* Selections
+SELECTION-SCREEN  BEGIN OF BLOCK sel  WITH FRAME  TITLE text-s01.
+SELECT-OPTIONS: so_awerk  FOR viqmel-arbplwerk        "Plant
+                              MEMORY ID wrk  OBLIGATORY,
+                so_arbpl  FOR viqmel-arbpl,           "Workcenter
+                so_erdat  FOR viqmel-erdat,           "Creation date
+                so_qmnam  FOR viqmel-qmnam,           "Reported by
+                so_qmnum  FOR viqmel-qmnum,           "Notification nr.
+                so_qmart  FOR viqmel-qmart            "Notification type
+                              NO INTERVALS.
+SELECTION-SCREEN  END OF BLOCK sel.
+
+
+*&---------------------------------------------------------------------*
+*&  Initialization                                                     *
+*&---------------------------------------------------------------------*
+INITIALIZATION.
+
+  SELECT n~qmart t~qmartx INTO TABLE t_nt
+         FROM tq80 AS n
+         INNER JOIN tq80_t AS t
+               ON n~qmart = t~qmart
+         WHERE ( n~qmart = 'X3' OR n~qmart = 'Z3' )
+           AND t~spras = sy-langu.
+
+
+*----------------------------------------------------------------------*
+* On the selection screen                                              *
+*----------------------------------------------------------------------*
+AT SELECTION-SCREEN.
+
+  PERFORM  check_authorization.
+
+*----------------------------------------------------------------------*
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR so_qmart-low.
+
+  CALL FUNCTION 'F4IF_INT_TABLE_VALUE_REQUEST'
+    EXPORTING
+      retfield        = 'QMART'
+      window_title    = text-h01
+      value_org       = 'S'
+    TABLES
+      value_tab       = t_nt
+      return_tab      = it_return_tab
+    EXCEPTIONS
+      parameter_error = 1
+      no_values_found = 2
+      OTHERS          = 3.
+
+  IF sy-subrc EQ 0.
+    READ TABLE it_return_tab INDEX 1.
+    so_qmart-low = it_return_tab-fieldval.
+  ENDIF.
+
+
+*&---------------------------------------------------------------------*
+*&  Main program                                                       *
+*&---------------------------------------------------------------------*
+START-OF-SELECTION.
+
+* Statistics for transaction / program
+  CALL METHOD ycl_statistics=>record_transaction.
+
+* Build & display list
+  PERFORM select_data.
+  PERFORM alv_fcat.
+  PERFORM alv_layout.
+  PERFORM alv_display.
+
+
+*&---------------------------------------------------------------------*
+*&  Forms                                                              *
+*&---------------------------------------------------------------------*
+
+*&---------------------------------------------------------------------*
+*&      FORM  CHECK_AUTHORIZATION
+*&---------------------------------------------------------------------*
+*       Check authorizations
+*----------------------------------------------------------------------*
+FORM check_authorization .
+
+  SELECT werks FROM t001w
+               INTO TABLE t_wrk
+               WHERE werks IN so_awerk.
+
+  LOOP AT t_wrk.
+    AUTHORITY-CHECK OBJECT 'M_MATE_WRK'
+             ID 'ACTVT' DUMMY
+             ID 'WERKS' FIELD t_wrk-werks.
+    IF sy-subrc = 4.
+*     No authorisation to display data
+      MESSAGE ID 'YSE_GENERAL' TYPE 'E' NUMBER '010' WITH t_wrk-werks.
+      EXIT.
+    ELSEIF sy-subrc <> 0.
+*     Error checking authorization.
+      MESSAGE ID 'YSE_GENERAL' TYPE 'E' NUMBER '004'.
+      EXIT.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    " CHECK_AUTHORIZATION
+
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_DATA
+*&---------------------------------------------------------------------*
+*       Select data
+*----------------------------------------------------------------------*
+FORM select_data .
+
+  REFRESH: t_notif, t_out.
+
+* Select notifications
+  SELECT n~qmnum n~qmart n~erdat n~qmnam n~aufnr n~vbeln
+         n~arbplwerk n~arbpl n~equnr n~tplnr n~objnr
+         INTO TABLE t_notif
+         FROM viqmel AS n
+         INNER JOIN jest AS s
+                    ON s~objnr = n~objnr
+         WHERE s~stat      = c_mobi
+           AND s~inact     = ' '
+           AND n~arbplwerk IN so_awerk
+           AND n~arbpl     IN so_arbpl
+           AND n~erdat     IN so_erdat
+           AND n~qmnam     IN so_qmnam
+           AND n~qmnum     IN so_qmnum
+           AND n~qmart     IN so_qmart
+           AND ( n~qmart = c_am OR n~qmart = c_seed ).
+
+* Notifications selected ?
+  CHECK NOT t_notif[] IS INITIAL.
+
+* Build output table.
+  LOOP AT t_notif.
+    CLEAR t_out.
+    MOVE-CORRESPONDING t_notif TO t_out.
+*   Status description
+    CALL FUNCTION 'STATUS_TEXT_EDIT'
+      EXPORTING
+*       CLIENT                  = SY-MANDT
+        flg_user_stat           = c_blank
+        objnr                   = t_notif-objnr
+        only_active             = c_x
+        spras                   = sy-langu
+*       BYPASS_BUFFER           = ' '
+      IMPORTING
+*       ANW_STAT_EXISTING       =
+*       E_STSMA                 =
+        line                    = t_out-statxt
+*       USER_LINE               =
+*       STONR                   =
+      EXCEPTIONS
+        object_not_found        = 1
+        OTHERS                  = 2
+              .
+    IF sy-subrc <> 0.
+*     MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*             WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+    ENDIF.
+    APPEND t_out.
+
+  ENDLOOP.
+
+  SORT t_out BY qmnum.
+
+ENDFORM.                    "select_data
+
+*&---------------------------------------------------------------------*
+*&      Form  ALV_FCAT
+*&---------------------------------------------------------------------*
+*       ALV field catalog
+*----------------------------------------------------------------------*
+FORM alv_fcat .
+
+** Create Fieldcatalogue from internal table
+** CALL FUNCTION 'REUSE_ALV_FIELDCATALOG_MERGE' ...
+
+  CLEAR h_col.
+
+* Field definitions
+  PERFORM add_field USING 'QMNUM'     12 'Notification'(t01)        'X'.
+  PERFORM add_field USING 'QMART'     04 'Type'(t02)                ' '.
+  PERFORM add_field USING 'ERDAT'     10 'Created on'(t03)          ' '.
+  PERFORM add_field USING 'QMNAM'     12 'Reported by'(t04)         ' '.
+  PERFORM add_field USING 'STATXT'    40 'Status'(t05)              ' '.
+  PERFORM add_field USING 'AUFNR'     12 'Serv. Order'(t06)         ' '.
+  PERFORM add_field USING 'VBELN'     12 'Sales Order'(t07)         ' '.
+  PERFORM add_field USING 'ARBPLWERK' 05 'Plant'(t08)               ' '.
+  PERFORM add_field USING 'ARBPL'     10 'Workcenter'(t09)          ' '.
+  PERFORM add_field USING 'EQUNR'     20 'Equipment'(t10)           ' '.
+  PERFORM add_field USING 'TPLNR'     30 'Functional Location'(t11) ' '.
+
+ENDFORM.                    " ALV_FCAT
+
+*&---------------------------------------------------------------------*
+*&      Form  ADD_FIELD
+*&---------------------------------------------------------------------*
+*       Add field to field catalog
+*----------------------------------------------------------------------*
+FORM add_field  USING    p_field
+                         p_len
+                         p_descr
+                         p_key.
+
+  h_col = h_col + 1.
+
+  CLEAR ls_fcat.
+  ls_fcat-col_pos    = h_col.
+  ls_fcat-fieldname  = p_field.
+  ls_fcat-outputlen  = p_len.
+  ls_fcat-seltext_l  = p_descr.
+  ls_fcat-seltext_m  = p_descr.
+  ls_fcat-seltext_s  = p_descr.
+  ls_fcat-fix_column = 'X'.
+  ls_fcat-emphasize  = 'X'.
+  ls_fcat-key        = p_key.
+  ls_fcat-hotspot    = p_key.
+
+  APPEND ls_fcat TO xt_fcat.
+
+ENDFORM.                    " ADD_FIELD
+
+*&---------------------------------------------------------------------*
+*&      Form  ALV_LAYOUT
+*&---------------------------------------------------------------------*
+*       Modify ALV layout
+*----------------------------------------------------------------------*
+FORM alv_layout .
+
+  xv_layout-zebra = c_x.
+*  xv_layout-colwidth_optimize = c_x.
+*  xv_layout-smalltitle = 'X'.
+*  xv_layout-grid_title = 'title'.
+
+ENDFORM.                    " ALV_LAYOUT
+
+*&---------------------------------------------------------------------*
+*&      Form  ALV_DISPLAY
+*&---------------------------------------------------------------------*
+*       Display ALV grid
+*----------------------------------------------------------------------*
+FORM alv_display .
+
+*  xv_sd_alv_variant = xv_variant.
+  h_repid = sy-repid.
+
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+    EXPORTING
+      i_callback_program      = h_repid
+      i_callback_user_command = xv_user_command
+*      i_callback_top_of_page  = 'ALV_TOP'
+      i_grid_title            = 'MAM Notifications'(h01)
+      is_layout               = xv_layout
+      it_fieldcat             = xt_fcat
+      it_sort                 = xt_alv_sort
+      i_default               = 'X'
+      i_save                  = 'A'
+*      is_variant              = xv_sd_alv_variant
+      i_screen_start_column   = 0
+      i_screen_start_line     = 0
+      i_screen_end_column     = 0
+      i_screen_end_line       = 0
+    TABLES
+      t_outtab                = t_out
+    EXCEPTIONS
+      program_error           = 1
+      OTHERS                  = 2.
+
+  IF sy-subrc NE 0.
+*   message id sy-msgid type sy-msgty number sy-msgno
+*           with sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+ENDFORM.                    " ALV_DISPLAY
+
+*&---------------------------------------------------------------------*
+*&   Form  USER_COMMAND
+*&---------------------------------------------------------------------*
+*    Process user command
+*----------------------------------------------------------------------*
+FORM user_command USING ucomm    LIKE sy-ucomm
+                        selfield TYPE slis_selfield.
+
+*-- Check function code
+  CASE ucomm.
+    WHEN '&IC1'.
+      IF NOT selfield-value IS INITIAL.
+        CASE selfield-fieldname.
+          WHEN 'QMNUM'.
+            SET PARAMETER ID 'IQM' FIELD selfield-value.
+            CALL TRANSACTION 'IW52' AND SKIP FIRST SCREEN.
+        ENDCASE.
+      ENDIF.
+  ENDCASE.
+
+ENDFORM.                    " USER_COMMAND
+
+*Text symbol text£º
+*H01:Notification Type
+*S01:Selection
+*T01:Notification
+*T02:Type
+*T03:Created on
+*T04:Reported by
+*T05:Status
+*T06:Serv. Order
+*T07:Sales Order
+*T08:Plant
+*T09:Workcenter
+*T10:Equipment
+
+*T11:Functional Location
+*Selection text£º
+*SO_ARBPL:        Work Center
+*SO_AWERK:        Plant
+*SO_ERDAT:        Created on
+*SO_ERNAM:        Created by
+*SO_QMART:        Notification type
+*SO_QMNUM:        Notification

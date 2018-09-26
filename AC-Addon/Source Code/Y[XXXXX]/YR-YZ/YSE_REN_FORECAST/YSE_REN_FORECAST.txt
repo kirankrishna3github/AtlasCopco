@@ -1,0 +1,1056 @@
+************************************************************************
+* Program ID           : YSE_REN_FORECAST                              *
+* Program Title        : REN: Revenue Forecast Report: rental quot     *
+* Author               : Erik Walravens                                *
+* Date                 : 22.11.2006                                    *
+* Change Request Number: CD1K908095                                    *
+* Description          : Estimation of the revenue over a selected     *
+*                        period based on quotations or contracts.      *
+************************************************************************
+* Notes:                                                               *
+* All items are shown in report, including non-rental material.        *
+* Changes:                                                             *
+* Extra columns - change calculation contracts through billing plan.   *
+************************************************************************
+REPORT yse_ren_forecast MESSAGE-ID yse_rental.
+
+************************************************************************
+* TABLES                                                               *
+************************************************************************
+TABLES: veda, makt.
+
+************************************************************************
+* TYPE-POOLS                                                           *
+************************************************************************
+TYPE-POOLS slis.
+
+************************************************************************
+* INTERNAL TYPES                                                       *
+************************************************************************
+TYPES:  BEGIN OF str_vbak,
+               vbeln        TYPE vbak-vbeln,
+               vkorg        TYPE vkorg,
+               vtweg        TYPE vtweg,
+               vkbur        TYPE vkbur,
+               yyse_hitrate TYPE vbak-yyse_hitrate,
+               kvgr2        TYPE vbak-kvgr2,
+               vposn        TYPE posnr_va,
+               vbegdat      TYPE vbdat_veda,
+               venddat      TYPE vndat_veda,
+        END OF str_vbak.
+
+TYPES:  BEGIN OF str_vbap,
+               vbeln   TYPE vbap-vbeln,
+               posnr   TYPE vbap-posnr,
+               matnr   TYPE vbap-matnr,
+               netwr   TYPE vbap-netwr,
+               vkaus   TYPE vbap-vkaus,
+               waerk   TYPE vbap-waerk,
+               prodh   TYPE vbap-prodh,
+        END OF str_vbap.
+
+TYPES:  BEGIN OF str_veda,
+               vbeln   TYPE veda-vbeln,
+               vposn   TYPE veda-vposn,
+               vbegdat TYPE veda-vbegdat,
+               venddat TYPE veda-venddat,
+        END OF str_veda.
+
+TYPES: BEGIN OF str_bill,
+               vbeln   TYPE vbkd-vbeln,
+               posnr   TYPE vbkd-posnr,
+               fplnr   TYPE vbkd-fplnr,
+               fakwr   TYPE fplt-fakwr,
+               nfdat   TYPE fplt-nfdat,
+               afdat   TYPE fplt-afdat,
+       END OF str_bill.
+
+TYPES:  BEGIN OF str_makt,
+               matnr   TYPE makt-matnr,
+               maktx   TYPE makt-maktx,
+        END OF str_makt.
+TYPES:  BEGIN OF str_hitrates.
+        INCLUDE STRUCTURE yse_hitrates.
+TYPES:  END OF str_hitrates.
+
+TYPES: BEGIN OF str_vbfa,
+        vbelv   TYPE vbfa-vbelv,
+        posnv   TYPE vbfa-posnv,
+        vbeln   TYPE vbfa-vbeln,
+        posnn   TYPE vbfa-posnn,
+        vbtyp_n TYPE vbfa-vbtyp_n,
+END  OF str_vbfa.
+
+************************************************************************
+* INTERNAL TABLES                                                      *
+************************************************************************
+DATA:
+  it_vbak             TYPE TABLE OF str_vbak     WITH HEADER LINE,
+  it_vbap             TYPE TABLE OF str_vbap     WITH HEADER LINE,
+  it_veda             TYPE TABLE OF str_veda     WITH HEADER LINE,
+  it_bill             TYPE TABLE OF str_bill     WITH HEADER LINE,
+  it_pgc              TYPE TABLE OF yse_pgc_gac  WITH HEADER LINE,
+  it_makt             TYPE TABLE OF str_makt     WITH HEADER LINE,
+  it_dates            TYPE TABLE OF rke_dat      WITH HEADER LINE,
+  it_hitrates         TYPE TABLE OF str_hitrates WITH HEADER LINE,
+  it_t179             TYPE t179  OCCURS 0,
+  it_vbfa             TYPE TABLE OF str_vbfa     WITH HEADER LINE,
+  it_dd03p            TYPE TABLE OF dd03p        WITH HEADER LINE,
+  it_fieldcat         TYPE  slis_t_fieldcat_alv ,
+
+
+  gt_list_top_of_page TYPE slis_t_listheader.
+DATA: BEGIN OF it_result OCCURS 0.
+        INCLUDE STRUCTURE yse_ren_alv_forecast.
+DATA: END OF it_result.
+
+RANGES:
+  r_prdha FOR mara-prdha,
+  r_auart FOR vbak-auart,
+  r_gbstk FOR vbuk-gbstk,
+  r_pstyv FOR vbap-pstyv.
+
+************************************************************************
+* CONSTANTS                                                            *
+************************************************************************
+CONSTANTS:
+  con_true       TYPE char1       VALUE 'X',
+  lc_vbtyp_quot  TYPE c           VALUE 'B',
+  lc_vkaus_nowe  TYPE char1       VALUE '5',    " No weekends
+  lc_kvgr2_month TYPE vbak-kvgr2  VALUE 'PCM',  " Monthly billing
+  lc_spras_en    LIKE tvagt-spras VALUE 'E',    " English
+  lc_factcal     LIKE fplt-fakca  VALUE '99',   " Factory calender
+  lc_doctyp_zqp  TYPE auart       VALUE 'ZQP',
+  lc_doctyp_zqp1 TYPE auart       VALUE 'ZQP1',
+  lc_doctyp_zqp2 TYPE auart       VALUE 'ZQP2',
+  lc_doctyp_zrib TYPE auart       VALUE 'ZRIB',
+  lc_doctyp_quot TYPE auart       VALUE 'ZQT',
+  lc_itmcat_cont TYPE pstyv       VALUE 'ZMVN',
+  lc_itmcat_quot TYPE pstyv       VALUE 'ZREN',
+  lc_gbstk_c     TYPE gbstk       VALUE 'C',
+  lc_pcb         TYPE kvgr2       VALUE 'PCB', " Calculated billing
+  lc_pcm         TYPE kvgr2       VALUE 'PCM'. " Monthly billing
+
+************************************************************************
+* DATA                                                                 *
+************************************************************************
+DATA: gv_repid   LIKE sy-repid,
+      gv_gac(4)  TYPE c,
+      gv_pgc(4)  TYPE c,
+      gs_variant TYPE disvariant,     " ALV grid variant
+      wa_result  LIKE it_result,      "
+      wa_t179    TYPE t179,
+      lv_netwr   TYPE netwr,          "
+*     lv_auart   LIKE vbak-auart,     " Document type
+*     lv_pstyv   LIKE vbap-pstyv,     " Item category
+      lv_begdat  TYPE veda-vbegdat,   "
+      lv_enddat  TYPE veda-venddat,   "
+      lv_caldays TYPE f,              " # days in the selected period
+      lv_chop    TYPE i,              " # days to be chopped off.
+      lv_factor  TYPE f.
+
+************************************************************************
+* SELECTION SCREEN                                                     *
+************************************************************************
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE text-s01.
+SELECT-OPTIONS:
+  so_vbeln FOR it_vbak-vbeln.
+PARAMETERS:
+  p_vkorg LIKE vbak-vkorg OBLIGATORY MEMORY ID vko,    " Sales Org
+  p_vtweg LIKE vbak-vtweg OBLIGATORY DEFAULT '21'.
+SELECT-OPTIONS:
+  p_vkbur FOR it_vbak-vkbur MEMORY ID vkb.    " Sales Office
+PARAMETERS:
+  p_start LIKE vbak-erdat OBLIGATORY,    " Date start period
+  p_end   LIKE vbak-erdat OBLIGATORY.    " Date end period
+SELECT-OPTIONS:
+  so_gac  FOR  gv_gac,
+  so_pgc  FOR  gv_pgc.
+PARAMETERS:
+  p_prodh LIKE mara-prdha.
+SELECTION-SCREEN END OF BLOCK b1.
+
+SELECTION-SCREEN BEGIN OF BLOCK b2 WITH FRAME TITLE text-s02.
+SELECTION-SCREEN BEGIN OF LINE.
+PARAMETERS: p_rb1 RADIOBUTTON GROUP r1 USER-COMMAND u1. " Quotations
+SELECTION-SCREEN COMMENT (35) text-p01 FOR FIELD p_rb1.
+SELECTION-SCREEN END   OF LINE.
+SELECTION-SCREEN BEGIN OF LINE.
+PARAMETERS: p_rb2 RADIOBUTTON GROUP r1.                 " Contracts
+SELECTION-SCREEN COMMENT (35) text-p02 FOR FIELD p_rb2.
+SELECTION-SCREEN END   OF LINE.
+SELECTION-SCREEN END OF BLOCK b2.
+
+************************************************************************
+* INITIALIZATION                                                       *
+************************************************************************
+INITIALIZATION.
+
+  gv_repid = sy-repid.
+
+  p_start = sy-datum.
+  p_start+6(2) = '01'.
+
+  CALL FUNCTION 'RE_ADD_MONTH_TO_DATE'
+    EXPORTING
+      months  = -3
+      olddate = p_start
+    IMPORTING
+      newdate = p_start.
+
+  CALL FUNCTION 'RE_ADD_MONTH_TO_DATE'
+    EXPORTING
+      months  = 6
+      olddate = p_start
+    IMPORTING
+      newdate = p_end.
+
+  p_end = p_end - 1.
+
+  PERFORM build_field_catalog.
+************************************************************************
+* AT SELECTION SCREEN                                                  *
+************************************************************************
+AT SELECTION-SCREEN.
+
+  PERFORM check_authorization.
+
+* Check if dates are chronologic
+  IF ( NOT p_start IS INITIAL AND NOT p_end IS INITIAL ).
+    IF p_start > p_end.
+      MESSAGE e033.
+    ENDIF.
+  ENDIF.
+
+************************************************************************
+* START OF SELECTION                                                   *
+************************************************************************
+START-OF-SELECTION.
+
+  PERFORM select_data.
+
+
+  PERFORM process_data.
+
+* Display results
+  PERFORM build_alv.
+
+*&---------------------------------------------------------------------*
+*&      Form  CALC_FC
+*&---------------------------------------------------------------------*
+*
+*----------------------------------------------------------------------*
+FORM calc_fc  CHANGING p_lv_netwr.
+
+  DATA: lv_begdat  TYPE veda-vbegdat,
+        lv_enddat  TYPE veda-venddat,
+        lv_caldays TYPE f.           " # days in the selected period
+
+  CLEAR it_veda.
+  READ TABLE it_veda
+        WITH KEY vbeln = it_vbap-vbeln
+                 vposn = it_vbap-posnr
+        BINARY SEARCH.
+
+  IF sy-subrc <> 0.
+
+    READ TABLE it_veda
+          WITH KEY vbeln = it_vbap-vbeln
+                   vposn = space
+          BINARY SEARCH.
+  ENDIF.
+
+* Check if record within requested period
+  IF ( ( it_veda-vbegdat GE p_start AND
+         it_veda-vbegdat LE p_end ) OR
+       ( it_veda-venddat GE p_start AND
+         it_veda-venddat LE p_end ) OR
+       ( it_veda-vbegdat LT p_start AND
+         it_veda-venddat GT p_end ) ).
+
+*   Find latest start date
+    IF p_start > it_veda-vbegdat.
+      lv_begdat = p_start.
+    ELSE.
+      lv_begdat =  it_veda-vbegdat.
+    ENDIF.
+
+*   Find earliest end date
+    IF p_end < it_veda-venddat.
+      lv_enddat = p_end.
+    ELSE.
+      lv_enddat =  it_veda-venddat.
+    ENDIF.
+
+*   Number of days over which the revenue needs to be calculated
+    IF it_vbap-vkaus(1) = lc_vkaus_nowe.
+
+*     Note: i_factid is factory calender. Common is 99.
+
+      REFRESH it_dates.
+      CALL FUNCTION 'RKE_SELECT_FACTDAYS_FOR_PERIOD'
+        EXPORTING
+          i_datab  = lv_begdat
+          i_datbi  = lv_enddat
+          i_factid = lc_factcal          " factory calender 99
+        TABLES
+          eth_dats = it_dates.
+
+*     Note: it_dates is a table with an entry for each working day
+      DESCRIBE TABLE it_dates LINES lv_caldays.   "E_ANZ_TAGE.
+
+    ELSE.
+      lv_caldays = lv_enddat - lv_begdat.
+    ENDIF.
+
+*   Calculate revenue
+    p_lv_netwr = it_vbap-netwr * lv_caldays.
+
+*   If monthly billing
+    READ TABLE it_vbak
+      WITH KEY vbeln = it_vbap-vbeln.
+    IF it_vbak-kvgr2 = lc_kvgr2_month.    " Monthly billing
+      p_lv_netwr = p_lv_netwr / 30.
+    ENDIF.
+
+*   Only for quotations, consider percentile hitrate
+    IF p_rb1 = con_true.
+*     Retrieve hit rate
+      CLEAR it_vbak.
+      READ TABLE it_vbak
+        WITH KEY vbeln = it_vbap-vbeln
+        BINARY SEARCH.
+
+      p_lv_netwr = p_lv_netwr * it_vbak-yyse_hitrate  / 100.
+    ENDIF.
+
+  ELSE.
+    p_lv_netwr = 0.
+  ENDIF.
+
+ENDFORM.                    " CALC_FC
+
+
+************************************************************************
+**      Form  BUILD_ALV                                                *
+************************************************************************
+FORM build_alv.
+
+* Build layout, including default variant with subtotals
+  gs_variant-report = sy-repid.
+* Load correct layout
+  IF p_rb1 = con_true.  " for quotations
+    gs_variant-variant = '/DEFQUOT'.
+  ELSE.                 " for contracts
+    gs_variant-variant = '/DEFCONT'.
+  ENDIF.
+
+
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+    EXPORTING
+      i_structure_name        = 'YSE_REN_ALV_FORECAST'
+      i_background_id         = 'ALV_BACKGROUND'
+      i_callback_program      = gv_repid
+      i_callback_user_command = 'ALV_USER_COMMAND'
+      i_callback_top_of_page  = 'TOP-OF-PAGE'
+      i_save                  = 'A'
+      is_variant              = gs_variant
+      it_fieldcat             = it_fieldcat
+    TABLES
+      t_outtab                = it_result
+    EXCEPTIONS
+      program_error           = 1
+      OTHERS                  = 2.
+
+  IF sy-subrc <> 0.
+*   MESSAGE ...
+  ENDIF.
+
+ENDFORM.                    "build_alv
+
+*-------------------------------------------------------------------*
+* Form  TOP-OF-PAGE                                                 *
+*-------------------------------------------------------------------*
+* ALV Report Header                                                 *
+*-------------------------------------------------------------------*
+FORM top-of-page.
+
+*ALV Header declarations
+  DATA: lt_header     TYPE slis_t_listheader,
+        wa_header     TYPE slis_listheader,
+        lt_line1      LIKE wa_header-info,
+        lt_line2      LIKE wa_header-info.
+
+* Sales organisation
+  wa_header-typ  = 'S'.
+  wa_header-key = 'Sales org:'(001).
+  wa_header-info = p_vkorg.
+  APPEND wa_header TO lt_header.
+  CLEAR wa_header.
+
+** Sales office
+*  wa_header-typ  = 'S'.
+*  wa_header-key = 'Sales off:'(002).
+*  wa_header-info = p_vkbur.
+*  APPEND wa_header TO lt_header.
+*  CLEAR wa_header.
+
+* Quotations or Contracts
+  wa_header-typ  = 'S'.
+  wa_header-key = 'Documents:'(003).
+  IF p_rb1 = con_true.
+    wa_header-info = 'Quotations'(004).
+  ELSE.
+    wa_header-info = 'Contracts'(005).
+  ENDIF.
+  APPEND wa_header TO lt_header.
+  CLEAR wa_header.
+
+* Period
+  wa_header-typ  = 'S'.
+  wa_header-key = 'Period:'(006).
+  CONCATENATE  p_start+6(2) '.'
+               p_start+4(2) '.'
+               p_start(4)
+         INTO  lt_line1.
+
+  CONCATENATE  p_end+6(2) '.'
+               p_end+4(2) '.'
+               p_end(4)
+         INTO lt_line2.
+
+  CONCATENATE lt_line1 'until' lt_line2
+         INTO wa_header-info
+    SEPARATED BY space.
+
+  APPEND wa_header TO lt_header.
+  CLEAR: wa_header.
+
+* Blank line
+  wa_header-typ  = 'S'.
+  wa_header-key = space.
+  wa_header-info = space.
+  APPEND wa_header TO lt_header.
+  CLEAR wa_header.
+
+  CALL FUNCTION 'REUSE_ALV_COMMENTARY_WRITE'
+    EXPORTING
+      it_list_commentary = lt_header.
+ENDFORM.                    "top-of-pag
+
+
+*&---------------------------------------------------------------------*
+*&      Form  Check_Authorization
+*&---------------------------------------------------------------------*
+FORM check_authorization .
+
+  AUTHORITY-CHECK OBJECT 'V_VBAK_VKO'
+                      ID 'VKORG' FIELD p_vkorg
+                      ID 'VTWEG' DUMMY
+                      ID 'SPART' DUMMY
+                      ID 'ACTVT' DUMMY.
+
+  IF sy-subrc = 4.
+*   No authorisation to display data from Sales Organisation p_vkorg
+    MESSAGE ID 'YSE_RENTAL' TYPE 'E' NUMBER '049' WITH p_vkorg.
+  ELSEIF sy-subrc <> 0.
+*   Error checking authorization.
+    MESSAGE ID 'YSE_RENTAL' TYPE 'E' NUMBER '046'.
+  ENDIF.
+
+ENDFORM.                    " Check_Authorization
+
+*&---------------------------------------------------------------------*
+*&      Form  FILL_GAC_PGC_TABLE
+*&---------------------------------------------------------------------*
+FORM fill_gac_pgc_table.
+
+* Select all level 2 hierarchy codes from the prodh table
+  SELECT *
+         FROM t179
+         INTO TABLE it_t179
+        WHERE stufe = '2'.
+
+* Default fields in range
+  r_prdha-sign   = 'I'.
+  r_prdha-option = 'EQ'.
+
+* Loop over hierarchy codes where the first 4 char's fit in S_GAC
+  IF NOT so_gac IS INITIAL.
+    LOOP AT it_t179 INTO wa_t179 WHERE prodh(4) IN so_gac.
+      r_prdha-low = wa_t179-prodh.
+      APPEND r_prdha.
+    ENDLOOP.
+  ENDIF.
+
+* Loop over hierarchy codes where the second 4 char's fit in S_PGC
+  IF NOT so_pgc IS INITIAL.
+    LOOP AT it_t179 INTO wa_t179 WHERE prodh+4(4) IN so_pgc.
+      r_prdha-low = wa_t179-prodh.
+      APPEND r_prdha.
+    ENDLOOP.
+  ENDIF.
+
+ENDFORM.                    " FILL_GAC_PGC_TABLE
+
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_DATA
+*&---------------------------------------------------------------------*
+FORM select_data.
+
+  DATA:
+    tmp        TYPE i.
+
+* Convert the GAC and PGC codes to PRODH codes for selecting from VBAP
+  PERFORM fill_gac_pgc_table.
+
+* Determine parameters to select from VBAK
+  r_auart-sign   = 'I'.
+  r_auart-option = 'EQ'.
+
+* In case of quotations
+  IF p_rb1 EQ 'X'.
+*   Fill allowed document types
+    r_auart-low = lc_doctyp_quot.
+    APPEND r_auart.
+*   Fill allowed document header overall stati (exclude completed doc's)
+    r_gbstk-sign   = 'E'.
+    r_gbstk-option = 'EQ'.
+    r_gbstk-low    = lc_gbstk_c.
+    APPEND r_gbstk.
+*   Set item category of interest
+**    lv_pstyv = lc_itmcat_quot.
+*    r_pstyv-sign   = 'I'.
+*    r_pstyv-option = 'EQ'.
+*    r_pstyv-low    = lc_itmcat_quot.
+*    APPEND r_pstyv.
+*    r_pstyv-low    = 'ZRNN'.
+*    APPEND r_pstyv.
+
+*   Set titlebar
+    SET TITLEBAR 'REN_RF_QUOT'.
+* In case of contracts
+  ELSE.
+*   Fill allowed document types
+    r_auart-low = lc_doctyp_zqp.
+    APPEND r_auart.
+    r_auart-low = lc_doctyp_zqp1.
+    APPEND r_auart.
+    r_auart-low = lc_doctyp_zqp2.
+    APPEND r_auart.
+    r_auart-low = lc_doctyp_zrib.
+    APPEND r_auart.
+*   Set item category of interest
+*    lv_pstyv = lc_itmcat_cont.
+*    r_pstyv-sign   = 'I'.
+*    r_pstyv-option = 'EQ'.
+*    r_pstyv-low    = lc_itmcat_cont.
+*    APPEND r_pstyv.
+
+*   Set titlebar
+    SET TITLEBAR 'REN_RF_CONT'.
+  ENDIF.
+
+* Select documents based on selection screen parameters
+* first select without billing plan
+  SELECT vbak~vbeln vbak~vkorg        vbak~vtweg
+         vbak~vkbur vbak~yyse_hitrate vbak~kvgr2
+         veda~vposn veda~vbegdat      veda~venddat
+      INTO TABLE it_vbak
+      FROM vbak
+      JOIN vbuk
+        ON vbak~vbeln  EQ vbuk~vbeln
+      JOIN veda
+        ON vbak~vbeln  EQ veda~vbeln
+       AND veda~vposn  EQ space
+    JOIN vbkd
+       ON vbak~vbeln  EQ vbkd~vbeln
+       AND veda~vposn  EQ vbkd~posnr
+     WHERE vbak~vbeln  IN so_vbeln
+       AND vbak~vkorg  EQ p_vkorg
+       AND vbak~vtweg  EQ p_vtweg
+       AND vbak~vkbur  IN p_vkbur
+       AND vbak~auart  IN r_auart
+       AND veda~vposn  EQ space
+*       AND (    (     veda~vbegdat GE p_start
+*                  AND veda~vbegdat LE p_end )
+*             OR (     veda~venddat GE p_start
+*                  AND veda~venddat LE p_end )
+*             OR (     veda~vbegdat LT p_start
+*                  AND veda~venddat GT p_end ) )
+*       AND vbkd~fkdat GE p_start
+*       AND vbkd~fkdat LE p_end
+       AND vbuk~gbstk  IN r_gbstk.
+
+
+
+* Check that we have data to work with
+  DESCRIBE TABLE it_vbak LINES tmp.
+  CHECK tmp NE 0.
+
+*  Only Quotations whitout a contract will be taken into account
+  IF p_rb1 EQ 'X'.
+    SELECT vbfa~vbelv vbfa~posnv vbfa~vbeln vbfa~posnn vbfa~vbtyp_n
+    INTO TABLE it_vbfa
+    FROM vbfa
+    FOR ALL ENTRIES IN it_vbak
+    WHERE vbelv EQ it_vbak-vbeln
+    AND posnv EQ '0'
+    AND vbtyp_n EQ 'C'.
+    IF sy-subrc EQ 0.
+      LOOP AT it_vbfa.
+        DELETE it_vbak WHERE vbeln EQ it_vbfa-vbelv.
+      ENDLOOP.
+    ENDIF.
+* Check that we have data to work with
+    DESCRIBE TABLE it_vbak LINES tmp.
+    CHECK tmp NE 0.
+  ENDIF.
+
+
+
+* Get relevant item data
+* first take item which refer to billing plan
+* with selection on billing plan date from fplt
+  SELECT vbap~vbeln vbap~posnr vbap~matnr vbap~netwr vbap~vkaus
+         vbap~prodh vbap~waerk
+       INTO CORRESPONDING FIELDS OF TABLE it_vbap
+       FROM vbap
+       JOIN vbkd ON vbap~vbeln EQ vbkd~vbeln
+                 AND vbap~posnr EQ vbkd~posnr
+       JOIN fplt ON vbkd~fplnr EQ fplt~fplnr
+       FOR ALL entries IN it_vbak
+      WHERE vbap~vbeln EQ it_vbak-vbeln
+        AND abgru EQ space
+        AND prodh IN r_prdha
+        AND fplt~afdat GE p_start
+        AND fplt~afdat LE p_end.
+
+* second take items which don't have a billing plan
+* * with selection on billing plan date from vbkd
+  SELECT vbap~vbeln vbap~posnr vbap~matnr vbap~netwr vbap~vkaus
+         vbap~prodh vbap~waerk
+       APPENDING CORRESPONDING FIELDS OF TABLE it_vbap
+       FROM vbap
+       JOIN vbkd ON vbap~vbeln EQ vbkd~vbeln
+               AND vbap~posnr EQ vbkd~posnr
+       FOR ALL entries IN it_vbak
+      WHERE vbap~vbeln EQ it_vbak-vbeln
+        AND abgru EQ space
+        AND prodh IN r_prdha
+        AND vbkd~fkdat GE p_start
+        AND vbkd~fkdat LE p_end
+        AND vbkd~fplnr  EQ space.
+
+
+
+
+
+* Get dates for header and items
+  SELECT vbeln vposn vbegdat venddat
+       INTO CORRESPONDING FIELDS OF TABLE it_veda
+       FROM veda
+        FOR ALL ENTRIES IN it_vbak
+      WHERE vbeln EQ it_vbak-vbeln.
+  SORT it_veda BY vbeln vposn.
+
+* Only for contracts
+*  IF p_rb2 = con_true.
+*   Get contracts' billing plan data
+  SELECT vbkd~vbeln vbkd~posnr vbkd~fplnr
+         fplt~fakwr fplt~nfdat fplt~afdat
+       INTO TABLE it_bill
+       FROM vbkd
+       JOIN fplt
+         ON vbkd~fplnr EQ fplt~fplnr
+        FOR ALL entries IN it_vbap
+      WHERE vbkd~vbeln EQ it_vbap-vbeln
+        AND vbkd~posnr EQ it_vbap-posnr
+        AND fplt~afdat GE p_start
+        AND fplt~afdat LE p_end.
+
+*  ELSE.
+*   Get hit rate defaults
+  SELECT *
+    INTO TABLE it_hitrates
+    FROM yse_hitrates.
+
+
+*  ENDIF.
+
+* Get material descriptions
+  SELECT matnr maktx
+      INTO CORRESPONDING FIELDS OF TABLE it_makt
+      FROM makt
+     WHERE spras = lc_spras_en.
+  SORT it_makt BY matnr.
+
+* fill pgc description
+  PERFORM fill_pgc_description .
+
+ENDFORM.                    " SELECT_DATA
+
+*&---------------------------------------------------------------------*
+*&      Form  PROCESS_DATA
+*&---------------------------------------------------------------------*
+FORM process_data .
+
+* Process all items
+  SORT it_vbap BY prodh matnr.
+  LOOP AT it_vbap.
+
+    CLEAR it_result.
+
+*   Don't process item w/o material or prod hier
+    IF it_vbap-matnr EQ space OR it_vbap-prodh EQ space.
+      CONTINUE.
+    ENDIF.
+
+*   Get item contract data
+    CLEAR it_veda.
+    READ TABLE it_veda WITH KEY vbeln = it_vbap-vbeln
+                                vposn = it_vbap-posnr
+                       BINARY SEARCH.
+    IF sy-subrc <> 0.
+*     If not found on item level, check header level
+      READ TABLE it_veda WITH KEY vbeln = it_vbap-vbeln
+                                  vposn = space
+                         BINARY SEARCH.
+    ENDIF.
+
+*   Don't process item if contract data is outside requested period,
+*    IF ( ( it_veda-vbegdat GT p_end AND
+*           it_veda-venddat GT p_end ) OR
+*         ( it_veda-vbegdat LT p_start AND
+*           it_veda-venddat LT p_end ) ).
+*      CONTINUE.
+*    ENDIF.
+
+*   Set corresponding GAC/PGC and description
+    it_result-gac      = it_vbap-prodh(4).
+    it_result-pgc      = it_vbap-prodh+4(4).
+    READ TABLE it_pgc WITH KEY pgc = it_vbap-prodh.
+    IF sy-subrc EQ 0.
+      it_result-pgc_desc = it_pgc-pgc_desc.
+    ENDIF.
+
+*   Retrieve material and material description
+    it_result-matnr    = it_vbap-matnr.
+    READ TABLE it_makt WITH KEY matnr  = it_result-matnr BINARY SEARCH.
+    IF sy-subrc EQ 0.
+      it_result-maktx    = it_makt-maktx.
+    ENDIF.
+
+*   Copy sales document number
+    it_result-vbeln    = it_vbap-vbeln.
+*   Copy currency code
+    it_result-waerk    = it_vbap-waerk.
+
+*   For calculate the value
+    IF p_rb1 = con_true.
+
+*      PERFORM calc_val_quot.
+      PERFORM calc_val_quot_new.
+
+*   for sales orders copy the billing plan result
+    ELSE.
+
+      PERFORM calc_val_cont.
+
+
+    ENDIF.  " quotations or contracts
+
+*   Add record to output table
+    APPEND it_result.
+
+  ENDLOOP.   " it_vbap
+
+ENDFORM.                    " PROCESS_DATA
+
+*&---------------------------------------------------------------------*
+*&      Form  CALC_VAL_QUOT
+*&---------------------------------------------------------------------*
+FORM calc_val_quot .
+
+  DATA:
+    lv_use,
+    lv_fakca TYPE fakca,
+    lv_tage      TYPE anz_tage,
+    lv_mth_f     TYPE anz_monate,
+    lv_mth_i     TYPE tfmatage,
+    lv_temp_date TYPE datum.
+
+* Retrieve hit rate
+  CLEAR it_vbak.
+  READ TABLE it_vbak WITH KEY vbeln = it_vbap-vbeln BINARY SEARCH.
+  it_result-hitrate  = it_vbak-yyse_hitrate.
+* If hitrate is nil, get the default value
+  IF it_result-hitrate IS INITIAL.
+    READ TABLE it_hitrates WITH KEY vkorg = it_vbak-vkorg
+                                    vtweg = it_vbak-vtweg
+                                    vkbur = it_vbak-vkbur.
+    it_result-hitrate  = it_hitrates-yyse_hitrate.
+  ENDIF.
+
+  it_result-netwr    = it_vbap-netwr.
+
+* Find latest start date
+  IF p_start > it_veda-vbegdat.
+    lv_begdat = p_start.
+  ELSE.
+    lv_begdat =  it_veda-vbegdat.
+  ENDIF.
+
+* Find earliest end date
+  IF p_end < it_veda-venddat.
+    lv_enddat = p_end.
+  ELSE.
+    lv_enddat =  it_veda-venddat.
+  ENDIF.
+
+* Recalculate net value... for Calculated (daily) billing
+  CLEAR: lv_tage, lv_mth_i, lv_mth_f, lv_temp_date.
+  IF it_vbak-kvgr2 EQ lc_pcb.
+
+*   If 5/7 regime, don't count the weekends/holidays
+    IF it_vbap-vkaus(1) = lc_vkaus_nowe.
+      lv_use   = 'B'.
+      lv_fakca = '99'.
+*   If 7/7 regime, count all days
+    ELSE.
+      lv_use   = 'A'.
+      lv_fakca = space.
+    ENDIF.
+    CALL FUNCTION 'YSE_REN_CALC_DAYS'
+      EXPORTING
+        i_fkdat         = lv_enddat
+        i_nfdat         = lv_begdat
+        i_fakca         = lv_fakca
+        i_use           = lv_use
+      CHANGING
+        e_anz_tage      = lv_tage
+      EXCEPTIONS
+        fakca_not_found = 1
+        OTHERS          = 2.
+
+    it_result-totwr = it_result-netwr * lv_tage.
+
+* Recalculate net value... for Monthly billing
+  ELSEIF it_vbak-kvgr2 EQ lc_pcm.
+
+*   Get number of full months
+    CALL FUNCTION 'FIMA_DAYS_AND_MONTHS_AND_YEARS'
+      EXPORTING
+        i_date_from    = lv_begdat
+        i_date_to      = lv_enddat
+        i_flg_separate = 'X'
+      IMPORTING
+        e_months       = lv_mth_i.
+
+*   Get temporary date: start date + full months
+    CALL FUNCTION 'RE_ADD_MONTH_TO_DATE'
+      EXPORTING
+        months  = lv_mth_i
+        olddate = lv_begdat
+      IMPORTING
+        newdate = lv_temp_date.
+
+*   Get remaining days in number of months (should be < 1)
+    lv_use   = 'A'.
+    lv_fakca = space.
+    CALL FUNCTION 'YSE_REN_CALC_DAYS'
+      EXPORTING
+        i_fkdat         = lv_enddat
+        i_nfdat         = lv_temp_date
+        i_use           = lv_use
+      CHANGING
+        e_anz_monate    = lv_mth_f
+      EXCEPTIONS
+        fakca_not_found = 1
+        OTHERS          = 2.
+
+    lv_mth_f = lv_mth_f + lv_mth_i.
+
+    it_result-totwr = it_result-netwr * lv_mth_f.
+
+  ENDIF.
+
+* Percentile hit rate
+  it_result-finwr = it_result-totwr * it_result-hitrate / 100.
+
+ENDFORM.                    " CALC_VAL_QUOT
+*&---------------------------------------------------------------------*
+*&      Form  calc_new_val_quot
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM calc_val_quot_new .
+
+* Retrieve hit rate
+  CLEAR it_vbak.
+  READ TABLE it_vbak WITH KEY vbeln = it_vbap-vbeln BINARY SEARCH.
+  it_result-hitrate  = it_vbak-yyse_hitrate.
+
+
+* Loop over billing plan lines of the item
+  LOOP AT it_bill WHERE vbeln = it_vbap-vbeln AND posnr = it_vbap-posnr.
+
+*   When billing plan line falls completely within selection dates
+    IF it_bill-nfdat GE p_start AND it_bill-afdat LE p_end.
+*     Add the complete billing plan entry value
+      it_result-totwr = it_result-totwr + it_bill-fakwr.
+*   If billing plan line only falls partly within selection dates
+    ELSEIF ( it_bill-nfdat GE p_start AND it_bill-nfdat LE p_end )
+        OR ( it_bill-afdat GE p_start AND it_bill-afdat LE p_end )
+*   Or if selection dates fall completely in billing plan line
+        OR ( p_start GT it_bill-nfdat AND p_end LT it_bill-afdat ).
+*     Clear the number of days to be subtracted
+      CLEAR: lv_chop.
+*     If selection start date comes after the billing plan line start date
+      IF p_start > it_bill-nfdat AND p_start <= it_bill-afdat.
+*       Determine the days to be subtracted at the start of the billing plan line
+        lv_chop = p_start - it_bill-nfdat.
+      ENDIF.
+*     If selection end date comes before the billing plan line end date
+      IF p_end < it_bill-afdat AND p_end >= it_bill-nfdat.
+*       Add the extra days to be subtracted at the end of the billing plan line
+        lv_chop = lv_chop + ( it_bill-afdat - p_end ).
+      ENDIF.
+
+*     Determine the ratio of the billing plan period to be taken into account,
+*     according to selection parameters
+      lv_factor = ( ( it_bill-afdat - it_bill-nfdat + 1 )
+                  - lv_chop )
+                  / ( it_bill-afdat - it_bill-nfdat + 1 ).
+*     Add the pro rata part of the billing plan line value to the contract item's total
+      it_result-totwr = it_result-totwr + ( it_bill-fakwr
+                                        * lv_factor ).
+    ENDIF.    " within interval
+  ENDLOOP.  " it_bill
+  IF sy-subrc EQ 4.
+
+    it_result-netwr   = it_vbap-netwr.
+    it_result-totwr   = it_vbap-netwr.
+  ENDIF.
+
+* Percentile hit rate
+  it_result-finwr = it_result-totwr * it_result-hitrate / 100.
+
+ENDFORM.                    " CALC_VAL_CONT
+
+*&---------------------------------------------------------------------*
+*&      Form  CALC_VAL_CONT
+*&---------------------------------------------------------------------*
+FORM calc_val_cont .
+
+* Loop over billing plan lines of the item
+  LOOP AT it_bill WHERE vbeln = it_vbap-vbeln AND posnr = it_vbap-posnr.
+
+*   When billing plan line falls completely within selection dates
+    IF it_bill-nfdat GE p_start AND it_bill-afdat LE p_end.
+*     Add the complete billing plan entry value
+      it_result-totwr = it_result-totwr + it_bill-fakwr.
+*   If billing plan line only falls partly within selection dates
+    ELSEIF ( it_bill-nfdat GE p_start AND it_bill-nfdat LE p_end )
+        OR ( it_bill-afdat GE p_start AND it_bill-afdat LE p_end )
+*   Or if selection dates fall completely in billing plan line
+        OR ( p_start GT it_bill-nfdat AND p_end LT it_bill-afdat ).
+*     Clear the number of days to be subtracted
+      CLEAR: lv_chop.
+*     If selection start date comes after the billing plan line start date
+      IF p_start > it_bill-nfdat AND p_start <= it_bill-afdat.
+*       Determine the days to be subtracted at the start of the billing plan line
+        lv_chop = p_start - it_bill-nfdat.
+      ENDIF.
+*     If selection end date comes before the billing plan line end date
+      IF p_end < it_bill-afdat AND p_end >= it_bill-nfdat.
+*       Add the extra days to be subtracted at the end of the billing plan line
+        lv_chop = lv_chop + ( it_bill-afdat - p_end ).
+      ENDIF.
+
+*     Determine the ratio of the billing plan period to be taken into account,
+*     according to selection parameters
+****      lv_factor = ( ( it_bill-afdat - it_bill-nfdat + 1 )
+****                  - lv_chop )
+****                  / ( it_bill-afdat - it_bill-nfdat + 1 ).
+      lv_factor = 1.
+*     Add the pro rata part of the billing plan line value to the contract item's total
+      it_result-totwr = it_result-totwr + ( it_bill-fakwr
+                                        * lv_factor ).
+    ENDIF.    " within interval
+  ENDLOOP.  " it_bill
+  IF sy-subrc EQ 4.
+    it_result-netwr   = it_vbap-netwr.
+    it_result-totwr   = it_vbap-netwr.
+  ENDIF.
+
+ENDFORM.                    " CALC_VAL_CONT
+
+*&---------------------------------------------------------------------*
+*&      Form  ALV_USER_COMMAND
+*&---------------------------------------------------------------------*
+FORM alv_user_command
+        USING r_ucomm     LIKE sy-ucomm
+              rs_selfield TYPE slis_selfield.
+
+  CASE r_ucomm.
+    WHEN 'PICK' OR '&IC1'.
+      READ TABLE it_result INDEX rs_selfield-tabindex.
+      IF sy-subrc EQ 0.
+        SET PARAMETER ID 'KTN' FIELD it_result-vbeln.
+        CALL TRANSACTION 'VA43' AND SKIP FIRST SCREEN.
+      ENDIF.
+  ENDCASE.
+
+ENDFORM. "ALV_USER_COMMAND
+
+
+*&---------------------------------------------------------------------*
+*&      Form  fill_pgc_description
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->LT_VBAP    text
+*----------------------------------------------------------------------*
+FORM fill_pgc_description.
+
+  SORT it_vbap BY prodh.
+  LOOP AT it_vbap.
+    IF it_vbap-prodh <> it_pgc-pgc.
+      it_pgc-pgc = it_vbap-prodh.
+      APPEND it_pgc.
+    ENDIF.
+  ENDLOOP.
+
+*   Get the corresponding GAC codes for the PGC codes
+  CALL FUNCTION 'YSE_CONVERT_PGC_GAC'
+    TABLES
+      it_pgc_gac = it_pgc.
+  SORT it_pgc BY pgc.
+
+ENDFORM.                    "fill_pgc_description
+
+
+INCLUDE yse_ren_forecast_build_fielf01.
+*Text symbol text£º
+*001:Sales org:
+*002:Sales off:
+*003:Documents:
+*004:Quotations
+*005:Contracts
+*006:Period:
+*P01:Quotations
+*P02:Contracts
+*S01:Selection
+
+*S02:Document types
+*Selection text£º
+*P_END:        Until date
+*P_PRODH:D       Product hierarchy
+*P_START:        From date
+*P_VKBUR:D       Sales office
+*P_VKORG:D       Sales Organization
+*P_VTWEG:D       Distribution Channel
+*SO_GAC:        GAC
+*SO_PGC:        PGC
+*SO_VBELN:D       Sales document

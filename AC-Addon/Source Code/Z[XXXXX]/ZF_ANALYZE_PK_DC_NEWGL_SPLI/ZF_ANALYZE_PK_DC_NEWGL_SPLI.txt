@@ -1,0 +1,536 @@
+*&---------------------------------------------------------------------*
+*& Report  ZF_ANALYZE_PK_DC_NEWGL_SPLI
+*&
+*&---------------------------------------------------------------------*
+*& Version 4: 26 February 2009
+*& o  Allow p_update to be set externally to enable ZF_ANALYZE_PK_DC_SUBMIT
+*&---------------------------------------------------------------------*
+
+REPORT  zzf_analyze_pk_dc_newgl_spli.
+
+TABLES: bkpf, fagl_splinfo, fagl_splinfo_val, t001, tbsl.
+
+TYPES: BEGIN OF bkpfkey ,
+       rbukrs LIKE faglflexa-rbukrs,
+       gjahr LIKE bkpf-gjahr,
+       belnr LIKE bkpf-belnr,
+       bstat LIKE bkpf-bstat,
+       END OF bkpfkey.
+
+TYPES: BEGIN OF bseginfo ,
+       bukrs LIKE bseg-bukrs,
+       gjahr LIKE bseg-gjahr,
+       belnr LIKE bseg-belnr,
+       buzei LIKE bseg-buzei,
+       shkzg LIKE bseg-shkzg,
+       bschl LIKE bseg-bschl,
+       xnegp LIKE bseg-xnegp,
+       END OF bseginfo.
+
+TYPES: BEGIN OF corrinfo,
+         bukrs LIKE fagl_splinfo-bukrs,
+         gjahr LIKE fagl_splinfo-gjahr,
+         belnr LIKE fagl_splinfo-belnr,
+         buzei LIKE fagl_splinfo-buzei,
+         spl_no LIKE fagl_splinfo-spl_no,
+         shkzg LIKE fagl_splinfo-shkzg,
+         shkzg_new LIKE fagl_splinfo-shkzg,
+         bschl LIKE fagl_splinfo-bschl,
+         bschl_new LIKE fagl_splinfo-bschl,
+         xnegp LIKE bseg-xnegp,
+       END OF corrinfo.
+
+DATA  expert TYPE boole_d.
+
+DATA: lv_upd_fclnt,
+      ls_faglflexa TYPE faglflexa,
+      lt_faglflexa TYPE TABLE OF faglflexa,
+      ls_splinfo TYPE fagl_splinfo,
+      lt_splinfo TYPE TABLE OF fagl_splinfo,
+      ls_corrold TYPE fagl_splinfo,
+      lt_corrold TYPE TABLE OF fagl_splinfo,
+      ls_corrnew TYPE fagl_splinfo,
+      lt_corrnew TYPE TABLE OF fagl_splinfo,
+      ls_corrinfo TYPE corrinfo,
+      lt_corrinfo TYPE TABLE OF corrinfo,
+      ls_bseginfo TYPE bseginfo,
+      lt_bseginfo TYPE TABLE OF bseginfo,
+      ls_splinfoval TYPE fagl_splinfo_val,
+      lt_splinfoval TYPE TABLE OF fagl_splinfo_val,
+      wa_faglflexa TYPE faglflexa,
+      lv_text TYPE string,
+      lv_update,
+      lv_del,
+      wa_bukrs TYPE fagl_s_bukrs,
+      lt_bukrs TYPE fagl_t_bukrs,
+      ls_bkpf TYPE bkpf,
+      lt_bkpf TYPE TABLE OF bkpf,
+      wa_fagl_split_actc TYPE fagl_split_actc,
+      lt_fagl_split_actc TYPE TABLE OF fagl_split_actc,
+      lb_active    TYPE boole_d,
+      ls_bkpfkey TYPE bkpfkey,
+      lt_bkpfkey TYPE TABLE OF bkpfkey,
+      xminus,
+      lv_reset,
+      cnt TYPE i,
+      cnt_cw TYPE i,
+      lv_delcnt TYPE i,
+      ls_stbsl TYPE tbsl-stbsl.
+
+
+SELECT-OPTIONS:
+s_bukrs FOR bkpf-bukrs OBLIGATORY,
+s_gjahr FOR bkpf-gjahr OBLIGATORY.
+
+
+SELECTION-SCREEN BEGIN OF BLOCK 002 WITH FRAME TITLE text-s01.
+PARAMETERS: p_update AS CHECKBOX MODIF ID u01,
+            p_clnt(3) TYPE c DEFAULT 'GLF' MODIF ID u01.
+SELECTION-SCREEN END OF BLOCK 002.
+
+SELECTION-SCREEN BEGIN OF BLOCK 003 WITH FRAME TITLE text-s03.
+PARAMETERS: p_dele  AS CHECKBOX MODIF ID d01,
+            p_cl_d(3) TYPE c  DEFAULT 'GLF'  MODIF ID d01.
+SELECTION-SCREEN END OF BLOCK 003.
+
+AT SELECTION-SCREEN OUTPUT.
+
+  GET PARAMETER ID 'EXP' FIELD expert. " Parameter ID der Recherche
+
+  IF expert IS INITIAL.
+    IF lv_del IS INITIAL.
+      CLEAR: p_dele.
+    ENDIF.
+    IF lv_update IS INITIAL.
+      CLEAR: p_update.
+    ENDIF.
+  ENDIF.
+
+  LOOP AT SCREEN.
+    IF screen-group1 = 'U01'.
+      IF lv_update = 'X'.
+        screen-invisible = '0'.
+        screen-active    = '1'.
+      ELSE.
+        screen-invisible = '1'.
+        screen-active    = '0'.
+      ENDIF.
+      MODIFY SCREEN.
+    ENDIF.
+
+    IF screen-group1 = 'D01'.
+      IF lv_del = 'X'.
+        screen-invisible = '0'.
+        screen-active    = '1'.
+      ELSE.
+        screen-invisible = '1'.
+        screen-active    = '0'.
+      ENDIF.
+      MODIFY SCREEN.
+    ENDIF.
+
+
+  ENDLOOP.
+
+AT SELECTION-SCREEN.
+
+  IF sy-ucomm = 'SAPONLY'.
+    lv_update = 'X'.
+  ENDIF.
+  IF sy-ucomm = 'DELCLT'.
+    lv_del = 'X'.
+  ENDIF.
+
+
+START-OF-SELECTION.
+
+  SELECT * FROM t001 WHERE bukrs IN s_bukrs.
+    MOVE-CORRESPONDING t001 TO wa_fagl_split_actc.
+    MOVE-CORRESPONDING t001 TO wa_bukrs.
+    APPEND wa_bukrs TO lt_bukrs.
+    lb_active = cl_fagl_split_services=>check_activity( it_bukrs = lt_bukrs ).
+    IF lb_active = abap_true.
+      APPEND wa_fagl_split_actc TO lt_fagl_split_actc.
+    ENDIF.
+    CLEAR lt_bukrs.
+  ENDSELECT.
+
+  DESCRIBE TABLE lt_fagl_split_actc LINES sy-tfill.
+  IF sy-tfill = 0.
+    WRITE:/ 'No company codes with activated split selected.' COLOR 3.
+    EXIT.
+  ENDIF.
+
+
+  IF NOT p_clnt IS INITIAL.
+    lv_text = 'Backup client & has not an alpha numeric name!'.
+*   FIND REGEX '[[:alpha:]]' IN p_clnt.
+*    IF sy-subrc <> 0.
+    IF p_clnt >= '000' AND p_clnt <= '999'.
+      REPLACE '&' IN lv_text WITH p_clnt.
+      MESSAGE lv_text TYPE 'E'.
+    ENDIF.
+  ELSE.
+    p_clnt = 'GLF'.  "sicherheitshalber Default - Selektion nur via Korrclnt.
+  ENDIF.
+
+  IF NOT p_clnt IS INITIAL. " ist hier hart sichergestellt.
+    LOOP AT lt_fagl_split_actc INTO wa_fagl_split_actc.
+      SELECT DISTINCT rbukrs gjahr belnr FROM faglflexa CLIENT SPECIFIED
+          INTO ls_bkpfkey
+          WHERE rclnt  = p_clnt
+          AND   rbukrs = wa_fagl_split_actc-bukrs
+          AND   gjahr  IN s_gjahr.
+        APPEND ls_bkpfkey TO lt_bkpfkey. "korrigierte splitrelev. Belegnummern
+      ENDSELECT.
+    ENDLOOP.
+  ENDIF.
+
+
+  CHECK lt_bkpfkey[] IS NOT INITIAL.
+
+  SELECT * FROM bkpf INTO TABLE lt_bkpf
+    FOR ALL ENTRIES IN lt_bkpfkey
+    WHERE bukrs = lt_bkpfkey-rbukrs
+    AND   gjahr = lt_bkpfkey-gjahr
+    AND   belnr = lt_bkpfkey-belnr.
+
+  IF sy-dbcnt EQ 0.
+    WRITE:/ 'No documents selected.' COLOR 3.
+  ENDIF.
+
+* so nun haben wir die zu pr¨¹fenden Kandidaten in lt_bkpf - einschlie#l. bstat
+
+  LOOP AT lt_bkpf INTO ls_bkpf.
+
+    SELECT * FROM fagl_splinfo INTO TABLE lt_splinfo
+    WHERE belnr EQ ls_bkpf-belnr
+    AND gjahr EQ ls_bkpf-gjahr
+    AND bukrs EQ ls_bkpf-bukrs.
+    CHECK sy-subrc EQ 0. " keine fagl_splinfo da, gibt es den Fehler nicht
+
+    SELECT * FROM fagl_splinfo_val INTO TABLE lt_splinfoval
+    WHERE belnr EQ ls_bkpf-belnr
+    AND gjahr EQ ls_bkpf-gjahr
+    AND bukrs EQ ls_bkpf-bukrs.
+
+    IF ls_bkpf-bstat = space.
+* bseg
+      SELECT * FROM bseg INTO CORRESPONDING FIELDS OF TABLE lt_bseginfo
+          WHERE belnr EQ ls_bkpf-belnr
+      AND gjahr EQ ls_bkpf-gjahr
+      AND bukrs EQ ls_bkpf-bukrs.
+
+    ELSEIF ls_bkpf-bstat = 'L'.
+* bseg_add
+      SELECT * FROM bseg_add INTO CORRESPONDING FIELDS OF TABLE lt_bseginfo
+          WHERE belnr EQ ls_bkpf-belnr
+      AND gjahr EQ ls_bkpf-gjahr
+      AND bukrs EQ ls_bkpf-bukrs.
+    ENDIF.
+
+    LOOP AT lt_bseginfo INTO ls_bseginfo.
+      LOOP AT lt_splinfo INTO ls_splinfo WHERE buzei = ls_bseginfo-buzei.
+        xminus = space.
+        IF ls_splinfo-pswbt < 0.
+          xminus = 'X'.
+        ELSEIF ls_splinfo-pswbt = 0.
+          LOOP AT lt_splinfoval INTO ls_splinfoval
+            WHERE buzei = ls_bseginfo-buzei AND spl_no = ls_splinfo-spl_no.
+            IF ls_splinfoval-wrbtr < 0.
+              xminus = 'X'.
+              EXIT.
+            ENDIF.
+          ENDLOOP.
+        ENDIF.
+**** - ---- Pr¨¹fung ---------
+* Egal ob XNEGP sitzt oder nicht, in FAGL_SPLINFO wird immer ein SHKZG gesetzt,
+* dass zur Betragsart der FAGL_PLINFO(_VAL) passt.
+* Sprich bei positivem Betrag Soll, bei negativem Betrag in FAGL_SPLINFO_VAL
+* hat FAGL_SPLINFO ein Haben-SHKZG.
+
+* (Dieses ist unabh#ngig von der Fortschreibung der FAGLFLEXA,
+* denn in FAGLFLEXA wird bei XNEGP das Soll- Habenkennzeichen kontr#r
+* zum FAGLFLEXA-Betrag und damit idR. (Achtung Zeile k#nnte in untersch.
+* Betragsarten gesplittet sein) auch kontr#r zum korrespondierenden
+* FAGL_SPLINFO_SATZ upgedated.)
+
+* Wenn das Soll-Habenkennzeichen der FAGL_SPLINFO identisches zur
+* korrespondierenden BSEG-BUZEI ist, hat FAGL_SPLINFO
+* (unabh#ngig von XNEGP) immer identischen Buchungsschl¨¹ssel wie die BSEG.
+* Hat FAGL_SPLINFO zum korrespondierenden BSEG-Eintrag gegenteiliges
+* Soll-Habenkennzeichen so ist auch der Buchungsschl¨¹ssel gegen¨¹ber der BSEG
+* invertiert (Stornobuchungsschl¨¹ssel).
+
+* (Bei FAGLFLEXA verh#lt es sich anders: dort entspricht der Typ des
+* Buchungsschl¨¹ssels immer der Betragsart
+* identischer FAGLFLEXA-Zeile.)
+
+        IF xminus = 'X'. " => SHKZG = 'H' in splinfo  ... weil Betr#ge negativ
+          IF ls_bseginfo-shkzg = 'H'.
+            IF  ls_splinfo-shkzg = 'H' AND ls_bseginfo-bschl = ls_splinfo-bschl.
+            ELSE.
+              APPEND ls_splinfo TO lt_corrold. " zu #ndernde Zeilen
+              MOVE-CORRESPONDING ls_splinfo TO ls_corrinfo.
+              ls_splinfo-shkzg = 'H'. " wegen negativem Betrag in splinfo
+              ls_splinfo-bschl = ls_bseginfo-bschl. " weil BSEG auch H
+              APPEND ls_splinfo TO lt_corrnew. " korrigierte Werte
+              ls_corrinfo-shkzg_new = ls_splinfo-shkzg.
+              ls_corrinfo-bschl_new = ls_splinfo-bschl.
+              APPEND ls_corrinfo TO lt_corrinfo.
+              ADD 1 TO cnt.
+            ENDIF.
+
+          ELSE. "bseg hat 'S' die Zeile in in untersch. SHKZG-Zeilen gesplittet
+*               gegen¨¹ber BSEG  in Splinfo gegenteil. SHKZG + gegenteil. BSCHL
+*               und negativer Betrag .
+
+            SELECT SINGLE stbsl FROM tbsl INTO ls_stbsl WHERE bschl = ls_bseginfo-bschl.
+
+            IF ls_splinfo-shkzg = 'H' AND ls_splinfo-bschl = ls_stbsl. " o.k.
+            ELSE. " entweder Buchungsschl¨¹ssel oder SHKZG bzw. beides falsch .
+              APPEND ls_splinfo TO lt_corrold.
+              MOVE-CORRESPONDING ls_splinfo TO ls_corrinfo.
+              ls_splinfo-shkzg = 'H'.
+              ls_splinfo-bschl = ls_stbsl.
+              APPEND ls_splinfo TO lt_corrnew.
+              ls_corrinfo-shkzg_new = ls_splinfo-shkzg.
+              ls_corrinfo-bschl_new = ls_splinfo-bschl.
+              APPEND ls_corrinfo TO lt_corrinfo.
+              ADD 1 TO cnt.
+            ENDIF.
+          ENDIF.
+        ELSE. " XMINUS = ' ' " positive Betr#ge in FAGL_SPLINFO
+          IF ls_bseginfo-shkzg = 'S'.
+            IF ls_splinfo-shkzg = 'S' AND ls_bseginfo-bschl = ls_splinfo-bschl.
+            ELSE.
+              APPEND ls_splinfo TO lt_corrold.
+              MOVE-CORRESPONDING ls_splinfo TO ls_corrinfo.
+              ls_splinfo-shkzg = 'S'.
+              ls_splinfo-bschl = ls_bseginfo-bschl.
+              APPEND ls_splinfo TO lt_corrnew.
+              ls_corrinfo-shkzg_new = ls_splinfo-shkzg.
+              ls_corrinfo-bschl_new = ls_splinfo-bschl.
+              APPEND ls_corrinfo TO lt_corrinfo.
+              ADD 1 TO cnt.
+            ENDIF.
+          ELSE. " ls_bseginfo-bschl = 'H' aber positive Betr#ge in splinfo ...
+*... d.h. unterschiedlich gesplittet.
+            SELECT SINGLE stbsl FROM tbsl INTO ls_stbsl WHERE bschl = ls_bseginfo-bschl.
+
+            IF ls_splinfo-shkzg = 'S' AND ls_splinfo-bschl = ls_stbsl. " o.k
+            ELSE.
+              APPEND ls_splinfo TO lt_corrold.
+              MOVE-CORRESPONDING ls_splinfo TO ls_corrinfo.
+              ls_splinfo-shkzg = 'S'.
+              ls_splinfo-bschl = ls_stbsl.
+              APPEND ls_splinfo TO lt_corrnew.
+              ls_corrinfo-shkzg_new = ls_splinfo-shkzg.
+              ls_corrinfo-bschl_new = ls_splinfo-bschl.
+              APPEND ls_corrinfo TO lt_corrinfo.
+              ADD 1 TO cnt.
+            ENDIF.
+          ENDIF.
+
+        ENDIF.
+
+      ENDLOOP.
+
+    ENDLOOP.
+  ENDLOOP.
+
+END-OF-SELECTION.
+*********************************
+  IF  NOT p_dele IS INITIAL
+  AND NOT p_cl_d IS INITIAL.
+
+    lv_text = 'Backup client marked for deletion & has not an alpha numeric name!'.
+    IF p_cl_d >= '000' AND p_cl_d <= '999'.
+      REPLACE '&' IN lv_text WITH p_clnt.
+      MESSAGE lv_text TYPE 'E'.
+    ENDIF.
+
+    LOOP AT lt_corrinfo INTO ls_corrinfo.
+      DELETE FROM fagl_splinfo CLIENT SPECIFIED
+          WHERE mandt = p_cl_d
+          AND bukrs = ls_corrinfo-bukrs
+          AND gjahr = ls_corrinfo-gjahr
+          AND belnr = ls_corrinfo-belnr
+          AND buzei = ls_corrinfo-buzei
+          AND spl_no =  ls_corrinfo-spl_no.
+      ADD 1 TO lv_delcnt.
+    ENDLOOP.
+    COMMIT WORK.
+  ENDIF.
+
+
+********************************
+  IF cnt > 0.
+    WRITE:/.
+    IF      p_update = 'X'
+    AND NOT p_clnt IS INITIAL.
+* sicherheitshalber keine #nderung erfolgt wg. Daten im Backupmandanten.
+      SELECT * FROM fagl_splinfo CLIENT SPECIFIED
+              INTO ls_splinfo
+*              UP TO 1 ROWS
+              FOR ALL ENTRIES IN lt_corrnew
+              WHERE mandt  = p_clnt
+              AND   bukrs =  lt_corrnew-bukrs
+              AND   belnr  = lt_corrnew-belnr
+              AND   gjahr  = lt_corrnew-gjahr
+              AND   buzei  = lt_corrnew-buzei
+              AND   spl_no = lt_corrnew-spl_no.
+        EXIT.
+      ENDSELECT.
+      IF sy-subrc = 0.
+        lv_text =
+  'Correction client & contains allready FAGL_SPLINFO entires'.
+        REPLACE '&' IN lv_text WITH p_clnt.
+        MESSAGE lv_text TYPE 'I'.
+        CLEAR p_update.
+        lv_reset = 'X'. "f¨¹r die Ausgabe, damit augegeben werden kann, dass
+      ELSE.
+        CLEAR lv_reset.
+      ENDIF.
+    ENDIF.
+
+    SORT lt_corrnew BY bukrs gjahr belnr buzei spl_no.
+    SORT lt_corrold BY bukrs gjahr belnr buzei spl_no.
+    SORT lt_corrinfo BY bukrs gjahr belnr buzei spl_no.
+
+    LOOP AT lt_corrinfo INTO ls_corrinfo.
+
+      FORMAT COLOR 2 INTENSIFIED OFF.
+      WRITE:/ sy-vline NO-GAP,
+               (5) ls_corrinfo-bukrs,
+               (5) ls_corrinfo-gjahr,
+              (11) ls_corrinfo-belnr,
+               (5) ls_corrinfo-buzei,
+               (7) ls_corrinfo-spl_no,
+               (6) ls_corrinfo-xnegp,
+               (5) ls_corrinfo-shkzg,
+               (9) ls_corrinfo-shkzg_new,
+               (5) ls_corrinfo-bschl,
+               (9) ls_corrinfo-bschl_new.
+      HIDE: ls_corrinfo-bukrs,
+            ls_corrinfo-belnr,
+            ls_corrinfo-gjahr.
+
+      IF p_update = 'X'.
+        PERFORM update_splinfo.
+      ENDIF.
+      WRITE: 105 sy-vline NO-GAP.
+      FORMAT COLOR OFF.
+      AT END OF belnr.
+        NEW-LINE.
+        ULINE (105).
+      ENDAT.
+    ENDLOOP.
+  ELSE.
+    WRITE:/ 'No items to be corrected.' COLOR 3.
+  ENDIF.
+
+  COMMIT WORK.
+
+  IF NOT p_dele IS INITIAL AND lv_delcnt > 0.
+    ULINE (105).
+    lv_text = 'Records deleted from client &c.'.
+    REPLACE: '&c' IN lv_text WITH p_cl_d.
+    WRITE: lv_delcnt, lv_text COLOR 5.
+    ULINE (105).
+  ENDIF.
+
+  CLEAR: p_update, p_dele.
+
+AT LINE-SELECTION.
+  CHECK NOT ls_splinfo-belnr IS INITIAL.
+  SET PARAMETER ID 'BUK' FIELD ls_splinfo-bukrs.
+  SET PARAMETER ID 'BLN' FIELD ls_splinfo-belnr.
+  SET PARAMETER ID 'GJR' FIELD ls_splinfo-gjahr.
+  CALL TRANSACTION 'FB03' AND SKIP FIRST SCREEN.
+
+*****************
+
+TOP-OF-PAGE.
+
+  FORMAT COLOR 1.
+  ULINE (105).
+  IF p_update IS INITIAL.
+    lv_text = 'TEST RUN'.
+  ELSE.
+    lv_text = 'UPDATE RUN'.
+  ENDIF.
+  WRITE:/ sy-vline NO-GAP,
+          5 'ITEMS TO BE CORRECTED:', cnt, lv_text,
+          105 sy-vline NO-GAP.
+  IF lv_reset = 'X'.
+    WRITE:/ sy-vline NO-GAP,
+            5 'ITEMS FOUND IN BACKUP CLIENT', p_clnt,
+            'UPDATE WAS RESET',
+            105 sy-vline NO-GAP.
+  ELSE.
+    WRITE:/ sy-vline NO-GAP,
+            5 'ITEMS COPIED TO BACKUP CLIENT:', p_clnt,
+            105 sy-vline NO-GAP.
+  ENDIF.
+  WRITE:/ sy-vline NO-GAP,
+               (5) 'BUKRS',
+               (5) 'GJAHR',
+              (11) 'BELNR',
+               (5) 'BUZEI',
+               (7) 'SPL_NO',
+               (6)  'XNEGP',
+               (5) 'SHKZG',
+               (9) 'SHKZG_NEW',
+               (5) 'BSCHL',
+               (9) 'BSCHL_NEW',
+        105 sy-vline NO-GAP.
+  NEW-LINE.
+  ULINE (105).
+
+*&---------------------------------------------------------------------*
+*&      Form  UPDATE_SPLINFO
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM update_splinfo .
+  IF NOT p_clnt IS INITIAL. "at least GLF or non-numeric
+    READ TABLE lt_corrold WITH KEY
+         bukrs = ls_corrinfo-bukrs
+         gjahr = ls_corrinfo-gjahr
+         belnr = ls_corrinfo-belnr
+         buzei = ls_corrinfo-buzei
+         spl_no = ls_corrinfo-spl_no
+         INTO ls_corrold.
+    CHECK sy-subrc = 0.
+    ls_corrold-mandt = p_clnt. "Backup-Client f¨¹r client spec update
+
+* zu korrigierende Daten in Backupclient sichern ... man wei# ja nie ...
+* Insert sollte gen¨¹gen, da im Falle im Backupclient vorhandener Daten  eh
+* immer update-flag auf test zur¨¹ckgesetzt wird ...
+    INSERT fagl_splinfo CLIENT SPECIFIED FROM ls_corrold.
+    IF sy-subrc <> 0.
+      UPDATE fagl_splinfo CLIENT SPECIFIED FROM ls_corrold.
+    ENDIF.
+    UPDATE fagl_splinfo
+        SET shkzg = ls_corrinfo-shkzg_new
+            bschl = ls_corrinfo-bschl_new
+        WHERE bukrs = ls_corrinfo-bukrs
+        AND   gjahr = ls_corrinfo-gjahr
+        AND belnr   = ls_corrinfo-belnr
+        AND buzei   = ls_corrinfo-buzei
+        AND spl_no =  ls_corrinfo-spl_no.
+    IF sy-subrc = 0.
+      WRITE: 'Updated' COLOR 5.
+      ADD 1 TO cnt_cw.
+    ENDIF.
+** commit counter
+    IF cnt_cw = 100.
+      cnt_cw = 0.
+      COMMIT WORK.
+    ENDIF.
+  ENDIF.
+ENDFORM.                    " UPDATE_SPLINFO

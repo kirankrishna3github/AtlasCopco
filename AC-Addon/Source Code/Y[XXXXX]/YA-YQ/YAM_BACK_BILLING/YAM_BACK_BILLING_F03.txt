@@ -1,0 +1,636 @@
+*----------------------------------------------------------------------*
+***INCLUDE YAM_BACK_BILLING_F03 .
+*----------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  create_bil_requests
+*&---------------------------------------------------------------------*
+*       text: Create the necessary Debit/credit memo request documents
+*----------------------------------------------------------------------*
+FORM create_bil_requests .
+*.. Local variables
+  DATA: lv_answer TYPE c,
+        lv_subrc  TYPE syst-subrc,
+        ls_vbak TYPE vbak,
+        lv_error TYPE c,
+        lv_lock  TYPE c,
+        lv_reverse type c,
+        lv_auart TYPE auart,
+        lv_augru TYPE augru,
+        lv_faksk TYPE faksk,
+        ls_vbakkom TYPE vbakkom,
+        ls_vbakkomx TYPE vbakkomx,
+        lt_vbapkomx TYPE STANDARD TABLE OF vbapkomx WITH HEADER LINE,
+        ls_konvkom TYPE konvkom.
+
+  TYPES: BEGIN OF ty_vbap_orig,
+          vbeln TYPE vbeln,
+          posnr TYPE posnr,
+          updkz TYPE updkz,
+        END   OF ty_vbap_orig.
+
+  DATA: lt_vbpakom TYPE STANDARD TABLE OF vbpakom.
+  DATA: lt_vbap_orig TYPE TABLE OF ty_vbap_orig WITH HEADER LINE.
+
+  CALL FUNCTION 'POPUP_TO_CONFIRM'
+    EXPORTING
+      titlebar              = text-p01
+      text_question         = text-p02
+      icon_button_1         = 'ICON_OKAY'
+      icon_button_2         = 'ICON_CANCEL'
+      default_button        = '2'
+      display_cancel_button = space
+    IMPORTING
+      answer                = lv_answer
+    EXCEPTIONS
+      text_not_found        = 1
+      OTHERS                = 2.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+  CHECK lv_answer = '1'.
+
+  FREE gt_vbmtv_loc[].
+
+*.. Loop on the selected contract items
+  LOOP AT gt_vbmtv WHERE selkz EQ gc_charx AND
+                         exclu NE gc_charx.
+*.... Make subset of selection sorted by contract
+    gt_vbmtv_loc = gt_vbmtv.
+    APPEND gt_vbmtv_loc.
+*.... Keep list of selected contract items vs. non-selected items
+    READ TABLE lt_vbap_orig WITH KEY vbeln = gt_vbmtv-vbeln
+                                     posnr = gt_vbmtv-posnr BINARY SEARCH.
+    IF sy-subrc EQ 0.  " If contract itesm already available, flag selected
+      lt_vbap_orig-updkz = 'X'.
+      MODIFY lt_vbap_orig INDEX sy-tabix.
+    ELSE.              " Contract items not yet available, select and flag
+
+*...... Select all contract items from database to identify the ones to delete in subsequent document
+      SELECT vbeln posnr
+      APPENDING TABLE lt_vbap_orig
+      FROM vbap
+      WHERE vbeln EQ gt_vbmtv-vbeln.
+      SORT lt_vbap_orig BY vbeln posnr.
+      READ TABLE lt_vbap_orig WITH KEY vbeln = gt_vbmtv-vbeln
+                                       posnr = gt_vbmtv-posnr BINARY SEARCH.
+      IF sy-subrc EQ 0.
+        lt_vbap_orig-updkz = 'X'.
+        MODIFY lt_vbap_orig INDEX sy-tabix.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+
+  SORT gt_vbmtv_loc BY vbeln posnr.
+
+  LOOP AT gt_vbmtv_loc.
+    AT NEW vbeln.
+*...... Lock contract
+      CALL FUNCTION 'ENQUEUE_EVVBAKE'
+        EXPORTING
+          vbeln          = gt_vbmtv_loc-vbeln
+        EXCEPTIONS
+          foreign_lock   = 1
+          system_failure = 2
+          OTHERS         = 3.
+      IF sy-subrc <> 0.
+*........ Contract &1 already locked by user &2. Back-billing not possible.
+        syst-msgv4 = syst-msgv1.
+        MESSAGE e013 WITH gt_vbmtv-vbeln sy-msgv4 INTO gv_msg.
+        PERFORM add_message_to_log.
+        lv_error = gc_charx.
+      ENDIF.
+
+      IF lv_error IS INITIAL.
+
+        FREE lt_vbapkomx.
+*........ Get list of selected contract items vs. non selected contract items
+        READ TABLE lt_vbap_orig WITH KEY vbeln = gt_vbmtv_loc-vbeln BINARY SEARCH.
+        LOOP AT lt_vbap_orig FROM sy-tabix.
+          IF lt_vbap_orig-vbeln NE gt_vbmtv_loc-vbeln.
+            EXIT.
+          ENDIF.
+          lt_vbapkomx-posnr = lt_vbap_orig-posnr.
+*.......... If contract item was selected, reference in document, if not delete
+          IF lt_vbap_orig-updkz EQ 'X'.
+            lt_vbapkomx-updkz = space.
+          ELSE.
+            lt_vbapkomx-updkz = 'D'.
+          ENDIF.
+          APPEND lt_vbapkomx.
+        ENDLOOP.
+
+*........ Determine SD document category and subsequently SD document type
+        SUM.
+        IF gt_vbmtv_loc-zzdcv > 0.  " Debit memo request
+          lv_auart = gs_bb_def-auart_ls.
+          lv_augru = gs_bb_def-augru_ls.
+          lv_faksk = gs_bb_def-faksk_ls.
+          clear lv_reverse.
+        ELSE.                   " Credit memo request
+          lv_auart = gs_bb_def-auart_gs.
+          lv_augru = gs_bb_def-augru_gs.
+          lv_faksk = gs_bb_def-faksk_gs.
+          lv_reverse = 'X'.
+        ENDIF.
+
+*........ Create SD document with reference
+        CALL FUNCTION 'SD_SALES_DOCUMENT_COPY'
+          EXPORTING
+            i_auarn           = lv_auart
+            i_vbeln           = gt_vbmtv_loc-vbeln
+            i_items_copy      = 'X'
+            i_keep_lock_entry = 'X'
+          IMPORTING
+            fvbakkom          = ls_vbakkom
+          TABLES
+            ix_vbapkomx_orig  = lt_vbapkomx
+          EXCEPTIONS
+            error_message     = 01.
+
+        IF sy-subrc NE 0.
+          PERFORM add_message_to_log.
+*.......... Error copying with reference for &1. Please see previous message.
+          MESSAGE e012 WITH gt_vbmtv_loc-vbeln INTO gv_msg.
+          PERFORM add_message_to_log.
+          lv_error = gc_charx.
+        ELSE.
+*.......... Update document header with billing block and order reason (if applicable)
+          ls_vbakkom-augru = lv_augru.
+          ls_vbakkom-faksk = lv_faksk.
+          ls_vbakkomx-augru = 'X'.
+          ls_vbakkomx-faksk = 'X'.
+
+          CALL FUNCTION 'SD_SALES_HEADER_MAINTAIN'
+            EXPORTING
+              i_call_bapi = gc_charx
+              fvbakkom    = ls_vbakkom
+              fvbakkomx   = ls_vbakkomx
+            TABLES
+              fxvbpakom   = lt_vbpakom.
+        ENDIF.
+      ENDIF.
+    ENDAT.
+
+    IF lv_error EQ space.
+*...... Update item texts if requested in YAM_BB_DEF
+      IF NOT gs_bb_def-tdid IS INITIAL.
+        CLEAR lv_subrc.
+        PERFORM update_item_text CHANGING lv_subrc.
+      ENDIF.
+
+      IF lv_subrc EQ 0.
+*........ Update item pricing
+        ls_konvkom-kschl = 'ZCR'.
+*........ In case of credit memo request, ensure condition value has the correct sign
+        if lv_reverse = 'X'.
+          ls_konvkom-kbetr = gt_vbmtv_loc-zzdcv * -1.
+        else.
+          ls_konvkom-kbetr = gt_vbmtv_loc-zzdcv.
+        endif.
+        ls_konvkom-waers = gt_vbmtv_loc-waerk.
+        ls_konvkom-kposn = gt_vbmtv_loc-posnr.
+        CALL FUNCTION 'SD_SALES_CONDITION_MAINTAIN'
+          EXPORTING
+            fkonvkom         = ls_konvkom
+          EXCEPTIONS
+            item_num_missing = 1
+            step_num_missing = 2
+            count_missing    = 3
+            error_message    = 4
+            OTHERS           = 5.
+        IF sy-subrc <> 0.
+          PERFORM add_message_to_log.
+*.......... Error updating pricing info for &1 &2. Please see previous message.
+          MESSAGE e007 WITH gt_vbmtv_loc-vbeln gt_vbmtv_loc-posnr INTO gv_msg.
+          PERFORM add_message_to_log.
+          lv_error = gc_charx.
+        ENDIF.
+      ELSE.
+*........ Error updating text info for &1 &2. Please see previous message.
+        MESSAGE e014 WITH gt_vbmtv_loc-vbeln gt_vbmtv_loc-posnr INTO gv_msg.
+        PERFORM add_message_to_log.
+        lv_error = gc_charx.
+      ENDIF.
+    ENDIF.
+
+    AT END OF vbeln.
+      IF lv_error IS INITIAL.
+*........ Save SD document
+        CALL FUNCTION 'SD_SALES_DOCUMENT_SAVE'
+          IMPORTING
+            evbak = ls_vbak.
+
+*........ Save successfull?
+        IF ls_vbak-vbeln IS INITIAL.
+*.......... Error saving Debit/Credit memo request for contract &1.
+          MESSAGE e008 WITH gt_vbmtv_loc-vbeln INTO gv_msg.
+          PERFORM add_message_to_log.
+          PERFORM update_list USING gt_vbmtv_loc-vbeln '4'.
+        ELSE.
+          PERFORM update_vbap TABLES lt_vbapkomx USING gt_vbmtv_loc-vbeln.
+          COMMIT WORK AND WAIT.
+          IF sy-subrc EQ 0.
+*............ Debit/Credit memo request &1 successfully created for contract &2.
+            MESSAGE s009 WITH ls_vbak-vbeln gt_vbmtv_loc-vbeln INTO gv_msg.
+            PERFORM add_message_to_log.
+            PERFORM update_list USING gt_vbmtv_loc-vbeln '0'.
+          ENDIF.
+        ENDIF.
+      ELSE.
+        PERFORM update_list USING gt_vbmtv_loc-vbeln '4'.
+      ENDIF.
+      CLEAR lv_error.
+    ENDAT.
+
+  ENDLOOP.
+
+ENDFORM.                    " create_bil_requests
+
+*eject
+*&---------------------------------------------------------------------*
+*&      Form  display_log
+*&---------------------------------------------------------------------*
+*       text: Display the already generated application log
+*----------------------------------------------------------------------*
+FORM display_log .
+*.. Local variables
+  DATA: ls_prof TYPE bal_s_prof.
+
+*.. Reset log indicator once displayed
+  CLEAR gv_log.
+
+*.. Get a prepared profile
+  CALL FUNCTION 'BAL_DSP_PROFILE_POPUP_GET'
+    IMPORTING
+      e_s_display_profile = ls_prof
+    EXCEPTIONS
+      OTHERS              = 1.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+             WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+*.. Use grid for display if wanted
+  ls_prof-use_grid = gc_charx.
+  ls_prof-start_row = 1.
+  ls_prof-end_row = 25.
+  CLEAR ls_prof-pop_adjst.
+
+*.. When you use also other ALV lists in your report,
+*.. please specify a handle to distinguish between the display
+*.. variants of these different lists, e.g:
+  ls_prof-disvariant-handle = 'LOG'.
+
+*.. Call display function module
+  CALL FUNCTION 'BAL_DSP_LOG_DISPLAY'
+    EXPORTING
+      i_s_display_profile = ls_prof
+    EXCEPTIONS
+      OTHERS              = 1.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+             WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+ENDFORM.                    " display_log
+
+*eject
+*&---------------------------------------------------------------------*
+*&      Form  display_contract
+*&---------------------------------------------------------------------*
+*       text: Display the contract information using transaction VA43
+*             for the selected contract item
+*----------------------------------------------------------------------*
+FORM display_contract .
+*.. Get first selected contract item
+  LOOP AT gt_vbmtv WHERE selkz EQ gc_charx.
+    SET PARAMETER ID 'KTN' FIELD gt_vbmtv-vbeln.
+    CALL TRANSACTION 'VA43' AND SKIP FIRST SCREEN.
+    EXIT.
+  ENDLOOP.
+ENDFORM.                    " display_contract
+
+*eject
+*&---------------------------------------------------------------------*
+*&      Form  update_list
+*&---------------------------------------------------------------------*
+*       text: Update list with billing request creation results
+*----------------------------------------------------------------------*
+*  -->  ip_vbeln  text: Contract number
+*  -->  ip_subrc  text: Creation result 0: success, 4: failure
+*----------------------------------------------------------------------*
+FORM update_list USING ip_vbeln TYPE vbeln
+                       ip_subrc TYPE syst-subrc.
+
+*.. Update list table with corresponding result
+  LOOP AT gt_vbmtv WHERE vbeln EQ ip_vbeln AND
+                         selkz EQ gc_charx AND
+                         exclu EQ space.
+    IF ip_subrc EQ 0.
+      gt_vbmtv-zzcol = gc_green.
+      gt_vbmtv-exclu = 'X'.
+    ELSE.
+      gt_vbmtv-zzcol = gc_red.
+    ENDIF.
+*.... Deselect the items
+    CLEAR gt_vbmtv-selkz.
+    MODIFY gt_vbmtv.
+  ENDLOOP.
+
+ENDFORM.                    " update_list
+
+*eject
+*&---------------------------------------------------------------------*
+*&      Form  update_vbap
+*&---------------------------------------------------------------------*
+*       text: Update the ready for back-billing flag on VBAP
+*----------------------------------------------------------------------*
+FORM update_vbap TABLES lt_vbapkomx STRUCTURE vbapkomx
+                 USING  ip_vbeln    TYPE vbeln.
+*.. Local variables
+  DATA: lt_vbap_bb TYPE STANDARD TABLE OF yam_vbap_bb WITH HEADER LINE.
+
+*.. Check for which items a debit/credit memo request is created
+  LOOP AT lt_vbapkomx WHERE updkz IS INITIAL.
+    lt_vbap_bb-vbeln = ip_vbeln.
+    lt_vbap_bb-posnr = lt_vbapkomx-posnr.
+    APPEND lt_vbap_bb.
+  ENDLOOP.
+
+*.. In update task
+  CALL FUNCTION 'YAM_VBAP_BB_UPDATE' IN UPDATE TASK
+    TABLES
+      it_vbap_bb = lt_vbap_bb.
+
+ENDFORM.                    " update_vbap
+
+*eject
+*&---------------------------------------------------------------------*
+*&      Form  update_item_text
+*&---------------------------------------------------------------------*
+*       text: Update the item text with the necessary backbilling info
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM update_item_text CHANGING ep_subrc TYPE sy-subrc.
+*.. Local variables
+  DATA: lv_tdline TYPE tdline,
+        lt_tline  TYPE STANDARD TABLE OF tline WITH HEADER LINE.
+
+  STATICS: ls_kna1       TYPE kna1,
+           lv_header TYPE thead,
+           lv_spras_old  TYPE spras,
+           lt_tline_base TYPE STANDARD TABLE OF tline.
+
+*.. Internal table for moving item texts to memory
+  DATA: BEGIN OF bapi_item_texts OCCURS 0.
+  DATA: posnr LIKE vbap-posnr.
+          INCLUDE STRUCTURE tlinekom.
+  DATA: msgfn LIKE bapisdtext-function.
+  DATA: END OF bapi_item_texts.
+
+*.. Read sold-to party info
+  IF ls_kna1-kunnr NE gt_vbmtv_loc-kunnr.
+    CALL FUNCTION 'KNA1_SINGLE_READ'
+      EXPORTING
+*       KZRFB            = ' '
+        kna1_kunnr       = gt_vbmtv_loc-kunnr
+      IMPORTING
+        wkna1            = ls_kna1
+      EXCEPTIONS
+        not_found        = 1
+        OTHERS           = 2
+              .
+    IF sy-subrc <> 0.
+      ep_subrc = sy-subrc.
+      PERFORM add_message_to_log.
+      EXIT.
+    ENDIF.
+
+*.... Read the base text to be used if different language
+    IF ls_kna1-spras NE lv_spras_old.
+      lv_spras_old = ls_kna1-spras.
+      CALL FUNCTION 'READ_TEXT'
+        EXPORTING
+          id                    = 'ST'
+          language              = ls_kna1-spras
+          name                  = gs_bb_def-tdname
+          object                = 'TEXT'
+*     LOCAL_CAT             = ' '
+        IMPORTING
+          header                = lv_header
+        TABLES
+          lines                 = lt_tline_base
+        EXCEPTIONS
+          id                      = 1
+          language                = 2
+          name                    = 3
+          not_found               = 4
+          object                  = 5
+          reference_check         = 6
+          wrong_access_to_archive = 7
+          OTHERS                  = 8
+                .
+      IF sy-subrc <> 0.
+        ep_subrc = sy-subrc.
+        PERFORM add_message_to_log.
+        EXIT.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+  bapi_item_texts-posnr = gt_vbmtv_loc-posnr.
+  bapi_item_texts-tdspras = ls_kna1-spras.
+  bapi_item_texts-msgfn = '001'.
+  bapi_item_texts-tdid = gs_bb_def-tdid.
+  APPEND bapi_item_texts.
+
+  lt_tline[] = lt_tline_base[].
+
+*.. Replace the necessary symbols
+  CALL FUNCTION 'TEXT_SYMBOL_REPLACE'
+    EXPORTING
+      header = lv_header
+    TABLES
+      lines  = lt_tline.
+
+*.. Move the entire text to the relevant internal table
+  LOOP AT lt_tline.
+    bapi_item_texts-tdformat = lt_tline-tdformat.
+    bapi_item_texts-tdline = lt_tline-tdline.
+    APPEND bapi_item_texts.
+  ENDLOOP.
+
+*.. Export compiled text to memory
+  EXPORT bapi_item_texts TO MEMORY ID 'SDBAPITEXTIT'.
+ENDFORM.                    " update_item_text
+
+*eject
+*&---------------------------------------------------------------------*
+*&      Form  display_price_agreement
+*&---------------------------------------------------------------------*
+*       text: Display price agreement conditions
+*----------------------------------------------------------------------*
+FORM display_price_agreement .
+*.. Local variables
+  DATA: ls_komg TYPE komg,
+        ls_komk TYPE komk,
+        ls_komp TYPE komp.
+
+*.. Get first selected contract item
+  LOOP AT gt_vbmtv WHERE selkz EQ gc_charx.
+*.... Get price information for header
+    CALL FUNCTION 'SD_SALES_PRICING_INFORMATION'
+      EXPORTING
+        i_read_doc = 'X'
+        i_vbeln    = gt_vbmtv-vbeln
+      IMPORTING
+        e_komk     = ls_komk.
+
+*.... Get price information for item
+    CALL FUNCTION 'SD_SALES_PRICING_INFORMATION'
+      EXPORTING
+        i_posnr = gt_vbmtv-posnr
+        i_vbeln = gt_vbmtv-vbeln
+      IMPORTING
+        e_komp  = ls_komp.
+
+*.... Pre-read contract condition records
+    CALL FUNCTION 'SD_CONTRACT_READ_CONDITIONS'
+      EXPORTING
+        sr_vbeln            = gt_vbmtv-vbeln
+        sr_kappl            = 'V'
+        transaction_mode    = 'A'
+        sr_posnr            = gt_vbmtv-posnr
+      EXCEPTIONS
+        no_conditions_found = 1
+        cancel_requested    = 2
+        OTHERS              = 3.
+    IF sy-subrc <> 0.
+      MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+              WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+    ENDIF.
+
+    ls_komk-kvorg = '06'.
+    ls_komg-vbeln = gt_vbmtv-vbeln.
+    ls_komg-posnr = gt_vbmtv-posnr.
+
+*.... Display contract condition records
+    CALL FUNCTION 'RV_CONDITION_MAINTENANCE'
+      EXPORTING
+        application              = 'V'
+        first_screen             = 'D'
+        i_komk                   = ls_komk
+        i_komp                   = ls_komp
+        key_fields               = ls_komg
+        maintain_mode            = 'C'
+        SOURCE                   = 'A'
+        context_requested        = 'X'
+      EXCEPTIONS
+        enqueue_on_record        = 1
+        invalid_application      = 2
+        invalid_condition_number = 3
+        invalid_condition_type   = 4
+        invalid_condition_table  = 5
+        no_authority_ekorg       = 6
+        no_authority_kschl       = 7
+        no_authority_vkorg       = 8
+        no_selection             = 9
+        table_not_valid          = 10
+        terminated_by_user       = 11
+        OTHERS                   = 12.
+    IF sy-subrc <> 0.
+      MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+              WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+    ENDIF.
+
+    PERFORM beleg_initialisieren(sapmv45a).
+    EXIT.
+  ENDLOOP.
+
+ENDFORM.                    " display_price_agreement
+
+*eject
+*&---------------------------------------------------------------------*
+*&      Form  reject_items
+*&---------------------------------------------------------------------*
+*       text: Reject contract items not to be flagged as ready for
+*             back-billing
+*----------------------------------------------------------------------*
+FORM reject_items .
+*.. Local variables
+  DATA: lt_vbap_bb TYPE STANDARD TABLE OF yam_vbap_bb WITH HEADER LINE,
+        lv_answer  TYPE c.
+
+  CALL FUNCTION 'POPUP_TO_CONFIRM'
+    EXPORTING
+      titlebar              = text-p03
+      text_question         = text-p04
+      icon_button_1         = 'ICON_OKAY'
+      icon_button_2         = 'ICON_CANCEL'
+      default_button        = '2'
+      display_cancel_button = space
+    IMPORTING
+      answer                = lv_answer
+    EXCEPTIONS
+      text_not_found        = 1
+      OTHERS                = 2.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+  CHECK lv_answer = '1'.
+
+*.. Loop on the selected contract items
+  LOOP AT gt_vbmtv WHERE selkz EQ gc_charx AND
+                         exclu NE gc_charx.
+*...... Lock contract
+    CALL FUNCTION 'ENQUEUE_EVVBAKE'
+      EXPORTING
+        vbeln          = gt_vbmtv-vbeln
+      EXCEPTIONS
+        foreign_lock   = 1
+        system_failure = 2
+        OTHERS         = 3.
+    IF sy-subrc <> 0.
+*........ Contract &1 already locked by user &2. Back-billing not possible.
+      syst-msgv4 = syst-msgv1.
+      MESSAGE e013 WITH gt_vbmtv-vbeln sy-msgv4 INTO gv_msg.
+      PERFORM add_message_to_log.
+      gt_vbmtv-zzcol = gc_red.
+    ENDIF.
+
+    lt_vbap_bb-vbeln = gt_vbmtv-vbeln.
+    lt_vbap_bb-posnr = gt_vbmtv-posnr.
+    APPEND lt_vbap_bb.
+
+*.. In update task
+    CALL FUNCTION 'YAM_VBAP_BB_UPDATE' IN UPDATE TASK
+      TABLES
+        it_vbap_bb = lt_vbap_bb.
+
+    COMMIT WORK AND WAIT.
+    IF sy-subrc EQ 0.
+*...... Contract item &1 &2 has been successfully rejected.
+      MESSAGE s015 WITH gt_vbmtv-vbeln gt_vbmtv-posnr INTO gv_msg.
+      PERFORM add_message_to_log.
+      gt_vbmtv-zzcol = gc_green.
+      gt_vbmtv-exclu = 'X'.
+    ELSE.
+*...... Rejection of contract item &1 &2 has failed.
+      MESSAGE s016 WITH gt_vbmtv-vbeln gt_vbmtv-posnr INTO gv_msg.
+      PERFORM add_message_to_log.
+      gt_vbmtv-zzcol = gc_red.
+    ENDIF.
+
+*.... Deselect the items
+    CLEAR gt_vbmtv-selkz.
+
+    MODIFY gt_vbmtv.
+    FREE lt_vbap_bb.
+  ENDLOOP.
+ENDFORM.                    " reject_items

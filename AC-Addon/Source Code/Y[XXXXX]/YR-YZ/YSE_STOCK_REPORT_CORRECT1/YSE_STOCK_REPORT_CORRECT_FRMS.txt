@@ -1,0 +1,553 @@
+*----------------------------------------------------------------------*
+* Program ID     : YSE_STOCK_REPORT_CORRECT_VAF01                      *
+* Program Title  : YSE_STOCK_REPORT table changes for                  *
+*                : YSE_STOCK_VAL_PREV_PERIOD                           *
+* Author         : Dashmantha                                          *
+* Date           : 23.01.2017                                          *
+* Change Request : CR4131                                              *
+* Transport      : CD1K990757                                          *
+* Description    : Correcting YSE_STOCK_REPORT table data              *
+*----------------------------------------------------------------------*
+*----------------------------------------------------------------------*
+***INCLUDE YSE_STOCK_REPORT_CORRECT_VAF01 .
+*----------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*&      Form  VALIDATE_SCREEN
+*&---------------------------------------------------------------------*
+
+FORM validate_screen .
+
+  LOOP AT SCREEN.
+    IF screen-name = 'P_TABLE'.
+      screen-input = '0'.
+    ENDIF.
+    MODIFY SCREEN.
+  ENDLOOP.
+
+ENDFORM.                    " VALIDATE_SCREEN
+*&---------------------------------------------------------------------*
+*&      Form  GET_DATA
+*&---------------------------------------------------------------------*
+*       Select data and update table suitably
+*----------------------------------------------------------------------*
+FORM get_data .
+
+* Select the complete data from YSE_STOCK_REPORT
+  SELECT * FROM (p_table)
+    INTO TABLE gt_yse_stock_report WHERE bwkey IN so_plant.
+
+* Select all material document numbers from MSEG for all materials of table YSE_STOCK_REPORT
+  IF NOT gt_yse_stock_report[] IS INITIAL.
+    SELECT werks
+           matnr
+           mblnr
+           mjahr
+           budat_mkpf
+           bwart      FROM mseg
+                      INTO TABLE gt_mseg
+                      FOR ALL ENTRIES IN gt_yse_stock_report
+                      WHERE matnr = gt_yse_stock_report-matnr
+                      AND   werks = gt_yse_stock_report-bwkey.
+    IF sy-subrc = 0 AND
+       gt_mseg[] IS NOT INITIAL.
+
+      SORT gt_mseg BY mblnr mjahr ASCENDING.
+* Select all the material document numbers dates form MKPF
+      SELECT mblnr
+             mjahr
+             budat FROM mkpf
+                    INTO TABLE gt_mkpf
+                    FOR ALL ENTRIES IN gt_mseg
+                    WHERE mblnr = gt_mseg-mblnr
+                    AND   mjahr = gt_mseg-mjahr.
+      IF sy-subrc = 0.
+        SORT gt_mseg BY mblnr mjahr.
+        SORT gt_mkpf BY mblnr mjahr.
+
+        LOOP AT gt_mseg INTO wa_mseg.
+          READ TABLE gt_mkpf INTO wa_mkpf
+                             WITH KEY mblnr = wa_mseg-mblnr
+                                      mjahr = wa_mseg-mjahr BINARY SEARCH.
+          IF sy-subrc = 0.
+            wa_mseg-budat_mkpf = wa_mkpf-budat.
+            MODIFY gt_mseg FROM wa_mseg TRANSPORTING budat_mkpf.
+            CLEAR wa_mseg.
+          ENDIF.
+        ENDLOOP.
+
+* Eliminate the records of movement types 501, 502, 561 and 562 whose date is 2016.12.31
+        LOOP AT gt_mseg INTO wa_mseg.
+          lv_tabix = sy-tabix.
+          IF ( wa_mseg-bwart = gv_501 OR
+               wa_mseg-bwart = gv_502 OR
+               wa_mseg-bwart = gv_561 OR
+               wa_mseg-bwart = gv_562 ) AND wa_mseg-budat_mkpf GE gv_date1. " 20161231
+            DELETE gt_mseg INDEX lv_tabix.
+          ENDIF.
+        ENDLOOP.
+
+* Collect only latest materil movement date.
+        SORT gt_mseg BY werks matnr ASCENDING budat_mkpf DESCENDING.
+        LOOP AT gt_mseg INTO wa_mseg.
+          wa_mseg1 = wa_mseg.
+          AT NEW matnr.
+            APPEND wa_mseg1 TO gt_mseg1.
+            CLEAR wa_mseg1.
+          ENDAT.
+        ENDLOOP.
+
+* update the latest movement dates if not correct as per table MKPF and write the log if corrected
+        SORT gt_mseg1 BY werks matnr.
+
+        LOOP AT gt_yse_stock_report INTO wa_yse_stock_report.
+          READ TABLE gt_mseg1 INTO wa_mseg1
+                              WITH KEY werks = wa_yse_stock_report-bwkey
+                                       matnr = wa_yse_stock_report-matnr
+                              BINARY SEARCH.
+
+          IF sy-subrc = 0 AND ( wa_yse_stock_report-lfgja NE wa_mseg1-budat_mkpf+0(4) OR
+                                wa_yse_stock_report-lfmon NE wa_mseg1-budat_mkpf+4(2) ).
+
+            lv_lfgja = wa_yse_stock_report-lfgja.
+            lv_lfmon = wa_yse_stock_report-lfmon.
+
+            wa_yse_stock_report-lfgja = wa_mseg1-budat_mkpf+0(4).
+            wa_yse_stock_report-lfmon = wa_mseg1-budat_mkpf+4(2).
+
+            UPDATE yse_stock_report FROM wa_yse_stock_report.
+            IF sy-subrc = 0.
+              APPEND wa_yse_stock_report TO  gt_yse_stock_report1.
+              CLEAR wa_yse_stock_report.
+*              WRITE :/ 'Period changed from'(001),
+*                        lv_lfgja,
+*                        lv_lfmon,
+*                        'TO'(002),
+*                        wa_mseg1-budat_mkpf+0(4),
+*                        wa_mseg1-budat_mkpf+4(2),
+*                        'for material'(003),
+*                        wa_yse_stock_report-matnr,
+*                        'and Plant'(004),
+*                        wa_yse_stock_report-bwkey.
+            ENDIF.
+          ENDIF.
+        ENDLOOP.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    " GET_DATA
+*&---------------------------------------------------------------------*
+*&      Form  DISPLAY
+*&---------------------------------------------------------------------*
+*       Display table yse_stock_report to spool after period update    *
+*----------------------------------------------------------------------*
+FORM display .
+***  TYPE-POOLS slis.
+***  DATA : gt_fieldcat TYPE slis_t_fieldcat_alv. "ALV Fieldcatalog
+***  DATA: lrec_layout TYPE slis_layout_alv.
+****DATA: i_fieldcat    TYPE slis_t_fieldcat_alv.
+***
+***  CALL FUNCTION 'REUSE_ALV_FIELDCATALOG_MERGE'
+***   EXPORTING
+***     i_program_name               = 'YSE_STOCK_REPORT_CORRECT' "sy-cprog
+***     i_internal_tabname           = 'YSE_STOCK_REPORT'
+****   I_STRUCTURE_NAME             =
+***     i_client_never_display       = 'X'
+****   I_INCLNAME                   = sy-cprog
+****   I_BYPASSING_BUFFER           =
+****   I_BUFFER_ACTIVE              =
+***    CHANGING
+***      ct_fieldcat                  = gt_fieldcat
+***   EXCEPTIONS
+***     inconsistent_interface       = 1
+***     program_error                = 2
+***     OTHERS                       = 3.
+***  IF sy-subrc <> 0.
+***    EXIT.
+***  ENDIF.
+***
+***  lrec_layout-colwidth_optimize = 'X'.
+***  lrec_layout-zebra             = 'X'.
+***  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+***    EXPORTING
+***      i_callback_program       = sy-repid
+***      i_callback_pf_status_set = 'SET_STATUS_10001'
+***      i_callback_user_command  = 'USER_COMMAND'
+***      is_layout                = lrec_layout
+***      it_fieldcat              = gt_fieldcat
+***    TABLES
+***      t_outtab                 = gt_yse_stock_report1
+***    EXCEPTIONS
+***      program_error            = 1
+***      OTHERS                   = 2.
+***  IF sy-subrc <> 0.
+***    EXIT.
+***  ELSE.
+***    LEAVE LIST-PROCESSING.
+***  ENDIF.
+*-------------------------------------------------------------------------------------------------------*
+
+***********************************************************************
+*                           Pattern ID : 001                           *
+*                   Begin of Pattern: A L V   C A L L                  *
+***********************************************************************
+***TYPE-POOLS:slis.
+**** Constants for ALV Events declaration
+***CONSTANTS:
+***  BEGIN OF C_alv_events,
+***  top_of_page(12) TYPE c VALUE 'TOP_OF_PAGE',  "Top Of Page
+***  End of C_alv_events.
+***CONSTANTS:
+***  c_check TYPE char1 VALUE 'X'.
+***
+***DATA:
+***wa_layout   TYPE slis_layout_alv,     "ALV Layout
+***wa_variant   TYPE disvariant,     "ALV Variant
+***it_fieldcat TYPE slis_t_fieldcat_alv, "ALV Fieldcatalog
+***it_events   TYPE slis_t_event,        "ALV Events table
+***it_sortcat  TYPE slis_t_sortinfo_alv. "ALV Sort table
+
+
+* Prepare layout for the ALV display
+Perform sub_prepare_layout USING wa_layout
+                             c_check    "Column Optimize
+                             space      "No Column Heading
+                             c_check    "Zebra layout
+                             space      "No Vertical line
+                             space      "No Key Fix
+                             c_check    "No Input
+                             space      "Window Titlebar
+                             space      "No Sumchoice
+                             space      "No total line
+                             space      "No subchoice
+                             space      "No subtotals
+                             space      "Totals only
+                             space      "Totals text
+                             space      "No scrolling
+                             space      "Detail popup
+                             space.     "Detail Titlebar
+
+* Prepare Event table for the ALV display
+Perform sub_populate_events Tables it_events
+                             Using C_ALV_EVENTS-TOP_OF_PAGE
+                                  'SUB_TOP_OF_PAGE'.
+
+
+* Prepare field catalog for the ALV display
+PERFORM sub_create_fieldcatalog.
+
+* Display report output
+Perform sub_display_report TABLES gt_yse_stock_report1 "YSE_STOCK_REPORT
+                        Using sy-cprog        "Callback program
+                              wa_layout       "Display layout
+                              it_fieldcat     "Field Catalog
+                              it_sortcat      "Sort details
+                              C_check         "Variant(A, ,U,X)
+                              wa_variant      "Display Variant
+                              it_events       "Events
+                              'YSE_STOCK_REPORT'     "Output itab name
+                              c_check.        "Grid display
+
+ENDFORM.                    " DISPLAY
+*&------------------------------------------------------------------*
+*&      Form  SUB_create_fieldcatalog
+*&------------------------------------------------------------------*
+*       text
+*-------------------------------------------------------------------*
+*       No parameter passed
+*-------------------------------------------------------------------*
+FORM sub_create_fieldcatalog .
+  Perform sub_build_fieldcat_tab Tables it_fieldcat using:
+'YSE_STOCK_REPORT' 'FIELD' ' ' 'DB_TAB' ' ' ' ' 'FLD TEXT' ' ' ' ' ' ' 'L'.
+ENDFORM.                    " sub_create_fieldcatalog
+*&-------------------------------------------------------------------
+*&      Form  sub_prepare_layout
+*&------------------------------------------------------------------*
+*   Prepare the Layout of the Report Output List
+*-------------------------------------------------------------------*
+*      -->P_WA_LAYOUT             " Layout structure
+*      -->P_NO_COLHEAD            " No Column Headings
+*      -->P_ZEBRA                 " Stripped Pattern
+*      -->P_NO_VLINE              " Columns Separated by Space
+*      -->P_NO_KEYFIX             " Do not fix key fields
+*      -->P_NO_INPUT              " Display fields only
+*      -->P_WINDOW_TITLEBAR       " Title of List
+*      -->P_NO_SUMCHOICE          " No Summation Choice
+*      -->P_NO_TOTALLINE          " Do not show total Line
+*      -->P_NO_SUBCHOICE          " No Subtotal Choice
+*      -->P_NO_SUBTOTALS          " Do not Show Subtotals
+*      -->P_TOTALS_ONLY           " Show Totals only
+*      -->P_TOTALS_TEXT           " Totals Text
+*      -->P_NO_SCROLLING          " Allow no scrolling
+*      -->P_DETAIL_POPUP          " Show details in a Popup
+*      -->P_DETAIL_TITLEBAR       " Tile for the Detail window
+*-------------------------------------------------------------------*
+FORM sub_prepare_layout USING p_wa_layout     TYPE slis_layout_alv
+                              p_col_optimize  TYPE any
+                              p_no_colhead    TYPE any
+                              p_zebra         TYPE any
+                              p_no_vline      TYPE any
+                              p_no_keyfix     TYPE any
+                              p_no_input      TYPE any
+                              p_window_titlebar TYPE any
+                              p_no_sumchoice  TYPE any
+                              p_no_totalline  TYPE any
+                              p_no_subchoice  TYPE any
+                              p_no_subtotals  TYPE any
+                              p_totals_only   TYPE any
+                              p_totals_text   TYPE any
+                              p_no_scrolling  TYPE any
+                              p_detail_popup  TYPE any
+                              p_detail_titlebar TYPE any.
+
+  p_wa_layout-colwidth_optimize        = p_col_optimize.
+  p_wa_layout-no_colhead               = p_no_colhead.
+  p_wa_layout-zebra                    = p_zebra.
+  p_wa_layout-no_vline                 = p_no_vline.
+  p_wa_layout-no_keyfix                = p_no_keyfix.
+  p_wa_layout-no_input                 = p_no_input.
+  p_wa_layout-window_titlebar          = p_window_titlebar.
+  p_wa_layout-no_sumchoice             = p_no_sumchoice.
+  p_wa_layout-no_totalline             = p_no_totalline.
+  p_wa_layout-no_subchoice             = p_no_subchoice.
+  p_wa_layout-no_subtotals             = p_no_subtotals.
+  p_wa_layout-totals_only              = p_totals_only.
+  p_wa_layout-totals_text              = p_totals_text.
+  p_wa_layout-no_scrolling             = p_no_scrolling.
+  p_wa_layout-detail_popup             = p_detail_popup.
+  p_wa_layout-detail_titlebar          = p_detail_titlebar.
+
+ENDFORM.                    " sub_prepare_layout
+*&------------------------------------------------------------------*
+*      Form sub_build_fieldcat_tab
+*&------------------------------------------------------------------*
+*    This subroutine is used to build the field catalog table for
+*    generating an ALV report
+*-------------------------------------------------------------------*
+*    Parameters:
+*    tablename       --> Internal Table Name
+*    fieldname       --> Internal Table Field Name
+*    key             --> (X or space) to declare field as key
+*    referencetable  --> Reference table
+*    outputactive    --> Output active
+*    col_posn        --> Cloumn Position
+*    col_hdng        --> Column heading
+*    datatype        --> Data Type
+*    outputlen       --> Length of output
+*    description     --> Desciption text
+*    justification   --> Justification of output L, R etc
+*-------------------------------------------------------------------*
+FORM sub_build_fieldcat_tab TABLES p_i_fieldcatalog
+                             USING tablename      TYPE any
+                                   fieldname      TYPE any
+                                   key            TYPE any
+                                   referencetable TYPE any
+                                   outputactive   TYPE any
+                                   col_posn       TYPE any
+                                   col_hdng       TYPE any
+                                   datatype       TYPE any
+                                   outputlen      TYPE any
+                                   description    TYPE any
+                                   justification  TYPE any.
+
+  DATA l_fieldcat TYPE slis_fieldcat_alv.
+
+  l_fieldcat-tabname      = tablename.      " Internal Table Name
+  l_fieldcat-fieldname    = fieldname.      " Internal Table Fld Name
+  l_fieldcat-key          = key. "(X or space) to declare fld as key
+  l_fieldcat-ref_tabname  = referencetable. " Reference table
+  l_fieldcat-no_out       = outputactive.   " Output active
+  l_fieldcat-col_pos      = col_posn.       " Cloumn Position
+  l_fieldcat-reptext_ddic = col_hdng.       " Column heading
+  l_fieldcat-datatype     = datatype.       " Data Type
+  l_fieldcat-outputlen    = outputlen.      " Length of output
+  l_fieldcat-seltext_m    = description.    " Desciption text
+  l_fieldcat-just         = justification.  " Justification
+
+*  APPEND l_fieldcat TO p_i_fieldcatalog.
+
+ENDFORM.                    " sub_build_fieldcat_tab
+
+*&-----------------------------------------------------------------*
+*&      Form  sub_populate_events
+*&-----------------------------------------------------------------*
+*     Populate events for the ALV report
+*------------------------------------------------------------------*
+*      -->P_NAME  Name of the Event
+*      -->P_FORM  Name of the Subroutine to handle the Event
+*------------------------------------------------------------------*
+FORM sub_populate_events TABLES p_i_event
+                          USING p_name       TYPE any
+                                p_form       TYPE any.
+
+  DATA  l_wa_event TYPE slis_alv_event.
+
+  l_wa_event-name          = p_name.
+  l_wa_event-form          = p_form.
+  APPEND l_wa_event TO p_i_event.
+
+ENDFORM.                    " sub_populate_events
+
+*&-----------------------------------------------------------------*
+*&      Form  sub_add_sort_field
+*&-----------------------------------------------------------------*
+*        Add a Field to the Sort Catalog
+*------------------------------------------------------------------*
+*      -->P_SPOS              " Sort Postion
+*      -->P_FIELDNAME         " Sort Field
+*      -->P_TABNAME           " Sort Table
+*      -->P_UP                " Sort Ascending
+*      -->P_DOWN              " Sort Descending
+*      -->P_SUBTOT            " Sobtotal on the Field
+*------------------------------------------------------------------*
+FORM sub_add_sort_field TABLES p_i_sortcatalog
+                         USING p_spos          TYPE any
+                               p_fieldname     TYPE any
+                               p_tabname       TYPE any
+                               p_up            TYPE any
+                               p_down          TYPE any
+                               p_subtot        TYPE any.
+
+* Internal table and Work area for ALV field Sort Catalog
+  DATA  l_wa_sortcat TYPE slis_sortinfo_alv  .
+
+  l_wa_sortcat-spos          = p_spos.
+  l_wa_sortcat-fieldname     = p_fieldname.
+  l_wa_sortcat-tabname       = p_tabname.
+  l_wa_sortcat-up            = p_up.
+  l_wa_sortcat-down          = p_down.
+  l_wa_sortcat-subtot        = p_subtot.
+  APPEND l_wa_sortcat TO p_i_sortcatalog.
+
+ENDFORM.                    " sub_add_sort_field
+*&------------------------------------------------------------------*
+*&      Form  sub_display_report
+*&------------------------------------------------------------------*
+*   Call the ALV Interface to Display the Report Output List
+*-------------------------------------------------------------------*
+*      -->P_I_OUTTAB                " Output List Internal Table
+*      -->P_I_CALLBACK_PROGRAM      " Callback Program name
+*      -->P_IS_LAYOUT               " Layout Defination
+*      -->P_IT_FIELDCAT             " Field Catalog
+*      -->P_IT_SORT                 " Sort Catalog
+*      -->P_SAVE                    " Allow saving of User Variants
+*      -->P_IS_VARIANT              " Variant Name
+*      -->P_IT_EVENTS               " List Events
+*      -->P_FLAG                    " Flg determine LIST/GRID display
+*-------------------------------------------------------------------*
+FORM sub_display_report TABLES p_i_outtab
+                         USING value(p_i_callback_program) TYPE any
+                               p_is_layout                 TYPE any
+                               p_it_fieldcat               TYPE any
+                               p_it_sort                   TYPE any
+                               p_save                      TYPE any
+                               p_is_variant                TYPE any
+                               p_it_events                 TYPE any
+                               p_itabname                  TYPE any
+                               p_flag                      TYPE any.
+
+  DATA l_tabname(30) TYPE c.
+  l_tabname = p_itabname.
+  TRANSLATE l_tabname TO UPPER CASE.
+
+* Merge field characteristics from Dictionary
+  CALL FUNCTION 'REUSE_ALV_FIELDCATALOG_MERGE'
+    EXPORTING
+      i_structure_name       = 'YSE_STOCK_REPORT'
+*      i_program_name     = p_i_callback_program
+*      i_internal_tabname = l_tabname
+*      i_inclname         = p_i_callback_program
+    CHANGING
+      ct_fieldcat        = p_it_fieldcat.
+
+  IF p_flag IS INITIAL.         "ALV List display
+
+    CALL FUNCTION 'REUSE_ALV_LIST_DISPLAY'
+      EXPORTING
+        i_callback_program = p_i_callback_program
+        is_layout          = p_is_layout
+        it_fieldcat        = p_it_fieldcat
+        it_sort            = p_it_sort
+        i_save             = p_save
+        is_variant         = p_is_variant
+        it_events          = p_it_events
+      TABLES
+        t_outtab           = p_i_outtab
+      EXCEPTIONS
+        program_error      = 1
+        OTHERS             = 2.
+    IF sy-subrc NE 0.
+*     Error handling
+    ENDIF.
+
+  ELSE.
+
+*   ALV Grid display
+    CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+      EXPORTING
+        i_callback_program = p_i_callback_program
+        is_layout          = p_is_layout
+        it_fieldcat        = p_it_fieldcat
+        it_sort            = p_it_sort
+        i_save             = p_save
+        is_variant         = p_is_variant
+        it_events          = p_it_events
+      TABLES
+        t_outtab           = gt_yse_stock_report1 "p_i_outtab
+      EXCEPTIONS
+        program_error      = 1
+        OTHERS             = 2.
+    IF sy-subrc NE 0.
+*     Error handling
+    ENDIF.
+
+  ENDIF.
+
+ENDFORM.                    " sub_display_report
+*&------------------------------------------------------------------*
+*&      Form  SUB_TOP_OF_PAGE
+*&------------------------------------------------------------------*
+*       Subroutine for Top of Page for ALV
+*-------------------------------------------------------------------*
+FORM SUB_TOP_OF_PAGE.
+  DATA
+  it_header   TYPE slis_t_listheader.   "ALV header
+  CONSTANTS: c_hyphen(1)   TYPE c VALUE '-'.   " Hyphen
+  DATA  l_alv_header       TYPE slis_listheader.
+
+* Title for ALV
+  l_alv_header-typ  = 'H'.
+  l_alv_header-info = 'Period correction in table YSE_STOCK_REPORT'.
+  APPEND l_alv_header TO it_header .
+  CLEAR l_alv_header.
+
+* First detail
+  l_alv_header-typ   = 'S'.
+  l_alv_header-key   = 'Program:'.
+  l_alv_header-info  = sy-repid.
+  l_alv_header-info+42  = 'System:'.
+  l_alv_header-info+50  = sy-sysid.
+  l_alv_header-info+53  = c_hyphen.
+  l_alv_header-info+54  = sy-mandt.
+  APPEND l_alv_header TO it_header .
+  CLEAR l_alv_header.
+
+* Second Detail
+  l_alv_header-typ  = 'S'.
+  l_alv_header-key   = 'User ID:'.
+  l_alv_header-info =  sy-uname.
+  l_alv_header-info+22  = 'Date:'.
+  l_alv_header-info+28  = sy-datum.
+  l_alv_header-info+42  = 'Time:'.
+  l_alv_header-info+47  = sy-uzeit.
+  APPEND l_alv_header TO it_header .
+  CLEAR l_alv_header.
+  CALL FUNCTION 'REUSE_ALV_COMMENTARY_WRITE'
+    EXPORTING
+      it_list_commentary = it_header.
+ENDFORM.                    "SUB_TOP_OF_PAGE
+
+***********************************************************************
+*                           Pattern ID : 001                           *
+*                    End of Pattern: A L V   C A L L                   *
+***********************************************************************

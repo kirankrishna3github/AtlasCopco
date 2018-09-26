@@ -1,0 +1,296 @@
+*&---------------------------------------------------------------------*
+*& Report  YSE_SEND_IDOC_AC_CONNECT_CUR                                *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+*&                                                                     *
+*& AC Connect : AC Connect : Send Currency Rates Idocs                 *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+*  Author                : Jules Smets
+*  Date                  : 28.04.2009
+*  Change Request Number : CR0101
+*  Transport request Nr. : CD1K947719
+*----------------------------------------------------------------------*
+*                                                                      *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME     |CORRECTION NUMBER| CHANGE REFERENCE # *
+*----------------------------------------------------------------------*
+* MOD-001 |01.01.9999|          |CD1K9.....       |(Description)       *
+*----------------------------------------------------------------------*
+
+************************************************************************
+
+REPORT  yse_send_idoc_ac_connect_cur  MESSAGE-ID yam_inf    .
+
+TABLES : yse_sd_acc_curr.
+
+DATA: gv_rate      LIKE tcurr-ukurs,
+      gv_ratef     LIKE tcurr-ukurs,
+      gv_typed     LIKE tcurr-kurst,
+      gv_ffact(5)  TYPE n,
+      gv_tfact(5)  TYPE n,
+      gv_datef     TYPE datum,
+      gv_dateo     TYPE datum.
+
+DATA: i_edidc_control_comm LIKE edidc OCCURS 1 WITH HEADER LINE ,
+      i_edidd_data LIKE edidd OCCURS 0 WITH HEADER LINE .
+DATA: wa_edidc    LIKE edidc.
+DATA: created_idocs LIKE sy-tabix.
+
+DATA: it_curr TYPE TABLE OF yse_sd_acc_curr
+                   WITH HEADER LINE.
+
+DATA: BEGIN OF it_rate OCCURS 0.
+        INCLUDE STRUCTURE yse_e1_acc_cur_rate.
+DATA:   vkorg           TYPE vkorg,
+      END OF it_rate.
+
+TYPES: BEGIN OF t_cur.
+        INCLUDE STRUCTURE yse_e1_acc_cur_rate.
+TYPES: END OF t_cur.
+DATA: it_cur TYPE TABLE OF t_cur WITH HEADER LINE.
+DATA: wa_cur TYPE t_cur.
+
+CONSTANTS : c_input           TYPE c     VALUE '0',
+            c_ls(2)           TYPE c     VALUE 'LS',
+            c_mestyp_pric     LIKE edidc-mestyp VALUE 'YSE_ACC_CUR',
+            c_idoc_type_pric  LIKE edidc-idoctp VALUE 'YSE_ACC_CUR',
+            c_segment_cur(20) TYPE c           VALUE 'YSE_E1_ACC_CUR_RATE',
+            c_x(1)            TYPE c     VALUE 'X',
+            c_v(2)            TYPE c     VALUE 'V ',
+            c_004(3)          TYPE c     VALUE '004',
+            c_0000(4)         TYPE c     VALUE '0000',
+            c_underscore(1)   TYPE c     VALUE '_',    " Underscore
+            c_sc1(3)          TYPE c     VALUE 'SC1'.
+
+* Selection
+PARAMETERS: p_mess  LIKE tbdme-mestyp OBLIGATORY DEFAULT 'YSE_ACC_CUR'
+                    MODIF ID sc1.
+SELECTION-SCREEN: BEGIN OF BLOCK block1 WITH FRAME TITLE text-001.
+SELECT-OPTIONS: s_famb   FOR yse_sd_acc_curr-famback,
+                s_fcurr  FOR yse_sd_acc_curr-fcurr,
+                s_tcurr  FOR yse_sd_acc_curr-tcurr,
+                s_kurst  FOR yse_sd_acc_curr-kurst.
+PARAMETERS:     p_datec  LIKE sy-datum DEFAULT sy-datum.
+SELECTION-SCREEN: END OF BLOCK block1.
+
+************************************************************************
+*    Disable Message Type Screen Field                                 *
+************************************************************************
+AT SELECTION-SCREEN OUTPUT.
+
+  LOOP AT SCREEN.
+    IF screen-group1 = c_sc1.
+      screen-input   = c_input.
+      MODIFY SCREEN.
+      CONTINUE.
+    ENDIF.
+  ENDLOOP.
+
+
+************************************************************************
+*       I N I T I A L I Z A T I O N    E V E N T                       *
+************************************************************************
+INITIALIZATION.
+
+
+************************************************************************
+*       S T A R T - O F - S E L E C T I O N    E V E N T               *
+************************************************************************
+START-OF-SELECTION.
+
+* Get the information
+  PERFORM get_detail.
+
+
+************************************************************************
+*       E N D - O F - S E L E C T I O N    E V E N T                   *
+************************************************************************
+END-OF-SELECTION .
+
+  IF it_cur[] IS INITIAL .
+    WRITE: / 'No Idocs created'.
+  ELSE.
+*   Generate Idoc's
+    PERFORM create_idocs_pric USING p_mess.
+    WRITE : /   created_idocs , ' Idocs created'.
+  ENDIF.
+  WRITE: / 'Job finished'.
+
+
+************************************************************************
+*--- S U B R O U T I N E S --------------------------------------------*
+************************************************************************
+*&---------------------------------------------------------------------*
+*&      Form  Validate_ALE_Configuration
+*&---------------------------------------------------------------------*
+FORM validate_ale_configuration .
+
+  DATA: l_create_idoc     TYPE     c .
+
+* CHECK IF IDOC CONFIGURATION IS READY AND IDOC CAN BE PROCESSED.
+  CALL FUNCTION 'ALE_MODEL_DETERMINE_IF_TO_SEND'
+    EXPORTING
+      message_type           = p_mess
+    IMPORTING
+      idoc_must_be_sent      = l_create_idoc
+    EXCEPTIONS
+      own_system_not_defined = 1
+      OTHERS                 = 2.
+
+  IF sy-subrc <> 0.
+    MESSAGE e029 WITH p_mess.
+    EXIT.
+  ENDIF.
+
+ENDFORM.                    " Validate_ALE_Configuration
+
+*&---------------------------------------------------------------------*
+*&      Form  Get_Detail
+*&---------------------------------------------------------------------*
+*       To get the information for selected Back-end FAM's
+*----------------------------------------------------------------------*
+FORM get_detail.
+
+  CLEAR: it_curr, it_cur.
+  REFRESH: it_curr, it_cur.
+
+* Select conditions data based on Selection screen parameters
+  SELECT * INTO TABLE it_curr
+           FROM yse_sd_acc_curr
+           WHERE famback IN s_famb
+             AND fcurr IN s_fcurr
+             AND tcurr IN s_tcurr
+             AND kurst IN s_kurst.
+* Process Error - No data found for the Selected S.O.
+  IF sy-subrc NE 0 .
+    WRITE: text-e01.
+    EXIT.
+  ENDIF .
+
+  SORT it_curr.
+
+* Get conditions
+  LOOP AT it_curr.
+*   Get rate
+    CALL FUNCTION 'READ_EXCHANGE_RATE'
+      EXPORTING
+*        CLIENT                  = SY-MANDT
+        date                    = p_datec
+        foreign_currency        = it_curr-fcurr
+        local_currency          = it_curr-tcurr
+        type_of_rate            = it_curr-kurst
+*        exact_date              =
+      IMPORTING
+        exchange_rate           = gv_rate
+*        foreign_factor          = gv_ffact
+*        local_factor            = gv_tfact
+        valid_from_date         = gv_datef
+*        derived_rate_type       = gv_typed
+*        fixed_rate              = gv_ratef
+*        oldest_rate_from        = gv_dateo
+      EXCEPTIONS
+        no_rate_found           = 1
+        no_factors_found        = 2
+        no_spread_found         = 3
+        derived_2_times         = 4
+        overflow                = 5
+        zero_rate               = 6
+        OTHERS                  = 7
+              .
+    IF sy-subrc <> 0.
+*     MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*             WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+    ELSE.
+      CLEAR it_cur.
+      it_cur-orgid = it_curr-famback.
+      it_cur-fcurr = it_curr-fcurr.
+      it_cur-tcurr = it_curr-tcurr.
+      it_cur-gdatu = gv_datef.
+      it_cur-ukurs = ABS( gv_rate ).
+      IF gv_rate < 0.
+        it_cur-multp = 'D'.
+      ELSE.
+        it_cur-multp = 'M'.
+      ENDIF.
+      APPEND it_cur.
+    ENDIF.
+
+  ENDLOOP.
+
+  SORT it_cur.
+
+ENDFORM.                    " Get_Detail
+
+*&---------------------------------------------------------------------*
+*&      Form  create_idocs_pric
+*&---------------------------------------------------------------------*
+*      -->MESSAGE_TYPE
+*----------------------------------------------------------------------*
+FORM create_idocs_pric  USING    message_type.
+
+  CLEAR: created_idocs.
+
+* FIND RECEIVING PARTNER
+  SELECT SINGLE rcvprn INTO wa_edidc-rcvprn
+         FROM edp13
+         WHERE mestyp = c_mestyp_pric.
+* Control Record
+  wa_edidc-mestyp =  c_mestyp_pric.
+  wa_edidc-idoctp =  c_idoc_type_pric.
+  wa_edidc-rcvprt =  c_ls.
+
+  LOOP AT it_cur INTO wa_cur.
+    CLEAR i_edidd_data[].
+    i_edidd_data-segnam  = c_segment_cur.
+    i_edidd_data-sdata   = wa_cur.
+    APPEND i_edidd_data.
+    CLEAR i_edidd_data.
+
+    IF NOT i_edidd_data[] IS INITIAL.
+      CALL FUNCTION 'MASTER_IDOC_DISTRIBUTE'
+        EXPORTING
+          master_idoc_control            = wa_edidc
+        TABLES
+          communication_idoc_control     = i_edidc_control_comm
+          master_idoc_data               = i_edidd_data
+        EXCEPTIONS
+          error_in_idoc_control          = 1
+          error_writing_idoc_status      = 2
+          error_in_idoc_data             = 3
+          sending_logical_system_unknown = 4
+          OTHERS                         = 5.
+
+      IF sy-subrc <> 0.
+
+      ELSE.
+        created_idocs = created_idocs + 1.
+      ENDIF.
+
+      CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'.
+
+      CALL FUNCTION 'EDI_DOCUMENT_DEQUEUE_LATER'
+        EXPORTING
+          docnum                 = i_edidc_control_comm-docnum
+        EXCEPTIONS
+          idoc_is_not_to_dequeue = 1
+          OTHERS                 = 2.
+
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    " CREATE_IDOCS_PRIC
+
+*Text symbol text£º
+*001:Selection parameters
+
+*E01:No data found for the selected Back-end FAM's & currencies
+*Selection text£º
+*P_DATEC:        Currency date
+*P_MESS:        Message type
+*S_FAMB:        Back-end FAM
+*S_FCURR:D       .
+*S_KURST:D       .
+*S_TCURR:D       .

@@ -1,0 +1,735 @@
+************************************************************************
+*     REPORT RM07MSAL  (MB5S, GR/IV-balances)                          *
+************************************************************************
+REPORT rm07msal MESSAGE-ID m7.
+* April 2006 MS                                             "n927484
+* Invoice amount is always the 'Invoice amount' and not the "n927484
+* WRX-amount (design); but the difference between the       "n927484
+* invoice amount and the invoice WRX-amount is added or     "n927484
+* subtract from the GR value                                "n927484
+*  -> this happens for the non-freight line, but not for    "n927484
+*     the freight line                                      "n927484
+
+* May 2005 TW
+* F4 mathcode search should be possible for purchase document "847458
+
+* May 2004 MM                                               "n725824
+* - ignore quantities of the history when the PO item has   "n725824
+*   item category service ( PSTYP = 9 ) and no service-     "n725824
+*   based invoice verification ( LEBRE is initial ).        "n725824
+* - process item category, its text and field LEBRE as      "n725824
+*   hidden fields                                           "n725824
+* - work with the ALV interface check in debugging mode     "n725824
+
+* April 2003 MM                                             "n603595
+* consider the second debit/credit indicator EKBZ-SHKKO     "n603595
+* for purchase orders with return items                     "n603595
+
+* posting for account maintenance of the freight clearing   "n480237
+* account were not considered                               "n480237
+*-----------------------------------------------------------------------*
+* MOD. NO.|  DATE      | NAME               | CORRECT.NR.  | CHANGE REF.*
+*-----------------------------------------------------------------------*
+* MOD-001 | 30/05/2013 | D.Praveen Babu     | CD1K976401   | CR2936     *
+*-----------------------------------------------------------------------*
+TYPE-POOLS: slis.
+CLASS cl_mmim_auth DEFINITION LOAD.
+
+* replace view v_mmin_bs by "select ... inner join"         "n603595
+TABLES: ekko, ekpo, ekbz, ekbes, t001.                      "n603595
+                                                            "n603595
+DATA: BEGIN OF ibs OCCURS 0,                                "n603595
+        EBELN                like  EKKO-EBELN,              "n603595
+        BUKRS                like  EKKO-BUKRS,              "n603595
+        BSTYP                like  EKKO-BSTYP,              "n603595
+        LIFNR                like  EKKO-LIFNR,              "n603595
+        EKORG                like  EKKO-EKORG,              "n603595
+        EKGRP                like  EKKO-EKGRP,              "n603595
+                                                            "n603595
+        EBELP                like  EKPO-EBELP,              "n603595
+        MATNR                like  EKPO-MATNR,              "n603595
+        MENGE                like  EKPO-MENGE,              "n603595
+        MEINS                like  EKPO-MEINS,              "n603595
+        BPRME                like  EKPO-BPRME,              "n603595
+        NETPR                like  EKPO-NETPR,              "n603595
+        PEINH                like  EKPO-PEINH,              "n603595
+        WEBRE                like  EKPO-WEBRE,              "n603595
+        WEPOS                like  EKPO-WEPOS,              "n603595
+        REPOS                like  EKPO-REPOS,              "n603595
+        WAERS                like  EKKO-WAERS,              "n603595
+        WEUNB                like  EKPO-WEUNB,              "n603595
+        ELIKZ                like  EKPO-ELIKZ,              "n603595
+        retpo                like  ekpo-retpo,              "n603595
+*       Item category in purchasing document and           "n725824
+*       Indicator for service-based invoice verification   "n725824
+        pstyp                like  ekpo-pstyp,              "n725824
+        lebre                like  ekpo-lebre,              "n725824
+      END OF ibs.                                           "n603595
+
+DATA: BEGIN OF itab OCCURS 0.
+        INCLUDE STRUCTURE ibs.                              "n603595
+DATA: wemng LIKE ekbes-wemng,
+      remng LIKE ekbes-wemng,
+      wewrt LIKE ekbes-wewrt,
+      rewrt LIKE ekbes-rewrt,
+*       to save the currency key from the PO                "n603595
+      BWAER                like  EKKO-WAERS,                "n603595
+      frlif LIKE am07m-frlif,
+*       Item category in PO and text for item category      "n725824
+      epstp                like  t163y-epstp,               "n725824
+      ptext                like  t163y-ptext,               "n725824
+      color TYPE slis_t_specialcol_alv.
+DATA: END OF itab.
+
+DATA: BEGIN OF header OCCURS 0,
+        ekorg LIKE v_mmim_bs-ekorg,
+        ekgrp LIKE v_mmim_bs-ekgrp,
+        lifnr LIKE v_mmim_bs-lifnr,
+      END OF header.
+
+DATA BEGIN OF iekbe OCCURS 0.
+        INCLUDE STRUCTURE ekbe.
+DATA END OF iekbe.
+DATA BEGIN OF iekbz_temp OCCURS 0.
+        INCLUDE STRUCTURE ekbz.
+DATA END OF iekbz_temp.
+DATA BEGIN OF iekbes OCCURS 0.
+        INCLUDE STRUCTURE ekbes.
+DATA END OF iekbes.
+DATA BEGIN OF iekbez OCCURS 0.
+        INCLUDE STRUCTURE ekbez.
+DATA END OF iekbez.
+DATA BEGIN OF iekbnk OCCURS 0.
+        INCLUDE STRUCTURE ekbnk.
+DATA END OF iekbnk.
+
+DATA: BEGIN OF iekbz OCCURS 0,
+        lifnr LIKE ekbz-lifnr,
+        bewtp LIKE ekbz-bewtp,
+        shkzg LIKE ekbz-shkzg,
+        menge LIKE ekbz-menge,
+        dmbtr LIKE ekbz-dmbtr,
+        arewr LIKE ekbz-arewr,                              "n927484
+      END OF iekbz.
+
+SELECTION-SCREEN: BEGIN OF BLOCK db WITH FRAME TITLE text-001.
+SELECT-OPTIONS: lifnr FOR ekko-lifnr MEMORY ID lif,         "n603595
+                ekorg FOR ekko-ekorg MEMORY ID eko,         "n603595
+                ekgrp FOR ekko-ekgrp MEMORY ID ekg,         "n603595
+                matnr FOR ekpo-matnr MEMORY ID mat MATCHCODE OBJECT
+                                              mat1,         "n746084
+                ebeln for ekpo-ebeln MATCHCODE OBJECT MEKK, "847458
+                ebelp FOR ekpo-ebelp.                       "n603595
+PARAMETERS:    final LIKE am07m-also_elikz DEFAULT 'X'.
+
+SELECTION-SCREEN: END OF BLOCK db.
+SELECTION-SCREEN: BEGIN OF BLOCK alv WITH FRAME TITLE text-002.
+PARAMETERS: alv_def LIKE disvariant-variant,
+            zero LIKE am07m-mb5s_zero.
+SELECTION-SCREEN: END OF BLOCK alv.
+
+INCLUDE rm07alvi.
+DATA: fc TYPE slis_fieldcat_alv OCCURS 0 WITH HEADER LINE.
+DATA: detail.
+
+INITIALIZATION.
+  PERFORM alv_init.
+
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR alv_def.
+  PERFORM alv_f4.
+
+AT SELECTION-SCREEN.
+  CALL FUNCTION 'MMIM_ENTRYCHECK_MAIN'
+    TABLES
+      it_matnr = matnr
+      it_lifnr = lifnr
+      it_ekorg = ekorg
+      it_ekgrp = ekgrp.
+
+  PERFORM alv_check.
+
+START-OF-SELECTION.
+  PERFORM read_data.
+
+END-OF-SELECTION.
+  PERFORM fieldcat_build.
+
+
+
+************************************************************************
+FORM read_data.
+  DATA: color TYPE slis_t_specialcol_alv WITH HEADER LINE.
+  RANGES: lr_elikz FOR v_mmim_bs-elikz.
+* Request for final delivery indicator:
+* - select also final deliveries: range can stay empty
+* - do not: fill range.
+  IF final IS INITIAL.
+    lr_elikz-sign   = 'I'.
+    lr_elikz-option = 'EQ'.
+    CLEAR lr_elikz-low.
+    APPEND lr_elikz.
+  ENDIF.
+* Read purchase order positions according to the selection criteria
+* replace view v_mmin_bs by "select ... inner join"         "n603595
+  select EKKO~EBELN  EKKO~BUKRS  EKKO~BSTYP                 "n603595
+         EKKO~LIFNR  EKKO~EKORG  EKKO~EKGRP                 "n603595
+         EKPO~EBELP  EKPO~MATNR  EKPO~MENGE                 "n603595
+         EKPO~MEINS  EKPO~BPRME  EKPO~NETPR                 "n603595
+         EKPO~PEINH  EKPO~WEBRE  EKPO~WEPOS                 "n603595
+         EKPO~REPOS  EKKO~WAERS  EKPO~WEUNB                 "n603595
+         EKPO~ELIKZ  ekpo~retpo                             "n603595
+*        Item category PO and flag for service-based IV    "n725824
+         ekpo~pstyp  ekpo~lebre                             "n725824
+                                                            "n603595
+    into corresponding fields of table ibs                  "n603595
+    from ekko inner join ekpo                               "n603595
+    on    ekko~mandt = ekpo~mandt                           "n603595
+      and ekko~ebeln = ekpo~ebeln                           "n603595
+                                                            "n603595
+    WHERE ekko~lifnr IN lifnr                               "n603595
+      AND ekko~ekorg IN ekorg                               "n603595
+      AND ekko~ekgrp IN ekgrp                               "n603595
+      AND ekpo~matnr IN matnr                               "n603595
+      AND ekpo~ebeln IN ebeln                               "n603595
+      AND ekpo~ebelp IN ebelp                               "n603595
+      AND ekpo~wepos <> space                               "n603595
+      AND ekpo~repos <> space                               "n603595
+      AND ekpo~weunb =  space                               "n603595
+      AND ekpo~elikz IN lr_elikz.                           "n603595
+
+  SORT ibs BY ebeln ebelp lifnr.
+* Eliminate entries without authority for the purchase organization
+  LOOP AT ibs.
+    IF NOT cl_mmim_auth=>check( i_object = 'M_BEST_EKO'
+                                I_VALUE1 = IBS-EKORG ) IS INITIAL.
+      DELETE ibs.
+    ENDIF.
+  ENDLOOP.
+
+* Read data for each PO position and create the output master table
+  LOOP AT ibs.
+    REFRESH: iekbe, iekbes, iekbez, iekbnk, iekbz, iekbz_temp.
+    CALL FUNCTION 'ME_READ_HISTORY'
+      EXPORTING
+        ebeln              = ibs-ebeln
+        ebelp              = ibs-ebelp
+        webre              = ibs-webre
+        i_bypassing_buffer = 'X'                            "388267
+        i_refresh_buffer   = 'X'                            "388267
+      TABLES
+        xekbe              = iekbe
+        xekbes             = iekbes
+        xekbez             = iekbez
+        xekbnk             = iekbnk
+        xekbz              = iekbz_temp.
+    CLEAR itab.
+    MOVE-CORRESPONDING ibs TO itab.
+
+*   save the PO currency                                    "n603595
+    move  ibs-waers          to  itab-bwaer.                "n603595
+
+* Local currency
+    IF itab-bukrs <> t001-bukrs.
+      SELECT SINGLE waers INTO (t001-waers) FROM t001
+         WHERE bukrs = itab-bukrs.
+    ENDIF.
+    itab-waers = t001-waers.
+* Goods receipts
+    LOOP AT iekbes WHERE zekkn = space.
+      ADD iekbes-wemng TO itab-wemng.
+      ADD iekbes-remng TO itab-remng.
+      ADD iekbes-rewrt TO itab-rewrt.
+      ADD iekbes-wewrt TO itab-wewrt.
+      IF iekbes-rewrt <> iekbes-arewr.
+        ADD      iekbes-rewrt TO   itab-wewrt.
+        SUBTRACT iekbes-arewr FROM itab-wewrt.
+      ENDIF.
+    ENDLOOP.
+    APPEND itab.
+* Freight costs
+    CLEAR: itab-wemng, itab-remng, itab-wewrt, itab-rewrt.
+    SORT iekbz_temp BY lifnr.
+* Copy data to internal table with vendor in FIRST position.
+* Needed for AT END OF LIFNR to detect the proper change of vendor
+    LOOP AT iekbz_temp.
+      MOVE-CORRESPONDING iekbz_temp TO iekbz.
+
+*     consider the second debit/credit indicator EKBZ-SHKKO "n603595
+*     for purchase orders with return items                 "n603595
+      if not ibs-retpo  is initial.                         "n603595
+*       this is a return item                               "n603595
+        if  not iekbz_temp-shkko is initial.                "n603595
+*         the second debit/credit indicator is filled       "n603595
+          if  not iekbz_temp-shkko = iekbz_temp-shkzg.      "n603595
+*           the credit/debit indicators differs             "n603595
+*           --> take indicator EKBZ-SHKKO                   "n603595
+            move iekbz_temp-shkko      to  iekbz-shkzg.     "n603595
+          endif.                                            "n603595
+        endif.                                              "n603595
+      endif.                                                "n603595
+
+      APPEND iekbz.
+    ENDLOOP.
+
+    LOOP AT iekbz.
+      IF iekbz-shkzg = 'H'.
+        iekbz-menge = - iekbz-menge.
+        iekbz-dmbtr = - iekbz-dmbtr.
+      ENDIF.
+      CASE iekbz-bewtp.
+        WHEN 'F'.                                  " goods receipt
+          SUBTRACT iekbz-menge FROM itab-wemng.
+          SUBTRACT iekbz-dmbtr FROM itab-wewrt.
+
+*       consider posting for account maintenance of the     "n480237
+*       freight clearing account                            "n480237
+        WHEN 'G' OR 'M' or 'K'.            " invoice 326904 "n480237
+          ADD iekbz-menge TO itab-remng.
+          ADD iekbz-dmbtr TO itab-rewrt.
+
+          IF iekbz-dmbtr <> iekbz-arewr.                    "n927484
+            ADD      iekbz-dmbtr TO   itab-wewrt.           "n927484
+            SUBTRACT iekbz-arewr FROM itab-wewrt.           "n927484
+          ENDIF.                                            "n927484
+
+      ENDCASE.
+      AT END OF lifnr.
+        itab-frlif = iekbz-lifnr.
+        APPEND itab.
+        CLEAR: itab-wemng, itab-remng,
+               itab-wewrt, itab-rewrt.
+      ENDAT.
+    ENDLOOP.
+  ENDLOOP.
+
+* define local working areas                                "n725824
+  data : begin of l_s_t163y.                                "n725824
+          include structure t163y.                          "n725824
+  data :   found(01)         type c,                        "n725824
+         end of l_s_t163y.                                  "n725824
+                                                            "n725824
+  data : l_flag_delete(01)   type c,                        "n725824
+         l_flag_service(01)  type c.                        "n725824
+
+* Eliminate entries with balanced quantities, colorize the rest
+  LOOP AT itab.
+    clear : l_flag_service,  l_flag_delete.                 "n725824
+                                                            "n725824
+*   new rules                                               "n725824
+    if  itab-pstyp = '9'  and                               "n725824
+        itab-lebre is initial.                              "n725824
+*     this is a service PO item without service-based       "n725824
+*     invoice verification ( LEBRE is initial ).            "n725824
+                                                            "n725824
+      if  itab-frlif is initial.                            "n725824
+*       check the values only                               "n725824
+        IF zero = space AND itab-wewrt = itab-rewrt.        "n725824
+          move  'X'          to  l_flag_delete.             "n725824
+        else.                                               "n725824
+          move  'X'          to  l_flag_service.            "n725824
+        endif.                                              "n725824
+      else.                                                 "n725824
+*       freight costs : check the quantities only           "n725824
+        IF zero = space AND itab-wemng = itab-remng.        "n725824
+          move  'X'          to  l_flag_delete.             "n725824
+        endif.                                              "n725824
+      endif.                                                "n725824
+    else.                                                   "n725824
+*     this is an other PO item / check quantities only      "n725824
+      IF zero       = space      AND                        "n725824
+         itab-wemng = itab-remng AND                        "n725824
+         itab-wewrt = itab-rewrt.                           "n725824
+        move  'X'            to  l_flag_delete.             "n725824
+      endif.                                                "n725824
+    endif.                                                  "n725824
+                                                            "n725824
+*(DEL) IF zero = space AND itab-wemng = itab-remng.         "n725824
+    if  l_flag_delete = 'X'.                                "n725824
+      DELETE itab.
+    ELSE.
+*     this line will be printed                             "n725824
+*     get the text of the item category                     "n725824
+      on change of itab-pstyp.                              "n725824
+        select single *      from  t163y                    "n725824
+          into corresponding fields of l_s_t163y            "n725824
+            where  spras = sy-langu                         "n725824
+              and  pstyp = itab-pstyp.                      "n725824
+                                                            "n725824
+        if  sy-subrc is initial.                            "n725824
+          move  'X'          to  l_s_t163y-found.           "n725824
+        else.                                               "n725824
+          clear              l_s_t163y.                     "n725824
+        endif.                                              "n725824
+      endon.                                                "n725824
+                                                            "n725824
+*     complete entry in table ITAB with the item category   "n725824
+      if l_s_t163y-found = 'X'.                             "n725824
+        move-corresponding  l_s_t163y                       "n725824
+                             to  itab.                      "n725824
+        modify               itab.                          "n725824
+      endif.                                                "n725824
+
+      REFRESH color.
+
+*     colorize the quantities                               "n725824
+      if   l_flag_service  is  initial     and              "n725824
+           itab-wemng      <>  itab-remng.                  "n725824
+        IF itab-wemng > itab-remng.                         "n725824
+          color-color-col = '5'.       "green               "n725824
+        ELSE.                                               "n725824
+          color-color-col = '6'.       "red                 "n725824
+        ENDIF.                                              "n725824
+                                                            "n725824
+        color-fieldname = 'WEMNG'. APPEND color.            "n725824
+        color-fieldname = 'REMNG'. APPEND color.            "n725824
+        color-fieldname = 'MEINS'. APPEND color.            "n725824
+      endif.                                                "n725824
+                                                            "n725824
+*     colorize the values for service PO                    "n725824
+      if   l_flag_service  =   'X'         and              "n725824
+           itab-wewrt      <>  itab-rewrt.                  "n725824
+        IF itab-wewrt > itab-rewrt.                         "n725824
+          color-color-col = '5'.       "green               "n725824
+        ELSE.                                               "n725824
+          color-color-col = '6'.       "red                 "n725824
+        ENDIF.                                              "n725824
+                                                            "n725824
+        color-fieldname = 'WEWRT'. APPEND color.            "n725824
+        color-fieldname = 'REWRT'. APPEND color.            "n725824
+        color-fieldname = 'WAERS'. APPEND color.            "n725824
+      endif.                                                "n725824
+
+      itab-color[] = color[].
+      MODIFY itab.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.                    "read_data
+
+************************************************************************
+FORM fieldcat_build.
+  DATA: BEGIN OF fc_struct,
+          tabname(7),
+          fieldname(6),
+          ref_tabname(6),
+          ref_fieldname(6),
+          no_out(1),
+          cqindicator(1),
+          cqfield(6),
+        END OF fc_struct.
+** Begin MOD-001
+  if sy-batch EQ 'X'.
+    DEFINE ac.
+      clear: fc, fc_struct.
+      fc_struct        = &1.
+      fc-tabname       = fc_struct-tabname.
+      fc-fieldname     = fc_struct-fieldname.
+      fc-ref_tabname   = fc_struct-ref_tabname.
+      fc-ref_fieldname = fc_struct-ref_fieldname.
+      fc-no_out        = fc_struct-no_out.
+      case fc_struct-cqindicator.
+        when 'C'.
+          fc-cfieldname = fc_struct-cqfield.
+        when 'Q'.
+          fc-qfieldname = fc_struct-cqfield.
+      endcase.
+      append fc.
+    END-OF-DEFINITION.
+
+
+    ac 'ITAB   LIFNR EKKO  LIFNR'.
+    ac 'ITAB   EBELN EKPO  EBELN'.
+    ac 'ITAB   EBELP EKPO  EBELP'.
+    ac 'ITAB   MATNR EKPO  MATNR '.
+    ac 'ITAB   MENGE EKPO  MENGE  XQMEINS'.
+    ac 'ITAB   WEMNG EKBES WEMNG  QMEINS'.
+    ac 'ITAB   REMNG EKBES REMNG  QMEINS'.
+    ac 'ITAB   MEINS EKPO  MEINS'.
+    ac 'ITAB   WEWRT EKBES WEWRT  CWAERS'.
+    ac 'ITAB   REWRT EKBES REWRT  CWAERS'.
+    ac 'ITAB   WAERS T001  WAERS'.
+    ac 'ITAB   NETPR EKPO  NETPR  XCBWAER'.
+    ac 'ITAB   BWAER EKKO  WAERS '.
+    ac 'ITAB   RETPO EKPO  RETPO'.
+    ac 'ITAB   FRLIF AM07M FRLIF X'.
+    ac 'ITAB   PEINH EKPO  PEINH X'.
+    ac 'ITAB   BPRME EKPO  BPRME X'.
+    ac 'ITAB   BSTYP EKKO  BSTYP X'.
+    ac 'ITAB   WEBRE EKPO  WEBRE X'.
+    ac 'ITAB   WEPOS EKPO  WEPOS X'.
+    ac 'ITAB   REPOS EKPO  REPOS X'.
+    ac 'ITAB   WEUNB EKPO  WEUNB X'.
+    ac 'ITAB   ELIKZ EKPO  ELIKZ X'.
+    PERFORM detail_list.
+
+  else.
+* End of MOD-001
+
+    DEFINE ac.
+      clear: fc, fc_struct.
+      fc_struct = &1.
+      fc-tabname   = fc_struct-tabname.
+      fc-fieldname = fc_struct-fieldname.
+      fc-ref_tabname = fc_struct-ref_tabname.
+      fc-ref_fieldname = fc_struct-ref_fieldname.
+      fc-no_out = fc_struct-no_out.
+      case fc_struct-cqindicator.
+        when 'C'.
+          fc-cfieldname = fc_struct-cqfield.
+        when 'Q'.
+          fc-qfieldname = fc_struct-cqfield.
+      endcase.
+      append fc.
+    END-OF-DEFINITION.
+
+
+    ac 'HEADER EKORG EKKO  EKORG'.
+    ac 'HEADER EKGRP EKKO  EKGRP'.
+    ac 'HEADER LIFNR EKKO  LIFNR'.
+    ac 'ITAB   EBELN EKPO  EBELN'.
+    ac 'ITAB   EBELP EKPO  EBELP'.
+    ac 'ITAB   MATNR EKPO  MATNR X'.
+    ac 'ITAB   FRLIF AM07M FRLIF'.
+    ac 'ITAB   MENGE EKPO  MENGE XQMEINS'.
+    ac 'ITAB   NETPR EKPO  NETPR XCBWAER'.
+    ac 'ITAB   BWAER EKKO  WAERS X'.
+    ac 'ITAB   PEINH EKPO  PEINH X'.
+    ac 'ITAB   BPRME EKPO  BPRME X'.
+    ac 'ITAB   WEMNG EKBES WEMNG  QMEINS'.
+    ac 'ITAB   REMNG EKBES REMNG  QMEINS'.
+    ac 'ITAB   MEINS EKPO  MEINS'.
+    ac 'ITAB   WEWRT EKBES WEWRT  CWAERS'.
+    ac 'ITAB   REWRT EKBES REWRT  CWAERS'.
+    ac 'ITAB   WAERS T001  WAERS'.
+    ac 'ITAB   BSTYP EKKO  BSTYP X'.
+    ac 'ITAB   WEBRE EKPO  WEBRE X'.
+    ac 'ITAB   WEPOS EKPO  WEPOS X'.
+    ac 'ITAB   REPOS EKPO  REPOS X'.
+    ac 'ITAB   WEUNB EKPO  WEUNB X'.
+    ac 'ITAB   ELIKZ EKPO  ELIKZ X'.
+
+* process indicator for retur item as hidden field          "n603595
+    ac 'ITAB   RETPO EKPO  RETPO X'.                        "n603595
+
+* process the fields Item category in PO, item category     "n725824
+* text, and indicator service-based invoice verification    "n725824
+    ac 'ITAB   EPSTP T163Y EPSTP X'.                        "n725824
+    ac 'ITAB   PTEXT T163Y PTEXT X'.                        "n725824
+    ac 'ITAB   LEBRE EKPO  LEBRE X'.                        "n725824
+    PERFORM list_output.
+  endif.
+
+
+ENDFORM.                    "fieldcat_build
+
+************************************************************************
+FORM list_output.
+  alv_keyinfo-header01 = 'EKORG'.
+  alv_keyinfo-header02 = 'EKGRP'.
+  alv_keyinfo-header03 = 'LIFNR'.
+  alv_keyinfo-item01   = 'EKORG'.
+  alv_keyinfo-item02   = 'EKGRP'.
+  alv_keyinfo-item03   = 'LIFNR'.
+  alv_keyinfo-item04   = 'EBELN'.
+
+  SORT itab BY ekorg ekgrp lifnr ebeln ebelp frlif.
+  REFRESH header.
+  LOOP AT itab.
+    ON CHANGE OF itab-ekorg OR itab-ekgrp OR itab-lifnr.
+      MOVE-CORRESPONDING itab TO header.
+      APPEND header.
+    ENDON.
+  ENDLOOP.
+
+  alv_layout-coltab_fieldname = 'COLOR'.
+
+  detail = ' '.
+
+* work with the ALV interface check in debugging mode       "n725824
+  data : l_flag_interface_check(01)    type c.              "n725824
+
+  CALL FUNCTION 'REUSE_ALV_HIERSEQ_LIST_DISPLAY'
+    EXPORTING
+      I_INTERFACE_CHECK        = l_flag_interface_check     "n725824
+      i_callback_program       = alv_repid
+      i_callback_pf_status_set = 'SET_STATUS'
+      i_callback_user_command  = 'USER_COMMAND'
+      is_layout                = alv_layout
+      it_fieldcat              = fc[]
+      i_default                = 'X'
+      i_save                   = 'A'
+      is_variant               = alv_variant
+      i_tabname_header         = 'HEADER'
+      i_tabname_item           = 'ITAB'
+      is_keyinfo               = alv_keyinfo
+      is_print                 = alv_print
+    TABLES
+      t_outtab_header          = header[]
+      t_outtab_item            = itab[]                     "n725824
+    EXCEPTIONS                                              "n725824
+      OTHERS                   = 1.                         "n725824
+                                                            "n725824
+  IF sy-subrc <> 0.                                         "n725824
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno       "n725824
+                WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.   "n725824
+  ENDIF.                                                    "n725824
+
+ENDFORM.                    "list_output
+
+************************************************************************
+
+FORM detail_list.
+
+  DATA: fc_detail TYPE slis_fieldcat_alv OCCURS 0 WITH HEADER LINE.
+  DATA: variant_detail      LIKE disvariant.
+  DATA: lt_base_list LIKE itab[].
+  alv_layout-coltab_fieldname = 'COLOR'.
+
+  detail = ' '.
+* The detail ALV may modify the list (sorting). If returned to the
+* base list, the original list needs to be restored.
+  lt_base_list[] = itab[].
+  REFRESH fc_detail.
+  LOOP AT fc.
+    MOVE-CORRESPONDING fc TO fc_detail.
+    CLEAR fc_detail-tabname.
+    APPEND fc_detail.
+  ENDLOOP.
+  CLEAR variant_detail.
+  variant_detail-report = alv_repid.
+  variant_detail-handle = 'DETA'.
+  detail = 'X'. "needed for GUI status differentiation
+
+* work with the ALV interface check in debugging mode
+  data : l_flag_interface_check(01)    type c.
+
+  CALL FUNCTION alv_detail_func
+    EXPORTING
+      i_interface_check        = l_flag_interface_check
+      i_callback_program       = alv_repid
+      i_callback_pf_status_set = 'SET_STATUS'
+      i_callback_user_command  = 'USER_COMMAND'
+      it_fieldcat              = fc_detail[]
+      i_default                = 'X'
+      is_variant               = variant_detail
+      i_save                   = 'A'
+      is_layout                = alv_layout
+      is_print                 = alv_print
+    TABLES
+      t_outtab                 = itab[]
+    EXCEPTIONS
+      OTHERS                   = 1.
+
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+                WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+  CLEAR detail.
+  itab[] = lt_base_list[].
+ENDFORM.                    "detail_list
+
+************************************************************************
+
+FORM set_status USING rt_extab TYPE slis_t_extab.  "#EC CALLED "n725824
+
+  DATA: wa TYPE slis_extab.
+  IF cl_mmim_auth=>level( ) IS INITIAL.
+    APPEND 'AUTH' TO rt_extab.
+  ENDIF.
+  IF cl_mmim_auth=>level( ) = cl_mmim_auth=>c_error.
+    MESSAGE s124(m7).
+  ENDIF.
+* Deactivate detail list if in detail list
+  IF detail = 'X'.
+    wa-fcode = 'DETAIL'.
+    APPEND wa TO rt_extab.
+  ENDIF.
+  SET PF-STATUS 'STANDARD' EXCLUDING rt_extab.
+ENDFORM.                    "set_status
+
+************************************************************************
+
+FORM user_command USING rf_ucomm LIKE sy-ucomm     "#EC CALLED "n725824
+                          rs TYPE slis_selfield.
+
+* Call from detail list: Change tablename
+  IF rs-tabname = '1'.
+    rs-tabname = 'ITAB'.
+  ENDIF.
+* Read the correct table
+  CLEAR: itab, header.
+  CASE rs-tabname.
+    WHEN 'HEADER'.
+      READ TABLE header INDEX rs-tabindex.
+      MOVE-CORRESPONDING header TO itab.
+    WHEN 'ITAB'.
+      READ TABLE itab INDEX rs-tabindex.
+  ENDCASE.
+  CHECK sy-subrc = 0.
+* Double click targets
+  IF rf_ucomm = '&IC1'.
+    CASE rs-fieldname.
+      WHEN 'LIFNR' OR 'FRLIF'.
+        rf_ucomm = 'KRED'.
+      WHEN OTHERS.
+        rf_ucomm = 'POHIST'.
+    ENDCASE.
+  ENDIF.
+* Commands
+  CASE rf_ucomm.
+    WHEN 'AUTH'.
+      CALL METHOD cl_mmim_auth=>display.
+    WHEN 'DETAIL'.
+      PERFORM detail_list.
+    WHEN 'PUOR'.
+      IF rs-tabname = 'ITAB'.
+        IF rs-fieldname <> 'EBELP'. CLEAR itab-ebelp. ENDIF.
+        CALL FUNCTION 'ME_DISPLAY_PURCHASE_DOCUMENT'
+          EXPORTING
+            i_ebeln      = itab-ebeln
+            i_ebelp      = itab-ebelp
+            i_enjoy      = 'X'
+          EXCEPTIONS
+            not_found    = 1
+            no_authority = 2
+            invalid_call = 3
+            OTHERS       = 4.
+        IF sy-subrc <> 0.
+          MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+                WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+        ENDIF.
+      ENDIF.
+    WHEN 'POHIST'.
+      IF rs-tabname = 'ITAB'.
+        SUBMIT rm06ehbe AND RETURN
+          WITH s_ebeln = itab-ebeln
+          WITH s_ebelp = itab-ebelp
+          WITH lesen    = 'Y'.
+      ENDIF.
+    WHEN 'KRED'.
+      IF rs-fieldname = 'FRLIF'. itab-lifnr = itab-frlif. ENDIF.
+      SET PARAMETER ID 'LIF' FIELD itab-lifnr.
+      CALL TRANSACTION 'MK03' AND SKIP FIRST SCREEN.
+
+  ENDCASE.
+
+
+
+  CLEAR rf_ucomm.
+ENDFORM.                    "user_command
+
+*Text symbol text£º
+*001:Database selections
+
+*002:Display options
+*Selection text£º
+*ALV_DEF:D       .
+*EBELN:D       .
+*EBELP:D       .
+*EKGRP:D       .
+*EKORG:D       .
+*FINAL:        Final delivery items also
+*LIFNR:D       .
+*MATNR:D       .
+*ZERO:        Cleared items too

@@ -1,0 +1,364 @@
+*----------------------------------------------------------------------*
+* PROGRAM ID           : YAM_I016_UNPLANNED_GDS_MVMT                   *
+* PROGRAM TITLE        : AM: I016 Unplanned Goods Movement             *
+* AUTHOR               : Ravin Malhotra                                *
+* DATE                 : 01/09/2004                                    *
+* DEVELOPMENT ID       : I016                                          *
+*                                                                      *
+* CHANGE REQUEST NUMBER:                                               *
+*                                                                      *
+* Program Description:  Outbound program to send Unplanned Material    *
+*                       used during Service Order Confirmation         *
+*                       Movement Type 961 & 962 will only be considered*
+*                                                                      *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME     |CORRECTION NUMBER| CHANGE REFERENCE # *
+*----------------------------------------------------------------------*
+* MOD-001 | 2004.12.03 | Ravin  |CD1K901057 |Initialize Logical System|*
+* MOD-002 | 2005.03.29 | L.Mertens      |CD1K901954 | CR163 |          *
+*                  - selection on entry date instead of posting date   *
+*                  - do not send zero value or orders w/o items        *
+* MOD-003 | 2005.07.07 | L. Mertens     |CD1K902757 | TPR-CP086        *
+*                  - if no worklist found job must not be canceled,    *
+*                    but an information message should be issued       *
+* MOD-004 | 2005.11.10 | L. Mertens     |CD1K902874 | CR221            *
+*                  - I016 selection on time possible                   *
+* MOD-005 | 2008-04-10 | M.Jacobs       |CD2K940551 |partner nr via    *
+*                    table yam_sel_partner                             *
+************************************************************************
+REPORT  yam_i016_unplanned_gds_mvmt   MESSAGE-ID yam_inf      .
+
+
+************************************************************************
+*                   C O N S T A N T S                                  *
+************************************************************************
+CONSTANTS :c_mestyp     LIKE edidc-mestyp VALUE 'YAM_I016' ,
+           c_idoc_type  LIKE edidc-idoctp VALUE 'YAM_I016' ,
+           c_header_segment(17) TYPE c VALUE 'YAM_E1I016_HEADER',
+           c_item_segment(16)   TYPE c VALUE 'YAM_E1I016_ITEMS' ,
+           c_ls(2)  VALUE 'LS'                             ,
+           c_sc1(3) VALUE 'SC1'                            ,
+           c_input VALUE '0'                               ,
+           c_plant      LIKE aufk-werks VALUE 'GBAA'       ,
+           c_961        LIKE aufm-bwart VALUE '961'        ,
+           c_962        LIKE aufm-bwart VALUE '962'        .
+* begin of deletion MOD-005
+*           c_clnt(4)    TYPE c VALUE 'CLNT' ,
+*           c_wbi(3)     TYPE c VALUE 'WBI'   .
+* end of deletion MOD-005
+************************************************************************
+*                   V A R I A B L E S                                  *
+************************************************************************
+DATA:  g_aufnr  TYPE aufm-aufnr ,               " Order Number
+* begin of change MOD-002
+*      g_budat  TYPE aufm-budat ,               " Date
+       g_cpudt  TYPE mkpf-cpudt ,               " Date
+* end of change MOD-002
+* begin of insert MOD-004
+       g_cputm  TYPE cputm,                     " Entry time
+* end of insert MOD-004
+* begin insertion MOD-005
+       g_bukrs  type vkbuk,
+* end of insertion MOD-005
+       g_werks  TYPE aufm-werks .               " Plant
+
+************************************************************************
+*                  I N T E R N A L   T A B L E S                       *
+************************************************************************
+
+DATA : BEGIN OF i_aufm OCCURS 0,
+          aufnr LIKE aufm-aufnr,         " Service Order Number
+          werks LIKE aufm-werks,         " Plant
+          lgort LIKE aufm-lgort,         " Storage Location
+          matnr LIKE aufm-matnr,         " Material Number
+          bwart LIKE aufm-bwart,         " Movement Type
+          erfmg LIKE aufm-erfmg,         " Quantity
+          erfme LIKE aufm-erfme,         " UOM
+       END OF i_aufm.
+
+DATA : BEGIN OF i_aufm_final OCCURS 0,
+          aufnr LIKE aufm-aufnr,         " Service Order Number
+          werks LIKE aufm-werks,         " Plant
+          lgort LIKE aufm-lgort,         " Storage Location
+          matnr LIKE aufm-matnr,         " Material Number
+          erfmg LIKE aufm-erfmg,         " Quantity
+          erfme LIKE aufm-erfme,         " UOM
+       END OF i_aufm_final .
+* begin of insertion MOD-005
+data: wa_i_aufm_final LIKE i_aufm_final.
+* end of insertion MOD-005
+
+DATA: i_edidc_control_comm LIKE edidc OCCURS 1 WITH HEADER LINE ,
+      i_edidd_data LIKE edidd OCCURS 0 WITH HEADER LINE         ,
+      wa_edidc LIKE edidc                                       ,
+      wa_order_items LIKE yam_e1i016_items                      ,
+      p_logsys LIKE tbdlst-logsys                               .
+
+
+************************************************************************
+*       S E L E C T - O P T I O N S / P A R A M E T E R S              *
+************************************************************************
+
+SELECTION-SCREEN : BEGIN OF BLOCK b1 WITH FRAME TITLE text-001.
+SELECT-OPTIONS: s_aufnr FOR g_aufnr ,  "Order Number
+* begin of change MOD-002
+*               s_budat FOR g_budat DEFAULT sy-datum,  "Posting Date
+                s_cpudt FOR g_cpudt DEFAULT sy-datum,  "Entry Date
+* end of change MOD-002
+* begin of insert MOD-004
+                s_cputm FOR g_cputm,                   "Entry time
+* end of insert MOD-004
+                s_werks FOR g_werks OBLIGATORY  DEFAULT c_plant.  "Plant
+
+*MESSAGE SYSTEM
+PARAMETERS: p_mestyp LIKE edmsg-msgtyp DEFAULT c_mestyp MODIF ID sc1.
+*DESTINATION SYSTEM
+*PARAMETERS: P_LOGSYS LIKE TBDLST-LOGSYS OBLIGATORY.
+SELECTION-SCREEN: END OF BLOCK b1.
+
+************************************************************************
+
+INITIALIZATION.
+  CALL FUNCTION 'OWN_LOGICAL_SYSTEM_GET'
+    IMPORTING
+      own_logical_system             = p_logsys
+    EXCEPTIONS
+      own_logical_system_not_defined = 1
+      OTHERS                         = 2.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+         WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+* begin of deletion MOD-005
+*  ELSE.
+*    REPLACE FIRST OCCURRENCE OF c_clnt IN p_logsys WITH c_wbi  .
+* end of deletion MOD-005
+  ENDIF.
+
+************************************************************************
+*    Disable Message Type Screen Field                                 *
+************************************************************************
+AT SELECTION-SCREEN OUTPUT.
+  LOOP AT SCREEN.
+    IF screen-group1 = c_sc1.
+      screen-input   = c_input.
+      MODIFY SCREEN.
+      CONTINUE.
+    ENDIF.
+  ENDLOOP.
+
+************************************************************************
+*       S T A R T - O F - S E L E C T I O N    E V E N T               *
+************************************************************************
+START-OF-SELECTION.
+
+** Validate if the ALE Configuration is correctly setup
+  PERFORM validate_ale_configuration .
+
+** Get the information for Movement Type 961 & 962
+  PERFORM get_detail .
+
+
+************************************************************************
+*       E N D - O F - S E L E C T I O N    E V E N T                   *
+***********************************************************************
+END-OF-SELECTION .
+
+  IF NOT i_aufm_final[] IS INITIAL .
+** Generate Idoc's
+    PERFORM create_idocs   .
+  ENDIF .
+
+*&---------------------------------------------------------------------*
+*&      Form  Validate_ALE_Configuration
+*&---------------------------------------------------------------------*
+FORM validate_ale_configuration .
+
+  DATA: l_create_idoc     TYPE     c .
+
+** Query the ALE distribution model for valid configuration .....
+  CALL FUNCTION 'ALE_MODEL_DETERMINE_IF_TO_SEND'
+    EXPORTING
+      message_type           = p_mestyp
+* begin of deletion MOD-005
+*      receiving_system       = p_logsys
+* end of deletion MOD-005
+    IMPORTING
+      idoc_must_be_sent      = l_create_idoc
+    EXCEPTIONS
+      own_system_not_defined = 1
+      OTHERS                 = 2.
+
+  IF ( sy-subrc <> 0 ).
+** Unexpected error .............................................
+* begin of change mod-005
+*   MESSAGE e038  .
+    MESSAGE e029 WITH p_mestyp.
+    EXIT.
+* end of change MOD-005
+* begin of deletion MOD-005
+*  ELSEIF ( l_create_idoc IS INITIAL ).
+** No message flow maintained in the model, nothing to do .......
+*    MESSAGE e037 WITH p_mestyp .
+*    EXIT.
+* end of deletion MOD-005
+  ENDIF.
+
+ENDFORM.                    " Validate_ALE_Configuration
+*&---------------------------------------------------------------------*
+*&      Form  Get_Detail
+*&---------------------------------------------------------------------*
+*       To get the information for Movement Type 961 & 962
+*----------------------------------------------------------------------*
+FORM get_detail .
+
+** Select data based on Selection screen parameters for movement type
+** 961 & 962
+* begin of change MOD-002
+* SELECT a~aufnr werks lgort matnr bwart erfmg erfme
+*                     INTO TABLE i_aufm
+*                     FROM       aufm
+*                     WHERE      aufnr  IN   s_aufnr
+*                     AND        werks  IN   s_werks
+*                     AND        bwart  IN  (c_961,c_962)
+*                     AND        budat  IN   s_budat .
+  SELECT a~aufnr a~werks a~lgort a~matnr a~bwart a~erfmg a~erfme
+                      INTO TABLE i_aufm
+                      FROM aufm as a inner join mkpf as b
+                      ON        a~mblnr = b~mblnr
+                      AND       a~mjahr = b~mjahr
+                      WHERE     a~aufnr IN   s_aufnr
+                      AND       a~werks IN   s_werks
+                      AND       a~bwart IN  (c_961,c_962)
+* begin of insert MOD-004
+                      AND       b~cputm IN   s_cputm
+* end of insert MOD-004
+                      AND       b~cpudt IN   s_cpudt.
+* end of change MOD-002
+
+** Process Error - No data found for the Selection Criteria
+  IF sy-subrc NE 0 .
+* begin of change MOD-003
+*   MESSAGE e039 .
+    message I039.
+* end of change
+    EXIT.
+  ENDIF .
+
+** Sort data by Service order Number, Material Number
+  SORT i_aufm BY aufnr werks lgort matnr bwart .
+
+** Populate data into Final Internal Table
+  LOOP AT i_aufm .
+    CLEAR i_aufm_final.
+    i_aufm_final-aufnr = i_aufm-aufnr .
+    i_aufm_final-werks = i_aufm-werks .
+    i_aufm_final-lgort = i_aufm-lgort .
+    i_aufm_final-matnr = i_aufm-matnr .
+    i_aufm_final-erfme = i_aufm-erfme .
+    IF i_aufm-bwart = c_961 .
+      i_aufm_final-erfmg = i_aufm-erfmg .
+    ELSEIF i_aufm-bwart = c_962 .
+      i_aufm_final-erfmg = i_aufm-erfmg * -1 .
+    ENDIF .
+    COLLECT i_aufm_final .
+  ENDLOOP .
+
+* begin of MOD-002 "skip items with zero value
+  LOOP AT i_aufm_final.
+    if i_aufm_final-erfmg = 0.
+      delete i_aufm_final.
+    endif.
+  ENDLOOP.
+* end of MOD-002
+
+ENDFORM.                    " Get_Detail
+*&---------------------------------------------------------------------*
+*&      Form  Create_IDocs
+*&---------------------------------------------------------------------*
+*       Create Idoc's
+*----------------------------------------------------------------------*
+FORM create_idocs .
+
+  DATA: l_created_comm_idocs TYPE sy-tabix .
+  CLEAR : i_edidc_control_comm ,
+          wa_edidc             ,
+          i_edidd_data         .
+
+
+** Polulate Control Record
+  wa_edidc-mestyp =  p_mestyp.
+  wa_edidc-idoctp =  c_idoc_type.
+  wa_edidc-rcvprt =  c_ls.
+* begin of deletion MOD-005
+*  wa_edidc-rcvprn =  p_logsys .
+* end of deletion MOD-005
+
+** Sort data by Service order Number, Material Number
+  SORT i_aufm_final BY aufnr werks lgort matnr .
+
+** Create Idoc's for every new Service Order
+  LOOP AT i_aufm_final into wa_i_aufm_final .
+    g_bukrs = wa_i_aufm_final-werks+0(4).
+    AT NEW aufnr .
+* begin of insertion MOD-005
+      clear wa_edidc-rcvprn.
+      select single parnum into wa_edidc-rcvprn
+           from yam_sel_partner
+           where bukrs  = g_bukrs
+             and msgtyp = p_mestyp.
+* end of insertion MOD-005
+      CLEAR i_edidd_data[] .
+      i_edidd_data-segnam  = c_header_segment  .
+*     i_edidd_data-sdata   = i_aufm_final-aufnr        .
+      i_edidd_data-sdata   = wa_i_aufm_final-aufnr        .
+      APPEND i_edidd_data .
+    ENDAT .
+
+*   MOVE-CORRESPONDING  i_aufm_final TO wa_order_items .
+    MOVE-CORRESPONDING  wa_i_aufm_final TO wa_order_items .
+
+    i_edidd_data-segnam  = c_item_segment      .
+    i_edidd_data-sdata   = wa_order_items      .
+    APPEND i_edidd_data .
+
+    AT END OF aufnr .
+** Generate Idoc's
+
+      CALL FUNCTION 'MASTER_IDOC_DISTRIBUTE'
+        EXPORTING
+          master_idoc_control            = wa_edidc
+        TABLES
+          communication_idoc_control     = i_edidc_control_comm
+          master_idoc_data               = i_edidd_data
+        EXCEPTIONS
+          error_in_idoc_control          = 1
+          error_writing_idoc_status      = 2
+          error_in_idoc_data             = 3
+          sending_logical_system_unknown = 4
+          OTHERS                         = 5.
+      IF sy-subrc <> 0.
+        MESSAGE e025 .
+      ELSE.
+        DESCRIBE TABLE i_edidc_control_comm LINES sy-tfill.
+        ADD sy-tfill TO l_created_comm_idocs.
+        REFRESH i_edidc_control_comm.
+      ENDIF.
+    ENDAT .
+  ENDLOOP .
+** get number of created IDocs
+*        DESCRIBE TABLE I_EDIDC_CONTROL_COMM LINES l_created_comm_idocs.
+  MESSAGE i040 WITH l_created_comm_idocs .
+
+ENDFORM.                    " Create_IDocs
+
+*Text symbol text£º
+
+*001:Selection Screen Input
+*Selection text£º
+*P_MESTYP:        Message Type
+*S_AUFNR:        Service Order Number
+*S_CPUDT:D       Entry date
+*S_CPUTM:D       Time of Entry
+*S_WERKS:        Plant

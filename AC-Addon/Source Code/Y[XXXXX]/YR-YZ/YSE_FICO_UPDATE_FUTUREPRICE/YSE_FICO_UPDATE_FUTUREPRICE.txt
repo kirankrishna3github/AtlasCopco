@@ -1,0 +1,557 @@
+REPORT  yse_fico_update_futureprice  MESSAGE-ID yse_sales_log.
+************************************************************************
+* PROGRAM ID           : YSE_FICO_UPDATE_FUTUREPRICE                   *
+* PROGRAM TITLE        : Upload standard costs from text file          *
+* AUTHOR               : Erik Walravens                                *
+* DATE                 : 30/04/2007                                    *
+* DEVELOPMENT ID       : 070430-FICO-OTH-D293-Future_Price_Update      *
+* CHANGE REQUEST NUMBER: CD1K914400                                    *
+*----------------------------------------------------------------------*
+* Program Description:  Upload program to insert future price in       *
+*                       material master record.                        *
+*----------------------------------------------------------------------*
+* Notes: This program is based on program YSE_UPLOAD_STANDARD_COSTS,   *
+*        by Andr¨¦ Blommaert.                                           *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME     |CORRECTION NUMBER| CHANGE REFERENCE # *
+*----------------------------------------------------------------------*
+* MOD-001 |11.10.2011|L. Mertens| CD1K968316      | CR2193: Performance*
+*         | Split input in parallel sessions - run in SM35             *
+* MOD-002 |23.12.2011|L. Mertens| CD1K969572      |                    *
+*         | create sessions of 50000 transaction                       *
+* MOD-003 |02.01.2014|L. Mertens| CD1K979356      | CR3146             *
+*         | Update future price of material                            *
+************************************************************************
+
+************************************************************************
+*                   T A B L E S                                        *
+************************************************************************
+
+
+************************************************************************
+*                   T Y P E S                                          *
+************************************************************************
+TYPES:
+  BEGIN OF str_input,
+    budat LIKE mkpf-budat,    " Document's posting date
+    bukrs LIKE t001-bukrs,    " Company Code
+    werks LIKE eine-werks,    " Plant
+    matnr LIKE eina-matnr,    " Material number
+******Begin of MOD3********MOD*****************************************
+*    zkprs(11) TYPE c,         " Future price
+    zkprs(19) TYPE c,         " Future price
+******End   of MOD3********MOD*****************************************
+  END OF str_input.
+
+
+************************************************************************
+*                   C O N S T A N T S                                  *
+************************************************************************
+CONSTANTS:
+  gc_true   TYPE c VALUE 'X'.
+
+
+************************************************************************
+*                   V A R I A B L E S                                  *
+************************************************************************
+DATA:
+  wa_input TYPE str_input,
+  gv_session_opened TYPE c,        " error session opened (' ' or 'X')
+  gv_mode  TYPE c.                 " transaction mode
+
+* begin of insert MOD-001
+DATA:
+  trans_count    TYPE sy-index,
+* begin of change MOD-002
+*  max_trans      TYPE anztran_bi VALUE 1000. "split criteria for SM35
+  max_trans      TYPE TBMAXSEL   VALUE 50000. "split criteria for SM35
+* end of change MOD-002
+* end of insert MOD-001
+
+************************************************************************
+*                  I N T E R N A L   T A B L E S                       *
+************************************************************************
+DATA:
+  it_input    TYPE TABLE OF str_input WITH HEADER LINE, " Entries
+  it_bdcdata  LIKE bdcdata  OCCURS 0  WITH HEADER LINE, " Batchinputdata
+  it_messtab  TYPE TABLE OF BDCMSGCOLL.                 " Message table
+
+
+************************************************************************
+*                  F I E L D - S Y M B O L S                           *
+************************************************************************
+
+
+************************************************************************
+*       S E L E C T - O P T I O N S / P A R A M E T E R S              *
+************************************************************************
+SELECTION-SCREEN : BEGIN OF BLOCK b1 WITH FRAME TITLE text-001.
+  PARAMETERS:
+    p_upfile  LIKE rlgrap-filename  " Filename
+              DEFAULT 'c:\temp\future_price.txt'
+              OBLIGATORY,
+    p_user    LIKE sy-uname         " user for session in batch
+              DEFAULT sy-uname,
+* begin of change MOD-001
+*    p_group   LIKE APQI-GROUPID.    " error-session
+    p_group   LIKE APQI-GROUPID OBLIGATORY.  " session(s)
+* end of change MOD-001
+SELECTION-SCREEN : END OF BLOCK b1.
+* begin of insert MOD-001
+* Comment
+SELECTION-SCREEN BEGIN OF BLOCK b2 WITH FRAME TITLE text-002.
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(72) text-c01.
+SELECTION-SCREEN END OF LINE.
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(72) text-c02.
+SELECTION-SCREEN END OF LINE.
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(72) text-c03.
+SELECTION-SCREEN END OF LINE.
+SELECTION-SCREEN END OF BLOCK b2.
+* end of insert MOD-001
+
+************************************************************************
+* AT SELECTION SCREEN                                                  *
+************************************************************************
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_upfile.
+
+  PERFORM file_lookup
+    USING p_upfile.
+
+
+************************************************************************
+* START-OF-SELECTION                                                   *
+************************************************************************
+START-OF-SELECTION.
+
+  PERFORM upload_file
+    TABLES it_input
+    USING  p_upfile.
+
+  PERFORM update_future_price
+    TABLES it_input.
+
+
+************************************************************************
+* FORM FILE_LOOKUP                                                     *
+************************************************************************
+* Description: Opens a requester to allow the user to select a file.   *
+************************************************************************
+* Arguments:                                                           *
+*   Input:                                                             *
+*     P_P_UPFILE: Default filename                                     *
+*   Output:                                                            *
+*     none.                                                            *
+************************************************************************
+FORM file_lookup USING p_p_upfile.
+
+  DATA: lv_filesel LIKE ibipparms-path.
+
+  CALL FUNCTION 'F4_FILENAME'
+    EXPORTING
+      program_name  = syst-repid
+      dynpro_number = syst-dynnr
+    IMPORTING
+      file_name     = lv_filesel
+    EXCEPTIONS
+      OTHERS        = 1.
+
+  p_p_upfile = lv_filesel.
+
+ENDFORM.                    " file_lookup
+
+
+************************************************************************
+* FORM UPLOAD_FILE                                                     *
+************************************************************************
+* Description: Loads a file from the user's PC to the SAP server.      *
+************************************************************************
+* Arguments:                                                           *
+*   Input:                                                             *
+*     P_IT_INPUT : Filename                                            *
+*     P_P_UPFILE : Data table that is to hold the data to be uploaded. *
+*   Output:                                                            *
+*     none                                                             *
+************************************************************************
+FORM upload_file TABLES p_it_input STRUCTURE wa_input
+               USING  p_p_upfile.
+
+  DATA: lv_filename TYPE string.
+
+  MOVE p_p_upfile TO lv_filename.
+
+  CALL FUNCTION 'GUI_UPLOAD'
+    EXPORTING
+      filename                      = lv_filename
+      filetype                      = 'ASC'
+      has_field_separator           = gc_true
+*     HEADER_LENGTH                 = 0
+*     READ_BY_LINE                  = gc_true
+*     DAT_MODE                      = ' '
+*     CODEPAGE                      = ' '
+*     IGNORE_CERR                   = ABAP_TRUE
+*     REPLACEMENT                   = '#'
+*     CHECK_BOM                     = ' '
+*     NO_AUTH_CHECK                 = ' '
+*   IMPORTING
+*     FILELENGTH                    =
+*     HEADER                        =
+    TABLES
+      data_tab                      = p_it_input
+    EXCEPTIONS
+      file_open_error               = 1
+      file_read_error               = 2
+      no_batch                      = 3
+      gui_refuse_filetransfer       = 4
+      invalid_type                  = 5
+      no_authority                  = 6
+      unknown_error                 = 7
+      bad_data_format               = 8
+      header_not_allowed            = 9
+      separator_not_allowed         = 10
+      header_too_long               = 11
+      unknown_dp_error              = 12
+      access_denied                 = 13
+      dp_out_of_memory              = 14
+      disk_full                     = 15
+      dp_timeout                    = 16
+      OTHERS                        = 17.
+
+  IF sy-subrc <> 0.
+*   MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+*           WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+  ENDIF.
+
+ENDFORM.                    " upload_future_price
+
+
+************************************************************************
+* FORM UPDATE_FUTURE_PRICE                                             *
+************************************************************************
+* Description: For each entry in the input file a material master      *
+*              record is opened and the future price field is entered. *
+*              If an error occurs, the update action is written to a   *
+*              batch input session under the user's login account.     *
+************************************************************************
+* Arguments:                                                           *
+*   Input:                                                             *
+*     A_IT_INPUT  Table with materials to be updated.                  *
+*   Output:                                                            *
+*     none.                                                            *
+************************************************************************
+FORM update_future_price TABLES a_it_input STRUCTURE wa_input.
+
+  DATA:
+        lv_zkdat(10) TYPE c,
+        lv_failure   TYPE i,
+        lv_success   TYPE i.
+
+* begin of insert MOD-001
+  PERFORM open_group.
+* end of insert MOD-001
+
+* Loop through table with material masters to be updated
+  LOOP AT a_it_input.
+
+*   Enter Material number
+    PERFORM bdc_dynpro USING 'SAPLMGMM' '0060'.
+    PERFORM bdc_field  USING 'RMMG1-MATNR' a_it_input-matnr.
+    PERFORM bdc_field  USING 'BDC_OKCODE' '=ENTR'.
+
+*   Open first view
+    PERFORM bdc_dynpro USING 'SAPLMGMM' '0070'.
+    PERFORM bdc_field  USING 'MSICHTAUSW-KZSEL(1)' gc_true.
+    PERFORM bdc_field  USING 'BDC_OKCODE' '=ENTR'.
+
+*   Jump to Accounting 1 view
+    PERFORM bdc_dynpro USING 'SAPLMGMM' '4004'.
+    PERFORM bdc_field USING 'BDC_SUBSCR'
+              'SAPLMGMM                                2004TABFRA1'.
+    PERFORM bdc_field  USING 'BDC_OKCODE' '=SP24'.
+
+*   Select plant
+    PERFORM bdc_dynpro USING 'SAPLMGMM' '0081'.
+    PERFORM bdc_field  USING 'RMMG1-WERKS' a_it_input-werks.
+    PERFORM bdc_field  USING 'BDC_OKCODE' '=ENTR'.
+
+*   Enter future price
+    PERFORM bdc_dynpro USING 'SAPLMGMM' '4000'.
+    PERFORM bdc_field  USING 'MBEW-ZKPRS' a_it_input-zkprs.
+
+*   Convert date
+    lv_zkdat(2)   = a_it_input-budat+6(2).
+    lv_zkdat+2    = '.'.
+    lv_zkdat+3(2) = a_it_input-budat+4(2).
+    lv_zkdat+5    = '.'.
+    lv_zkdat+6(4) = a_it_input-budat(4).
+
+*   Enter validity date
+    PERFORM bdc_field  USING 'MBEW-zkdat' lv_zkdat.
+    PERFORM bdc_field  USING 'BDC_OKCODE' '=BU'.
+
+* begin of delete MOD-001
+**   No-show mode
+*    gv_mode = 'N'.
+*
+**   Run transaction Edit Material Master
+*    CALL TRANSACTION 'MM02'
+*      USING it_bdcdata
+*      MODE  gv_mode
+*      MESSAGES INTO it_messtab.
+*
+**   If error
+*    IF sy-subrc <> 0.
+*      lv_failure = lv_failure + 1.
+**     If an error batch session is requested
+*      IF NOT p_group IS INITIAL.
+**       If the error session has not been opened yet
+*        IF gv_session_opened IS INITIAL.
+**         Open batch input session
+*          CALL FUNCTION 'BDC_OPEN_GROUP'
+*            EXPORTING
+*              client   = sy-mandt
+*              group    = p_group
+*              user     = p_user
+*              keep     = gc_true.
+**              holddate = sy-datum.
+*          gv_session_opened = gc_true.
+*        ENDIF.
+**       Insert erroneous entry
+*        CALL FUNCTION 'BDC_INSERT'
+*             EXPORTING tcode     = 'MM02'
+*             TABLES    dynprotab = it_bdcdata.
+*      ENDIF.
+*    ELSE.
+*      lv_success = lv_success + 1.
+*    ENDIF.
+*¡§end of delete MOD-001
+
+* begin of insert MOD-001
+    PERFORM bdc_insert.
+    trans_count = trans_count + 1.
+
+    if trans_count GE max_trans.  "Create seperate session
+      PERFORM close_group.
+      PERFORM open_group.
+      CLEAR trans_count.
+    ENDIF.
+* end of insert MOD-001
+
+    REFRESH it_bdcdata.
+  ENDLOOP.  " p_it_input
+
+* begin of insert MOD-001
+  PERFORM close_group.
+* end of insert MOD-001
+
+* begin of delete MOD-001
+** If error session was opened, close it
+*  IF lv_failure > 0.
+*    IF NOT p_group IS INITIAL.
+*      CALL FUNCTION 'BDC_CLOSE_GROUP'.
+*    ENDIF.
+*    MESSAGE ID 'YSE_FICO' TYPE 'I' NUMBER 11 WITH lv_failure p_group.
+*  ELSE.
+*    MESSAGE ID 'YSE_FICO' TYPE 'I' NUMBER 12 WITH lv_success.
+*  ENDIF.
+* end of delete MOD-001
+
+* begin of insert MOD-001
+* Release the BDC sessions created
+  PERFORM release_bdc.
+
+  write:/ 'Processing has now been started ...'.
+  write:/ '  *    '.
+  write:/ '  * Follow-up instructions :'.
+
+  write:/ '  * Please go to Transaction SM35 and wait for session(s) to finish.'.
+* begin of change MOD-002
+*  write:/ '  * Multiple session can be created -> One session per 1000 entries.'.
+  write:/ '  * Multiple session can be created -> One session per 5000 entries.'.
+* end of change MOD-002
+* end of insert MOD-001
+
+ENDFORM.  " update_future_price
+
+
+************************************************************************
+* FORM BDC_DYNPRO                                                      *
+************************************************************************
+* Description: Start new screen                                        *
+************************************************************************
+* Arguments:                                                           *
+*   Input:                                                             *
+*     A_PROGRAM  Transaction                                           *
+*     A_DYNPRO   Screen                                                *
+*   Output:                                                            *
+*     none.                                                            *
+************************************************************************
+FORM bdc_dynpro USING a_program a_dynpro.
+  CLEAR it_bdcdata.
+  it_bdcdata-program  = a_program.
+  it_bdcdata-dynpro   = a_dynpro.
+  it_bdcdata-dynbegin = gc_true.
+  APPEND it_bdcdata.
+ENDFORM.
+
+
+************************************************************************
+* FORM BDC_FIELD                                                       *
+************************************************************************
+* Description: Insert field                                            *
+************************************************************************
+* Arguments:                                                           *
+*   Input:                                                             *
+*     A_NAM   Fieldname                                                *
+*     A_VAL   Value                                                    *
+*   Output:                                                            *
+*     none.                                                            *
+************************************************************************
+FORM bdc_field USING a_nam a_val.
+  CLEAR it_bdcdata.
+  it_bdcdata-fnam = a_nam.
+  it_bdcdata-fval = a_val.
+  APPEND it_bdcdata.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*&      Form  BDC_TRANSACTION                        " MOD-001
+*&---------------------------------------------------------------------*
+FORM bdc_insert.
+
+  CALL FUNCTION 'BDC_INSERT'
+    EXPORTING
+      tcode            = 'MM02'
+    TABLES
+      dynprotab        = it_bdcdata
+    EXCEPTIONS
+      internal_error   = 1
+      not_open         = 2
+      queue_error      = 3
+      tcode_invalid    = 4
+      printing_invalid = 5
+      posting_invalid  = 6
+      OTHERS           = 7.
+
+  IF sy-subrc <> 0.
+    MESSAGE e014(yam_dc).
+  ENDIF.
+
+ENDFORM.                    " BDC_TRANSACTION
+
+*&---------------------------------------------------------------------*
+*&      Form  open_group                                " MOD-001
+*&---------------------------------------------------------------------*
+FORM open_group .
+
+  CALL FUNCTION 'BDC_OPEN_GROUP'
+    EXPORTING
+      client = sy-mandt
+      group  = p_group
+      user   = p_user
+      keep   = gc_true.
+
+  IF sy-subrc <> 0.
+    MESSAGE e013(yam_dc). " OPEN SESSION FAILED
+  ENDIF.
+
+ENDFORM.                    " open_group
+
+*&---------------------------------------------------------------------*
+*&      Form  close_group                               " MOD-001
+*&---------------------------------------------------------------------*
+FORM close_group .
+
+  CALL FUNCTION 'BDC_CLOSE_GROUP'.
+
+ENDFORM.                    " close_group
+
+*&---------------------------------------------------------------------*
+*&      Form  release_bdc                               " MOD-001
+*&---------------------------------------------------------------------*
+*      Release BDC session
+*----------------------------------------------------------------------*
+FORM release_bdc.
+
+  DATA: lv_number      TYPE tbtcjob-jobcount,
+        lv_name        TYPE tbtcjob-jobname VALUE 'FUT_PRICE'.
+
+  CALL FUNCTION 'JOB_OPEN'
+    EXPORTING
+      jobname                = lv_name
+    IMPORTING
+      JOBCOUNT               = lv_number
+    EXCEPTIONS
+      CANT_CREATE_JOB        = 1
+      INVALID_JOB_DATA       = 2
+      JOBNAME_MISSING        = 3
+      OTHERS                 = 4.
+
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ELSE.
+    SUBMIT rsbdcsub WITH mappe EQ p_group
+                    WITH von   EQ sy-datum
+                    WITH bis   EQ sy-datum
+                    TO SAP-SPOOL
+                    WITHOUT SPOOL DYNPRO
+                    VIA JOB lv_name NUMBER lv_number
+                    AND RETURN.
+
+    CALL FUNCTION 'JOB_CLOSE'
+        EXPORTING
+           jobcount                          = lv_number
+           jobname                           = lv_name
+           STRTIMMED                         = 'X'
+        EXCEPTIONS
+           CANT_START_IMMEDIATE              = 1
+           INVALID_STARTDATE                 = 2
+           JOBNAME_MISSING                   = 3
+           JOB_CLOSE_FAILED                  = 4
+           JOB_NOSTEPS                       = 5
+           JOB_NOTEX                         = 6
+           LOCK_FAILED                       = 7
+           INVALID_TARGET                    = 8
+           OTHERS                            = 9.
+
+      IF sy-subrc <> 0.
+        MESSAGE ID SY-MSGID TYPE SY-MSGTY NUMBER SY-MSGNO
+              WITH SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+      ENDIF.
+    ENDIF.
+
+ENDFORM.
+
+*Text symbol text£º
+*001:Selections
+*002:Remarks
+*C01:NEW VERSION OF PROGRAM for performance improvement!!!
+*C02:--> Multiple sessions can be created and then checked via SM35
+*C03:Click Program Doc. button at top of program for file format description
+*E00:Error opening dataset, return code:
+*I01:Session name
+*I02:Open session
+*I03:Insert transaction
+*I04:Close Session
+*I05:Return code =
+*I06:Error session created
+*S01:Session name
+*S02:User
+*S03:Keep session
+*S04:Lock date
+*S05:Processing Mode
+*S06:Update Mode
+*S07:Generate session
+*S08:Call transaction
+*S09:Error sessn
+
+*S10:Nodata indicator
+*Selection text£º
+*P_GROUP:        Session name
+*P_UPFILE:        Upload file
+*P_USER:        User ID

@@ -1,0 +1,604 @@
+REPORT  yse_cost_recognition LINE-SIZE 204.
+*message-ID
+***********************************************************************************
+* Program ID           : YSE_COST_RECOGNITION                                     *
+* Program Title        : Cost Recognition for Service Contract Report(ST/LT) +    *
+*                        cost estimate update                                     *
+* Author               : Pierre Melin                                             *
+* Date                 : 15/01/2007                                               *
+* Change Request Number:                                                          *
+* Description          : Each period end a report of the current accruals on a    *
+*                         contract is compared to LT and ST planned costs.        *
+*                         Depending upon the status of the amount of the          *
+*                         contract accruals will be re-calculated for Long Term   *
+*                         accrual postings.                                       *
+*                         A button to create the accruals automatically is an     *
+*                         enhanced feature of this design. Automatic accruals
+*                         will be posted per profit centre in the balance sheet.  *
+*                         For the profit and loss it will be against a designated *
+*                         cost centre.                                            *
+*                         To ensure that the planned costs are in place then an   *
+*                         additional part of this development is to update the    *
+*                         contract with the total plan cost in the unit cost      *
+*                         estimate. This is similar to the process in program     *
+*                         YSE_SDI_PLAN_COSTS for updating the SDI.                *
+*                         This time it is a contract and there is only one cost   *
+*                         category used                                           *
+*=================================================================================*
+* Copied From         : (Cloned Program)                                          *
+* Title               : (Program Title)                                           *
+* Other Related obj   : (Object names)                                            *
+*=================================================================================*
+* Change History Log                                                              *
+*---------------------------------------------------------------------------------*
+* Mod. no.|  Date    | Name           | Correction Number  | Change Reference #   *
+*---------------------------------------------------------------------------------*
+* MOD-001 |13/09/2007| Isabelle VB    | XXXXxxxxxx         |   XXXXxxxxxx         *
+*                                                                                 *
+* Description: Bugfixing                                                          *
+*                 a) Posting header contains wrong period number                  *
+*                 b) Posting date can be before selection period                  *
+*                 c) Adjustments value may not be zero <-> short dump in BI       *
+*                 d) Sales order should be entered in assignment field -> This is *
+*                     not possible since results are aggregated by profit center  *
+*                     so there can be multiple sales orders linked -> Logtable    *
+*                     YSE_COST_RECOGN is created. Entries will be saved in this   *
+*                     table on click on 'Posting'-button                          *
+*---------------------------------------------------------------------------------*
+* MOD-002 |dd/mm/yyyy| xxxxxxxxxxxxxx | XXXXxxxxxx                                *
+*                                                                                 *
+* Description:                                                                    *
+***********************************************************************************
+
+TABLES : vbak, vbap, coepb, cosp, ce11000, jest, coss, bkpf, bseg, t001.
+
+PARAMETERS : p_bukrs LIKE t001-bukrs MEMORY ID buk OBLIGATORY,
+             p_versi LIKE ce11000-versi MEMORY ID pvs OBLIGATORY,
+             p_perio LIKE coepb-perio MEMORY ID vpe OBLIGATORY,
+             p_gjahr LIKE coepb-gjahr MEMORY ID gjr OBLIGATORY,
+             p_budat LIKE bkpf-budat OBLIGATORY
+             .
+
+SELECT-OPTIONS : s_vkorg FOR vbak-vkorg MEMORY ID vko OBLIGATORY,
+                 s_trvog FOR vbak-trvog MEMORY ID vtv OBLIGATORY,
+                 s_prctr FOR vbap-prctr MEMORY ID prc,
+                 s_vbeln FOR vbap-vbeln MEMORY ID aun,
+                 s_posnr FOR vbap-posnr MEMORY ID apo,
+                 s_kstar FOR cosp-kstar MEMORY ID kat OBLIGATORY
+                 .
+
+PARAMETERS : p_blart LIKE bkpf-blart,
+            p_newbs1 LIKE bseg-bschl,
+            p_newbs2 LIKE bseg-bschl,
+            p_newko1 LIKE rf05a-newko,
+            p_newko2 LIKE rf05a-newko
+            .
+
+DATA : BEGIN OF i_vbak OCCURS 0,
+          vbeln LIKE vbak-vbeln,
+       END OF i_vbak.
+
+DATA : BEGIN OF i_vbap OCCURS 0,
+          vbeln LIKE vbap-vbeln,
+          posnr LIKE vbap-posnr,
+          objnr LIKE vbap-objnr,
+          prctr LIKE vbap-prctr,
+          future_plan LIKE ce11000-vv199,
+          plan12 LIKE ce11000-vv199,
+          pland  LIKE ce11000-vv199,
+          actual LIKE cosp-wog001,
+          wogbtr LIKE coepb-wogbtr,
+       END OF i_vbap.
+
+DATA : BEGIN OF i_coepb OCCURS 0,
+        objnr LIKE coepb-objnr,
+        wogbtr LIKE coepb-wogbtr,
+       END OF i_coepb.
+
+DATA : BEGIN OF i_jest OCCURS 0,
+        mandt LIKE jest-mandt,
+        objnr LIKE jest-objnr,
+        stat LIKE jest-stat,
+        inact LIKE jest-inact,
+        chgnr LIKE jest-chgnr,
+       END OF i_jest.
+
+DATA : BEGIN OF i_output OCCURS 0,
+          prctr LIKE vbap-prctr,
+          vbeln LIKE vbap-vbeln,
+          posnr LIKE vbap-posnr,
+          total_plan LIKE cosp-wog001,
+          costs_to_date LIKE cosp-wog001,
+          st_plan LIKE cosp-wog001,
+          lt_plan LIKE cosp-wog001,
+          accruals LIKE cosp-wog001,
+          st_accruals LIKE cosp-wog001,
+          lt_accruals LIKE cosp-wog001,
+       END OF i_output.
+
+* Begin INS mod001 (d)
+DATA: BEGIN OF i_log OCCURS 0.
+        INCLUDE STRUCTURE yse_cost_recogn.
+DATA: END OF i_log.
+* End INS mod001 (d)
+
+DATA : w_run_year LIKE ce11000-gjahr,
+       w_total_plan LIKE ce11000-vv199,
+       w_value LIKE ce11000-vv199,
+       w_paledger LIKE ce11000-paledger.
+
+RANGES : r_vbap FOR vbap-objnr OCCURS 0,
+         r_objnr FOR vbap-objnr OCCURS 0.
+
+*       Batchinputdata of single transaction
+DATA:   bdcdata LIKE bdcdata    OCCURS 0 WITH HEADER LINE.
+*       messages of call transaction
+DATA:   messtab LIKE bdcmsgcoll OCCURS 0 WITH HEADER LINE.
+*       error session opened (' ' or 'X')
+DATA:   e_group_opened.
+*       message texts
+DATA:   ls_usr01 TYPE usr01.
+DATA:   v_mod(1).
+** This parameter can be changed in debugging to change the way the call transaction is done
+
+INITIALIZATION.
+
+  SELECT SINGLE * FROM usr01 INTO ls_usr01 WHERE bname EQ sy-uname.
+
+  v_mod = 'N'.
+*The processing mode can take the following values:
+* 'A' Display screen
+* 'E' Display only if an error occurs
+* 'N' Do not display
+* 'P' Do not display; debugging possible
+
+
+AT SELECTION-SCREEN.
+  AUTHORITY-CHECK OBJECT 'F_KNA1_BUK'
+                      ID 'BUKRS' FIELD p_bukrs
+                      ID 'ACTVT' DUMMY.
+
+  IF sy-subrc = 4.
+*   No authorisation to display the data
+    MESSAGE ID 'YSE_RENTAL' TYPE 'E' NUMBER '040' WITH p_bukrs.
+  ELSEIF sy-subrc <> 0.
+*   Error checking authorization.
+    MESSAGE ID 'YSE_RENTAL' TYPE 'E' NUMBER '046'.
+  ENDIF.
+
+** Check posting date GE selection period (MOD 001 (b) )
+  IF p_budat(4) < p_gjahr.
+    MESSAGE ID 'YSE_RENTAL' TYPE 'E' NUMBER '071'.
+  ELSEIF p_budat(4) = p_gjahr AND p_budat+4(2) < p_perio+1(2).
+    MESSAGE ID 'YSE_RENTAL' TYPE 'E' NUMBER '071'.
+  ENDIF.
+  EXIT.
+
+
+START-OF-SELECTION.
+
+  SET PF-STATUS 'STAT1'.
+
+  SELECT vbeln INTO TABLE i_vbak
+               FROM vbak WHERE vkorg IN s_vkorg
+                         AND   trvog IN s_trvog
+                         AND   vbeln IN s_vbeln.
+
+  IF NOT i_vbak[] IS INITIAL.
+    SELECT vbeln posnr objnr prctr INTO TABLE i_vbap
+      FROM vbap
+      FOR ALL ENTRIES IN i_vbak
+      WHERE vbeln = i_vbak-vbeln
+      AND   posnr IN s_posnr
+      AND   prctr IN s_prctr
+      AND   abgrs <> ''.
+  ENDIF.
+
+  LOOP AT i_vbap.
+    r_vbap-sign = 'I'.
+    r_vbap-option = 'EQ'.
+    r_vbap-low = i_vbap-objnr.
+    APPEND r_vbap.
+  ENDLOOP.
+
+  IF NOT i_vbap[] IS INITIAL.
+    SELECT objnr SUM( wogbtr ) INTO TABLE i_coepb
+    FROM coepb
+    WHERE objnr IN r_vbap
+*    and ( ( GJAHR =
+    AND lednr = '00'
+    AND abkat = '54'
+    GROUP BY objnr HAVING SUM( wogbtr ) <> 0.
+  ENDIF.
+
+  LOOP AT i_coepb.
+    r_objnr-sign = 'I'.
+    r_objnr-option = 'EQ'.
+    r_objnr-low = i_coepb-objnr.
+    APPEND r_objnr.
+  ENDLOOP.
+
+  SELECT * FROM jest INTO TABLE i_jest
+    WHERE objnr IN r_objnr
+    AND   stat IN ('I0001','I0046','I0076')
+    AND   inact = ' ' .
+
+
+  CLEAR r_objnr. REFRESH r_objnr.
+  LOOP AT i_jest.
+    r_objnr-sign = 'I'.
+    r_objnr-option = 'EQ'.
+    r_objnr-low = i_jest-objnr.
+    APPEND r_objnr.
+  ENDLOOP.
+
+  IF NOT r_objnr[] IS INITIAL.
+    DELETE i_coepb WHERE objnr IN r_objnr.
+  ENDIF.
+
+  CLEAR r_objnr. REFRESH r_objnr.
+  LOOP AT i_coepb.
+    r_objnr-sign = 'I'.
+    r_objnr-option = 'EQ'.
+    r_objnr-low = i_coepb-objnr.
+    APPEND r_objnr.
+  ENDLOOP.
+
+  DELETE i_vbap WHERE objnr NOT IN r_objnr.
+
+  CALL FUNCTION 'CONVERSION_EXIT_LEDBO_INPUT'
+    EXPORTING
+      input         = '10'
+    IMPORTING
+      output        = w_paledger
+    EXCEPTIONS
+      invalid_input = 1
+      OTHERS        = 2.
+
+
+
+  LOOP AT i_vbap.
+
+* Total future plan (A)
+
+    SELECT SUM( vv199 ) INTO i_vbap-future_plan
+    FROM ce11000
+    WHERE kaufn = i_vbap-vbeln
+    AND   kdpos = i_vbap-posnr
+    AND   paledger = w_paledger
+    AND   vrgar = 'A'
+*    AND   ( ( gjahr > sy-datum+0(4) )
+*    OR ( gjahr = sy-datum+0(4) AND perde >= sy-datum+4(2) ) )
+    AND   ( ( gjahr > p_gjahr )
+    OR ( gjahr = p_gjahr AND perde >= p_perio ) )
+    .
+
+    w_run_year = sy-datum+0(4).
+    w_run_year = w_run_year + 1.
+
+*  Total plan for the next 12 months (B)
+
+    SELECT SUM( vv199 ) INTO i_vbap-plan12
+    FROM ce11000
+    WHERE kaufn = i_vbap-vbeln
+    AND   kdpos = i_vbap-posnr
+    AND   paledger = w_paledger
+    AND   vrgar = 'A'
+*    AND   ( ( gjahr = sy-datum+0(4) AND perde = sy-datum+4(2)  )    OR ( gjahr = w_run_year    AND perde < sy-datum+4(2) ) ).
+    AND   ( ( gjahr = p_gjahr AND perde >= p_perio  )    OR ( gjahr = w_run_year    AND perde < p_perio ) ).
+
+
+* Total plan to date (C)
+
+    SELECT SUM( vv199 ) INTO i_vbap-pland
+    FROM ce11000
+    WHERE kaufn = i_vbap-vbeln
+    AND   kdpos = i_vbap-posnr
+    AND   paledger = w_paledger
+    AND   vrgar = 'A'
+*    AND   ( ( gjahr < sy-datum+0(4) ) OR ( gjahr = sy-datum+0(4) AND perde < sy-datum+4(2) ) ).
+    AND   ( ( gjahr < p_gjahr ) OR ( gjahr = p_gjahr AND perde < p_perio ) ).
+
+
+* Total actual costs to date (D)
+    CLEAR i_vbap-actual.
+    SELECT * FROM cosp
+      WHERE lednr = '00'
+      AND   objnr = i_vbap-objnr
+      AND   versn = '000'
+      AND   wrttp = '04'
+*      AND   gjahr <= sy-datum+0(4)
+      AND   gjahr <= p_gjahr
+      AND   kstar IN s_kstar.
+      i_vbap-actual = i_vbap-actual + cosp-wog001 + cosp-wog002 + cosp-wog003
+                      + cosp-wog004 + cosp-wog005 + cosp-wog006 + cosp-wog007
+                      + cosp-wog008 + cosp-wog009 + cosp-wog010 + cosp-wog011
+                      + cosp-wog012 + cosp-wog013 + cosp-wog014 + cosp-wog015
+                      + cosp-wog016.
+    ENDSELECT.
+
+    SELECT * FROM coss
+    WHERE lednr = '00'
+    AND   objnr = i_vbap-objnr
+    AND   versn = '000'
+    AND   wrttp = '04'
+*    AND   gjahr <= sy-datum+0(4)
+    AND   gjahr <= p_gjahr
+    AND   kstar IN s_kstar.
+      i_vbap-actual = i_vbap-actual + coss-wog001 + coss-wog002 + coss-wog003
+                      + coss-wog004 + coss-wog005 + coss-wog006 + coss-wog007
+                      + coss-wog008 + coss-wog009 + coss-wog010 + coss-wog011
+                      + coss-wog012 + coss-wog013 + coss-wog014 + coss-wog015
+                      + coss-wog016.
+    ENDSELECT.
+
+*  read table i_coepb to get (H)
+
+    READ TABLE i_coepb WITH KEY objnr = i_vbap-objnr.
+    MOVE i_coepb-wogbtr TO i_vbap-wogbtr.
+
+    MODIFY i_vbap.
+
+
+
+  ENDLOOP.
+
+  LOOP AT i_vbap.
+    CLEAR : i_output, w_total_plan.
+    MOVE-CORRESPONDING i_vbap TO i_output.
+    i_output-total_plan = i_vbap-future_plan + i_vbap-pland.
+    i_output-costs_to_date = i_vbap-actual.
+    i_output-st_plan = i_vbap-pland + i_vbap-plan12 - i_vbap-actual.
+    IF i_output-st_plan < 0.
+      i_output-st_plan = 0.
+    ENDIF.
+    w_total_plan = i_vbap-future_plan + i_vbap-pland - i_vbap-actual.
+    i_output-lt_plan = w_total_plan - i_output-st_plan.
+    IF i_output-lt_plan < 0.
+      i_output-lt_plan = 0.
+    ENDIF.
+    i_output-accruals = i_vbap-wogbtr.
+    IF w_total_plan <> 0.
+      i_output-st_accruals = i_vbap-wogbtr / w_total_plan  * i_output-st_plan.
+      i_output-lt_accruals = i_vbap-wogbtr / w_total_plan * i_output-lt_plan.
+    ENDIF.
+    IF i_output-st_accruals NE 0 OR
+       i_output-lt_accruals NE 0.
+      APPEND i_output.
+    ENDIF.
+  ENDLOOP.
+**Inserted by Kevin Raskin, requested by Michael
+  SORT i_output BY prctr vbeln posnr.
+**End of insert
+  LOOP AT i_output.
+    WRITE : / '|',  i_output-prctr, '|',
+          i_output-vbeln , '|',
+          i_output-posnr , '|',
+          i_output-total_plan , '|',                    "#EC UOM_IN_MES
+          i_output-costs_to_date , '|',                 "#EC UOM_IN_MES
+          i_output-st_plan , '|',                       "#EC UOM_IN_MES
+          i_output-lt_plan , '|',                       "#EC UOM_IN_MES
+          i_output-accruals , '|',                      "#EC UOM_IN_MES
+          i_output-st_accruals , '|',                   "#EC UOM_IN_MES
+          i_output-lt_accruals , '|'.                   "#EC UOM_IN_MES
+  ENDLOOP.
+  ULINE.
+
+TOP-OF-PAGE.
+  WRITE : / '|Profit Ctr. | S.O.numb   |Item    | Total Plan            |'(009),
+          ' Costs to date        | ST Plan               |'(008),
+          ' LT Plan              | Provisions to date    |'(007),
+          ' ST provisions        | LT provisions         |'(006).
+  ULINE.
+
+AT USER-COMMAND.
+
+  CASE sy-ucomm.
+
+    WHEN 'POSTING'.
+
+      PERFORM posting.
+
+  ENDCASE.
+*&---------------------------------------------------------------------*
+*&      Form  posting
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM posting .
+
+  DATA : BEGIN OF i_posting OCCURS 0,
+          prctr       LIKE i_output-prctr,
+          lt_accruals LIKE i_output-lt_accruals,
+*          vbeln       LIKE i_output-vbeln,
+         END OF i_posting,
+         w_bktxt LIKE bkpf-bktxt,
+         w_budat(10) TYPE c,
+        w_wrbtr(13) TYPE  c.
+
+  CLEAR i_posting. REFRESH i_posting.
+
+  LOOP AT i_output.
+    MOVE i_output-prctr TO i_posting-prctr.
+    MOVE i_output-lt_accruals TO i_posting-lt_accruals.
+*    MOVE i_output-vbeln TO i_posting-vbeln.
+    COLLECT i_posting.
+  ENDLOOP.
+  SELECT SINGLE * FROM t001 WHERE bukrs = p_bukrs.
+  WRITE p_budat TO w_budat.
+  LOOP AT i_posting.
+
+    MOVE i_posting-lt_accruals TO w_wrbtr.
+
+    PERFORM bdc_dynpro      USING 'SAPMF05A' '0100'.
+
+    PERFORM bdc_field       USING 'BDC_OKCODE'
+                                  '/00'.
+    PERFORM bdc_field       USING 'BKPF-BLDAT'
+                                  w_budat
+                                  .
+    PERFORM bdc_field       USING 'BKPF-BLART'
+                                  p_blart
+                                  .
+    PERFORM bdc_field       USING 'BKPF-BUKRS'
+                                  p_bukrs.
+    PERFORM bdc_field       USING 'BKPF-BUDAT'
+                                  w_budat.
+    PERFORM bdc_field       USING 'BKPF-WAERS'
+                                  t001-waers.
+    PERFORM bdc_field       USING 'BKPF-XBLNR'
+                                  'LT Provisions'(005).
+** MOD 001 (a)
+*    CONCATENATE 'LT Provisions'(004) sy-datum+4(2) sy-datum+0(4) INTO w_bktxt SEPARATED BY space.
+    CONCATENATE 'LT Provisions'(004) p_perio+1(2) p_gjahr INTO w_bktxt SEPARATED BY space.
+
+    PERFORM bdc_field       USING 'BKPF-BKTXT'
+                                  w_bktxt.
+
+    PERFORM bdc_field       USING 'RF05A-NEWBS'
+                                  p_newbs1.
+    PERFORM bdc_field       USING 'RF05A-NEWKO'
+                                  p_newko1.
+
+
+    PERFORM bdc_dynpro      USING 'SAPMF05A' '0300'.
+    PERFORM bdc_field       USING 'BDC_OKCODE'
+                                  '/00'.
+
+**
+    IF ls_usr01-dcpfm = 'Y'.
+      REPLACE ALL OCCURRENCES OF '.' IN w_wrbtr WITH ',' .
+    ELSEIF ls_usr01-dcpfm = space.
+      REPLACE ALL OCCURRENCES OF '.' IN w_wrbtr WITH '/'.
+      REPLACE ALL OCCURRENCES OF ',' IN w_wrbtr WITH '.'.
+      REPLACE ALL OCCURRENCES OF '/' IN w_wrbtr WITH ','.
+    ENDIF.
+**
+    PERFORM bdc_field       USING 'BSEG-WRBTR'
+                                  w_wrbtr.
+** MOD001 (d)
+*    PERFORM bdc_field       USING 'BSEG-ZUONR'
+*                                  i_posting-vbeln.
+    PERFORM bdc_field       USING 'RF05A-NEWBS'
+                                  p_newbs2.
+    PERFORM bdc_field       USING 'RF05A-NEWKO'
+                                  p_newko2.
+
+    PERFORM bdc_dynpro      USING 'SAPLKACB' '0002'.
+    PERFORM bdc_field       USING 'BDC_OKCODE'
+                                  '=ENTE'.
+
+    PERFORM bdc_field       USING 'COBL-PRCTR'
+                                  i_posting-prctr.
+
+
+    PERFORM bdc_dynpro      USING 'SAPMF05A' '0300'.
+    PERFORM bdc_field       USING 'BDC_OKCODE'
+                                  '/00'.
+
+    PERFORM bdc_field       USING 'BSEG-WRBTR'
+                                  w_wrbtr.
+
+    PERFORM bdc_dynpro      USING 'SAPLKACB' '0002'.
+    PERFORM bdc_field       USING 'BDC_OKCODE'
+                                  '=ENTE'.
+
+    PERFORM bdc_field       USING 'COBL-PRCTR'
+                                  i_posting-prctr.
+    PERFORM bdc_dynpro      USING 'SAPMF05A' '0300'.
+    PERFORM bdc_field       USING 'BDC_OKCODE'
+                                    '=BU'.
+
+    CALL TRANSACTION 'FB01' USING bdcdata MODE v_mod.
+    CLEAR bdcdata. REFRESH bdcdata.
+
+  ENDLOOP.
+  PERFORM update_log.
+
+ENDFORM.                    " posting
+
+*----------------------------------------------------------------------*
+*        Start new screen                                              *
+*----------------------------------------------------------------------*
+FORM bdc_dynpro USING program dynpro.
+  CLEAR bdcdata.
+  bdcdata-program  = program.
+  bdcdata-dynpro   = dynpro.
+  bdcdata-dynbegin = 'X'.
+  APPEND bdcdata.
+ENDFORM.                    "BDC_DYNPRO
+
+*----------------------------------------------------------------------*
+*        Insert field                                                  *
+*----------------------------------------------------------------------*
+FORM bdc_field USING fnam fval.
+*  IF fval <> '/'.
+  CLEAR bdcdata.
+  bdcdata-fnam = fnam.
+  bdcdata-fval = fval.
+  APPEND bdcdata.
+*  ENDIF.
+ENDFORM.                    "bdc_field
+
+*&---------------------------------------------------------------------*
+*&      Form  update_log
+*&---------------------------------------------------------------------*
+*       Update logtable YSE_COST_RECOGN
+*----------------------------------------------------------------------*
+FORM update_log .
+
+  DATA: v_bukrs LIKE t001-bukrs,
+        v_waers LIKE t001-bukrs.
+
+  SELECT SINGLE bukrs waers
+      FROM t001
+      INTO (v_bukrs, v_waers)
+      WHERE bukrs = p_bukrs.
+  LOOP AT i_output.
+    MOVE-CORRESPONDING i_output TO i_log.
+    i_log-bukrs   = v_bukrs.
+    i_log-waers   = v_waers.
+    i_log-mandt   = sy-mandt.
+    i_log-selper  = p_perio.
+    i_log-selyear = p_gjahr.
+    APPEND i_log.
+    CLEAR i_log.
+  ENDLOOP.
+
+  CALL FUNCTION 'YSE_UPDATE_YSE_COST_RECOGN'
+    IN UPDATE TASK
+    TABLES
+      log = i_log.
+
+  COMMIT WORK.
+
+ENDFORM.                    "update_log
+
+*Text symbol text£º
+*004:LT Provisions
+*005:LT Provisions
+*006: ST provisions        | LT provisions         |
+*007: LT Plan              | Provisions to date    |
+*008: Costs to date        | ST Plan               |
+
+*009:|Profit Ctr. | S.O.numb   |Item    | Total Plan            |
+*Selection text£º
+*P_BLART:D       Document type
+*P_BUDAT:D       Posting Date
+*P_BUKRS:D       Company Code
+*P_GJAHR:D       Fiscal Year
+*P_NEWBS1:        Short term Posting Key
+*P_NEWBS2:        Long term Posting Key
+*P_NEWKO1:        Short term Account
+*P_NEWKO2:        Long term Account
+*P_PERIO:D       Period
+*P_VERSI:D       Version
+*S_KSTAR:D       Cost Element
+*S_POSNR:D       Sales Document Item
+*S_PRCTR:D       Profit Center
+*S_TRVOG:D       Transaction group
+*S_VBELN:D       Sales document
+*S_VKORG:D       Sales Organization

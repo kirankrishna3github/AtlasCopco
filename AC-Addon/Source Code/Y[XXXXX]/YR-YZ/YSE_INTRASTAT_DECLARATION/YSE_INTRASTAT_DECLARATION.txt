@@ -1,0 +1,320 @@
+*&---------------------------------------------------------------------*
+*& Report  YSE_INTRASTAT_DECLARATION                                   *
+*&                                                                     *
+*&---------------------------------------------------------------------*
+*& This report calculates the new invoice/statistical value (incl.     *
+*& freight/insurance) for the Intrastat declaration of Poland.         *
+*&---------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME              |CORRECTION NUMBER|CHANGE REF#*
+*----------------------------------------------------------------------*
+* MOD-001 |13/05/2013| Nanda Sreenivasan | CD1K976141      | CR 2913   *
+*----------------------------------------------------------------------*
+
+REPORT  yse_intrastat_declaration.
+
+*.................. Tables definitions................................ *
+TABLES: veiav,
+        ekbe,
+        yse_veiav.
+
+*.................. Variable definitions.............................. *
+TYPES: BEGIN OF ty_upload,
+         v_text(100)   TYPE c,            " FILE UPLOAD TEXT
+       END OF ty_upload.
+
+DATA: gt_upload TYPE STANDARD TABLE OF ty_upload
+                INITIAL SIZE 0 WITH HEADER LINE.
+
+* Begin of change MOD-001
+TYPES: BEGIN OF TY_RSEG,
+         BELNR      LIKE EKBE-BELNR,    "Number of Material Document
+         GJAHR      LIKE EKBE-GJAHR,    "Material Document Year
+         BUZEI      LIKE EKBE-BUZEI,    "Item in Material Document
+         EBELN      LIKE EKBE-EBELN,    "Purchasing Document Number
+         EBELP      LIKE EKBE-EBELP,    "Item Number of Purchasing Document
+       END OF TY_RSEG.
+
+
+TYPES: BEGIN OF TY_EKBE2,
+         EBELN      LIKE EKBE-EBELN,    "Purchasing Document Number
+         EBELP      LIKE EKBE-EBELP,    "Item Number of Purchasing Document
+         GJAHR      LIKE EKBE-GJAHR,    "Material Document Year
+         BELNR      LIKE EKBE-BELNR,    "Number of Material Document
+         BUZEI      LIKE EKBE-BUZEI,    "Item in Material Document
+         AREWR      LIKE EKBE-AREWR,    "GR/IR account clearing value in local currency
+       END OF TY_EKBE2.
+
+DATA: LT_RSEG    TYPE STANDARD TABLE OF TY_RSEG  WITH HEADER LINE,
+      LT_EKBE2   TYPE STANDARD TABLE OF TY_EKBE2 WITH HEADER LINE.
+
+* End of change MOD-001
+
+
+DATA: BEGIN OF gt_frord OCCURS 0,
+        ebeln  LIKE ekko-ebeln,
+      END OF gt_frord.
+
+DATA: BEGIN OF gt_pord OCCURS 0,
+        ebeln(10)    TYPE n,
+        ebelp(6)     TYPE n,
+* begin of modification mj 10/10/2007
+*       classkey(10) type n,
+        classkey(7)  TYPE n,
+* end of modificatin mj 10/10/2007
+      END OF gt_pord.
+
+DATA: BEGIN OF gt_ekbe OCCURS 0,
+        ebeln  LIKE ekbe-ebeln,
+        ebelp  LIKE ekbe-ebelp,
+        belnr  LIKE ekbe-belnr,
+        buzei  LIKE ekbe-buzei,
+        dmbtr  LIKE ekbe-dmbtr,
+        waers  TYPE waers,
+      END OF gt_ekbe.
+
+DATA: BEGIN OF gt_ekbe2 OCCURS 0,
+        belnr      LIKE ekbe-belnr,
+        val_fo     LIKE ekbe-dmbtr,
+        tot_amount LIKE ekbe-dmbtr,
+*       waers      type waers,
+      END OF gt_ekbe2.
+
+DATA: gt_veiav    LIKE yse_veiav OCCURS 0 WITH HEADER LINE,
+      wa_veiav    LIKE yse_veiav,
+      wa_ekbe     LIKE gt_ekbe.
+
+*.. Global variables
+DATA: gv_filename   TYPE string,
+*     gv_waers      type waers,
+      gv_val_fo     LIKE ekbe-dmbtr,
+      gv_tot_amount LIKE ekbe-dmbtr.
+
+DATA : wa_string    TYPE string.
+
+*.. Global constants
+CONSTANTS: c_filetype(10)   TYPE c VALUE 'ASC',     " FILE TYPE
+           c_blank          TYPE c VALUE ' '.       " no separator
+
+*.. Parameters........................................................ *
+PARAMETERS: p_infile   LIKE /sapdmc/lsoinp-filename OBLIGATORY.
+
+*.. Select-options.....................................................*
+SELECT-OPTIONS: s_budat FOR ekbe-budat OBLIGATORY.
+
+*.. AT selection-screen  ----------------------------------------------*
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_infile.
+
+  CALL FUNCTION 'WS_FILENAME_GET'
+    EXPORTING
+      def_path = 'C:\SAP\'
+      mask     = ',*,*.txt.'
+    IMPORTING
+      filename = p_infile
+    EXCEPTIONS
+      OTHERS   = 5.
+
+*.................. Main program...................................... *
+START-OF-SELECTION.
+
+  CLASS cl_abap_char_utilities DEFINITION LOAD.
+  CONSTANTS:
+      con_tab  TYPE c VALUE cl_abap_char_utilities=>horizontal_tab.
+
+* FILE READ FROM PRESENTATION SERVER
+  MOVE p_infile TO gv_filename.
+  PERFORM get_from_pres IN PROGRAM yam_common_routines
+                                  TABLES  gt_upload
+                                  USING   gv_filename
+                                          c_filetype
+                                          c_blank.
+
+  LOOP AT gt_upload INTO wa_string.
+    SPLIT wa_string AT con_tab
+     INTO gt_pord-classkey
+          gt_pord-ebeln
+          gt_pord-ebelp.
+    APPEND gt_pord.
+  ENDLOOP.
+
+  SORT gt_pord BY ebeln ebelp.
+
+* Select active Framework Orders
+  SELECT ebeln
+     INTO CORRESPONDING FIELDS OF TABLE gt_frord
+     FROM ekko WHERE bukrs EQ 'POLA'
+                 AND bstyp EQ 'F'
+                 AND bsart EQ 'FO'
+                 AND kdatb LE s_budat-high
+                 AND kdate GE s_budat-high
+                 AND loekz EQ space.
+
+* Add active workorders to internal table
+  LOOP AT gt_frord.
+    SELECT ebeln ebelp belnr buzei dmbtr waers
+       APPENDING CORRESPONDING FIELDS OF TABLE gt_ekbe
+       FROM ekbe WHERE ebeln EQ gt_frord-ebeln
+                   AND vgabe EQ '2'
+* begin of change mj 20071009
+*                   and budat in s_budat.
+                    and budat LE s_budat-high.
+* end of change mj 20071009
+  ENDLOOP.
+
+* Select PO's resulting from MEIS
+  LOOP AT gt_pord.
+
+*.. Select PO's resulting from MEIS
+    SELECT ebeln ebelp belnr buzei dmbtr
+       APPENDING CORRESPONDING FIELDS OF TABLE gt_ekbe
+       FROM ekbe WHERE ebeln EQ gt_pord-ebeln
+                   AND ebelp EQ gt_pord-ebelp
+                   AND vgabe EQ '2'
+* begin of change mj 20071009
+*                   and budat in s_budat.
+                    and budat LE s_budat-high.
+* end of change mj 20071009
+  ENDLOOP.
+
+* Calculate freight/insurance value
+  SORT gt_ekbe BY belnr.
+  LOOP AT gt_ekbe.
+
+    wa_ekbe = gt_ekbe.
+
+    AT NEW belnr.
+      CLEAR: gt_ekbe2,
+*            gv_waers,
+             gv_val_fo,
+             gv_tot_amount.
+    ENDAT.
+
+    IF gt_ekbe-waers IS INITIAL.
+      MOVE wa_ekbe-dmbtr TO gv_tot_amount.
+    ELSE.
+      MOVE wa_ekbe-dmbtr TO gv_val_fo.
+*     move wa_ekbe-waers to gv_waers.
+    ENDIF.
+
+    AT END OF belnr.
+      MOVE gt_ekbe-belnr TO gt_ekbe2-belnr.
+      MOVE gv_val_fo     TO gt_ekbe2-val_fo.
+*     MOVE gv_tot_amount TO gt_ekbe2-tot_amount.
+*     move gv_waers      to gt_ekbe2-waers.
+      COLLECT gt_ekbe2.
+    ENDAT.
+
+  ENDLOOP.
+
+* put total amount for incoming invoice
+
+* Begin of change MOD-001
+
+*  LOOP AT gt_ekbe2.
+*
+*    SELECT SUM( arewr ) INTO gt_ekbe2-tot_amount
+*     FROM ekbe WHERE belnr = gt_ekbe2-belnr.
+*    MODIFY gt_ekbe2.
+*
+*  ENDLOOP.
+
+
+* It is not possible to get the data from EKBE using BELNR as it will goto DUMP.
+* So, use RSEG to get the EBELN and then get the data from EKBE.
+SELECT BELNR
+       GJAHR
+       BUZEI
+       EBELN
+       EBELP
+       FROM RSEG
+       INTO TABLE LT_RSEG
+       FOR ALL ENTRIES IN GT_EKBE2
+       WHERE BELNR EQ GT_EKBE2-BELNR.
+
+SORT LT_RSEG BY BELNR.
+
+IF NOT LT_RSEG[] IS INITIAL.
+SELECT EBELN
+       EBELP
+       GJAHR
+       BELNR
+       BUZEI
+       AREWR
+       FROM EKBE
+       INTO TABLE LT_EKBE2
+       FOR ALL ENTRIES IN LT_RSEG
+       WHERE EBELN EQ LT_RSEG-EBELN
+       AND   EBELP EQ LT_RSEG-EBELP
+       AND   GJAHR EQ LT_RSEG-GJAHR
+       AND   BELNR EQ LT_RSEG-BELNR
+       AND   BUZEI EQ LT_RSEG-BUZEI.
+
+
+SORT LT_EKBE2 BY BELNR.
+
+* Lets move the total of AREWR for each BELNR to the GT_EKBE2 table.
+LOOP AT GT_EKBE2.
+    LOOP AT LT_EKBE2 WHERE BELNR = GT_EKBE2-BELNR.
+          GT_EKBE2-TOT_AMOUNT = GT_EKBE2-TOT_AMOUNT + LT_EKBE2-AREWR.
+    ENDLOOP.
+
+    MODIFY GT_EKBE2 TRANSPORTING TOT_AMOUNT.
+
+CLEAR   GT_EKBE2-TOT_AMOUNT.
+ENDLOOP.
+
+
+REFRESH : LT_RSEG,
+          LT_EKBE2.
+
+
+ENDIF.
+* End of change MOD-001
+
+
+* Put new values into table YSE_VEIAV, first delete old entries
+  DELETE FROM yse_veiav.
+  COMMIT WORK AND WAIT.
+
+  SORT gt_ekbe2 BY belnr.
+
+  LOOP AT gt_ekbe.
+
+    IF NOT gt_ekbe-waers IS INITIAL.
+      CONTINUE.
+    ENDIF.
+
+*.. (value from framework order X item amount) / total amount
+    CLEAR wa_veiav.
+    wa_veiav-belegnumr   = gt_ekbe-ebeln.
+    wa_veiav-hauptposi   = gt_ekbe-ebelp.
+
+    READ TABLE gt_pord WITH KEY ebeln = gt_ekbe-ebeln
+                                ebelp = gt_ekbe-ebelp
+                     BINARY SEARCH.
+    IF sy-subrc = 0.
+      wa_veiav-lfdnrveia = gt_pord-classkey.
+    ENDIF.
+
+    wa_veiav-rechnweak = gt_ekbe-dmbtr.
+
+    READ TABLE gt_ekbe2 WITH KEY belnr = gt_ekbe-belnr
+                     BINARY SEARCH.
+    IF sy-subrc = 0.
+*     wa_veiav-rechnweeh = gt_ekbe2-waers.
+      IF gt_ekbe2-tot_amount NE 0.
+        wa_veiav-dmbtr     = ( gt_ekbe-dmbtr * gt_ekbe2-val_fo )
+                              / gt_ekbe2-tot_amount.
+      ENDIF.
+      wa_veiav-yse_rechnweak = wa_veiav-rechnweak + wa_veiav-dmbtr.
+*     wa_veiav-yse_rechnweeh = gt_ekbe2-waers.
+    ENDIF.
+
+    MODIFY yse_veiav FROM wa_veiav.
+
+  ENDLOOP.
+
+*Selection text£º
+*P_INFILE:        Input filename
+*S_BUDAT:D       Posting Date

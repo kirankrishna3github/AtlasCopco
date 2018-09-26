@@ -1,0 +1,1038 @@
+*&---------------------------------------------------------------------*
+*&  Include           J_3R_LF_COMMON_FORMS
+*&---------------------------------------------------------------------*
+
+*&--------------------------------------------------------------------*
+*&      Form  F_GET_COMPANY_PARAM
+*&--------------------------------------------------------------------*
+*      Returns parameter of a company corresponding the given parameter:
+*      p_bukrs ('BUKRS') and the parameter type ('T001Z-PARTY')
+*---------------------------------------------------------------------*
+*      -->P_BUKRS     -  Company Code
+*      -->P_TYPE      -  Parameter type
+*
+* USAGE: e.g.:
+* f_get_company_param USING 'RU01', gc_okpo_type CHANGING p_param
+*
+* The function returns the okpo code for company RU01.
+*---------------------------------------------------------------------*
+
+* Table T001Z contains row with the following structure:
+* 'mandt', 'bukrs', 'party', 'paval'
+* 'party' is the type of the paramer. e.g. 'SAPR02' = OKPO
+* 'paval' is the value of the given parameter type
+
+FORM f_get_company_param USING p_bukrs TYPE bukrs p_type TYPE party CHANGING p_param TYPE ANY.
+
+  SELECT SINGLE paval FROM t001z INTO p_param
+    WHERE bukrs = p_bukrs AND party = p_type.
+
+*  IF sy-subrc <> 0.
+*    MESSAGE text-020 TYPE 'I'.
+*  ENDIF.
+
+ENDFORM. " f_get_okpo
+
+*&---------------------------------------------------------------------*
+*&      Form  visibility_change
+*&---------------------------------------------------------------------*
+FORM visibility_change  USING    value(pv_name) TYPE ANY
+                                 value(pv_text_off) TYPE ANY
+                                 value(pv_text_on) TYPE ANY
+                        CHANGING pv_status TYPE ANY
+                                 pv_pbtext TYPE ANY.
+
+  DATA: lv_text_mod TYPE string.
+
+* for printer device checking/correction
+  IF pv_name = 'SET'.
+    IF NOT p_out IS INITIAL.
+      MOVE 1 TO pv_status.
+      CLEAR p_out.
+    ENDIF.
+  ENDIF.
+
+* Change pushbutton text
+  IF pv_status = 1.
+    "MOVE  pv_text_on       TO  pv_pbtext.
+    MOVE pv_text_on TO lv_text_mod.
+    REPLACE SUBSTRING '@0H\Q@ ' IN lv_text_mod WITH ''. " IN CHARACTER MODE.
+
+
+*    CONCATENATE ICON_COLUMN_right lv_text_mod INTO pv_pbtext.
+*    FIND '@0H\Q@ ' IN lv_text_mod.
+
+    CALL FUNCTION 'ICON_CREATE'
+      EXPORTING
+        name   = ICON_COLUMN_right
+        text   = lv_text_mod
+        info   = lv_text_mod
+      IMPORTING
+        RESULT = pv_pbtext
+      EXCEPTIONS
+        OTHERS = 0.
+
+  ELSE.
+    "MOVE  pv_text_off      TO  pv_pbtext.
+    MOVE pv_text_off TO lv_text_mod.
+    REPLACE SUBSTRING '@0E\Q@ ' IN lv_text_mod WITH ''. " IN CHARACTER MODE.
+*    CONCATENATE ICON_PREVIOUS_VALUE lv_text_mod INTO pv_pbtext.
+
+    CALL FUNCTION 'ICON_CREATE'
+      EXPORTING
+        name   = ICON_PREVIOUS_VALUE
+        text   = lv_text_mod
+        info   = lv_text_mod
+      IMPORTING
+        RESULT = pv_pbtext
+      EXCEPTIONS
+        OTHERS = 0.
+
+  ENDIF.
+
+* Change of the visiblitiy of the fields for the selected block
+  LOOP AT SCREEN.
+    CHECK screen-group1 EQ pv_name.
+    screen-active = pv_status.
+    if p_formna = 'OS2' and pv_status = 1.
+         screen-invisible = 0.
+    endif.
+    MODIFY SCREEN.
+  ENDLOOP.
+
+ENDFORM.                    " visibility_change
+
+
+*&--------------------------------------------------------------------*
+*&      Form  get_selection_parameters
+*&--------------------------------------------------------------------*
+*       Retrieves the parameters and select-options of the current
+*       form with their values.
+*---------------------------------------------------------------------*
+*      -->T_PARAMETERtext
+*---------------------------------------------------------------------*
+FORM get_selection_parameters
+       TABLES
+               t_parameters TYPE j_3r_rsparams_tab.
+
+  CLEAR t_parameters.
+* gets parameters and select-options with values and selection lines
+  CALL FUNCTION 'RS_REFRESH_FROM_SELECTOPTIONS'
+    EXPORTING
+      curr_report     = sy-repid
+    TABLES
+      selection_table = t_parameters
+    EXCEPTIONS
+      not_found       = 1
+      no_report       = 2
+      OTHERS          = 3.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+      WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+ENDFORM.                    "get_selection_parameters
+
+*&--------------------------------------------------------------------*
+*&      Form  set_selection_parameters
+*&--------------------------------------------------------------------*
+*       Sets the parameters and select-options of the current form
+*       based on the T_ORIGINAL_PARAMETERS with the values set in
+*       T_NEW_PARAMETERS
+*       It deletes the original values and fills the parameters with
+*       the new values contained by the new parameters table.
+*       To ensure which parameters are have to be erased, this code
+*       makes a cross-check with the old table. Only those parameters
+*       would be deleted which are in the new table.
+*---------------------------------------------------------------------*
+*      -->T_NEW_PARAMETERS text
+*      -->T_ORIGINAL_PARAMETERS text
+*---------------------------------------------------------------------*
+FORM set_selection_parameters
+       TABLES
+               t_new_parameters TYPE j_3r_rsparams_tab
+               t_original_parameters TYPE j_3r_rsparams_tab.
+
+  DATA: ls_parameters TYPE rsparams,
+        ls_parameters_check TYPE rsparams.
+  DATA: lv_type TYPE string.
+  DATA: lt_selinfo TYPE TABLE OF selinfo,
+        ls_selinfo TYPE selinfo.
+  DATA: lv_string TYPE string.
+  data: lv_so_name   TYPE  string.              " Note 1648742
+
+  FIELD-SYMBOLS: <param> TYPE ANY.
+  FIELD-SYMBOLS: <selop> TYPE STANDARD TABLE.
+  FIELD-SYMBOLS: <selopline> TYPE ANY.
+  FIELD-SYMBOLS: <field> TYPE ANY.
+
+  CHECK t_new_parameters[] IS NOT INITIAL.
+  SORT t_new_parameters[] BY kind selname.        " Note 1648742
+  CLEAR ls_parameters_check.
+
+  LOOP AT t_new_parameters INTO ls_parameters.
+
+    READ TABLE t_original_parameters
+      WITH KEY
+        selname = ls_parameters-selname
+        kind = ls_parameters-kind
+     INTO ls_parameters_check.
+    CHECK sy-subrc EQ 0. " valid record in the new table
+
+    CALL FUNCTION 'RS_SELECTIONS_DESCRIPTION'
+      EXPORTING
+        report              = sy-repid
+      TABLES
+        selections_info     = lt_selinfo
+      EXCEPTIONS
+        no_selections       = 1
+        report_not_existent = 2
+        subroutine_pool     = 3
+        OTHERS              = 4.
+    IF sy-subrc <> 0.
+      MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+              WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+    ENDIF.
+
+    READ TABLE lt_selinfo
+    WITH KEY
+      name = ls_parameters-selname
+      kind = ls_parameters-kind
+      INTO ls_selinfo.
+    CHECK sy-subrc EQ 0. " valid record in the selinfo
+
+    lv_type = ls_selinfo-type.
+    ASSIGN COMPONENT 'LOW' OF STRUCTURE ls_parameters_check TO <field> CASTING TYPE (lv_type).
+*   CHECK <field> IS INITIAL. " the target structure has no initial value (OK to fill)
+    CLEAR <field>.
+
+    CASE ls_parameters-kind.
+      WHEN 'P'. " parameter
+        ASSIGN (ls_parameters-selname) TO <param>.
+        CHECK sy-subrc EQ 0.
+        <param> = ls_parameters-low.
+      WHEN OTHERS. " select-option
+        CONCATENATE ls_parameters-selname '[]' INTO lv_string.
+        IF lv_string NE lv_so_name.                     " Note 1648742
+          MOVE lv_string TO lv_so_name.                 " Note 1648742
+          ASSIGN (lv_so_name) TO <selop>.               " Note 1648742
+          CHECK sy-subrc EQ 0.                          " Note 1648742
+          CLEAR <selop>.                                " Note 1648742
+        ENDIF.                                          " Note 1648742
+        ASSIGN (lv_string) TO <selop>.
+        CHECK sy-subrc EQ 0.
+        ASSIGN (ls_parameters-selname) TO <selopline>.
+        CHECK sy-subrc EQ 0.
+        MOVE-CORRESPONDING ls_parameters TO <selopline>.
+        CHECK ls_parameters-option IS NOT INITIAL AND ls_parameters-sign IS NOT INITIAL.  " Note 1648742
+        APPEND <selopline> TO <selop>.
+    ENDCASE.
+  ENDLOOP.
+
+ENDFORM.                    "set_selection_parameters
+
+*&--------------------------------------------------------------------*
+*&      Form  fill_data_tables
+*&--------------------------------------------------------------------*
+*       Fill the selection and the selected tables and keys with
+*       the values of the parameters and select-options of the
+*       current form
+*---------------------------------------------------------------------*
+*      -->T_SELN     text
+*      -->T_SELD     text
+*      -->CV_SELNKEY text
+*      -->CV_SELDKEY text
+*---------------------------------------------------------------------*
+*FORM fill_data_tables
+*       TABLES t_seln TYPE j_3r_lf_sline_tab
+*              t_seld TYPE j_3r_lf_sline_tab
+**USING uv_repid TYPE sy-repid
+*       CHANGING cv_selnkey TYPE j_3r_lfhdr-selnparkey
+*                cv_seldkey TYPE j_3r_lfhdr-seldparkey.
+*
+** Variables for creating selection/selected key
+*  DATA: ls_seln      TYPE j_3r_lf_sline,
+*        ls_seld      TYPE j_3r_lf_sline,
+*        lv_selnsubrc TYPE sy-subrc,
+*        lv_seldsubrc TYPE sy-subrc,
+**        lv_selstr(1000).
+*        lv_selstr TYPE string.
+*
+** select result to store select-option selected data
+*  TYPES: BEGIN OF ys_select_result,
+*            line TYPE j_3r_lf_sline-low,
+*         END OF ys_select_result.
+*
+*  DATA: lt_select_result TYPE TABLE OF ys_select_result,
+*        ls_select_result TYPE ys_select_result.
+*
+** select-option and parameter names and attributes
+*  DATA:
+*    lt_rsparams TYPE TABLE OF rsparams,
+*    ls_rsparams TYPE rsparams.
+*
+** insertable variable for select-option real selection
+*  DATA:
+**    lt_so_insert TYPE TABLE OF j_3r_lf_sline,
+*    ls_so_insert TYPE j_3r_lf_sline.
+*
+** select-option table-field
+*  DATA:
+*    lt_sscr TYPE TABLE OF rsscr,
+*    ls_sscr TYPE rsscr,
+*    lv_dbtab TYPE c LENGTH 30,
+*    lv_chktab TYPE c LENGTH 30,
+*    lv_field TYPE c LENGTH 30,
+*    lv_tabclass TYPE dd02l-tabclass,
+**    lv_string TYPE string,
+*    lv_condition TYPE string.
+*
+*
+*  FIELD-SYMBOLS: <fs> TYPE ANY.
+*
+*  DATA: lv_so_counter.
+*
+*  DATA: lv_subrc TYPE sy-subrc.
+*
+** not relevant parameters
+*  DATA:
+*    lt_not_rel_par TYPE TABLE OF j_3r_clnrelpar,
+*    ls_not_rel_par TYPE j_3r_clnrelpar,
+*    lv_not_relevant_par TYPE c.
+*********************************
+*
+*  CLEAR: t_seln,
+*         t_seld,
+*         cv_selnkey,
+*         cv_seldkey.
+*
+** gets parameters and select-options with values and selection lines
+*  CALL FUNCTION 'RS_REFRESH_FROM_SELECTOPTIONS'
+*    EXPORTING
+*      curr_report     = sy-repid
+*    TABLES
+*      selection_table = lt_rsparams
+*    EXCEPTIONS
+*      not_found       = 1
+*      no_report       = 2
+*      OTHERS          = 3.
+*  IF sy-subrc <> 0.
+*    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+*      WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+*  ENDIF.
+*
+** read not relevant parameter names from customizing
+*  SELECT *
+*    FROM j_3r_clnrelpar
+*    INTO TABLE lt_not_rel_par
+*    WHERE form_name = j_3r_cl_lf_general=>cv_form_name.
+*
+*  ls_not_rel_par-mandt = sy-mandt.
+*  ls_not_rel_par-form_name = j_3r_cl_lf_general=>cv_form_name.
+*
+*
+*
+** insert selection and selected parameters and select-options
+*  LOOP AT lt_rsparams INTO ls_rsparams.
+*
+** store just the relevant parameters and selections
+*    ASSIGN (ls_rsparams-selname) TO <fs>.
+**    if <fs> IS INITIAL.
+**      ls_rsparams-low = '0'.
+**    endif.
+*    CHECK <fs> IS NOT INITIAL.
+*
+*    AT NEW kind.
+*      CLEAR lv_so_counter.
+*
+** select-option selected lines
+*      IF ls_rsparams-kind EQ 'S'.
+*
+** get reference for "select-options", when necessary
+*        IF lt_sscr IS INITIAL.
+*          PERFORM load_sscr IN PROGRAM rsdbrunt   TABLES    lt_sscr
+*                                                  USING     sy-repid
+*                                                  CHANGING  lv_subrc.
+*        ENDIF.
+*
+*        READ TABLE lt_sscr INTO ls_sscr WITH KEY name = ls_rsparams-selname.
+*        SPLIT ls_sscr-dbfield AT '-' INTO lv_dbtab lv_field.
+*        CLEAR lv_condition.
+*        SELECT checktable FROM  dd03l
+*                          INTO lv_chktab
+*               WHERE  tabname    = lv_dbtab
+*               AND    fieldname  = lv_field
+*               AND    as4local   = 'A'.
+*          Exit.
+*        ENDSELECT.
+*        CASE sy-subrc.
+*          WHEN 0.
+** everything is fine
+*          WHEN OTHERS.
+** not found
+*            EXIT.
+*        ENDCASE.
+*
+*        IF lv_chktab IS INITIAL.
+*          SELECT SINGLE tabclass FROM  dd02l
+*                                 INTO lv_tabclass
+*                 WHERE  tabname   = lv_dbtab
+*                 AND    as4local  = 'A'
+*                 AND    as4vers   = '0000'.
+*          IF lv_tabclass NE 'TRANSP' AND
+*             lv_tabclass NE 'VIEW'.
+*
+*            EXIT.
+*
+*          ELSE.
+*            MOVE lv_dbtab TO lv_chktab.
+*          ENDIF.
+*        ENDIF.
+*
+*        IF NOT lv_chktab IS INITIAL.  " we have a valid table
+*          CONCATENATE
+*            lv_field
+*            'in'
+*            ls_rsparams-selname
+*            INTO lv_condition SEPARATED BY space.
+*          TRY.
+*              SELECT DISTINCT (lv_field) FROM (lv_chktab)
+*                                INTO TABLE lt_select_result
+*                          WHERE (lv_condition).
+** checks is it a relevant or a not relevant parameter
+*              ls_not_rel_par-par_name = ls_rsparams-selname.
+*              READ TABLE lt_not_rel_par FROM ls_not_rel_par INTO ls_not_rel_par.
+*              lv_not_relevant_par = space.
+*              IF sy-subrc NE 4.
+*                lv_not_relevant_par = 'X'.
+*              ENDIF.
+** it is a relevant parameter
+*
+*
+** stores select-option selected lines
+*              LOOP AT lt_select_result INTO ls_select_result.
+*                CLEAR ls_seld.
+*                MOVE:
+*                      ls_rsparams-selname TO ls_seld-sname,
+*                      sy-tabix TO ls_seld-linnr,
+*                      'D'      TO ls_seld-sign,
+*                      ls_select_result TO ls_seld-low.
+*                APPEND ls_seld TO t_seld.
+** processing selected parameters key
+*                CHECK lv_seldsubrc EQ 0.
+*                CHECK lv_not_relevant_par EQ space.
+*                MOVE ls_seld TO lv_selstr.
+*                CONDENSE lv_selstr NO-GAPS.
+*                CONCATENATE cv_seldkey lv_selstr
+*                       INTO cv_seldkey.
+*                MOVE sy-subrc TO lv_seldsubrc.
+*              ENDLOOP.
+*            CATCH cx_sy_dynamic_osql_semantics.      "#EC NO_HANDLER
+*          ENDTRY.
+*        ENDIF.       " chktab -> sel ok
+*      ENDIF.         " KIND = 'S'
+*    ENDAT.
+*
+*
+*    CASE ls_rsparams-kind.
+*      WHEN 'P'.
+** parameters selection
+*        CLEAR ls_seln.
+*        MOVE: ls_rsparams-selname TO ls_seln-sname,
+*              'P' TO ls_seln-sign,
+*              ls_rsparams-low TO ls_seln-low.
+*        APPEND ls_seln TO t_seln.
+*
+** checks is it a relevant or a not relevant parameter
+*        ls_not_rel_par-par_name = ls_rsparams-selname.
+*        READ TABLE lt_not_rel_par FROM ls_not_rel_par INTO ls_not_rel_par.
+*        CHECK sy-subrc NE 0.
+** it is a relevant parameter
+*
+*        IF lv_selnsubrc EQ 0.
+*          CLEAR ls_seln-sname.
+*          MOVE ls_seln TO lv_selstr.
+*          CONDENSE lv_selstr NO-GAPS.
+*          CONCATENATE cv_selnkey lv_selstr
+*                 INTO cv_selnkey.
+*          MOVE sy-subrc TO lv_selnsubrc.
+*        ENDIF.
+*
+*
+** parameters selected
+*        CLEAR ls_seld.
+*        MOVE: ls_rsparams-selname TO ls_seld-sname,
+*              'P' TO ls_seld-sign,
+*              ls_rsparams-low  TO ls_seld-low.
+*        APPEND ls_seld TO t_seld.
+*
+** checks is it a relevant or a not relevant parameter
+*        ls_not_rel_par-par_name = ls_rsparams-selname.
+*        READ TABLE lt_not_rel_par FROM ls_not_rel_par INTO ls_not_rel_par.
+*        CHECK sy-subrc NE 0.
+** it is a relevant parameter
+*
+*        IF lv_seldsubrc EQ 0.
+*          CLEAR ls_seld-sname.
+*          MOVE ls_seld TO lv_selstr.
+*          CONDENSE lv_selstr NO-GAPS.
+*          CONCATENATE cv_seldkey lv_selstr
+*                 INTO cv_seldkey.
+*          MOVE sy-subrc TO lv_seldsubrc.
+*        ENDIF.
+*
+*      WHEN 'S'.
+*
+** select-options selection lines
+*        ADD 1 TO lv_so_counter.
+*        ls_so_insert-sname = ls_rsparams-selname.
+*        ls_so_insert-sign = ls_rsparams-sign.
+*        ls_so_insert-rngoption = ls_rsparams-option.
+*        ls_so_insert-low = ls_rsparams-low.
+*        ls_so_insert-high = ls_rsparams-high.
+*        ls_so_insert-linnr = lv_so_counter.
+*
+*        CLEAR ls_seln.
+*        MOVE-CORRESPONDING ls_so_insert TO ls_seln.
+*        APPEND ls_seln TO t_seln.
+*
+** checks is it a relevant or a not relevant parameter
+*        ls_not_rel_par-par_name = ls_rsparams-selname.
+*        READ TABLE lt_not_rel_par FROM ls_not_rel_par INTO ls_not_rel_par.
+*        CHECK sy-subrc NE 0.
+** it is a relevant parameter
+*
+*        IF lv_selnsubrc EQ 0.
+*          MOVE ls_seln TO lv_selstr.
+*          CONDENSE lv_selstr NO-GAPS.
+*          CONCATENATE cv_selnkey lv_selstr
+*                 INTO cv_selnkey.
+*          MOVE sy-subrc TO lv_selnsubrc.
+*        ENDIF.
+*
+*    ENDCASE.
+*
+*  ENDLOOP.
+*
+*ENDFORM.                    " fill_data_tables
+
+
+*&---------------------------------------------------------------------*
+*&      Form  check_printer
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM check_printer.
+  DATA: lv_pdltype      TYPE string.
+*        lv_adsextension TYPE string.
+
+* select-option and parameter names and attributes
+*  DATA:
+*    lt_rsparams TYPE TABLE OF rsparams.
+
+  CHECK pdf_pre EQ 'X' OR
+        pdf_prn EQ 'X'.
+
+  CHECK p_printr IS NOT INITIAL.
+
+* TRANSLATE p_printr TO UPPER CASE.
+  gs_outpar-dest =  p_printr.
+
+  CALL FUNCTION 'ADS_GET_PRINTER_ATTRIBUTES'
+    EXPORTING
+      dest    = gs_outpar-dest
+    IMPORTING
+      adstype = lv_pdltype.
+*      adsextension = lv_adsextension.
+
+  IF lv_pdltype IS INITIAL.
+
+    IF sy-batch EQ 'X'.
+      MESSAGE e035 WITH gs_outpar-dest.
+    ELSE.
+      MESSAGE w035 WITH gs_outpar-dest.
+      PERFORM leave_to_selection_screen.
+    ENDIF.
+
+  ENDIF.
+
+ENDFORM.                 " check_printer
+
+*&---------------------------------------------------------------------*
+*&      Form  check_printer
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM leave_to_selection_screen.
+
+* select-option and parameter names and attributes
+  DATA:
+    lt_rsparams TYPE TABLE OF rsparams.
+
+
+  MOVE 1 TO p_out.
+
+*     gets parameters and select-options with values and selection lines
+  CALL FUNCTION 'RS_REFRESH_FROM_SELECTOPTIONS'
+    EXPORTING
+      curr_report     = sy-repid
+    TABLES
+      selection_table = lt_rsparams
+    EXCEPTIONS
+      not_found       = 1
+      no_report       = 2
+      OTHERS          = 3.
+
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+      WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+  SUBMIT (sy-repid)
+         VIA SELECTION-SCREEN
+         WITH SELECTION-TABLE lt_rsparams
+         USING SELECTION-SET sy-slset.                   "#EC CI_SUBMIT
+
+
+
+ENDFORM.                 " leave_to_selection_screen
+
+*&---------------------------------------------------------------------*
+*&      Form  set_report_title
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM set_report_title.
+DATA: lv_title  like J_3R_CLFORMT-LTEXT.
+
+      SELECT SINGLE LTEXT
+        FROM J_3R_CLFORMT
+        INTO lv_title
+        WHERE LANGU  =  SY-LANGU AND
+              FORM_NAME = p_formna.
+
+      IF SY-SUBRC NE 0.
+
+      SELECT SINGLE LTEXT    "#EC CI_GENBUFF
+        FROM J_3R_CLFORMT
+        INTO lv_title
+        WHERE LANGU  ne  SY-LANGU AND
+               FORM_NAME = p_formna.
+
+  ENDIF.
+
+  IF lv_title IS NOT INITIAL.
+    SET TITLEBAR 'MAIN' WITH lv_title ."#EC * " OF PROGRAM sy-prog. WITH p1 p2.
+  ENDIF.
+
+
+
+ENDFORM.                    "set_report_title
+
+*&---------------------------------------------------------------------*
+*&      Form  output_control
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->PT_CONTENT text
+*----------------------------------------------------------------------*
+FORM output_control CHANGING pt_content TYPE ANY TABLE.
+
+  IF gv_badi_exists = 1.
+
+    PERFORM call_badi_handler USING 'POST_CTRL' CHANGING pt_content.
+
+*    CALL BADI gp_badi->post_selection_control
+*      CHANGING
+**        ct_input = pt_content
+*        ct_content = pt_content
+*      EXCEPTIONS
+*        OTHERS   = 1.
+*
+*    IF sy-subrc <> 0.
+*      MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+*                 WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+*    ENDIF.
+
+  ENDIF.
+
+
+* Output control.
+
+* Number of copies
+  MOVE p_numcpy TO gs_outpar-copies.
+
+
+* if printing is needed in several copies,
+* set GS_OUTPAR-COPIES to the corresponding value
+  PERFORM output_document
+        USING
+                 gv_structure_name
+                 gv_outputtype
+*                 p_printr
+
+        CHANGING gs_outpar
+          pt_content
+          gs_docpar
+          gv_printed_content_num.
+
+ENDFORM.                    "output_control
+
+*&---------------------------------------------------------------------*
+*&      Form  collect_statistics
+*&---------------------------------------------------------------------*
+*       Collects statistical data from message
+*----------------------------------------------------------------------*
+*      -->P_GT_msg  text
+*      <--P_GT_stat  text
+*----------------------------------------------------------------------*
+FORM collect_statistics  TABLES  pt_msg.                    "#EC CALLED
+
+  DATA: ls_msg     TYPE hier_mess,
+        lt_msg     TYPE STANDARD TABLE OF hier_mess,
+        ls_stat     TYPE idalv_s_stat,
+        lv_cnt     TYPE i.
+
+  LOOP AT pt_msg INTO ls_msg.
+    APPEND ls_msg TO lt_msg.
+  ENDLOOP.
+  SORT lt_msg BY msgty.
+
+  CLEAR ls_msg.
+  LOOP AT lt_msg INTO ls_msg.
+    lv_cnt              = lv_cnt + 1.
+    MOVE-CORRESPONDING ls_msg TO ls_stat.                   "#EC ENHOK
+    ls_stat-stat_count = lv_cnt.
+    AT END OF msgty.
+*      ls_stat-msgv1    = gv_see_above.
+*      ls_stat-msgv2    = gv_see_above.
+      APPEND ls_stat TO gt_stat.
+      lv_cnt            = 0.
+    ENDAT.
+  ENDLOOP.
+
+ENDFORM.                    " collect_statistics
+*&---------------------------------------------------------------------*
+*&      Form  message_add
+*&---------------------------------------------------------------------*
+*       Insert a new message record into the message table
+*----------------------------------------------------------------------*
+*     -->P_0494         Message type   (e.g. 'E')
+*     -->P_106          Message Number (e.g. 104)
+*     -->P_0496         Message ID     (e.g. 'J_3R_MESSAGE_CLASS')
+*     -->p_par1         Parameters, which can be inserted into the message text (e.g. &1)
+*     -->p_par2
+*     -->p_par3
+*     -->p_par4
+*----------------------------------------------------------------------*
+form message_add  using    value(p_msgtype) TYPE ANY
+                           value(p_msgno) TYPE ANY
+                           value(p_msgid) TYPE ANY
+                           p_par1 TYPE ANY
+                           p_par2 TYPE ANY
+                           p_par3 TYPE ANY
+                           p_par4 TYPE ANY.
+
+*  gs_msg-msgv1    = p_par1.
+  move p_par1 To gs_msg-msgv1.
+  gs_msg-msgv2    = p_par2.
+  gs_msg-msgv3    = p_par3.
+  gs_msg-msgv4    = p_par4.
+  gs_msg-msgty    = p_msgtype.
+  gs_msg-msgno    = p_msgno.
+  gs_msg-msgid    = p_msgid.
+
+  condense gs_msg-msgv1.
+
+  " Append new message to the message table
+  APPEND gs_msg TO gt_msg.
+endform.                    " message_add
+
+*&---------------------------------------------------------------------*
+*&      Form  get_address_data
+*&---------------------------------------------------------------------*
+*       Select the relevant address data for address id
+*----------------------------------------------------------------------*
+FORM get_address_data USING ip_addr TYPE ADRNR
+                            i_spras type spras
+                      CHANGING ov_org_txt.
+data lv_dummy(256) type c.
+  PERFORM  get_address_2 USING ip_addr
+                              i_spras
+                        CHANGING ov_org_txt
+                                 lv_dummy.
+
+ENDFORM.                    " get_address_data
+*&---------------------------------------------------------------------*
+*&      Form  read_order_type
+*&---------------------------------------------------------------------*
+*       Reads the Short Description for Order Type to meet
+*       the requirements in INV-1/1a/18
+*----------------------------------------------------------------------*
+*
+*----------------------------------------------------------------------*
+FORM read_order_type USING ip_ordtyp CHANGING op_ordtyp.
+
+  DATA: lt_val_tab TYPE STANDARD TABLE OF DD07V,
+        ls_val_tab TYPE DD07V.
+
+  CALL FUNCTION 'GET_DOMAIN_VALUES'
+    EXPORTING
+      DOMNAME               = 'J_3R_TIO'
+      TEXT                  = 'X'
+*     FILL_DD07L_TAB = ' '
+    TABLES
+      values_tab     = lt_val_tab
+*     VALUES_DD07L   =
+    EXCEPTIONS
+      OTHERS                = 1.
+  .
+  IF SY-SUBRC = 0.
+    READ TABLE lt_val_tab INTO ls_val_tab WITH KEY
+                                          DDLANGUAGE = sy-langu
+                                          DOMVALUE_L = ip_ordtyp.
+
+    IF sy-subrc = 0.
+      op_ordtyp = ls_val_tab-ddtext.
+    ENDIF.
+  ENDIF.
+
+* If it was not possible to fill the
+* order type then set it to default value
+  IF op_ordtyp IS INITIAL.
+    op_ordtyp = ip_ordtyp.
+  ENDIF.
+ENDFORM.              " read_order_type
+
+*&---------------------------------------------------------------------*
+*&      Form  trim_currency
+*&---------------------------------------------------------------------*
+*       Check the Russian string if it contains the currency unit and
+*       if yes returns the value without cu
+*----------------------------------------------------------------------*
+*
+*----------------------------------------------------------------------*
+FORM trim_currency CHANGING ip_spelled_amnt.
+
+  DATA: lt_t015z     TYPE STANDARD TABLE OF t015z,
+        ls_t015z     TYPE t015z,
+        lv_cu        TYPE CHAR25,
+        lt_nums      TYPE TABLE OF string,
+        lv_num       TYPE string,  "the currency unit amond the numbers
+        lv_ln        TYPE i,
+        lv_curr_len  TYPE i.
+
+  SPLIT ip_spelled_amnt AT SPACE INTO TABLE lt_nums.
+  DESCRIBE TABLE lt_nums LINES lv_ln.
+  READ TABLE lt_nums INTO lv_num INDEX lv_ln.
+
+  SELECT * FROM t015z INTO TABLE lt_t015z
+        WHERE spras = 'R'
+        AND   ( einh  = 'R' OR einh = 'N' ).
+
+  LOOP AT lt_t015z INTO ls_t015z.
+
+    lv_cu = ls_t015z-wort.
+    REPLACE ALL OCCURRENCES OF ';' IN lv_cu WITH ''. "remove the deliminator
+    CONDENSE lv_cu.
+    TRANSLATE lv_cu TO LOWER CASE.                   "#EC SYNTCHAR "print in lower case
+    IF lv_cu = lv_num.
+      REPLACE ALL OCCURRENCES OF lv_num IN ip_spelled_amnt WITH ''.
+      EXIT.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.              " read_order_type
+*&---------------------------------------------------------------------*
+*&      Form  GET_WRITE_OFF_REASON
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_PS_TABLE4  text
+*      <--P_LS_OS4B_S1T_N30_4_WROFF_REASON  text
+*----------------------------------------------------------------------*
+FORM GET_WRITE_OFF_REASON  USING    ps_table4 TYPE j_3r_invc_s4
+                           CHANGING c_wroff_reason.
+if ps_table4-sgtxt is not INITIAL .
+    c_wroff_reason = ps_table4-sgtxt.
+else.
+    c_wroff_reason = ps_table4-bktxt.
+endif.
+ENDFORM.                    " GET_WRITE_OFF_REASON
+*&---------------------------------------------------------------------*
+*&      Form  UPDATE_PRECM_UNITS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_LS_TABLE7D_QUNIT  text
+*      -->P_LS_TABLE7D_WUNIT  text
+*      -->P_GS_T001_SPRAS  text
+*      <--P_LS_OS6_S7T_7T5_QUNIT  text
+*      <--P_LS_OS6_S7T_7T7_WUNIT  text
+*----------------------------------------------------------------------*
+* Fill unit of mesure for precious material in company code language
+form UPDATE_PRECM_UNIT  using    p_unit
+                                  p_spras
+                         changing cv_unit.
+          CALL FUNCTION 'CONVERSION_EXIT_CUNIT_OUTPUT'
+            EXPORTING
+              input                =  p_unit
+              LANGUAGE             =  p_spras
+           IMPORTING
+*     LONG_TEXT      =
+      output         = cv_unit
+*     SHORT_TEXT     =
+    EXCEPTIONS
+      unit_not_found = 1
+      OTHERS         = 2.
+          IF sy-subrc <> 0.
+            cv_unit     = p_unit.
+          ENDIF.
+
+endform.                    " UPDATE_PRECM_UNITS
+*&---------------------------------------------------------------------*
+*&      Form  GET_SERIAL_NUMBER
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_LS_HEADER_ALSERN  text
+*      -->P_LS_HEADER_GLO_RUS_SERNR  text
+*      <--P_GS_OS1_FSD_N19_SERIAL_NR  text
+*----------------------------------------------------------------------*
+form GET_SERIAL_NUMBER  using    p_short_sernr
+                                 p_long_sernr
+                        changing p_sernr.
+if p_long_sernr is not INITIAL.
+    p_sernr = p_long_sernr.
+else.
+    p_sernr = p_short_sernr.
+endif.
+endform.                    " GET_SERIAL_NUMBER
+
+
+
+*&---------------------------------------------------------------------*
+*&      Form  get_address_2
+*&---------------------------------------------------------------------*
+*       Select the relevant address data for address id
+*----------------------------------------------------------------------*
+FORM get_address_2 USING ip_addr TYPE ADRNR
+                            i_spras type spras
+                      CHANGING ov_org_txt
+                               ov_org_long_txt.
+
+  DATA: lt_adrc         TYPE TABLE OF ADRC,
+        ls_adrc         TYPE ADRC,
+        lv_org          TYPE c LENGTH 200.
+DATA sel_adr LIKE addr1_sel.
+ clear: sel_adr, addr1_val.
+
+  sel_adr-addrnumber = ip_addr.
+  sel_adr-nation = i_spras.
+  call function 'ADDR_GET'
+       exporting
+            address_selection       = sel_adr
+            address_group           = 'CA01'
+*         READ_SADR_ONLY          = ' '
+*         READ_TEXTS              = ' '
+       importing
+            address_value           = addr1_val
+*         ADDRESS_ADDITIONAL_INFO =
+*         RETURNCODE              =
+*         ADDRESS_TEXT            =
+*         SADR                    =
+*    TABLES
+*         ADDRESS_GROUPS          =
+*         ERROR_TABLE             =
+*         VERSIONS                =
+       exceptions
+            parameter_error         = 1
+            address_not_exist       = 2
+            version_not_exist       = 3
+            internal_error          = 4
+            others                  = 5.
+  if sy-subrc ne 0.
+    clear: addr1_val, sel_adr-nation.
+    call function 'ADDR_GET'
+         exporting
+              address_selection       = sel_adr
+              address_group           = 'CA01'
+*           READ_SADR_ONLY          = ' '
+*           READ_TEXTS              = ' '
+         importing
+              address_value           = addr1_val
+*           ADDRESS_ADDITIONAL_INFO =
+*           RETURNCODE              =
+*           ADDRESS_TEXT            =
+*           SADR                    =
+*      TABLES
+*           ADDRESS_GROUPS          =
+*           ERROR_TABLE             =
+*           VERSIONS                =
+         exceptions
+              parameter_error         = 1
+              address_not_exist       = 2
+              version_not_exist       = 3
+              internal_error          = 4
+              others                  = 5.
+    if sy-subrc ne 0.
+      clear addr1_val.
+    endif.
+  endif.
+
+
+
+  CONCATENATE addr1_val-name1 addr1_val-name2 addr1_val-name3 addr1_val-name4
+*  addr1_val-post_code1 addr1_val-city1 addr1_val-street addr1_val-house_num1
+    INTO ov_org_txt SEPARATED BY SPACE.
+
+  CONCATENATE addr1_val-name1 addr1_val-name2 addr1_val-name3 addr1_val-name4
+  addr1_val-post_code1 addr1_val-city1 addr1_val-street addr1_val-house_num1
+    INTO ov_org_long_txt SEPARATED BY SPACE.
+
+
+
+ENDFORM.                    " get_address_2
+* Code below is for note 1652575
+*&---------------------------------------------------------------------*
+*&      Form  get_state_badi_set_default
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_STATE    text
+*----------------------------------------------------------------------*
+FORM import_state_badi_set_default
+  CHANGING p_state TYPE xfeld.
+
+  DATA:
+        lv_mid(60)   TYPE c.
+
+  CONCATENATE gc_badi_set_def sy-cprog INTO lv_mid.
+
+  IMPORT p1 = p_state FROM MEMORY ID lv_mid.
+
+  IF sy-subrc IS NOT INITIAL.
+    CLEAR p_state.
+    EXPORT p1 = p_state TO MEMORY ID lv_mid.
+  ENDIF.
+ENDFORM.                    "get_state_badi_set_default
+
+*&---------------------------------------------------------------------*
+*&      Form  set_state_badi_set_default
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->(PV_STATE) text
+*----------------------------------------------------------------------*
+FORM export_state_badi_set_default
+  USING value(pv_state) TYPE xfeld.
+  DATA:
+        lv_mid(60)   TYPE c,
+        lv_tmp       type xfeld.
+
+  CONCATENATE gc_badi_set_def sy-cprog INTO lv_mid.
+  EXPORT p1 = pv_state TO MEMORY ID lv_mid.
+
+ENDFORM.                    "set_state_badi_set_default
+
+"set_state_badi_set_default

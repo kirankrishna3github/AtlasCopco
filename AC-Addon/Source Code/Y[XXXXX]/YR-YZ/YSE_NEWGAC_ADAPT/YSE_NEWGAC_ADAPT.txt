@@ -1,0 +1,834 @@
+*&---------------------------------------------------------------------*
+* PROGRAM ID           : YSE_NEWGAC_ADAPT                              *
+* PROGRAM TITLE        :                                               *
+* AUTHOR               : Anda Wu                                       *
+* DATE                 : 13/10/2016                                    *
+* DEVELOPMENT ID       : CD1K989889                                    *
+* CHANGE REQUEST NUMBER: CR4052                                        *
+* PROGRAM DESCRIPTION  : Upate the Material master data  to adapt      *
+*                        new GAC                                       *
+*----------------------------------------------------------------------*
+* CHANGE HISTORY LOG                                                   *
+*----------------------------------------------------------------------*
+* MOD. NO.|  DATE    | NAME     |CORRECTION NUMBER| CHANGE REFERENCE # *
+*----------------------------------------------------------------------*
+REPORT  yse_newgac_adapt.
+************************************************************************
+* TYPE SPOOLS                                                          *
+************************************************************************
+TYPE-POOLS slis.
+************************************************************************
+* TABLES DECLARATIONS
+************************************************************************
+TABLES: marc,mvke.
+
+************************************************************************
+* TYPES
+************************************************************************
+TYPES: BEGIN OF ty_marc,
+        matnr   TYPE marc-matnr,
+        werks   TYPE marc-werks,
+        prctr   TYPE marc-prctr,
+       END OF ty_marc,
+
+       BEGIN OF ty_mvke,
+         matnr  TYPE mvke-matnr,
+         vkorg  TYPE mvke-vkorg,
+         vtweg  TYPE mvke-vtweg,
+         prodh  TYPE mvke-prodh,
+       END OF ty_mvke,
+
+       BEGIN OF ty_mara,
+         matnr TYPE mara-matnr,
+         prdha  TYPE mara-prdha,
+       END OF ty_mara,
+
+       BEGIN OF ty_errlog,
+        matnr   TYPE marc-matnr,
+        werks   TYPE marc-werks,
+        vkorg   TYPE mvke-vkorg,
+        vtweg   TYPE mvke-vtweg,
+        errmsg  TYPE char128,
+       END OF ty_errlog.
+
+************************************************************************
+* VARIABLES DECLARATIONS
+************************************************************************
+DATA:   gv_ucomm          TYPE sy-ucomm,
+        gt_fieldcat       TYPE slis_t_fieldcat_alv,
+        gv_suc_marc       TYPE char10,
+        gv_suc_mara       TYPE char10,
+        gv_suc_mvke       TYPE char10.
+
+************************************************************************
+* WORKAERA
+************************************************************************
+DATA: gs_layout       TYPE slis_layout_alv.
+
+************************************************************************
+* CONSTANTS DECLARATIONS
+************************************************************************
+DATA: gc_x    TYPE char1 VALUE 'X',
+      gc_callback_routine TYPE slis_formname VALUE 'USER_COMMAND'.
+
+************************************************************************
+* INTERNAL TABLE DECLARATIONS
+************************************************************************
+DATA: gt_marc         TYPE STANDARD TABLE OF ty_marc,
+      gt_mvke         TYPE STANDARD TABLE OF ty_mvke,
+      gt_mara         TYPE STANDARD TABLE OF ty_mara,
+      gt_errlog_ph    TYPE STANDARD TABLE OF ty_errlog,
+      gt_errlog_pc    TYPE STANDARD TABLE OF ty_errlog,
+      gt_errlog_bph   TYPE STANDARD TABLE OF ty_errlog,
+      gt_mat_log_old  TYPE STANDARD TABLE OF yse_mat_log_old,
+      gt_map_gacpgc   TYPE STANDARD TABLE OF yse_map_gacpgc,
+      gt_map_prctr    TYPE STANDARD TABLE OF yse_map_prctr,
+      gt_map_bscph    TYPE STANDARD TABLE OF yse_map_bscph.
+
+************************************************************************
+* SELECTION SCREEN
+************************************************************************
+SELECTION-SCREEN BEGIN OF BLOCK b0 WITH FRAME TITLE text-001.
+PARAMETER: cb_ph AS CHECKBOX USER-COMMAND ph,
+           cb_pc AS CHECKBOX USER-COMMAND pc,
+           cb_bph AS CHECKBOX USER-COMMAND bph.
+SELECTION-SCREEN END OF BLOCK b0.
+
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE text-001.
+SELECT-OPTIONS: s_matnr FOR mvke-matnr,
+                s_vkorg FOR mvke-vkorg,
+                s_vtweg FOR mvke-vtweg,
+                s_werks FOR marc-werks.
+SELECTION-SCREEN END OF BLOCK b1.
+
+AT SELECTION-SCREEN OUTPUT.
+  PERFORM frm_screen_set.
+
+AT SELECTION-SCREEN.
+  gv_ucomm = sy-ucomm.
+  IF sy-ucomm  IS INITIAL OR sy-ucomm = 'ONLI'.
+    PERFORM frm_screen_check.
+  ENDIF.
+
+
+************************************************************************
+* INITIALIZATION.
+************************************************************************
+INITIALIZATION.
+* Do initialization
+  PERFORM do_init.
+
+************************************************************************
+* START-OF-SELECTION
+************************************************************************
+START-OF-SELECTION.
+* Extact the GAC and Product Hierarcy mapping data
+  PERFORM get_mapping_data.
+* Extact material data from MARA MARC and MVKE
+  PERFORM get_materials_data.
+* Update the materials per the mapping
+  PERFORM update_materials.
+
+END-OF-SELECTION.
+* Show the procee error log
+  PERFORM show_log.
+
+*&---------------------------------------------------------------------*
+*&      Form  DO_INIT
+*&---------------------------------------------------------------------*
+*       Do initialization
+*----------------------------------------------------------------------*
+FORM do_init .
+
+  REFRESH:  gt_marc,
+            gt_mvke,
+            gt_errlog_ph,
+            gt_errlog_pc,
+            gt_map_gacpgc,
+            gt_fieldcat,
+            gt_map_prctr.
+
+  CLEAR: gs_layout.
+  gv_suc_mvke = 0.
+  gv_suc_marc = 0.
+ENDFORM.                    " DO_INIT
+*&---------------------------------------------------------------------*
+*&      Form  GET_MATERIALS_DATA
+*&---------------------------------------------------------------------*
+*       Get the material data per selection screen
+*----------------------------------------------------------------------*
+FORM get_materials_data .
+
+  DATA: ls_marc TYPE ty_marc,
+        ls_mvke TYPE ty_mvke.
+
+  IF cb_pc IS NOT INITIAL.
+    IF gt_map_prctr IS NOT INITIAL.
+      SELECT matnr
+             werks
+             prctr
+        FROM marc
+        INTO ls_marc
+        FOR ALL ENTRIES IN gt_map_prctr
+        WHERE matnr IN s_matnr
+          AND werks IN s_werks
+          AND prctr = gt_map_prctr-prctr_old.
+        SELECT COUNT(*)
+          FROM yse_mat_ngac_log
+          WHERE matnr = ls_marc-matnr
+            AND werks = ls_marc-werks.
+        IF sy-subrc <> 0.
+          APPEND ls_marc TO gt_marc.
+        ENDIF.
+      ENDSELECT.
+      IF gt_marc IS INITIAL.
+        IF  cb_bph IS INITIAL AND cb_ph IS INITIAL .
+          MESSAGE s001(00) WITH text-m02 DISPLAY LIKE 'E'.
+          LEAVE LIST-PROCESSING.
+        ENDIF.
+      ENDIF.
+    ELSE.
+      IF cb_bph IS INITIAL AND cb_ph IS INITIAL .
+        MESSAGE s001(00) WITH text-m70 DISPLAY LIKE 'E'.
+        LEAVE LIST-PROCESSING.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+  IF cb_ph IS NOT INITIAL.
+    IF gt_map_gacpgc IS NOT INITIAL.
+      SELECT matnr
+             vkorg
+             vtweg
+             prodh
+        FROM mvke
+        INTO ls_mvke
+        FOR ALL ENTRIES IN gt_map_gacpgc
+        WHERE matnr IN s_matnr
+          AND vkorg IN s_vkorg
+          AND vtweg IN s_vtweg
+          AND prodh = gt_map_gacpgc-prodh_old.
+        SELECT COUNT(*)
+          FROM yse_mat_ngac_log
+          WHERE matnr = ls_mvke-matnr
+            AND vkorg = ls_mvke-vkorg
+            AND vtweg = ls_mvke-vtweg.
+        IF sy-subrc <> 0.
+          APPEND ls_mvke TO  gt_mvke.
+        ENDIF.
+      ENDSELECT.
+      IF gt_mvke IS INITIAL.
+        IF cb_pc IS INITIAL AND cb_bph IS INITIAL .
+          MESSAGE s001(00) WITH text-m92 DISPLAY LIKE 'E'.
+          LEAVE LIST-PROCESSING.
+        ENDIF.
+      ENDIF.
+    ELSE.
+      IF cb_pc IS  INITIAL AND cb_bph IS INITIAL .
+        MESSAGE s001(00) WITH text-m71 DISPLAY LIKE 'E'.
+        LEAVE LIST-PROCESSING.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+  IF cb_bph IS NOT INITIAL.
+    IF gt_map_bscph IS NOT INITIAL.
+      SELECT  matnr
+              prdha
+        FROM mara
+        INTO TABLE gt_mara
+        FOR ALL ENTRIES IN gt_map_bscph
+        WHERE matnr = gt_map_bscph-matnr.
+      IF sy-subrc <> 0.
+        IF cb_pc IS INITIAL AND cb_ph IS INITIAL .
+          MESSAGE s001(00) WITH text-m82 DISPLAY LIKE 'E'.
+          LEAVE LIST-PROCESSING.
+        ENDIF.
+      ENDIF.
+    ELSE.
+      IF cb_pc IS INITIAL AND cb_ph IS INITIAL .
+        MESSAGE s001(00) WITH text-m94 DISPLAY LIKE 'E'.
+        LEAVE LIST-PROCESSING.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+
+  IF gt_mvke IS INITIAL AND gt_marc IS INITIAL AND gt_mara IS INITIAL.
+    MESSAGE s001(00) WITH text-m82 DISPLAY LIKE 'E'.
+    LEAVE LIST-PROCESSING.
+  ENDIF.
+
+ENDFORM.                    " GET_MATERIALS_DATA
+*&---------------------------------------------------------------------*
+*&      Form  GET_MAPPING_DATA
+*&---------------------------------------------------------------------*
+*       Extract the GAC and Product Hierarcy mapping data
+*----------------------------------------------------------------------*
+FORM get_mapping_data .
+
+* Extract the GAC&PGC mapping data
+  SELECT *
+    FROM yse_map_gacpgc
+    INTO TABLE gt_map_gacpgc.
+
+* Extract the GAC mapping data
+  SELECT *
+    FROM yse_map_prctr
+    INTO TABLE gt_map_prctr.
+
+* Extract the Basic view PH mapping data
+  SELECT *
+    FROM yse_map_bscph
+    INTO TABLE gt_map_bscph.
+
+ENDFORM.                    "GET_MAPPING_DATA
+*&---------------------------------------------------------------------*
+*&      Form  UPDATE_MATERIALS
+*&---------------------------------------------------------------------*
+*       Update the materials per the mapping
+*----------------------------------------------------------------------*
+FORM update_materials .
+
+  DATA: ls_marc   TYPE ty_marc,
+        ls_mvke   TYPE ty_mvke,
+        ls_mara   TYPE ty_mara,
+        ls_map_bph TYPE yse_map_bscph,
+        ls_map_gacpgc TYPE yse_map_gacpgc,
+        ls_map_prctr  TYPE yse_map_prctr,
+        ls_mat_log_old  TYPE yse_mat_log_old,
+        lt_mat_log_old  TYPE STANDARD TABLE OF yse_mat_log_old,
+        lflg_update   TYPE char1,
+        ls_errlog     TYPE ty_errlog.
+
+  DATA : ls_headdata      TYPE bapimathead,
+         ls_plantdata     TYPE bapi_marc,
+         ls_plantdatax    TYPE bapi_marcx,
+         ls_clientdata    TYPE bapi_mara,
+         ls_clientdatax   TYPE bapi_marax,
+         ls_salesdata     TYPE bapi_mvke,
+         ls_salesdatax    TYPE bapi_mvkex,
+         ls_return        TYPE bapiret2.
+
+  IF cb_ph IS NOT INITIAL.
+    LOOP AT gt_mvke INTO ls_mvke.
+      CLEAR:    ls_map_gacpgc ,
+                ls_headdata,
+                ls_salesdata,
+                ls_salesdatax,
+                lflg_update   ,
+                ls_mat_log_old,
+                ls_errlog     .
+
+      READ TABLE gt_map_gacpgc INTO ls_map_gacpgc
+        WITH KEY prodh_old = ls_mvke-prodh.
+      IF sy-subrc = 0.
+        IF ls_map_gacpgc-prodh_new IS INITIAL.
+          CONTINUE.
+        ENDIF.
+      ELSE.
+        CONTINUE.
+      ENDIF.
+
+*     Material head data
+      ls_headdata-material = ls_mvke-matnr.
+      ls_headdata-sales_view   =  gc_x.
+*      ls_headdata-cost_view    = gc_x.
+
+      IF ls_map_gacpgc-prodh_new IS NOT INITIAL.
+        ls_salesdata-sales_org = ls_mvke-vkorg.
+        ls_salesdata-distr_chan = ls_mvke-vtweg.
+        ls_salesdata-prod_hier  = ls_map_gacpgc-prodh_new.
+        ls_salesdatax-sales_org = ls_mvke-vkorg.
+        ls_salesdatax-distr_chan = ls_mvke-vtweg.
+        ls_salesdatax-prod_hier = gc_x.
+      ENDIF.
+
+      CALL FUNCTION 'BAPI_MATERIAL_SAVEDATA'
+        EXPORTING
+          headdata   = ls_headdata
+          salesdata  = ls_salesdata
+          salesdatax = ls_salesdatax
+        IMPORTING
+          return     = ls_return.
+*     Check if the update was successful.
+      IF ls_return-type = 'S'.
+*       save the record into the database.
+        CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+          EXPORTING
+            wait = gc_x.
+        gv_suc_mvke = gv_suc_mvke + 1.
+        ls_mat_log_old-matnr    = ls_mvke-matnr.
+        ls_mat_log_old-vkorg    = ls_mvke-vkorg.
+        ls_mat_log_old-vtweg    = ls_mvke-vtweg.
+        ls_mat_log_old-oprodh   = ls_mvke-prodh.
+        ls_mat_log_old-nprodh   = ls_map_gacpgc-prodh_new.
+        ls_mat_log_old-flag_ph  = 'U'.
+*        ls_mat_log_old-TXT_PH
+        ls_mat_log_old-aenam      = sy-uname.
+        ls_mat_log_old-aedat      = sy-datum.
+        ls_mat_log_old-aezet      = sy-uzeit.
+        APPEND ls_mat_log_old TO lt_mat_log_old.
+      ELSE.
+        CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+        CLEAR ls_errlog.
+        ls_errlog-matnr  = ls_mvke-matnr.
+        ls_errlog-vkorg  = ls_mvke-vkorg.
+        ls_errlog-vtweg  = ls_mvke-vtweg.
+        ls_errlog-errmsg = ls_return-message.
+        APPEND ls_errlog TO gt_errlog_ph.
+        ls_mat_log_old-matnr    = ls_mvke-matnr.
+        ls_mat_log_old-vkorg    = ls_mvke-vkorg.
+        ls_mat_log_old-vtweg    = ls_mvke-vtweg.
+        ls_mat_log_old-oprodh   = ls_mvke-prodh.
+        ls_mat_log_old-nprodh   = ls_map_gacpgc-prodh_new.
+        ls_mat_log_old-flag_ph  = 'E'.
+        ls_mat_log_old-txt_ph = ls_return-message.
+        ls_mat_log_old-aenam      = sy-uname.
+        ls_mat_log_old-aedat      = sy-datum.
+        ls_mat_log_old-aezet      = sy-uzeit.
+        APPEND ls_mat_log_old TO lt_mat_log_old.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+
+  IF cb_pc IS NOT INITIAL.
+    LOOP AT gt_marc INTO ls_marc.
+      CLEAR:    ls_map_prctr  ,
+                ls_headdata   ,
+                ls_plantdata  ,
+                ls_plantdatax ,
+                ls_mat_log_old,
+                lflg_update   ,
+                ls_errlog     .
+
+      READ TABLE gt_map_prctr INTO ls_map_prctr
+        WITH KEY prctr_old = ls_marc-prctr.
+      IF sy-subrc = 0.
+        IF ls_map_prctr-prctr_new IS INITIAL.
+          CONTINUE.
+        ENDIF.
+      ELSE.
+        CONTINUE.
+      ENDIF.
+
+*     Material head data
+      ls_headdata-material = ls_marc-matnr.
+*      ls_headdata-basic_view  = gc_x.
+      ls_headdata-sales_view   =  gc_x.
+*      ls_headdata-cost_view    = gc_x.
+
+      IF ls_map_prctr-prctr_new IS NOT INITIAL.
+        ls_plantdata-plant = ls_marc-werks.
+        ls_plantdata-profit_ctr = ls_map_prctr-prctr_new.
+        ls_plantdatax-plant = ls_marc-werks.
+        ls_plantdatax-profit_ctr = gc_x.
+      ENDIF.
+
+      CALL FUNCTION 'BAPI_MATERIAL_SAVEDATA'
+        EXPORTING
+          headdata   = ls_headdata
+          plantdata  = ls_plantdata
+          plantdatax = ls_plantdatax
+        IMPORTING
+          return     = ls_return.
+*     Check if the update was successful.
+      IF ls_return-type = 'S'.
+*       save the record into the database.
+        CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+          EXPORTING
+            wait = gc_x.
+        gv_suc_marc = gv_suc_marc + 1.
+        ls_mat_log_old-matnr = ls_marc-matnr.
+        ls_mat_log_old-werks = ls_marc-werks.
+        ls_mat_log_old-oprctr = ls_marc-prctr.
+        ls_mat_log_old-nprctr = ls_map_prctr-prctr_new.
+        ls_mat_log_old-flag_pc = 'U'.
+        ls_mat_log_old-aenam      = sy-uname.
+        ls_mat_log_old-aedat      = sy-datum.
+        ls_mat_log_old-aezet      = sy-uzeit.
+        APPEND ls_mat_log_old TO lt_mat_log_old.
+      ELSE.
+        CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+        CLEAR ls_errlog.
+        ls_errlog-matnr  = ls_marc-matnr.
+        ls_errlog-werks  = ls_marc-werks.
+        ls_errlog-errmsg = ls_return-message.
+        APPEND ls_errlog TO gt_errlog_pc.
+        ls_mat_log_old-matnr = ls_marc-matnr.
+        ls_mat_log_old-werks = ls_marc-werks.
+        ls_mat_log_old-oprctr = ls_marc-prctr.
+        ls_mat_log_old-nprctr = ls_map_prctr-prctr_new.
+        ls_mat_log_old-flag_pc = 'E'.
+        ls_mat_log_old-txt_pc = ls_return-message.
+        ls_mat_log_old-aenam      = sy-uname.
+        ls_mat_log_old-aedat      = sy-datum.
+        ls_mat_log_old-aezet      = sy-uzeit.
+        APPEND ls_mat_log_old TO lt_mat_log_old.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+
+  IF cb_bph IS NOT INITIAL.
+    LOOP AT gt_mara INTO ls_mara.
+      CLEAR:    ls_headdata,
+                ls_mat_log_old,
+                ls_clientdata,
+                ls_clientdatax,
+                lflg_update   ,
+                ls_errlog     .
+
+      READ TABLE gt_map_bscph INTO ls_map_bph
+        WITH KEY matnr = ls_mara-matnr.
+      IF sy-subrc = 0.
+        IF ls_map_bph-prdha = ls_mara-prdha.
+          CONTINUE.
+        ENDIF.
+      ELSE.
+        CONTINUE.
+      ENDIF.
+
+*     Material head data
+      ls_headdata-material = ls_mara-matnr.
+      ls_headdata-basic_view   =  gc_x.
+
+      ls_clientdata-prod_hier = ls_map_bph-prdha.
+      ls_clientdatax-prod_hier = gc_x.
+
+      CALL FUNCTION 'BAPI_MATERIAL_SAVEDATA'
+        EXPORTING
+          headdata    = ls_headdata
+          clientdata  = ls_clientdata
+          clientdatax = ls_clientdatax
+        IMPORTING
+          return      = ls_return.
+*     Check if the update was successful.
+      IF ls_return-type = 'S'.
+*       save the record into the database.
+        CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+          EXPORTING
+            wait = gc_x.
+        gv_suc_mara = gv_suc_mara + 1.
+        ls_mat_log_old-matnr    = ls_mara-matnr.
+        ls_mat_log_old-oprodh_b = ls_mara-prdha.
+        ls_mat_log_old-nprodh_b = ls_map_bph-prdha.
+        ls_mat_log_old-flag_ph_b  = 'U'.
+*        ls_mat_log_old-TXT_PH_B =
+        ls_mat_log_old-aenam      = sy-uname.
+        ls_mat_log_old-aedat      = sy-datum.
+        ls_mat_log_old-aezet      = sy-uzeit.
+        APPEND ls_mat_log_old TO lt_mat_log_old.
+      ELSE.
+        CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+        CLEAR ls_errlog.
+        ls_errlog-matnr  = ls_mara-matnr.
+        ls_errlog-errmsg = ls_return-message.
+        APPEND ls_errlog TO gt_errlog_bph.
+        ls_mat_log_old-matnr    = ls_mara-matnr.
+        ls_mat_log_old-oprodh_b = ls_mara-prdha.
+        ls_mat_log_old-nprodh_b = ls_map_bph-prdha.
+        ls_mat_log_old-flag_ph_b  = 'E'.
+        ls_mat_log_old-txt_ph_b = ls_return-message.
+        ls_mat_log_old-aenam      = sy-uname.
+        ls_mat_log_old-aedat      = sy-datum.
+        ls_mat_log_old-aezet      = sy-uzeit.
+        APPEND ls_mat_log_old TO lt_mat_log_old.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+
+  IF lt_mat_log_old IS NOT INITIAL.
+    MODIFY yse_mat_log_old FROM TABLE lt_mat_log_old.
+  ENDIF.
+ENDFORM.                    " UPDATE_MATERIALS
+*&---------------------------------------------------------------------*
+*&      Form  SHOW_LOG
+*&---------------------------------------------------------------------*
+*       Show the procee error log
+*----------------------------------------------------------------------*
+FORM show_log .
+
+  DATA: lv_err_no_gac TYPE char10,
+        lv_err_no_ph  TYPE char10,
+        lv_err_no_bph TYPE char10,
+        lv_message1 TYPE string,
+        lv_message2 TYPE string,
+        lv_message3 TYPE string,
+        lv_message4 TYPE string.
+
+  DESCRIBE TABLE gt_errlog_pc LINES lv_err_no_gac.
+  DESCRIBE TABLE gt_errlog_ph LINES lv_err_no_ph.
+  DESCRIBE TABLE gt_errlog_ph LINES lv_err_no_bph.
+
+  CONDENSE: gv_suc_marc,gv_suc_mvke,lv_err_no_ph,lv_err_no_gac,
+            lv_message1,lv_message2,lv_message3,lv_message4.
+
+  IF cb_pc IS NOT INITIAL.
+    lv_message1 = text-i10.
+    lv_message2 = text-i11.
+    REPLACE '&1' IN lv_message1 WITH gv_suc_marc.
+    REPLACE '&1' IN lv_message2 WITH lv_err_no_gac.
+  ENDIF.
+
+  IF cb_ph IS NOT INITIAL.
+    CLEAR: lv_message3, lv_message4.
+    lv_message3 = text-i10.
+    lv_message4 = text-i21.
+    REPLACE '&1' IN lv_message3 WITH gv_suc_mvke.
+    REPLACE '&1' IN lv_message4 WITH lv_err_no_ph.
+    IF lv_message1 IS NOT INITIAL.
+      CONCATENATE cl_abap_char_utilities=>vertical_tab
+        lv_message3 INTO lv_message3.
+    ENDIF.
+  ENDIF.
+
+  IF cb_bph IS NOT INITIAL.
+    CLEAR: lv_message3, lv_message4.
+    lv_message3 = text-i10.
+    lv_message4 = text-i22.
+    REPLACE '&1' IN lv_message3 WITH gv_suc_mara.
+    REPLACE '&1' IN lv_message4 WITH lv_err_no_bph.
+    IF lv_message1 IS NOT INITIAL.
+      CONCATENATE cl_abap_char_utilities=>vertical_tab
+        lv_message3 INTO lv_message3.
+    ENDIF.
+  ENDIF.
+
+  MESSAGE i001(00) WITH lv_message1 lv_message2
+                        lv_message3 lv_message4.
+
+* FIELDCAT set
+  PERFORM alv_fieldcat_set.
+* LAYOUT set
+  PERFORM alv_layout_set.
+* ALV display
+  PERFORM alv_display.
+
+ENDFORM.                    " SHOW_LOG
+
+*&---------------------------------------------------------------------*
+*&      Form  ALV_FIELDCAT_SET
+*&---------------------------------------------------------------------*
+*       FIELDCAT set
+*----------------------------------------------------------------------*
+FORM alv_fieldcat_set .
+
+  DATA:
+     lv_linecnt  TYPE i,
+     ls_fieldcat TYPE slis_fieldcat_alv.
+
+  CLEAR lv_linecnt.
+* Material Number
+  CLEAR ls_fieldcat.
+  lv_linecnt = lv_linecnt + 1.
+  ls_fieldcat-col_pos = lv_linecnt.
+  ls_fieldcat-fieldname = 'MATNR'.
+  ls_fieldcat-seltext_s = 'Mat.No'(030).
+  ls_fieldcat-seltext_m = 'Material Number'(031).
+  ls_fieldcat-hotspot = gc_x.
+  ls_fieldcat-ref_fieldname =  'MATNR'.
+  ls_fieldcat-ref_tabname   = 'MARA'.
+  ls_fieldcat-fix_column = gc_x.
+  APPEND ls_fieldcat TO gt_fieldcat.
+
+* Sales org
+  CLEAR ls_fieldcat.
+  lv_linecnt = lv_linecnt + 1.
+  ls_fieldcat-col_pos = lv_linecnt.
+  ls_fieldcat-fieldname = 'VKORG'.
+  ls_fieldcat-seltext_s = 'Sales Org'(052).
+  ls_fieldcat-seltext_m = 'Sales Organization'(053).
+  ls_fieldcat-fix_column = gc_x.
+  APPEND ls_fieldcat TO gt_fieldcat.
+
+* Distribute channel
+  CLEAR ls_fieldcat.
+  lv_linecnt = lv_linecnt + 1.
+  ls_fieldcat-col_pos = lv_linecnt.
+  ls_fieldcat-fieldname = 'VTWEG'.
+  ls_fieldcat-seltext_s = 'Distr. Chl'(054).
+  ls_fieldcat-seltext_m = 'Distribution Channel'(055).
+  ls_fieldcat-fix_column = gc_x.
+  APPEND ls_fieldcat TO gt_fieldcat.
+
+* Plant
+  CLEAR ls_fieldcat.
+  lv_linecnt = lv_linecnt + 1.
+  ls_fieldcat-col_pos = lv_linecnt.
+  ls_fieldcat-fieldname = 'WERKS'.
+  ls_fieldcat-seltext_s = 'Plant'(032).
+  ls_fieldcat-seltext_m = 'Plant'(032).
+  ls_fieldcat-fix_column = gc_x.
+  APPEND ls_fieldcat TO gt_fieldcat.
+
+* Error message
+  CLEAR ls_fieldcat.
+  lv_linecnt = lv_linecnt + 1.
+  ls_fieldcat-col_pos = lv_linecnt.
+  ls_fieldcat-fieldname = 'ERRMSG'.
+  ls_fieldcat-seltext_s = 'Err.Msg'(033).
+  ls_fieldcat-seltext_m = 'Error Message'(034).
+  APPEND ls_fieldcat TO gt_fieldcat.
+
+ENDFORM.                    " ALV_FIELDCAT_SET
+*&---------------------------------------------------------------------*
+*&      Form  ALV_LAYOUT_SET
+*&---------------------------------------------------------------------*
+*       LAYOUT set
+*----------------------------------------------------------------------*
+FORM alv_layout_set .
+
+  CLEAR: gs_layout.
+  gs_layout-zebra = gc_x.               "ALV lines cross-color display
+  gs_layout-colwidth_optimize = gc_x.   " Auto optimize column width
+  gs_layout-detail_popup = gc_x.        " Show detail screen
+
+ENDFORM.                    " ALV_LAYOUT_SET
+
+*&---------------------------------------------------------------------*
+*&      Form  ALV_DISPLAY
+*&---------------------------------------------------------------------*
+*       ALV display
+*----------------------------------------------------------------------*
+FORM alv_display .
+  DATA: lv_callback TYPE slis_formname,
+        lt_errlog   TYPE STANDARD TABLE OF ty_errlog.
+  APPEND LINES OF gt_errlog_pc TO lt_errlog.
+  APPEND LINES OF gt_errlog_ph TO lt_errlog.
+  APPEND LINES OF gt_errlog_bph TO lt_errlog.
+
+  CHECK lt_errlog IS NOT INITIAL.
+  lv_callback = gc_callback_routine.
+  CALL FUNCTION 'REUSE_ALV_GRID_DISPLAY'
+    EXPORTING
+      i_callback_program      = sy-repid
+      is_layout               = gs_layout
+      i_callback_user_command = lv_callback
+      it_fieldcat             = gt_fieldcat
+    TABLES
+      t_outtab                = lt_errlog
+    EXCEPTIONS
+      program_error           = 1
+      OTHERS                  = 2.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+ENDFORM.                    " ALV_DISPLAY
+
+*&---------------------------------------------------------------------*
+*&      Form  ALV_OTHERS_SET
+*&---------------------------------------------------------------------*
+*       USER_COMMAND
+*----------------------------------------------------------------------*
+FORM user_command USING u_ucomm     LIKE sy-ucomm           "#EC CALLED
+                        p_selfield  TYPE slis_selfield.
+
+  CASE u_ucomm.
+    WHEN '&IC1'.        " SAP standard code for double-clicking
+      IF p_selfield-fieldname = 'MATNR'.
+        IF p_selfield-value IS NOT INITIAL.
+          SET PARAMETER ID 'MAT' FIELD p_selfield-value.
+          CALL TRANSACTION 'MM03' AND SKIP FIRST SCREEN.
+        ENDIF.
+      ENDIF.
+    WHEN OTHERS.
+  ENDCASE.
+
+ENDFORM.                    " USER_COMMAND
+*&---------------------------------------------------------------------*
+*&      Form  FRM_SCREEN_SET
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM frm_screen_set .
+  LOOP AT SCREEN.
+    IF cb_pc IS NOT INITIAL.
+      IF screen-name CS 'S_WERKS'.
+        screen-input = '1'.
+        screen-invisible = '0'.
+        MODIFY SCREEN .
+      ENDIF.
+    ELSE.
+      IF screen-name CS 'S_WERKS'.
+        screen-input = '0'.
+        screen-invisible = '1'.
+        MODIFY SCREEN .
+      ENDIF.
+    ENDIF.
+    IF cb_ph IS NOT INITIAL.
+      IF    screen-name CS 'S_VKORG'
+        OR  screen-name CS 'S_VTWEG'.
+        screen-input = '1'.
+        screen-invisible = '0'.
+        MODIFY SCREEN .
+      ENDIF.
+    ELSE.
+      IF    screen-name  CS 'S_VKORG'
+        OR  screen-name  CS 'S_VTWEG'.
+        screen-input = '0'.
+        screen-invisible = '1'.
+        MODIFY SCREEN .
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+ENDFORM.                    " FRM_SCREEN_SET
+*&---------------------------------------------------------------------*
+*&      Form  FRM_SCREEN_CHECK
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM frm_screen_check .
+
+  IF cb_pc IS NOT INITIAL.
+    IF s_werks[] IS INITIAL OR s_werks IS INITIAL.
+      SET CURSOR FIELD 'S_WERKS'.
+      MESSAGE e001(00) WITH text-m60.
+    ENDIF.
+  ENDIF.
+  IF cb_ph IS NOT INITIAL.
+    IF s_vkorg[] IS INITIAL OR s_vkorg IS INITIAL.
+      SET CURSOR FIELD 'S_VKORG'.
+      MESSAGE e001(00) WITH text-m61.
+    ENDIF.
+    IF s_vtweg[] IS INITIAL OR s_vtweg IS INITIAL.
+      SET CURSOR FIELD 'S_VTWEG'.
+      MESSAGE e001(00) WITH text-m62.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    " FRM_SCREEN_CHECK
+
+*Text symbol text£º
+*001:Selection screen
+*030:Mat.No
+*031:Material Number
+*032:Plant
+*033:Err.Msg
+*034:Error Message
+*052:Sales Org
+*053:Sales Organization
+*054:Distr. Chl
+*055:Distribution Channel
+*I10:Totally &1 materials are updated successfully,
+*I11:while &1 failed(GAC).
+*I21:while &1 failed(GACPGC).
+*I22:while &1 failed(Basic PH).
+*M02:No data found per the selection screen - GAC
+*M60:Please enter the [Plant]
+*M61:Please enter the [Sales Org]
+*M62:Please enter the [Distr. Chl]
+*M70:Please maintain the mapping table of GAC - YSE_MAP_PRCTR
+*M71:Please maintain the mapping table of GACPGC -YSE_MAP_GACPGC
+*M82:No data found per the selection screen
+*M92:No data found per the selection screen - GACPGC
+
+*M94:Please maintain the mapping table of GACPGC -YSE_MAP_BSCPH
+*Selection text£º
+*CB_BPH:        Update Prod.Hier(Basic View)
+*CB_PC:        Update GAC
+*CB_PH:        Update Prod.Hier(Sale View)
+*S_MATNR:D       .
+*S_VKORG:D       .
+*S_VTWEG:D       .
+*S_WERKS:D       .

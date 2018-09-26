@@ -1,0 +1,634 @@
+************************************************************************
+* Program ID           : YSE_SD_DTC_AUTOMATION_11                      *
+* Program Title        : DTC automation : GR and GI (for AM)           *
+* Author               : Lakshmi Reddy                                 *
+* Date                 : 21/02/2011                                    *
+* Change Request Number: CD1K963138                                    *
+*======================================================================*
+* Copied From          : YSE_SD_DTC_AUTOMATION_01                      *
+* Title                : DTC automation : GR and GI (for AM)           *
+* Other Related obj    : N/A                                           *
+*======================================================================*
+* Change History Log                                                   *
+*----------------------------------------------------------------------*
+* Mod. no.|Date      |Name        |Correction Number|Change Reference  *
+*----------------------------------------------------------------------*
+* MOD-001 |21/02/2011|LakshmiReddy|CD1K963138       |CR1944            *
+* Description: Initial Development                                     *
+*----------------------------------------------------------------------*
+
+REPORT yse_sd_dtc_automation_11.
+
+*----------------------------------------------------------------------*
+* Data declarations                                                    *
+*----------------------------------------------------------------------*
+*-- Dictionary tables
+TABLES: ekes, ser01, marc, objk, vbfa.
+TABLES: ekko.
+TABLES: ekpo.
+TABLES: likp.
+TABLES: lips.
+TABLES: resb.
+TABLES: rsdbs.
+TABLES: t001w.
+TABLES: vbup.
+TABLES: yse_em_plant.
+TABLES: yse_sd_vend_llab.
+
+TYPES: BEGIN OF ty_ekpo,
+        ebeln TYPE ebeln,
+        bukrs TYPE bukrs,
+        bsart TYPE esart,
+        lifnr TYPE elifn,
+        ekorg TYPE ekorg,
+        ebelp TYPE ebelp,
+        matnr TYPE matnr,
+        werks TYPE ewerk,
+      END   OF ty_ekpo.
+
+*-- Internal tables
+DATA: BEGIN OF i_plants OCCURS 0,
+        werks      LIKE yse_em_plant-werks,
+        name1      LIKE t001w-name1.
+DATA: END OF i_plants.
+
+DATA: BEGIN OF i_ddshretval OCCURS 0.
+        INCLUDE STRUCTURE ddshretval.
+DATA: END OF i_ddshretval.
+
+DATA: i_ekes TYPE SORTED TABLE OF ekes
+      WITH NON-UNIQUE KEY ebeln ebelp
+      WITH HEADER LINE.
+
+DATA: BEGIN OF i_ekko OCCURS 0,
+        ebeln TYPE ebeln,
+        bukrs TYPE bukrs,
+        bsart TYPE esart,
+        lifnr TYPE elifn,
+        ekorg TYPE ekorg,
+      END   OF i_ekko.
+
+DATA: i_ekpo      TYPE SORTED TABLE OF ty_ekpo WITH NON-UNIQUE KEY ebeln ebelp,
+      i_ekpo_temp TYPE SORTED TABLE OF ty_ekpo WITH NON-UNIQUE KEY ebeln ebelp.
+
+DATA: wa_ekpo TYPE ty_ekpo.
+
+DATA: i_marc       LIKE marc                OCCURS 0 WITH HEADER LINE.
+DATA: i_likp  TYPE SORTED TABLE OF likp  WITH NON-UNIQUE KEY vbeln WITH HEADER LINE.
+DATA: i_lips  TYPE SORTED TABLE OF lips  WITH NON-UNIQUE KEY vbeln posnr WITH HEADER LINE.
+DATA: i_resb  TYPE SORTED TABLE OF resb  WITH NON-UNIQUE KEY rsnum rspos WITH HEADER LINE.
+DATA: i_rsdbs TYPE SORTED TABLE OF rsdbs WITH NON-UNIQUE KEY rsnum rspos WITH HEADER LINE.
+
+DATA: i_vbup       LIKE vbup                OCCURS 0 WITH HEADER LINE.
+DATA: i_vendllab   LIKE yse_sd_vend_llab    OCCURS 0 WITH HEADER LINE.
+DATA: i_sernr LIKE objk OCCURS 0 WITH HEADER LINE.
+DATA: i_items      LIKE bapi2017_gm_item_create
+                                            OCCURS 0 WITH HEADER LINE.
+DATA: i_itemsser   LIKE bapi2017_gm_serialnumber
+                                            OCCURS 0 WITH HEADER LINE.
+
+DATA: i_return     LIKE bapiret2            OCCURS 0 WITH HEADER LINE.
+
+*-- Structures
+DATA: str_header   LIKE bapi2017_gm_head_01.
+
+*-- Constants
+CONSTANTS: c_bsart_znb3 LIKE ekko-bsart          VALUE 'ZNB3'.
+CONSTANTS: c_ebtyp_la   LIKE ekes-ebtyp          VALUE 'LA'.
+CONSTANTS: c_flag       TYPE c                   VALUE 'X'.
+CONSTANTS: c_gmcode_03  LIKE bapi2017_gm_code    VALUE '03'.
+CONSTANTS: c_movgi(3)   TYPE c                   VALUE 'GI'.
+CONSTANTS: c_wbsta_a    LIKE vbup-wbsta          VALUE 'A'.
+
+*-- Variables
+DATA: x_gmcode          LIKE bapi2017_gm_code.
+DATA: x_resfound        TYPE c.
+
+***********************************************************************
+* Insert Raskin Kevin regarding replacement of BAPI                   *
+*                                                                     *
+***********************************************************************
+DATA: ls_header TYPE bapiibdlvhdrcon,
+      ls_control TYPE bapiibdlvhdrctrlcon,
+      lv_delivery TYPE vbeln_vl,
+      lt_sernr TYPE STANDARD TABLE OF bapidlvitmserno,
+      ls_sernr TYPE bapidlvitmserno,
+      lt_deadlines TYPE STANDARD TABLE OF bapidlvdeadln,
+      ls_deadlines TYPE bapidlvdeadln.
+
+***********************************************************************
+* Insert Luc Mertens regarding posting period closed                  *
+*                                                                     *
+***********************************************************************
+DATA:
+  lf_error     TYPE flag,
+  ls_vbkok     TYPE vbkok,
+  ls_logfile   TYPE prott,
+  lt_log_file  TYPE TABLE OF prott,
+  gv_wadat     TYPE datum,
+  gv_pp(1)     TYPE c,
+  gv_input(12) TYPE c.
+
+*----------------------------------------------------------------------*
+* Selection screen                                                     *
+*----------------------------------------------------------------------*
+*-- Layout of the selection screen
+SELECTION-SCREEN BEGIN OF BLOCK b01.
+SELECT-OPTIONS: s_ebeln  FOR ekko-ebeln.
+SELECT-OPTIONS: s_ebelp  FOR ekpo-ebelp.
+SELECTION-SCREEN SKIP.
+SELECT-OPTIONS: s_ekorg  FOR ekko-ekorg.
+SELECT-OPTIONS: s_werks  FOR ekpo-werks.
+SELECT-OPTIONS: s_bsart  FOR ekko-bsart.
+SELECTION-SCREEN END OF BLOCK b01.
+
+*-- Initialization of the selection-screen
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR s_werks-low.
+  PERFORM plants_to_display CHANGING s_werks-low.
+
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR s_werks-high.
+  PERFORM plants_to_display CHANGING s_werks-high.
+
+
+
+************************************************************************
+* START MAIN PROGRAM                                                   *
+************************************************************************
+START-OF-SELECTION.
+
+  PERFORM initialize_data.
+
+  PERFORM select_data.
+
+  PERFORM process_data.
+
+
+************************************************************************
+* SUBROUTINES  LEVEL 01                                                *
+************************************************************************
+
+*----------------------------------------------------------------------*
+*   Form  PLANTS_TO_DISPLAY                                            *
+*----------------------------------------------------------------------*
+*   .....                                                              *
+*----------------------------------------------------------------------*
+FORM plants_to_display CHANGING plant.
+
+*-- Select relevant plants to display
+  CLEAR: i_plants.
+  REFRESH: i_plants.
+  SELECT * FROM yse_em_plant WHERE whtype EQ 'D'.
+    CLEAR t001w.
+    SELECT SINGLE * FROM t001w WHERE werks EQ yse_em_plant-werks.
+    IF sy-subrc EQ 0.
+      i_plants-werks = yse_em_plant-werks.
+      i_plants-name1 = t001w-name1.
+      APPEND i_plants.
+    ENDIF.
+  ENDSELECT.
+
+*-- Call list with selected plants
+  CALL FUNCTION 'F4IF_INT_TABLE_VALUE_REQUEST'
+    EXPORTING
+      value_org       = 'S'
+      retfield        = 'WERKS'
+      window_title    = 'Plants'
+    TABLES
+      value_tab       = i_plants
+      return_tab      = i_ddshretval
+    EXCEPTIONS
+      parameter_error = 1
+      no_values_found = 2
+      OTHERS          = 3.
+  IF sy-subrc EQ 0.
+    READ TABLE i_ddshretval INDEX 1.
+    plant = i_ddshretval-fieldval.
+  ENDIF.
+
+ENDFORM.                    " PLANTS_TO_DISPLAY
+
+
+*----------------------------------------------------------------------*
+*   Form  INITIALIZE_DATA                                              *
+*----------------------------------------------------------------------*
+*   .....                                                              *
+*----------------------------------------------------------------------*
+FORM initialize_data.
+
+  CLEAR: i_ekko, i_ekpo, i_ekes, i_likp, i_lips, i_vbup.
+  REFRESH: i_ekko, i_ekpo, i_ekes, i_likp, i_lips, i_vbup.
+
+  CLEAR: i_vendllab.
+  REFRESH: i_vendllab.
+
+ENDFORM.                    " INITIALIZE_DATA
+
+
+*----------------------------------------------------------------------*
+*   Form  SELECT_DATA                                                  *
+*----------------------------------------------------------------------*
+*   .....                                                              *
+*----------------------------------------------------------------------*
+FORM select_data.
+
+*-- Select all vendors with requirements for local case labeling
+  SELECT *
+  INTO   TABLE i_vendllab
+  FROM   yse_sd_vend_llab
+  WHERE  ekorg IN s_ekorg.
+
+  REFRESH: i_ekpo[].
+  SELECT ekko~ebeln
+         ekko~bukrs
+         ekko~bsart
+         ekko~lifnr
+         ekko~ekorg
+         ekpo~ebelp
+         ekpo~matnr
+         ekpo~werks
+  FROM   ekko INNER JOIN ekpo
+  ON     ekko~ebeln EQ ekpo~ebeln
+  INTO   CORRESPONDING FIELDS OF TABLE i_ekpo
+  WHERE  ekko~ebeln IN s_ebeln
+  AND    ekko~bsart IN s_bsart
+  AND    ekko~ekorg IN s_ekorg
+  AND    ekpo~ebelp IN s_ebelp
+  AND    ekpo~werks IN s_werks
+  AND    ekpo~loekz EQ ' '.
+
+  CHECK sy-subrc EQ 0.
+
+  REFRESH: i_ekpo_temp.
+  APPEND LINES OF i_ekpo TO i_ekpo_temp.
+
+  DELETE ADJACENT DUPLICATES FROM i_ekpo_temp COMPARING ebeln.
+  REFRESH: i_ekko.
+  CLEAR:   wa_ekpo.
+  LOOP AT i_ekpo_temp INTO wa_ekpo.
+    i_ekko-ebeln = wa_ekpo-ebeln.
+    i_ekko-bukrs = wa_ekpo-bukrs.
+    i_ekko-bsart = wa_ekpo-bsart.
+    i_ekko-lifnr = wa_ekpo-lifnr.
+    i_ekko-ekorg = wa_ekpo-ekorg.
+    APPEND i_ekko.
+    CLEAR: wa_ekpo.
+  ENDLOOP.
+
+  IF NOT i_ekpo[] IS INITIAL.
+    SELECT * INTO TABLE i_marc FROM marc
+    FOR ALL ENTRIES IN i_ekpo
+    WHERE matnr EQ i_ekpo-matnr
+    AND werks EQ i_ekpo-werks.
+  ENDIF.
+
+  IF NOT i_ekko[] IS INITIAL.
+    SELECT * INTO TABLE i_ekes FROM ekes
+                               FOR ALL ENTRIES IN i_ekko
+                               WHERE ebeln EQ i_ekko-ebeln
+                                 AND ebtyp EQ c_ebtyp_la.
+    IF NOT i_ekes[] IS INITIAL.
+      SELECT * INTO TABLE i_likp FROM likp
+                                 FOR ALL ENTRIES IN i_ekes
+                                 WHERE vbeln EQ i_ekes-vbeln.
+      DELETE ADJACENT DUPLICATES FROM i_likp COMPARING vbeln.
+      IF NOT i_likp[] IS INITIAL.
+        SELECT * INTO TABLE i_lips FROM lips
+                                   FOR ALL ENTRIES IN i_likp
+                                   WHERE vbeln EQ i_likp-vbeln.
+        IF NOT i_lips[] IS INITIAL.
+          SELECT * INTO TABLE i_vbup FROM vbup
+                                     FOR ALL ENTRIES IN i_lips
+                                     WHERE vbeln EQ i_lips-vbeln
+                                       AND posnr EQ i_lips-posnr
+                                       AND wbsta EQ c_wbsta_a.
+        ENDIF.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+  IF NOT i_ekko[] IS INITIAL.
+    SELECT * INTO TABLE i_rsdbs FROM rsdbs
+                                FOR ALL ENTRIES IN i_ekko
+                                WHERE ebeln EQ i_ekko-ebeln.
+    IF NOT i_rsdbs[] IS INITIAL.
+      SELECT * INTO TABLE i_resb FROM resb
+                                 FOR ALL ENTRIES IN i_rsdbs
+                                 WHERE rsnum EQ i_rsdbs-rsnum.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    " SELECT_DATA
+
+
+*----------------------------------------------------------------------*
+*   Form  PROCESS_DATA                                                 *
+*----------------------------------------------------------------------*
+*   .....                                                              *
+*----------------------------------------------------------------------*
+FORM process_data.
+
+  LOOP AT i_ekko.
+    CLEAR: wa_ekpo.
+    LOOP AT i_ekpo INTO wa_ekpo WHERE ebeln EQ i_ekko-ebeln.
+      REFRESH: i_sernr, i_itemsser.
+
+      LOOP AT  i_ekes WHERE ebeln = wa_ekpo-ebeln
+                        AND ebelp = wa_ekpo-ebelp.
+
+        READ TABLE i_likp WITH KEY vbeln = i_ekes-vbeln.
+        IF sy-subrc NE 0.
+          CLEAR i_likp.
+        ENDIF.
+
+        READ TABLE i_lips WITH KEY vbeln = i_ekes-vbeln
+                                   posnr = i_ekes-vbelp.
+        IF sy-subrc NE 0.
+          CLEAR i_lips.
+        ENDIF.
+
+        READ TABLE i_rsdbs WITH KEY ebeln = wa_ekpo-ebeln
+                                    ebelp = wa_ekpo-ebelp.
+        IF sy-subrc EQ 0.
+          READ TABLE i_resb WITH KEY rsnum = i_rsdbs-rsnum
+                                     rspos = i_rsdbs-rspos.
+          IF sy-subrc EQ 0.
+            x_resfound = c_flag.
+          ELSE.
+            CLEAR x_resfound.
+          ENDIF.
+        ELSE.
+          CLEAR x_resfound.
+        ENDIF.
+
+*-- Goods receipt for delivery item
+*        if x_resfound is initial.
+        PERFORM goods_movement_from_po.
+*        else.
+*          perform goods_movement using c_movgr2.
+*        endif.
+
+        IF i_ekko-bsart EQ c_bsart_znb3.
+          READ TABLE i_vendllab WITH KEY ekorg = i_ekko-ekorg
+                                         lifnr = i_ekko-lifnr.
+          IF sy-subrc NE 0.
+*-- Goods issue for reservation item
+            PERFORM goods_movement_for_res.
+          ENDIF.
+        ENDIF.
+      ENDLOOP.
+    ENDLOOP.
+  ENDLOOP.
+
+ENDFORM.                    " PROCESS_DATA
+
+
+
+************************************************************************
+* SUBROUTINES  LEVEL 02                                                *
+************************************************************************
+
+*----------------------------------------------------------------------*
+*   Form  GOODS_MOVEMENT                                               *
+*----------------------------------------------------------------------*
+*   .....                                                              *
+*----------------------------------------------------------------------*
+FORM goods_movement_from_po.
+
+
+* Check posting date in valid period
+  CONCATENATE sy-datum i_ekko-bukrs INTO gv_input.
+  CALL FUNCTION 'CONVERSION_EXIT_YPSTD_INPUT'
+    EXPORTING
+      input     = gv_input
+    IMPORTING
+      output    = gv_wadat
+    EXCEPTIONS
+      not_found = 1
+      OTHERS    = 2.
+
+  CLEAR: ls_header, ls_control, lv_delivery, i_return, lt_sernr[], i_return[].
+  lv_delivery = i_lips-vbeln.
+
+  ls_header-deliv_numb = lv_delivery.
+
+  ls_deadlines-deliv_numb = lv_delivery.
+  ls_deadlines-timetype = 'WSHDRWADTI '.
+* CONVERT DATE I_LIKP-ERDAT TIME I_LIKP-ERZET INTO TIME STAMP LS_DEADLINES-TIMESTAMP_UTC TIME ZONE SY-ZONLO.
+  CONVERT DATE gv_wadat TIME sy-uzeit INTO TIME STAMP ls_deadlines-timestamp_utc TIME ZONE sy-zonlo.
+  APPEND ls_deadlines TO lt_deadlines.
+
+  ls_control-deliv_numb = lv_delivery.
+  ls_control-post_gi_flg = 'X'.
+
+
+* check if serial number are necessary
+  READ TABLE i_marc WITH KEY matnr = wa_ekpo-matnr
+                       werks = wa_ekpo-werks.
+  IF NOT i_marc-sernp IS INITIAL.
+    CLEAR ser01.
+    SELECT SINGLE *
+    FROM ser01
+    WHERE lief_nr = i_lips-vbeln
+    AND posnr = i_lips-posnr.
+    IF sy-subrc EQ 0.
+      CLEAR: i_sernr.
+      SELECT *
+      FROM objk
+      INTO TABLE i_sernr
+      WHERE obknr EQ ser01-obknr.
+
+      LOOP AT i_sernr.
+        ls_sernr-deliv_numb = lv_delivery.
+        ls_sernr-itm_number = '0001'.
+        ls_sernr-serialno = i_sernr-sernr.
+        APPEND ls_sernr TO lt_sernr.
+      ENDLOOP.
+
+    ENDIF.
+  ENDIF.
+
+
+*We need to check if the GR has already been done for this delivery
+*if so we do not need to do this function and show any message
+  SELECT SINGLE * FROM vbfa INTO vbfa
+              WHERE vbelv EQ lv_delivery AND
+                    vbtyp_n EQ 'R' AND  "goods movement
+                    bwart EQ '101'.
+  IF sy-subrc EQ 0.
+*GR was already made for this inbound delivery
+*Do nothing
+  ELSE.
+    CALL FUNCTION 'BAPI_INB_DELIVERY_CONFIRM_DEC'
+      EXPORTING
+        header_data      = ls_header
+        header_control   = ls_control
+        delivery         = lv_delivery
+      TABLES
+        item_serial_no   = lt_sernr
+        return           = i_return
+        header_deadlines = lt_deadlines.
+
+*Better to check on 'error' messages or 'abort' messages to see
+*if the BAPI was correctly executed.
+    LOOP AT i_return TRANSPORTING NO FIELDS
+                    WHERE     type = 'E' OR
+                              type = 'A'.
+    ENDLOOP.
+
+    IF sy-subrc NE 0.
+      CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+        EXPORTING
+          wait = 'X'.
+      WRITE:/ 'Goods receipt created for delivery', lv_delivery, i_lips-posnr.
+    ELSE.
+      WRITE:/ 'Goods receipt failed for delivery', lv_delivery, i_lips-posnr.
+      LOOP AT i_return.
+        WRITE:/ i_return-type, i_return-id, i_return-number, i_return-message.
+      ENDLOOP.
+      CLEAR i_return[].
+      CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'
+        IMPORTING
+          return = i_return.
+    ENDIF.
+  ENDIF.
+
+ENDFORM.                    " GOODS_MOVEMENT
+*&---------------------------------------------------------------------*
+*&      Form  goods_movement_for_res
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM goods_movement_for_res .
+
+
+  CLEAR: str_header.
+  CLEAR: i_items, i_return, i_itemsser[].
+  REFRESH: i_items, i_return.
+
+* Check/Get new posting date
+  CONCATENATE sy-datum i_ekko-bukrs INTO gv_input.
+  CALL FUNCTION 'CONVERSION_EXIT_YPSTD_INPUT'
+    EXPORTING
+      input     = gv_input
+    IMPORTING
+      output    = gv_wadat
+    EXCEPTIONS
+      not_found = 1
+      OTHERS    = 2.
+
+  IF sy-subrc = 0.
+    str_header-pstng_date = gv_wadat.
+  ELSE.
+
+    str_header-pstng_date = sy-datum.
+  ENDIF.
+
+  str_header-doc_date   = sy-datum.
+
+  x_gmcode          = '03'.
+  IF NOT i_resb-lgort IS INITIAL.
+    i_items-stge_loc = i_resb-lgort.
+  ELSE.
+    i_items-stge_loc = '0001'.
+  ENDIF.
+  i_items-move_type = i_resb-bwart.
+  i_items-entry_qnt = i_resb-bdmng.
+  i_items-entry_uom = i_resb-meins.
+  SELECT SINGLE isocode INTO i_items-entry_uom_iso
+                        FROM t006
+                        WHERE msehi = i_resb-meins.
+  i_items-reserv_no = i_resb-rsnum.
+  i_items-res_item  = i_resb-rspos.
+  i_items-res_type  = i_resb-rsart.
+  i_items-mvt_ind   = space.
+  APPEND i_items.
+
+*Copy over the sernrs if any
+  LOOP AT lt_sernr INTO ls_sernr.
+    MOVE: '1'               TO i_itemsser-matdoc_itm,
+          ls_sernr-serialno TO i_itemsser-serialno.
+    APPEND i_itemsser.
+  ENDLOOP.
+
+  PERFORM check_mat_locked.
+
+  CALL FUNCTION 'BAPI_GOODSMVT_CREATE'
+    EXPORTING
+      goodsmvt_header       = str_header
+      goodsmvt_code         = x_gmcode
+*     testrun               = ' '
+*   importing
+*     goodsmvt_headret      =
+*     materialdocument      =
+*     matdocumentyear       =
+    TABLES
+      goodsmvt_item         = i_items
+     goodsmvt_serialnumber = i_itemsser
+      return                = i_return.
+
+  IF i_return[] IS INITIAL.
+    CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+      EXPORTING
+        wait = 'X'.
+    WRITE:/ 'Goods issue created for reservation', i_resb-rsnum, i_resb-rspos.
+  ELSE.
+    WRITE:/ 'Goods issue failed for reservation', i_resb-rsnum, i_resb-rspos.
+    LOOP AT i_return.
+      WRITE:/ i_return-message.
+    ENDLOOP.
+    CLEAR i_return[].
+    CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'
+      IMPORTING
+        return = i_return.
+  ENDIF.
+
+
+ENDFORM.                    " goods_movement_for_res
+
+*&---------------------------------------------------------------------*
+*&      Form  check_mat_locked
+*&---------------------------------------------------------------------*
+*       Check if material is still locked by the previous GR
+*----------------------------------------------------------------------*
+FORM check_mat_locked.
+
+  DATA: lv_stop(1) TYPE c.
+  CONSTANTS: gc_time TYPE num2 VALUE 1.
+
+  CLEAR lv_stop.
+
+  WHILE lv_stop = ' '.
+    CALL FUNCTION 'ENQUEUE_EMMARCE'
+      EXPORTING
+        mode_marc      = 'E'
+        mandt          = sy-mandt
+        matnr          = i_resb-matnr
+        werks          = i_resb-werks
+      EXCEPTIONS
+        foreign_lock   = 1
+        system_failure = 2
+        OTHERS         = 3.
+
+    IF sy-subrc <> 0.
+      WAIT UP TO gc_time SECONDS.
+    ELSE.
+      lv_stop = 'X'.
+      CALL FUNCTION 'DEQUEUE_EMMARCE'
+        EXPORTING
+          mode_marc = 'E'
+          mandt     = sy-mandt
+          matnr     = i_resb-matnr
+          werks     = i_resb-werks.
+    ENDIF.
+  ENDWHILE.
+
+ENDFORM.                    "check_mat_locked
+
+*Selection text£º
+*S_BSART:D       Purchasing Doc. Type
+*S_EBELN:D       Purchasing Document
+*S_EBELP:D       Item
+*S_EKORG:D       Purch. Organization
+*S_WERKS:D       Plant
